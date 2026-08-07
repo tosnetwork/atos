@@ -408,7 +408,7 @@ paths:
     post:
       tags: [artifacts]
       summary: Request a signed upload target
-      description: `job_input` requires `invocations:create` or `jobs:create`; `capability_asset` requires `capabilities:write`.
+      description: '`job_input` requires `invocations:create` or `jobs:create`; `capability_asset` requires `capabilities:write`.'
       requestBody:
         required: true
         content:
