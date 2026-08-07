@@ -47,11 +47,15 @@ type RegisterCapabilityInput struct {
 	Tags                []string
 	RequestedTrustModes []domain.TrustMode
 	Bindings            []domain.CapabilityBinding
+	IdempotencyKey      string
 }
 
 func (s *CapabilityService) Register(ctx context.Context, in RegisterCapabilityInput) (domain.Capability, error) {
 	if in.ProviderID == "" || in.Name == "" || in.Description == "" {
 		return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "provider_id, name and description are required", false)
+	}
+	if in.IdempotencyKey == "" {
+		return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "idempotency_key is required", false)
 	}
 	if in.DeliveryMode != domain.DeliveryInstant && in.DeliveryMode != domain.DeliveryAsync && in.DeliveryMode != domain.DeliveryInteractive {
 		return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "delivery_mode must be instant, async or interactive", false)
@@ -67,6 +71,31 @@ func (s *CapabilityService) Register(ctx context.Context, in RegisterCapabilityI
 	if err != nil {
 		return domain.Capability{}, err
 	}
+
+	requestHash := hashRequest(
+		"register-capability", in.ProviderID, in.Name, in.Description,
+		in.DeliveryMode, in.InputSchema, in.OutputSchema, in.Pricing,
+		in.Tags, requested, bindings,
+	)
+	record, reserved, err := s.store.Reserve(ctx, in.ProviderID, in.IdempotencyKey, requestHash)
+	if err != nil {
+		return domain.Capability{}, err
+	}
+	if !reserved {
+		if record.RequestHash != requestHash {
+			return domain.Capability{}, domain.NewError(domain.ErrIdempotencyConflict, "idempotency_key reused with a different registration", false)
+		}
+		if record.Status != store.IdempotencyCompleted {
+			return domain.Capability{}, domain.NewError(domain.ErrIdempotencyConflict, "capability registration is still in progress", true)
+		}
+		return s.Get(ctx, record.ResponseKey)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.store.Release(ctx, in.ProviderID, in.IdempotencyKey)
+		}
+	}()
 
 	inputArtifacts := artifactFields(in.InputSchema)
 	outputArtifacts := artifactFields(in.OutputSchema)
@@ -100,10 +129,38 @@ func (s *CapabilityService) Register(ctx context.Context, in RegisterCapabilityI
 	if err := s.store.Put(ctx, c); err != nil {
 		return domain.Capability{}, err
 	}
+	if err := s.store.Finish(ctx, in.ProviderID, in.IdempotencyKey, c.ID); err != nil {
+		return domain.Capability{}, err
+	}
+	committed = true
 	return c, nil
 }
 
-func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID string, patch map[string]any) (domain.Capability, error) {
+func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID string, patch map[string]any, idempotencyKey string) (domain.Capability, error) {
+	if idempotencyKey == "" {
+		return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "idempotency_key is required", false)
+	}
+	requestHash := hashRequest("update-capability", id, patch)
+	record, reserved, err := s.store.Reserve(ctx, requestingProviderID, idempotencyKey, requestHash)
+	if err != nil {
+		return domain.Capability{}, err
+	}
+	if !reserved {
+		if record.RequestHash != requestHash {
+			return domain.Capability{}, domain.NewError(domain.ErrIdempotencyConflict, "idempotency_key reused with a different capability update", false)
+		}
+		if record.Status != store.IdempotencyCompleted {
+			return domain.Capability{}, domain.NewError(domain.ErrIdempotencyConflict, "capability update is still in progress", true)
+		}
+		return s.Get(ctx, record.ResponseKey)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.store.Release(ctx, requestingProviderID, idempotencyKey)
+		}
+	}()
+
 	c, err := s.Get(ctx, id)
 	if err != nil {
 		return domain.Capability{}, err
@@ -183,6 +240,10 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 	if err := s.store.Put(ctx, c); err != nil {
 		return domain.Capability{}, err
 	}
+	if err := s.store.Finish(ctx, requestingProviderID, idempotencyKey, c.ID); err != nil {
+		return domain.Capability{}, err
+	}
+	committed = true
 	return c, nil
 }
 
@@ -197,12 +258,12 @@ func (s *CapabilityService) ListByProvider(ctx context.Context, providerID strin
 	return caps, nil
 }
 
-func (s *CapabilityService) Pause(ctx context.Context, id, requestingProviderID string) (domain.Capability, error) {
-	return s.Update(ctx, id, requestingProviderID, map[string]any{"status": string(domain.CapabilityPaused)})
+func (s *CapabilityService) Pause(ctx context.Context, id, requestingProviderID, idempotencyKey string) (domain.Capability, error) {
+	return s.Update(ctx, id, requestingProviderID, map[string]any{"status": string(domain.CapabilityPaused)}, idempotencyKey)
 }
 
-func (s *CapabilityService) Resume(ctx context.Context, id, requestingProviderID string) (domain.Capability, error) {
-	return s.Update(ctx, id, requestingProviderID, map[string]any{"status": string(domain.CapabilityActive)})
+func (s *CapabilityService) Resume(ctx context.Context, id, requestingProviderID, idempotencyKey string) (domain.Capability, error) {
+	return s.Update(ctx, id, requestingProviderID, map[string]any{"status": string(domain.CapabilityActive)}, idempotencyKey)
 }
 
 func (s *CapabilityService) Taxonomy(ctx context.Context) ([]string, error) {
