@@ -1,6 +1,10 @@
 package httpapi
 
-import "net/http"
+import (
+	"net/http"
+
+	"github.com/tosnetwork/atos/internal/domain"
+)
 
 func (s *Server) handleTaxonomy(w http.ResponseWriter, r *http.Request) {
 	tags, err := s.Capabilities.Taxonomy(r.Context())
@@ -35,10 +39,10 @@ func (s *Server) handleProviderAgentCard(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	skills := make([]map[string]any, 0, len(caps))
-	identityAssurance := "self_asserted"
+	identityAssurance := domain.TrustSelfAsserted
 	for _, capability := range caps {
-		if string(capability.Trust.Level) > identityAssurance {
-			identityAssurance = string(capability.Trust.Level)
+		if trustLevelRank(capability.Trust.Level) > trustLevelRank(identityAssurance) {
+			identityAssurance = capability.Trust.Level
 		}
 		skills = append(skills, map[string]any{
 			"id":          capability.ID,
@@ -77,4 +81,17 @@ func (s *Server) handleProviderAgentCard(w http.ResponseWriter, r *http.Request)
 			},
 		},
 	})
+}
+
+func trustLevelRank(level domain.TrustLevel) int {
+	switch level {
+	case domain.TrustTOSAttested:
+		return 3
+	case domain.TrustATOSVerified:
+		return 2
+	case domain.TrustSelfAsserted:
+		return 1
+	default:
+		return 0
+	}
 }
