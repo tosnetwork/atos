@@ -8,8 +8,8 @@ type toolSpec struct {
 }
 
 const (
-	toolsListTTLMS    = 30000
-	toolsCacheScope   = "private"
+	toolsListTTLMS  = 30000
+	toolsCacheScope = "private"
 )
 
 var orderedToolSpecs = []toolSpec{
@@ -64,37 +64,37 @@ func requestedModeSchema() map[string]any {
 func proofRequirementsSchema() map[string]any {
 	return objectSchema(nil, map[string]any{
 		"network_verifiable_receipt": map[string]any{"type": "boolean"},
-		"tos_settlement": map[string]any{"type": "boolean"},
-		"portable_proof_of_service": map[string]any{"type": "boolean"},
+		"tos_settlement":             map[string]any{"type": "boolean"},
+		"portable_proof_of_service":  map[string]any{"type": "boolean"},
 	})
 }
 
 func moneySchema() map[string]any {
 	return objectSchema([]string{"amount", "currency"}, map[string]any{
-		"amount": map[string]any{"type": "string", "minLength": 1},
+		"amount":   map[string]any{"type": "string", "minLength": 1},
 		"currency": map[string]any{"type": "string", "minLength": 3, "maxLength": 12},
 	})
 }
 
 func searchTool() map[string]any {
 	return map[string]any{
-		"name": "atos_search",
+		"name":        "atos_search",
 		"description": "Search and rank ATOS capabilities by intent, price, delivery, trust mode and proof requirements.",
 		"inputSchema": objectSchema([]string{"query"}, map[string]any{
 			"query": map[string]any{"type": "string", "minLength": 1},
 			"filters": objectSchema(nil, map[string]any{
-				"max_price": moneySchema(),
-				"delivery_modes": map[string]any{"type": "array", "uniqueItems": true, "items": map[string]any{"type": "string", "enum": []string{"instant", "async", "interactive"}}},
+				"max_price":            moneySchema(),
+				"delivery_modes":       map[string]any{"type": "array", "uniqueItems": true, "items": map[string]any{"type": "string", "enum": []string{"instant", "async", "interactive"}}},
 				"requested_trust_mode": requestedModeSchema(),
-				"proof_requirements": proofRequirementsSchema(),
-				"min_trust_score": map[string]any{"type": "number", "minimum": 0, "maximum": 1},
-				"max_latency_ms": map[string]any{"type": "integer", "minimum": 0},
+				"proof_requirements":   proofRequirementsSchema(),
+				"min_trust_score":      map[string]any{"type": "number", "minimum": 0, "maximum": 1},
+				"max_latency_ms":       map[string]any{"type": "integer", "minimum": 0},
 			}),
-			"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+			"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
 			"cursor": map[string]any{"type": []string{"string", "null"}},
 		}),
 		"outputSchema": objectSchema([]string{"matches"}, map[string]any{
-			"matches": map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
+			"matches":     map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 			"next_cursor": map[string]any{"type": []string{"string", "null"}},
 		}),
 	}
@@ -102,25 +102,25 @@ func searchTool() map[string]any {
 
 func getCapabilityTool() map[string]any {
 	return map[string]any{
-		"name": "atos_get_capability",
-		"description": "Get capability schemas, pricing, active trust modes, proof profiles, bindings and artifact requirements.",
-		"inputSchema": objectSchema([]string{"capability_id"}, map[string]any{"capability_id": map[string]any{"type": "string", "minLength": 1}}),
+		"name":         "atos_get_capability",
+		"description":  "Get capability schemas, pricing, active trust modes, proof profiles, bindings and artifact requirements.",
+		"inputSchema":  objectSchema([]string{"capability_id"}, map[string]any{"capability_id": map[string]any{"type": "string", "minLength": 1}}),
 		"outputSchema": map[string]any{"type": "object"},
 	}
 }
 
 func quoteTool() map[string]any {
 	return map[string]any{
-		"name": "atos_quote",
+		"name":        "atos_quote",
 		"description": "Create a short-lived executable Quote and freeze one concrete trust mode and proof profile.",
 		"inputSchema": objectSchema([]string{"capability_id"}, map[string]any{
-			"capability_id": map[string]any{"type": "string", "minLength": 1},
-			"input_summary": map[string]any{"type": "object"},
+			"capability_id":        map[string]any{"type": "string", "minLength": 1},
+			"input_summary":        map[string]any{"type": "object"},
 			"requested_trust_mode": requestedModeSchema(),
-			"proof_requirements": proofRequirementsSchema(),
+			"proof_requirements":   proofRequirementsSchema(),
 			"constraints": objectSchema(nil, map[string]any{
 				"max_total": moneySchema(),
-				"deadline": map[string]any{"type": "string", "format": "date-time"},
+				"deadline":  map[string]any{"type": "string", "format": "date-time"},
 			}),
 		}),
 		"outputSchema": objectSchema(
@@ -140,12 +140,12 @@ func quoteTool() map[string]any {
 
 func invocationInputSchema() map[string]any {
 	return objectSchema([]string{"capability_id", "quote_id", "input", "idempotency_key"}, map[string]any{
-		"capability_id": map[string]any{"type": "string", "minLength": 1},
-		"quote_id": map[string]any{"type": "string", "minLength": 1},
-		"input": map[string]any{},
+		"capability_id":   map[string]any{"type": "string", "minLength": 1},
+		"quote_id":        map[string]any{"type": "string", "minLength": 1},
+		"input":           map[string]any{},
 		"idempotency_key": map[string]any{"type": "string", "minLength": 1},
-		"max_wait_ms": map[string]any{"type": "integer", "minimum": 1000, "maximum": 120000},
-		"confirmed": map[string]any{"type": "boolean", "description": "Phase 0 continuation flag after input_required; production MCP elicitation binds signed request state."},
+		"max_wait_ms":     map[string]any{"type": "integer", "minimum": 1000, "maximum": 120000},
+		"confirmed":       map[string]any{"type": "boolean", "description": "Phase 0 continuation flag after input_required; production MCP elicitation binds signed request state."},
 	})
 }
 
@@ -154,7 +154,7 @@ func invokeTool() map[string]any {
 		"name": "atos_invoke", "description": "Invoke a bounded capability using an immutable Quote.",
 		"inputSchema": invocationInputSchema(),
 		"outputSchema": objectSchema([]string{"result_type", "quote_id", "trust_mode"}, map[string]any{
-			"result_type": map[string]any{"type": "string", "enum": []string{"completed", "accepted", "input_required", "failed"}},
+			"result_type":   map[string]any{"type": "string", "enum": []string{"completed", "accepted", "input_required", "failed"}},
 			"invocation_id": map[string]any{"type": []string{"string", "null"}}, "job_id": map[string]any{"type": []string{"string", "null"}},
 			"quote_id": map[string]any{"type": "string"}, "trust_mode": concreteModeSchema(),
 			"proof_profile": map[string]any{"type": []string{"string", "null"}}, "output": map[string]any{},
@@ -175,7 +175,7 @@ func createJobTool() map[string]any {
 func getJobTool() map[string]any {
 	return map[string]any{
 		"name": "atos_get_job", "description": "Get current Job state, trust mode, proof progress, artifacts and receipt.",
-		"inputSchema": objectSchema([]string{"job_id"}, map[string]any{"job_id": map[string]any{"type": "string", "minLength": 1}}),
+		"inputSchema":  objectSchema([]string{"job_id"}, map[string]any{"job_id": map[string]any{"type": "string", "minLength": 1}}),
 		"outputSchema": map[string]any{"type": "object"},
 	}
 }
@@ -200,7 +200,7 @@ func accountTool() map[string]any {
 
 func artifactTool() map[string]any {
 	return map[string]any{
-		"name": "atos_artifact",
+		"name":        "atos_artifact",
 		"description": "Work with ATOS artifacts using signed URLs; binary bytes never pass through this tool call.",
 		"inputSchema": map[string]any{"oneOf": []any{
 			objectSchema([]string{"operation", "content_type", "size_bytes", "purpose"}, map[string]any{
@@ -231,12 +231,12 @@ func capabilityRegistrationProperties() map[string]any {
 	return map[string]any{
 		"name": map[string]any{"type": "string", "minLength": 1}, "description": map[string]any{"type": "string", "minLength": 1},
 		"delivery_mode": map[string]any{"type": "string", "enum": []string{"instant", "async", "interactive"}},
-		"input_schema": map[string]any{"type": "object"}, "output_schema": map[string]any{"type": "object"}, "pricing": map[string]any{"type": "object"},
-		"tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+		"input_schema":  map[string]any{"type": "object"}, "output_schema": map[string]any{"type": "object"}, "pricing": map[string]any{"type": "object"},
+		"tags":                  map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 		"requested_trust_modes": map[string]any{"type": "array", "minItems": 1, "uniqueItems": true, "items": concreteModeSchema()},
 		"bindings": map[string]any{"type": "array", "items": objectSchema([]string{"transport", "endpoint_ref", "eligible_trust_modes"}, map[string]any{
-			"transport": map[string]any{"type": "string", "enum": []string{"http", "mcp", "a2a", "human", "tos-native"}},
-			"endpoint_ref": map[string]any{"type": "string", "minLength": 1},
+			"transport":            map[string]any{"type": "string", "enum": []string{"http", "mcp", "a2a", "human", "tos-native"}},
+			"endpoint_ref":         map[string]any{"type": "string", "minLength": 1},
 			"eligible_trust_modes": map[string]any{"type": "array", "minItems": 1, "uniqueItems": true, "items": concreteModeSchema()},
 		})},
 	}
@@ -245,7 +245,7 @@ func capabilityRegistrationProperties() map[string]any {
 func registerCapabilityTool() map[string]any {
 	return map[string]any{
 		"name": "atos_register_capability", "description": "Register a provider capability and request concrete trust modes.",
-		"inputSchema": objectSchema([]string{"name", "description", "delivery_mode", "input_schema", "output_schema", "pricing", "requested_trust_modes"}, capabilityRegistrationProperties()),
+		"inputSchema":  objectSchema([]string{"name", "description", "delivery_mode", "input_schema", "output_schema", "pricing", "requested_trust_modes"}, capabilityRegistrationProperties()),
 		"outputSchema": map[string]any{"type": "object"},
 	}
 }
@@ -253,7 +253,7 @@ func registerCapabilityTool() map[string]any {
 func updateCapabilityTool() map[string]any {
 	return map[string]any{
 		"name": "atos_update_capability", "description": "Update mutable capability metadata or requested trust modes; active support remains derived.",
-		"inputSchema": objectSchema([]string{"capability_id", "patch"}, map[string]any{"capability_id": map[string]any{"type": "string", "minLength": 1}, "patch": map[string]any{"type": "object"}}),
+		"inputSchema":  objectSchema([]string{"capability_id", "patch"}, map[string]any{"capability_id": map[string]any{"type": "string", "minLength": 1}, "patch": map[string]any{"type": "object"}}),
 		"outputSchema": map[string]any{"type": "object"},
 	}
 }
@@ -268,7 +268,7 @@ func listMyCapabilitiesTool() map[string]any {
 func pauseCapabilityTool() map[string]any {
 	return map[string]any{
 		"name": "atos_pause_capability", "description": "Pause one capability owned by the authenticated provider.",
-		"inputSchema": objectSchema([]string{"capability_id"}, map[string]any{"capability_id": map[string]any{"type": "string", "minLength": 1}}),
+		"inputSchema":  objectSchema([]string{"capability_id"}, map[string]any{"capability_id": map[string]any{"type": "string", "minLength": 1}}),
 		"outputSchema": map[string]any{"type": "object"},
 	}
 }

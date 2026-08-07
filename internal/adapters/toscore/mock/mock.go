@@ -82,14 +82,14 @@ func (c *Core) ResolveExecutionSignerAuthorization(
 	// The Phase 0 mock signer is local Managed evidence. It is not a TOS
 	// attestation and therefore cannot activate Verified/Native mode.
 	auth := toscore.ExecutionSignerAuthorization{
-		AuthorizationID:    "auth_mock_" + capabilityID,
-		ProviderID:         providerID,
-		CapabilityID:       capabilityID,
-		CapabilityVersion:  capabilityVersion,
-		ExecutionSignerID:  signerID,
-		ValidFrom:          at.Add(-24 * time.Hour),
-		ValidUntil:         at.Add(24 * time.Hour),
-		AuthorizationRef:   "atos:managed:signer:" + signerID,
+		AuthorizationID:   "auth_mock_" + capabilityID,
+		ProviderID:        providerID,
+		CapabilityID:      capabilityID,
+		CapabilityVersion: capabilityVersion,
+		ExecutionSignerID: signerID,
+		ValidFrom:         at.Add(-24 * time.Hour),
+		ValidUntil:        at.Add(24 * time.Hour),
+		AuthorizationRef:  "atos:managed:signer:" + signerID,
 	}
 	return auth, true, nil
 }
@@ -333,13 +333,13 @@ func (c *Core) ReadProof(ctx context.Context, receiptID string) (map[string]any,
 		return nil, err
 	}
 	return map[string]any{
-		"receipt_id":       r.ID,
-		"escrow_id":        r.EscrowID,
-		"trust_mode":       r.TrustMode,
-		"proof_profile":    r.ProofProfile,
-		"proof_status":     r.ProofStatus,
+		"receipt_id":        r.ID,
+		"escrow_id":         r.EscrowID,
+		"trust_mode":        r.TrustMode,
+		"proof_profile":     r.ProofProfile,
+		"proof_status":      r.ProofStatus,
 		"network_proof_ref": r.NetworkProofRef,
-		"attested":        false,
-		"note":            fmt.Sprintf("Phase 0/1 mock evidence; %s is not a TOS network proof", r.TrustMode),
+		"attested":          false,
+		"note":              fmt.Sprintf("Phase 0/1 mock evidence; %s is not a TOS network proof", r.TrustMode),
 	}, nil
 }

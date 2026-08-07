@@ -12,18 +12,18 @@ import (
 )
 
 type SubmitJobRequest struct {
-	JobID              string
-	QuoteID            string
-	EscrowID           string
-	PrincipalID        string
-	CapabilityID       string
-	CapabilityVersion  string
-	ProviderID         string
-	TrustMode          domain.TrustMode
-	ProofProfile       domain.ProofProfile
-	Input              map[string]any
-	InputCommitment    string
-	MaxWaitMS          int64
+	JobID             string
+	QuoteID           string
+	EscrowID          string
+	PrincipalID       string
+	CapabilityID      string
+	CapabilityVersion string
+	ProviderID        string
+	TrustMode         domain.TrustMode
+	ProofProfile      domain.ProofProfile
+	Input             map[string]any
+	InputCommitment   string
+	MaxWaitMS         int64
 }
 
 type SubmitJobResult struct {

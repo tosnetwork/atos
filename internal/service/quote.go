@@ -100,13 +100,13 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 	now := time.Now().UTC()
 	disputePolicyHash := termsHash("atos-dispute-policy", "v0.2", "72h")
 	q := domain.Quote{
-		ID:                     "q_" + uuid.NewString(),
-		CapabilityID:           cap.ID,
-		CapabilityVersion:      cap.Version,
-		ProviderID:             cap.ProviderID,
-		RequestedTrustMode:     requested,
-		TrustMode:              mode,
-		ProofProfile:           profile,
+		ID:                 "q_" + uuid.NewString(),
+		CapabilityID:       cap.ID,
+		CapabilityVersion:  cap.Version,
+		ProviderID:         cap.ProviderID,
+		RequestedTrustMode: requested,
+		TrustMode:          mode,
+		ProofProfile:       profile,
 		Price: domain.Price{
 			Subtotal: subtotal.String(),
 			Fees:     fees.String(),
@@ -140,13 +140,13 @@ func quoteGuarantees(mode domain.TrustMode, clientAsset string) (domain.Settleme
 		}, domain.ProofDescriptor{ExecutionReceipt: true}
 	}
 	return domain.SettlementDescriptor{
-		Backend: domain.SettlementTOS, Escrow: true,
-		FundingModel: domain.FundingGatewaySponsored,
-		ClientAsset: clientAsset, ProviderAsset: "TOS",
-	}, domain.ProofDescriptor{
-		QuoteCommitment: true, ExecutionReceipt: true,
-		SettlementProof: true, ProofOfService: true,
-	}
+			Backend: domain.SettlementTOS, Escrow: true,
+			FundingModel: domain.FundingGatewaySponsored,
+			ClientAsset:  clientAsset, ProviderAsset: "TOS",
+		}, domain.ProofDescriptor{
+			QuoteCommitment: true, ExecutionReceipt: true,
+			SettlementProof: true, ProofOfService: true,
+		}
 }
 
 func (s *QuoteService) Get(ctx context.Context, id string) (domain.Quote, error) {

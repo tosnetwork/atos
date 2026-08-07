@@ -66,11 +66,11 @@ func (s *Server) handleResourceRead(ctx context.Context, w http.ResponseWriter, 
 		content, err = s.Accounts.Get(ctx, principal.ID)
 	case "atos://network/status":
 		content = map[string]any{
-			"managed": "available",
+			"managed":  "available",
 			"verified": "unavailable",
-			"native": "unavailable",
-			"network": "TOS",
-			"note": "Phase 0/1 uses mock tos-core; Verified/Native are never silently mapped to Managed.",
+			"native":   "unavailable",
+			"network":  "TOS",
+			"note":     "Phase 0/1 uses mock tos-core; Verified/Native are never silently mapped to Managed.",
 		}
 	case "atos://docs/protocol-version":
 		content = map[string]any{"mcp_protocol_version": defaultProtocolVersion, "atos_version": "0.2.0"}

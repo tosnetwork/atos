@@ -10,16 +10,16 @@ import (
 )
 
 type CreateEscrowRequest struct {
-	QuoteID          string
-	JobID            string
-	CapabilityID     string
+	QuoteID           string
+	JobID             string
+	CapabilityID      string
 	CapabilityVersion string
-	PrincipalID      string
-	ProviderID       string
-	TrustMode        domain.TrustMode
-	ProofProfile     domain.ProofProfile
-	Settlement       domain.SettlementDescriptor
-	Reserved         domain.Money
+	PrincipalID       string
+	ProviderID        string
+	TrustMode         domain.TrustMode
+	ProofProfile      domain.ProofProfile
+	Settlement        domain.SettlementDescriptor
+	Reserved          domain.Money
 }
 
 type VerifyExecutionReceiptResult struct {
@@ -29,9 +29,9 @@ type VerifyExecutionReceiptResult struct {
 }
 
 type SettleJobRequest struct {
-	EscrowID  string
-	JobID     string
-	ReceiptID string
+	EscrowID   string
+	JobID      string
+	ReceiptID  string
 	ActualCost domain.Money
 }
 
@@ -40,15 +40,15 @@ type SettleJobResult struct {
 }
 
 type ExecutionSignerAuthorization struct {
-	AuthorizationID string
-	ProviderID      string
-	CapabilityID    string
+	AuthorizationID   string
+	ProviderID        string
+	CapabilityID      string
 	CapabilityVersion string
 	ExecutionSignerID string
-	ValidFrom       time.Time
-	ValidUntil      time.Time
-	AuthorizationRef string
-	Revoked         bool
+	ValidFrom         time.Time
+	ValidUntil        time.Time
+	AuthorizationRef  string
+	Revoked           bool
 }
 
 type Core interface {

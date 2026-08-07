@@ -108,11 +108,11 @@ func main() {
 func seedDemoCapability(capabilities *service.CapabilityService) error {
 	_, err := capabilities.Register(context.Background(), service.RegisterCapabilityInput{
 		ProviderID: "agt_demo", Name: "Echo Sandbox",
-		Description: "Returns its input unchanged. For exercising the ATOS v0.2 Managed contract end to end.",
+		Description:  "Returns its input unchanged. For exercising the ATOS v0.2 Managed contract end to end.",
 		DeliveryMode: domain.DeliveryInstant,
-		InputSchema: map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
-		Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
-		Tags: []string{"sandbox", "demo"},
+		InputSchema:  map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing:             domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
+		Tags:                []string{"sandbox", "demo"},
 		RequestedTrustModes: []domain.TrustMode{domain.TrustModeManaged},
 		Bindings: []domain.CapabilityBinding{{
 			Transport: domain.AdapterTOSNative, EndpointRef: "internal:mock",

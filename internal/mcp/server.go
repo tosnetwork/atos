@@ -117,9 +117,9 @@ func (s *Server) Handler() http.HandlerFunc {
 		if req.Method == "initialize" {
 			writeRPCResult(w, req.ID, map[string]any{
 				"protocolVersion": negotiateProtocolVersion(req.Params),
-				"serverInfo": map[string]any{"name": "atos-mcp", "version": "0.2.0"},
+				"serverInfo":      map[string]any{"name": "atos-mcp", "version": "0.2.0"},
 				"capabilities": map[string]any{
-					"tools": map[string]any{"listChanged": false},
+					"tools":     map[string]any{"listChanged": false},
 					"resources": map[string]any{"subscribe": false, "listChanged": false},
 				},
 			})
@@ -139,16 +139,16 @@ func (s *Server) Handler() http.HandlerFunc {
 		switch req.Method {
 		case "tools/list":
 			writeRPCResult(w, req.ID, map[string]any{
-				"tools": s.toolsForPrincipal(principal),
-				"ttlMs": toolsListTTLMS,
+				"tools":      s.toolsForPrincipal(principal),
+				"ttlMs":      toolsListTTLMS,
 				"cacheScope": toolsCacheScope,
 			})
 		case "tools/call":
 			s.handleToolCall(ctx, w, req, principal)
 		case "resources/list":
 			writeRPCResult(w, req.ID, map[string]any{
-				"resources": resourcesForPrincipal(principal),
-				"ttlMs": toolsListTTLMS,
+				"resources":  resourcesForPrincipal(principal),
+				"ttlMs":      toolsListTTLMS,
 				"cacheScope": toolsCacheScope,
 			})
 		case "resources/read":
@@ -203,8 +203,8 @@ func (s *Server) handleToolCall(ctx context.Context, w http.ResponseWriter, req 
 		return
 	}
 	writeRPCResult(w, req.ID, map[string]any{
-		"isError": false,
-		"content": []map[string]any{{"type": "text", "text": "ATOS operation completed"}},
+		"isError":           false,
+		"content":           []map[string]any{{"type": "text", "text": "ATOS operation completed"}},
 		"structuredContent": result,
 	})
 }

@@ -149,8 +149,8 @@ const (
 type SettlementBackend string
 
 const (
-	SettlementATOSManaged    SettlementBackend = "atos_managed"
-	SettlementTOS            SettlementBackend = "tos"
+	SettlementATOSManaged     SettlementBackend = "atos_managed"
+	SettlementTOS             SettlementBackend = "tos"
 	SettlementExternalManaged SettlementBackend = "external_managed"
 )
 

@@ -79,8 +79,8 @@ func (s *ReceiptService) UsageSummary(ctx context.Context, principalID string) (
 		return UsageSummary{}, err
 	}
 	summary := UsageSummary{
-		TotalJobs: len(jobs),
-		TotalCharged: domain.Money{Amount: "0.00", Currency: "USD"},
+		TotalJobs:     len(jobs),
+		TotalCharged:  domain.Money{Amount: "0.00", Currency: "USD"},
 		TotalRefunded: domain.Money{Amount: "0.00", Currency: "USD"},
 	}
 	for _, job := range jobs {

@@ -79,28 +79,28 @@ type CapabilityBinding struct {
 }
 
 type Capability struct {
-	ID                    string              `json:"id"`
-	CanonicalURI          string              `json:"canonical_uri,omitempty"`
-	ProviderID            string              `json:"provider_id"`
-	Name                  string              `json:"name"`
-	Description           string              `json:"description"`
-	Version               string              `json:"version"`
-	ManifestCommitment    string              `json:"manifest_commitment,omitempty"`
-	Tags                  []string            `json:"tags,omitempty"`
-	Modalities            []string            `json:"modalities,omitempty"`
-	DeliveryMode          DeliveryMode        `json:"delivery_mode"`
-	InputSchema           map[string]any      `json:"input_schema"`
-	OutputSchema          map[string]any      `json:"output_schema"`
-	Pricing               Pricing             `json:"pricing"`
-	SLA                   SLA                 `json:"sla"`
-	Trust                 Trust               `json:"trust_summary"`
-	RequestedTrustModes   []TrustMode         `json:"requested_trust_modes"`
-	SupportedTrustModes   []TrustMode         `json:"supported_trust_modes"`
-	ModeSupport           ModeSupport         `json:"mode_support"`
-	Bindings              []CapabilityBinding `json:"bindings,omitempty"`
-	RequiresArtifactTransfer bool             `json:"requires_artifact_transfer"`
-	ArtifactInputFields   []string            `json:"artifact_input_fields,omitempty"`
-	ArtifactOutputFields  []string            `json:"artifact_output_fields,omitempty"`
+	ID                       string              `json:"id"`
+	CanonicalURI             string              `json:"canonical_uri,omitempty"`
+	ProviderID               string              `json:"provider_id"`
+	Name                     string              `json:"name"`
+	Description              string              `json:"description"`
+	Version                  string              `json:"version"`
+	ManifestCommitment       string              `json:"manifest_commitment,omitempty"`
+	Tags                     []string            `json:"tags,omitempty"`
+	Modalities               []string            `json:"modalities,omitempty"`
+	DeliveryMode             DeliveryMode        `json:"delivery_mode"`
+	InputSchema              map[string]any      `json:"input_schema"`
+	OutputSchema             map[string]any      `json:"output_schema"`
+	Pricing                  Pricing             `json:"pricing"`
+	SLA                      SLA                 `json:"sla"`
+	Trust                    Trust               `json:"trust_summary"`
+	RequestedTrustModes      []TrustMode         `json:"requested_trust_modes"`
+	SupportedTrustModes      []TrustMode         `json:"supported_trust_modes"`
+	ModeSupport              ModeSupport         `json:"mode_support"`
+	Bindings                 []CapabilityBinding `json:"bindings,omitempty"`
+	RequiresArtifactTransfer bool                `json:"requires_artifact_transfer"`
+	ArtifactInputFields      []string            `json:"artifact_input_fields,omitempty"`
+	ArtifactOutputFields     []string            `json:"artifact_output_fields,omitempty"`
 	// AdapterType remains an internal compatibility shortcut for the current
 	// single-adapter Phase 0 runtime. Bindings are the public v0.2 contract.
 	AdapterType EndpointAdapterType `json:"-"`

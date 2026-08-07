@@ -111,7 +111,7 @@ func authFrom(r *http.Request) authContext {
 	return value
 }
 
-func principalFrom(r *http.Request) string { return authFrom(r).Principal.ID }
+func principalFrom(r *http.Request) string      { return authFrom(r).Principal.ID }
 func scopesFrom(r *http.Request) auth.Principal { return authFrom(r).Principal }
 
 func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {

@@ -18,20 +18,20 @@ import (
 type Scope string
 
 const (
-	ScopeCapabilitiesRead  Scope = "capabilities:read"
-	ScopeCapabilitiesWrite Scope = "capabilities:write"
-	ScopeQuotesRead        Scope = "quotes:read"
-	ScopeInvocationsCreate Scope = "invocations:create"
-	ScopeJobsCreate        Scope = "jobs:create"
-	ScopeJobsRead          Scope = "jobs:read"
-	ScopeJobsCancel        Scope = "jobs:cancel"
-	ScopeAccountRead       Scope = "account:read"
-	ScopeProviderJobsRead  Scope = "provider_jobs:read"
+	ScopeCapabilitiesRead    Scope = "capabilities:read"
+	ScopeCapabilitiesWrite   Scope = "capabilities:write"
+	ScopeQuotesRead          Scope = "quotes:read"
+	ScopeInvocationsCreate   Scope = "invocations:create"
+	ScopeJobsCreate          Scope = "jobs:create"
+	ScopeJobsRead            Scope = "jobs:read"
+	ScopeJobsCancel          Scope = "jobs:cancel"
+	ScopeAccountRead         Scope = "account:read"
+	ScopeProviderJobsRead    Scope = "provider_jobs:read"
 	ScopeProviderJobsDeliver Scope = "provider_jobs:deliver"
-	ScopeEarningsRead      Scope = "earnings:read"
-	ScopeSettlementRead    Scope = "settlement:read"
-	ScopeProofsRead        Scope = "proofs:read"
-	ScopeNetworkRead       Scope = "network:read"
+	ScopeEarningsRead        Scope = "earnings:read"
+	ScopeSettlementRead      Scope = "settlement:read"
+	ScopeProofsRead          Scope = "proofs:read"
+	ScopeNetworkRead         Scope = "network:read"
 )
 
 var allowedScopes = map[Scope]struct{}{
@@ -131,8 +131,8 @@ func (s *Service) StartDevice(requested []string) (DeviceGrant, error) {
 	deviceCode := "dc_" + opaqueToken(24)
 	grant := DeviceGrant{
 		DeviceCode: deviceCode,
-		UserCode: strings.ToUpper(uuid.NewString()[0:8]),
-		Scopes: scopes, ExpiresAt: now.Add(15 * time.Minute),
+		UserCode:   strings.ToUpper(uuid.NewString()[0:8]),
+		Scopes:     scopes, ExpiresAt: now.Add(15 * time.Minute),
 		// Phase 0: authorization is immediate. Production replaces this flag
 		// with the user-facing verification flow without changing token scopes.
 		Authorized: true,

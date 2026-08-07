@@ -13,24 +13,24 @@ const (
 )
 
 type Receipt struct {
-	ID                     string        `json:"receipt_id"`
-	QuoteID                string        `json:"quote_id"`
-	EscrowID               string        `json:"escrow_id"`
-	JobID                  string        `json:"job_id"`
-	PrincipalID            string        `json:"-"`
-	TrustMode              TrustMode     `json:"trust_mode"`
-	ProofProfile           ProofProfile  `json:"proof_profile,omitempty"`
-	Charged                Money         `json:"charged"`
-	Refunded               Money         `json:"refunded"`
-	Status                 ReceiptStatus `json:"status"`
+	ID                     string          `json:"receipt_id"`
+	QuoteID                string          `json:"quote_id"`
+	EscrowID               string          `json:"escrow_id"`
+	JobID                  string          `json:"job_id"`
+	PrincipalID            string          `json:"-"`
+	TrustMode              TrustMode       `json:"trust_mode"`
+	ProofProfile           ProofProfile    `json:"proof_profile,omitempty"`
+	Charged                Money           `json:"charged"`
+	Refunded               Money           `json:"refunded"`
+	Status                 ReceiptStatus   `json:"status"`
 	ProofStatus            ProofCheckpoint `json:"proof_status"`
-	NetworkProofRef        string        `json:"network_proof_ref,omitempty"`
-	ExecutionSignerID      string        `json:"execution_signer_id,omitempty"`
-	SignerAuthorizationRef string        `json:"signer_authorization_ref,omitempty"`
-	InputCommitment        string        `json:"input_commitment,omitempty"`
-	OutputCommitment       string        `json:"output_commitment,omitempty"`
-	UsageCommitment        string        `json:"usage_commitment,omitempty"`
-	CreatedAt              time.Time     `json:"created_at"`
+	NetworkProofRef        string          `json:"network_proof_ref,omitempty"`
+	ExecutionSignerID      string          `json:"execution_signer_id,omitempty"`
+	SignerAuthorizationRef string          `json:"signer_authorization_ref,omitempty"`
+	InputCommitment        string          `json:"input_commitment,omitempty"`
+	OutputCommitment       string          `json:"output_commitment,omitempty"`
+	UsageCommitment        string          `json:"usage_commitment,omitempty"`
+	CreatedAt              time.Time       `json:"created_at"`
 }
 
 type ExecutionResult string

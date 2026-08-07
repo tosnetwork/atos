@@ -13,19 +13,19 @@ type toolHandler func(ctx context.Context, principal auth.Principal, args map[st
 
 func (s *Server) dispatch() map[string]toolHandler {
 	return map[string]toolHandler{
-		"atos_search": s.toolSearch,
-		"atos_get_capability": s.toolGetCapability,
-		"atos_quote": s.toolQuote,
-		"atos_invoke": s.toolInvoke,
-		"atos_create_job": s.toolCreateJob,
-		"atos_get_job": s.toolGetJob,
-		"atos_cancel_job": s.toolCancelJob,
-		"atos_account": s.toolAccount,
-		"atos_artifact": s.toolArtifact,
-		"atos_register_capability": s.toolRegisterCapability,
-		"atos_update_capability": s.toolUpdateCapability,
+		"atos_search":               s.toolSearch,
+		"atos_get_capability":       s.toolGetCapability,
+		"atos_quote":                s.toolQuote,
+		"atos_invoke":               s.toolInvoke,
+		"atos_create_job":           s.toolCreateJob,
+		"atos_get_job":              s.toolGetJob,
+		"atos_cancel_job":           s.toolCancelJob,
+		"atos_account":              s.toolAccount,
+		"atos_artifact":             s.toolArtifact,
+		"atos_register_capability":  s.toolRegisterCapability,
+		"atos_update_capability":    s.toolUpdateCapability,
 		"atos_list_my_capabilities": s.toolListMyCapabilities,
-		"atos_pause_capability": s.toolPauseCapability,
+		"atos_pause_capability":     s.toolPauseCapability,
 	}
 }
 
@@ -110,8 +110,8 @@ func (s *Server) toolGetCapability(ctx context.Context, principal auth.Principal
 
 func (s *Server) toolQuote(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
 	input := service.CreateQuoteInput{
-		CapabilityID: argString(args, "capability_id"),
-		InputSummary: argObject(args, "input_summary"),
+		CapabilityID:       argString(args, "capability_id"),
+		InputSummary:       argObject(args, "input_summary"),
 		RequestedTrustMode: domain.RequestedTrustMode(argString(args, "requested_trust_mode")),
 	}
 	if raw := args["proof_requirements"]; raw != nil {
@@ -148,15 +148,15 @@ func (s *Server) toolInvoke(ctx context.Context, principal auth.Principal, args 
 		}
 	}
 	return map[string]any{
-		"result_type": result.Type,
+		"result_type":   result.Type,
 		"invocation_id": nullableString(result.Job.InvocationID),
-		"job_id": nullableString(result.Job.ID),
-		"quote_id": result.Job.QuoteID,
-		"trust_mode": result.Job.TrustMode,
+		"job_id":        nullableString(result.Job.ID),
+		"quote_id":      result.Job.QuoteID,
+		"trust_mode":    result.Job.TrustMode,
 		"proof_profile": nullableString(string(result.Job.ProofProfile)),
-		"output": result.Job.Output,
-		"artifacts": result.Job.Artifacts,
-		"receipt": receipt,
+		"output":        result.Job.Output,
+		"artifacts":     result.Job.Artifacts,
+		"receipt":       receipt,
 	}, nil
 }
 
