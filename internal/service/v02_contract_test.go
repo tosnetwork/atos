@@ -102,21 +102,21 @@ func TestManagedQuoteContractPropagatesThroughReceipt(t *testing.T) {
 func TestCapabilityArtifactMetadataDerivedFromSchema(t *testing.T) {
 	h := newHarness()
 	cap, err := h.capabilities.Register(context.Background(), service.RegisterCapabilityInput{
-		ProviderID:  "agt_artifact",
-		Name:        "PDF Analyzer",
-		Description: "analyzes a PDF",
+		ProviderID:   "agt_artifact",
+		Name:         "PDF Analyzer",
+		Description:  "analyzes a PDF",
 		DeliveryMode: domain.DeliveryAsync,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"document": map[string]any{
-					"type": "object",
+					"type":       "object",
 					"properties": map[string]any{"artifact_id": map[string]any{"type": "string"}},
 				},
 			},
 		},
 		OutputSchema: map[string]any{"type": "object"},
-		Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "2.00", Currency: "USD"}},
+		Pricing:      domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "2.00", Currency: "USD"}},
 	})
 	if err != nil {
 		t.Fatal(err)
