@@ -79,18 +79,18 @@ func TaskFromJob(j domain.Job) Task {
 		artifacts = append(artifacts, Artifact{ID: j.ID + "-output", Name: "result", Content: j.Output})
 	}
 	return Task{
-		ID:     j.ID,
-		Status: TaskStatus{State: StateFromJob(j.State), Timestamp: j.UpdatedAt},
+		ID:        j.ID,
+		Status:    TaskStatus{State: StateFromJob(j.State), Timestamp: j.UpdatedAt},
 		Artifacts: artifacts,
 		Metadata: map[string]any{
 			CommerceExtensionURI: map[string]any{
-				"quote_id": j.QuoteID,
-				"capability_id": j.CapabilityID,
+				"quote_id":           j.QuoteID,
+				"capability_id":      j.CapabilityID,
 				"capability_version": j.CapabilityVersion,
-				"provider_id": j.ProviderID,
-				"trust_mode": j.TrustMode,
-				"proof_profile": nullableProfile(j.ProofProfile),
-				"proof_status": j.ProofStatus,
+				"provider_id":        j.ProviderID,
+				"trust_mode":         j.TrustMode,
+				"proof_profile":      nullableProfile(j.ProofProfile),
+				"proof_status":       j.ProofStatus,
 			},
 		},
 	}
