@@ -16,10 +16,21 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          # pull_request events normally check out GitHub's synthetic merge
+          # ref. ATOS validates the exact proposed implementation here; PR
+          # mergeability is checked independently by GitHub.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25.x'
           cache: true
+      - name: Verify checked-out revision
+        run: |
+          echo "event=${{ github.event_name }}"
+          echo "expected=${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "actual=$(git rev-parse HEAD)"
+          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
       - name: Verify formatting
         run: |
           unformatted="$(gofmt -l .)"
