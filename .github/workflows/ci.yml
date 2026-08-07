@@ -28,6 +28,8 @@ jobs:
             echo "$unformatted"
             exit 1
           fi
+      - name: Validate OpenAPI YAML
+        run: ruby -e 'require "yaml"; document = YAML.load_file("api/openapi.yaml"); abort "missing OpenAPI version" unless document["openapi"] == "3.1.0"'
       - name: Vet
         run: go vet ./...
       - name: Test
