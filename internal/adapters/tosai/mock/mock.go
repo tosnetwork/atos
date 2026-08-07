@@ -1,8 +1,4 @@
-// Package mock is a synchronous, in-process stand-in for a real tos-ai
-// provider network. It "executes" a job by echoing its input back as
-// output, which is enough to exercise the full ATOS contract end to end
-// before any real provider exists — the Phase 0 "mock provider" called for
-// in ~/atos-spec/docs/IMPLEMENTATION_ROADMAP.md.
+// Package mock is a synchronous in-process stand-in for the execution plane.
 package mock
 
 import (
@@ -37,42 +33,67 @@ func (p *Provider) GetProviderStatus(ctx context.Context, providerID string) (bo
 	return true, nil
 }
 
-// SubmitJob runs synchronously and always succeeds for Phase 0 — realistic
-// failure/latency simulation is out of scope until a real tos-ai network is
-// wired in.
 func (p *Provider) SubmitJob(ctx context.Context, req tosai.SubmitJobRequest) (tosai.SubmitJobResult, error) {
-	started := time.Now()
+	if req.TrustMode != domain.TrustModeManaged {
+		return tosai.SubmitJobResult{}, fmt.Errorf("mock tos-ai is certified for managed mode only")
+	}
+	started := time.Now().UTC()
 	output := map[string]any{
 		"echo":    req.Input,
-		"note":    "mock tos-ai execution — replace with a real provider before Phase 2",
+		"note":    "mock tos-ai execution — replace with tos-protocol Edge Core before Phase 2",
 		"job_id":  req.JobID,
 		"handled": req.CapabilityID,
 	}
-	inputHash := hashJSON(req.Input)
+	inputHash := req.InputCommitment
+	if inputHash == "" {
+		inputHash = hashJSON(req.Input)
+	}
 	outputHash := hashJSON(output)
-	completed := time.Now()
-
+	completed := time.Now().UTC()
+	executionMillis := completed.Sub(started).Milliseconds()
+	if executionMillis < 0 {
+		executionMillis = 0
+	}
+	usage := domain.Usage{
+		InputBytes:      jsonSize(req.Input),
+		OutputBytes:     jsonSize(output),
+		ExecutionMillis: uint64(executionMillis),
+	}
+	usageCommitment := hashAny(usage)
+	receiptID := "xrcpt_" + uuid.NewString()
+	signerID := "sig_mock_tos_ai"
+	authorizationID := "auth_mock_" + req.CapabilityID
 	receipt := &domain.ExecutionReceipt{
-		JobID:        req.JobID,
-		ProviderID:   req.ProviderID,
-		CapabilityID: req.CapabilityID,
-		InputHash:    inputHash,
-		OutputHash:   outputHash,
-		StartedAt:    started,
-		CompletedAt:  completed,
-		Signature:    mockSignature(req.JobID, inputHash, outputHash),
+		ID:                     receiptID,
+		QuoteID:                req.QuoteID,
+		EscrowID:               req.EscrowID,
+		JobID:                  req.JobID,
+		PrincipalID:            req.PrincipalID,
+		ProviderID:             req.ProviderID,
+		CapabilityID:           req.CapabilityID,
+		CapabilityVersion:      req.CapabilityVersion,
+		TrustMode:              req.TrustMode,
+		ProofProfile:           req.ProofProfile,
+		Result:                 domain.ExecutionSuccess,
+		InputHash:              inputHash,
+		OutputHash:             outputHash,
+		UsageCommitment:        usageCommitment,
+		Usage:                  usage,
+		StartedAt:              started,
+		CompletedAt:            completed,
+		ExecutionSignerID:      signerID,
+		SignerAuthorizationID:  authorizationID,
+		SignerAuthorizationRef: "atos:managed:signer:" + signerID,
+		SignatureAlgorithm:     "mock-sha256",
+		Signature:              mockSignature(receiptID, req.QuoteID, req.JobID, inputHash, outputHash, usageCommitment),
 	}
 
 	result := tosai.SubmitJobResult{
-		State:   domain.JobCompleted,
-		Output:  output,
-		Receipt: receipt,
+		State: domain.JobCompleted, Output: output, Usage: usage, Receipt: receipt,
 	}
-
 	p.mu.Lock()
 	p.jobs[req.JobID] = result
 	p.mu.Unlock()
-
 	return result, nil
 }
 
@@ -109,20 +130,24 @@ func (p *Provider) FetchReceipt(ctx context.Context, jobID string) (*domain.Exec
 	return result.Receipt, nil
 }
 
-func hashJSON(v map[string]any) string {
+func hashJSON(v map[string]any) string { return hashAny(v) }
+
+func hashAny(v any) string {
 	b, _ := json.Marshal(v)
 	sum := sha256.Sum256(b)
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-// mockSignature stands in for a real provider signing key. It is
-// deterministic and clearly labeled so nobody mistakes it for a real
-// cryptographic signature.
+func jsonSize(v any) uint64 {
+	b, _ := json.Marshal(v)
+	return uint64(len(b))
+}
+
 func mockSignature(parts ...string) string {
 	h := sha256.New()
-	for _, p := range parts {
-		h.Write([]byte(p))
+	for _, part := range parts {
+		_, _ = h.Write([]byte(part))
 	}
-	h.Write([]byte(uuid.NewString())) // nonce so repeated calls don't collide
+	_, _ = h.Write([]byte(uuid.NewString()))
 	return "mock-unsigned:" + hex.EncodeToString(h.Sum(nil))
 }
