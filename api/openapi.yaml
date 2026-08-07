@@ -1,69 +1,79 @@
-openapi: 3.0.3
+openapi: 3.1.0
 info:
   title: ATOS REST API
-  version: 0.1.0
-  description: >
-    REST surface for the ATOS gateway, per ~/atos-spec/docs/API.md. This
-    document describes the Phase 0 implementation in internal/httpapi —
-    every path, method and schema here matches a real handler, not an
-    aspirational future surface. See internal/httpapi/api.go's error
-    envelope and status-code mapping for the authoritative error contract.
-servers:
-  - url: https://api.atos.im/v1
-    description: Production (not yet deployed — Phase 0 is local-only)
-  - url: http://localhost:8080/v1
-    description: Local development (go run ./cmd/api)
+  version: 0.2.0
+  description: |
+    REST projection of the ATOS Agent Internet gateway. Managed, Verified and
+    Native share one API. `requested_trust_mode=auto` is accepted before Quote
+    creation; every Quote freezes one concrete `trust_mode`, which propagates
+    through Job, Escrow, Execution Receipt and settlement.
 
+    This implementation currently exposes the complete Managed flow. Verified
+    and Native contracts are modeled but fail closed until their real TOS
+    integrations are available.
+servers:
+  - url: https://api.atos.im
+    description: Production reference gateway
+  - url: http://localhost:8080
+    description: Local development
 security:
   - bearerAuth: []
-
 tags:
+  - name: auth
   - name: capabilities
   - name: quotes
   - name: invocations
   - name: jobs
   - name: account
   - name: receipts
+  - name: artifacts
   - name: metadata
-  - name: auth
-
 paths:
-  /auth/device:
+  /livez:
+    get:
+      tags: [metadata]
+      summary: Liveness probe
+      security: []
+      responses:
+        '200':
+          description: Gateway process is live
+          content:
+            text/plain:
+              schema: {type: string}
+  /.well-known/agent-card.json:
+    get:
+      tags: [metadata]
+      summary: ATOS A2A Agent Card
+      security: []
+      responses:
+        '200':
+          description: Agent Card with v0.2 ATOS extensions
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+  /v1/auth/device:
     post:
       tags: [auth]
-      summary: Start Device Authorization
+      summary: Start scoped Device Authorization
       security: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              properties:
-                client_type: { type: string, example: codex }
-                client_name: { type: string }
-                requested_scopes:
-                  type: array
-                  items: { type: string }
+              $ref: '#/components/schemas/DeviceAuthorizationRequest'
       responses:
-        "200":
-          description: Device code issued
+        '200':
+          description: Device grant
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  device_code: { type: string }
-                  user_code: { type: string }
-                  verification_uri: { type: string }
-                  verification_uri_complete: { type: string }
-                  expires_in: { type: integer }
-                  interval: { type: integer }
-
-  /auth/device/token:
+                $ref: '#/components/schemas/DeviceAuthorizationResponse'
+        default: {$ref: '#/components/responses/Error'}
+  /v1/auth/device/token:
     post:
       tags: [auth]
-      summary: Poll for the Device Authorization access token
+      summary: Exchange an authorized device code
       security: []
       requestBody:
         required: true
@@ -71,20 +81,22 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [device_code]
               properties:
-                device_code: { type: string }
+                device_code: {type: string, minLength: 1}
       responses:
-        "200":
-          description: Access token issued (Phase 0 always succeeds immediately — see internal/httpapi/auth.go)
+        '200':
+          description: Scoped access and refresh tokens
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/TokenResponse" }
-
-  /auth/token/refresh:
+              schema: {$ref: '#/components/schemas/TokenResponse'}
+        '202': {$ref: '#/components/responses/Error'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/auth/token/refresh:
     post:
       tags: [auth]
-      summary: Refresh an access token
+      summary: Rotate a refresh token
       security: []
       requestBody:
         required: true
@@ -92,653 +104,769 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [refresh_token]
               properties:
-                refresh_token: { type: string }
+                refresh_token: {type: string, minLength: 1}
       responses:
-        "200":
-          description: New access token
+        '200':
+          description: Rotated token pair
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/TokenResponse" }
-        "400": { $ref: "#/components/responses/Error" }
-
-  /auth/revoke:
+              schema: {$ref: '#/components/schemas/TokenResponse'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/auth/revoke:
     post:
       tags: [auth]
-      summary: Revoke the caller's own credentials
+      summary: Revoke the current access token
       responses:
-        "204":
-          description: >
-            Acknowledged. Phase 0 has no server-side token store to revoke
-            against yet — see internal/httpapi/auth.go.
-
-  /capabilities:
+        '204': {description: Revoked}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/capabilities:
     get:
       tags: [capabilities]
-      summary: Search capabilities
+      summary: Search active Capabilities
+      description: Requires `capabilities:read`.
       parameters:
-        - name: q
-          in: query
-          schema: { type: string }
-          description: Natural-language query; text-match + multi-factor ranking in Phase 0/1 (see docs/CAPABILITIES.md).
-        - name: max_price
-          in: query
-          schema: { type: string }
-          description: Hard filter — excludes capabilities priced above this amount.
-        - name: max_price_currency
-          in: query
-          schema: { type: string, default: USD }
-        - name: min_trust_score
-          in: query
-          schema: { type: number }
-          description: Hard filter — excludes capabilities below this trust score.
-        - name: max_latency_ms
-          in: query
-          schema: { type: integer }
-          description: Hard filter — excludes capabilities with a higher target latency (capabilities with no SLA set are not filtered).
-        - name: delivery_mode
-          in: query
-          schema: { type: array, items: { type: string, enum: [instant, async, interactive] } }
-          style: form
-          explode: true
-          description: Hard filter — repeatable; a capability must match one of the given modes.
+        - {name: q, in: query, schema: {type: string}}
+        - {name: max_price, in: query, schema: {type: string}}
+        - {name: max_price_currency, in: query, schema: {type: string, default: USD}}
+        - {name: delivery_mode, in: query, schema: {type: array, items: {type: string, enum: [instant, async, interactive]}}, explode: true}
+        - {name: min_trust_score, in: query, schema: {type: number, minimum: 0, maximum: 1}}
+        - {name: max_latency_ms, in: query, schema: {type: integer, minimum: 0}}
+        - {name: requested_trust_mode, in: query, schema: {$ref: '#/components/schemas/RequestedTrustMode'}}
+        - {name: network_verifiable_receipt, in: query, schema: {type: boolean}}
+        - {name: tos_settlement, in: query, schema: {type: boolean}}
+        - {name: portable_proof_of_service, in: query, schema: {type: boolean}}
       responses:
-        "200":
-          description: Ranked candidates
+        '200':
+          description: Ranked Capability projection
           content:
             application/json:
               schema:
                 type: object
+                required: [capabilities]
                 properties:
                   capabilities:
                     type: array
-                    items: { $ref: "#/components/schemas/Capability" }
+                    items: {$ref: '#/components/schemas/Capability'}
+        default: {$ref: '#/components/responses/Error'}
     post:
       tags: [capabilities]
-      summary: Register a capability (provider-side)
+      summary: Register a provider Capability
+      description: Requires `capabilities:write`. Requested stronger modes remain pending until certified.
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: "#/components/schemas/RegisterCapabilityRequest" }
+            schema: {$ref: '#/components/schemas/RegisterCapabilityRequest'}
       responses:
-        "201":
-          description: Created
+        '201':
+          description: Capability registered
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Capability" }
-        "400": { $ref: "#/components/responses/Error" }
-
-  /capabilities/{id}:
+              schema: {$ref: '#/components/schemas/Capability'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/capabilities/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/CapabilityID'}
     get:
       tags: [capabilities]
-      summary: Get one capability
-      parameters: [{ $ref: "#/components/parameters/CapabilityId" }]
+      summary: Get one Capability
+      description: Requires `capabilities:read`.
       responses:
-        "200":
+        '200':
           description: Capability
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Capability" }
-        "404": { $ref: "#/components/responses/Error" }
+              schema: {$ref: '#/components/schemas/Capability'}
+        default: {$ref: '#/components/responses/Error'}
     patch:
       tags: [capabilities]
-      summary: Update a capability (owning provider only)
-      parameters: [{ $ref: "#/components/parameters/CapabilityId" }]
+      summary: Update mutable Capability fields
+      description: Requires `capabilities:write` and target ownership. Derived active mode fields are immutable through this route.
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              description: >
-                Partial patch. provider_id is immutable (rejected). Changing
-                pricing/input_schema/output_schema bumps the capability's
-                version — see docs/CAPABILITIES.md Versioning.
+            schema: {type: object, additionalProperties: true}
       responses:
-        "200":
-          description: Updated capability
+        '200':
+          description: Updated Capability
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Capability" }
-        "403": { $ref: "#/components/responses/Error" }
-
-  /capabilities/{id}/pause:
+              schema: {$ref: '#/components/schemas/Capability'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/capabilities/{id}/pause:
+    parameters:
+      - {$ref: '#/components/parameters/CapabilityID'}
     post:
       tags: [capabilities]
-      summary: Pause a capability (owning provider only)
-      parameters: [{ $ref: "#/components/parameters/CapabilityId" }]
+      summary: Pause an owned Capability
       responses:
-        "200":
-          description: Paused capability
+        '200':
+          description: Paused Capability
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Capability" }
-
-  /capabilities/{id}/resume:
+              schema: {$ref: '#/components/schemas/Capability'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/capabilities/{id}/resume:
+    parameters:
+      - {$ref: '#/components/parameters/CapabilityID'}
     post:
       tags: [capabilities]
-      summary: Resume a capability (owning provider only)
-      parameters: [{ $ref: "#/components/parameters/CapabilityId" }]
+      summary: Resume an owned Capability
       responses:
-        "200":
-          description: Active capability
+        '200':
+          description: Active Capability
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Capability" }
-
-  /quotes:
+              schema: {$ref: '#/components/schemas/Capability'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/quotes:
     post:
       tags: [quotes]
-      summary: Create a time-limited executable quote
+      summary: Create an immutable executable Quote
+      description: Requires `quotes:read`. Resolves requested policy to one concrete mode.
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [capability_id]
-              properties:
-                capability_id: { type: string }
-                constraints:
-                  type: object
-                  properties:
-                    max_total: { $ref: "#/components/schemas/Money" }
+            schema: {$ref: '#/components/schemas/CreateQuoteRequest'}
       responses:
-        "201":
+        '201':
           description: Quote
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Quote" }
-        "400": { $ref: "#/components/responses/Error" }
-
-  /quotes/{id}:
+              schema: {$ref: '#/components/schemas/Quote'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/quotes/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/QuoteID'}
     get:
       tags: [quotes]
-      summary: Get a quote
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
+      summary: Read a Quote
       responses:
-        "200":
+        '200':
           description: Quote
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Quote" }
-        "404": { $ref: "#/components/responses/Error" }
-
-  /invocations:
+              schema: {$ref: '#/components/schemas/Quote'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/invocations:
     post:
       tags: [invocations]
-      summary: Invoke a bounded capability synchronously (bounded by max_wait_ms)
+      summary: Invoke a bounded Capability
+      description: Requires `invocations:create`. Trust mode is inherited from the Quote.
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: "#/components/schemas/SubmitRequest" }
+            schema: {$ref: '#/components/schemas/SubmitWorkRequest'}
       responses:
-        "200":
-          description: Completed or input_required within the wait window
+        '200':
+          description: Completed, accepted or input-required result
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/SubmitResponse" }
-        "202":
-          description: Still running past max_wait_ms; poll GET /jobs/{id}
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/SubmitResponse" }
-        "400": { $ref: "#/components/responses/Error" }
-        "402": { $ref: "#/components/responses/Error" }
-
-  /invocations/{id}:
+              schema: {$ref: '#/components/schemas/SubmitWorkResponse'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/invocations/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/JobID'}
     get:
       tags: [invocations]
-      summary: Get an invocation's current state (shares storage with jobs)
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
+      summary: Get an Invocation-backed Job
       responses:
-        "200":
+        '200':
           description: Job
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Job" }
-        "404": { $ref: "#/components/responses/Error" }
-
-  /jobs:
+              schema: {$ref: '#/components/schemas/Job'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/jobs:
     post:
       tags: [jobs]
-      summary: Create a long-running or interactive job (always returns immediately)
+      summary: Create asynchronous or interactive work
+      description: Requires `jobs:create`. Trust mode is inherited from the Quote.
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: "#/components/schemas/SubmitRequest" }
+            schema: {$ref: '#/components/schemas/SubmitWorkRequest'}
       responses:
-        "202":
-          description: Accepted or input_required
+        '200':
+          description: Job accepted or input required
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/SubmitResponse" }
-        "400": { $ref: "#/components/responses/Error" }
-
-  /jobs/{id}:
+              schema: {$ref: '#/components/schemas/SubmitWorkResponse'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/JobID'}
     get:
       tags: [jobs]
-      summary: Get a job's current state
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
+      summary: Get Job state and proof progress
+      description: Requires `jobs:read` and ownership.
       responses:
-        "200":
+        '200':
           description: Job
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Job" }
-        "403": { $ref: "#/components/responses/Error" }
-        "404": { $ref: "#/components/responses/Error" }
-
-  /jobs/{id}/cancel:
+              schema: {$ref: '#/components/schemas/Job'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}/cancel:
+    parameters:
+      - {$ref: '#/components/parameters/JobID'}
     post:
       tags: [jobs]
-      summary: Cancel a non-terminal job
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
+      summary: Cancel a non-terminal Job
+      description: Requires `jobs:cancel`. Cancellation preserves the Quote's settlement guarantees.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [idempotency_key]
               properties:
-                reason: { type: string }
-                idempotency_key: { type: string }
+                reason: {type: string}
+                idempotency_key: {type: string, minLength: 1}
       responses:
-        "200":
-          description: Canceled job
+        '200':
+          description: Canceled Job
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Job" }
-        "409": { $ref: "#/components/responses/Error" }
-
-  /account:
+              schema: {$ref: '#/components/schemas/Job'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/account:
     get:
       tags: [account]
-      summary: Get account balance and spending policy
+      summary: Read balance, spend policy and trust policy
+      description: Requires `account:read`.
       responses:
-        "200":
+        '200':
           description: Account
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Account" }
-
-  /account/usage:
+              schema: {$ref: '#/components/schemas/Account'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/account/usage:
     get:
       tags: [account]
-      summary: Aggregate usage for the authenticated principal
+      summary: Read aggregate usage
       responses:
-        "200":
+        '200':
           description: Usage summary
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/UsageSummary" }
-
-  /account/receipts:
+              schema: {type: object, additionalProperties: true}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/account/receipts:
     get:
-      tags: [account, receipts]
-      summary: List the authenticated principal's receipts
+      tags: [receipts]
+      summary: List the caller's receipts
       responses:
-        "200":
+        '200':
           description: Receipts
           content:
             application/json:
               schema:
                 type: object
+                required: [receipts]
                 properties:
-                  receipts:
-                    type: array
-                    items: { $ref: "#/components/schemas/Receipt" }
-
-  /receipts/{id}:
+                  receipts: {type: array, items: {$ref: '#/components/schemas/Receipt'}}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/receipts/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/ReceiptID'}
     get:
       tags: [receipts]
-      summary: Get one receipt (owning principal only)
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
+      summary: Read one owned Receipt
       responses:
-        "200":
+        '200':
           description: Receipt
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Receipt" }
-        "403": { $ref: "#/components/responses/Error" }
-        "404": { $ref: "#/components/responses/Error" }
-
-  /receipts/{id}/settlement-proof:
+              schema: {$ref: '#/components/schemas/Receipt'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/receipts/{id}/settlement-proof:
+    parameters:
+      - {$ref: '#/components/parameters/ReceiptID'}
     get:
       tags: [receipts]
-      summary: Optional advanced verifiability proof for a receipt
-      description: >
-        Phase 0/1: no TOS Network commitment exists yet — this returns an
-        explicitly unattested proof object rather than fabricated chain
-        data. See docs/SETTLEMENT.md "TOS Abstraction Boundary".
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
+      summary: Materialize advanced proof information
+      description: Requires `proofs:read`. Managed mock evidence is explicitly not represented as a TOS proof.
       responses:
-        "200":
-          description: Proof (unattested in Phase 0/1)
+        '200':
+          description: Proof package or Managed evidence descriptor
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  receipt_id: { type: string }
-                  escrow_id: { type: string }
-                  attested: { type: boolean }
-                  note: { type: string }
-
-  /taxonomy:
+              schema: {type: object, additionalProperties: true}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/uploads:
+    post:
+      tags: [artifacts]
+      summary: Request a signed upload target
+      description: `job_input` requires `invocations:create` or `jobs:create`; `capability_asset` requires `capabilities:write`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateUploadRequest'}
+      responses:
+        '201':
+          description: Signed upload target
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UploadTarget'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/uploads/{id}/complete:
+    parameters:
+      - {$ref: '#/components/parameters/ArtifactID'}
+    post:
+      tags: [artifacts]
+      summary: Complete an owned upload
+      responses:
+        '200':
+          description: Available Artifact metadata and content commitment
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StoredArtifact'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/artifacts/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/ArtifactID'}
+    get:
+      tags: [artifacts]
+      summary: Read authorized Artifact metadata
+      responses:
+        '200':
+          description: Artifact metadata
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StoredArtifact'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/artifacts/{id}/download-url:
+    parameters:
+      - {$ref: '#/components/parameters/ArtifactID'}
+    get:
+      tags: [artifacts]
+      summary: Issue a short-lived authorized download URL
+      responses:
+        '200':
+          description: Download target
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DownloadTarget'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/taxonomy:
     get:
       tags: [metadata]
-      summary: Distinct tags currently in use across active capabilities
+      summary: List Capability tags
       responses:
-        "200":
-          description: Tags
+        '200':
+          description: Taxonomy
           content:
             application/json:
               schema:
                 type: object
+                required: [tags]
                 properties:
-                  tags:
-                    type: array
-                    items: { type: string }
-
-  /network/status:
+                  tags: {type: array, items: {type: string}}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/network/status:
     get:
       tags: [metadata]
-      summary: Whether this gateway has a live TOS Network connection
+      summary: Read high-level trust-mode availability
       responses:
-        "200":
-          description: Status (Phase 0/1 always reports not_connected — tos-core is an in-process mock)
+        '200':
+          description: Network and mode status
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  network: { type: string }
-                  status: { type: string, enum: [not_connected, connected] }
-                  note: { type: string }
-
-  /providers/{id}/agent-card:
+              schema: {type: object, additionalProperties: true}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/providers/{id}/agent-card:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
     get:
       tags: [metadata]
-      summary: Per-provider discovery card built from that provider's active capabilities
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
+      summary: Read an ATOS provider Agent Card
       responses:
-        "200":
-          description: Provider agent card
+        '200':
+          description: Provider Agent Card
           content:
             application/json:
-              schema:
-                type: object
-
+              schema: {type: object, additionalProperties: true}
+        default: {$ref: '#/components/responses/Error'}
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
-      description: >
-        Phase 0 simplification (see internal/httpapi/api.go withAuth): the
-        bearer token IS the principal_id, unsigned and non-expiring. Not a
-        real credential — do not rely on this for anything beyond local
-        development.
-
+      bearerFormat: opaque ATOS access token
   parameters:
-    CapabilityId:
+    CapabilityID:
       name: id
       in: path
       required: true
-      schema: { type: string }
-
+      schema: {type: string, pattern: '^cap_'}
+    QuoteID:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, pattern: '^q_'}
+    JobID:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    ReceiptID:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, pattern: '^rcpt_'}
+    ArtifactID:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, pattern: '^art_'}
   responses:
     Error:
-      description: Machine-coded error envelope
+      description: ATOS error envelope
       content:
         application/json:
-          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
-
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
   schemas:
+    RequestedTrustMode:
+      type: string
+      enum: [managed, verified, native, auto]
+      default: auto
+    TrustMode:
+      type: string
+      enum: [managed, verified, native]
+    ProofProfile:
+      oneOf:
+        - type: string
+          enum: [tos_verified_v1, tos_native_v1]
+        - type: 'null'
+    ProofRequirements:
+      type: object
+      additionalProperties: false
+      properties:
+        network_verifiable_receipt: {type: boolean, default: false}
+        tos_settlement: {type: boolean, default: false}
+        portable_proof_of_service: {type: boolean, default: false}
     Money:
       type: object
+      additionalProperties: false
       required: [amount, currency]
       properties:
-        amount: { type: string, example: "5.25" }
-        currency: { type: string, example: USD }
-
-    Pricing:
-      type: object
-      properties:
-        model:
-          type: string
-          enum: [free, fixed, per_use, per_unit, metered, negotiated]
-        unit: { type: string }
-        price_hint: { $ref: "#/components/schemas/Money" }
-
-    SLA:
-      type: object
-      properties:
-        target_latency_ms: { type: integer }
-        timeout_ms: { type: integer }
-
-    Trust:
-      type: object
-      properties:
-        score: { type: number }
-        level:
-          type: string
-          enum: [self_asserted, atos_verified, tos_attested]
-
-    Capability:
-      type: object
-      properties:
-        id: { type: string }
-        provider_id: { type: string }
-        name: { type: string }
-        description: { type: string }
-        version: { type: string }
-        tags:
-          type: array
-          items: { type: string }
-        modalities:
-          type: array
-          items: { type: string }
-        delivery_mode:
-          type: string
-          enum: [instant, async, interactive]
-        input_schema: { type: object }
-        output_schema: { type: object }
-        pricing: { $ref: "#/components/schemas/Pricing" }
-        sla: { $ref: "#/components/schemas/SLA" }
-        trust: { $ref: "#/components/schemas/Trust" }
-        status:
-          type: string
-          enum: [active, paused]
-        updated_at: { type: string, format: date-time }
-
-    RegisterCapabilityRequest:
-      type: object
-      required: [name, description, delivery_mode, input_schema, output_schema, pricing]
-      properties:
-        name: { type: string }
-        description: { type: string }
-        delivery_mode:
-          type: string
-          enum: [instant, async, interactive]
-        input_schema: { type: object }
-        output_schema: { type: object }
-        pricing: { $ref: "#/components/schemas/Pricing" }
-        tags:
-          type: array
-          items: { type: string }
-
+        amount: {type: string, pattern: '^-?[0-9]+(?:\.[0-9]+)?$'}
+        currency: {type: string, minLength: 3, maxLength: 12}
     Price:
       type: object
+      required: [subtotal, fees, total_max, currency]
       properties:
-        subtotal: { type: string }
-        fees: { type: string }
-        total_max: { type: string }
-        currency: { type: string }
-
+        subtotal: {type: string}
+        fees: {type: string}
+        total_max: {type: string}
+        currency: {type: string}
+    ProofDescriptor:
+      type: object
+      required: [quote_commitment, execution_receipt, settlement_proof, proof_of_service]
+      properties:
+        quote_commitment: {type: boolean}
+        execution_receipt: {type: boolean}
+        settlement_proof: {type: boolean}
+        proof_of_service: {type: boolean}
+    SettlementDescriptor:
+      type: object
+      required: [backend, escrow]
+      properties:
+        backend: {type: string, enum: [atos_managed, tos, external_managed]}
+        escrow: {type: boolean}
+        funding_model: {type: string, enum: [managed_balance, client_tos, client_supported_asset, gateway_sponsored, external_sponsor]}
+        client_asset: {type: string}
+        provider_asset: {type: string}
+    ModeSupportEntry:
+      type: object
+      required: [status]
+      properties:
+        status: {type: string, enum: [requested, pending, active, suspended, unsupported]}
+        proof_profile: {$ref: '#/components/schemas/ProofProfile'}
+        reason: {type: string}
+    CapabilityBinding:
+      type: object
+      additionalProperties: false
+      required: [transport, endpoint_ref, eligible_trust_modes]
+      properties:
+        transport: {type: string, enum: [http, mcp, a2a, human, tos-native]}
+        endpoint_ref: {type: string}
+        eligible_trust_modes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: {$ref: '#/components/schemas/TrustMode'}
+    Pricing:
+      type: object
+      required: [model, price_hint]
+      properties:
+        model: {type: string, enum: [free, fixed, per_use, per_unit, metered, negotiated]}
+        unit: {type: string}
+        price_hint: {$ref: '#/components/schemas/Money'}
+    Capability:
+      type: object
+      required: [id, provider_id, name, description, version, delivery_mode, input_schema, output_schema, pricing, requested_trust_modes, supported_trust_modes, mode_support, requires_artifact_transfer, status, updated_at]
+      properties:
+        id: {type: string}
+        canonical_uri: {type: string}
+        provider_id: {type: string}
+        name: {type: string}
+        description: {type: string}
+        version: {type: string}
+        manifest_commitment: {type: string}
+        tags: {type: array, items: {type: string}}
+        modalities: {type: array, items: {type: string}}
+        delivery_mode: {type: string, enum: [instant, async, interactive]}
+        input_schema: {type: object, additionalProperties: true}
+        output_schema: {type: object, additionalProperties: true}
+        pricing: {$ref: '#/components/schemas/Pricing'}
+        sla: {type: object, additionalProperties: true}
+        trust_summary: {type: object, additionalProperties: true}
+        requested_trust_modes: {type: array, items: {$ref: '#/components/schemas/TrustMode'}}
+        supported_trust_modes: {type: array, items: {$ref: '#/components/schemas/TrustMode'}}
+        mode_support:
+          type: object
+          properties:
+            managed: {$ref: '#/components/schemas/ModeSupportEntry'}
+            verified: {$ref: '#/components/schemas/ModeSupportEntry'}
+            native: {$ref: '#/components/schemas/ModeSupportEntry'}
+        bindings: {type: array, items: {$ref: '#/components/schemas/CapabilityBinding'}}
+        requires_artifact_transfer: {type: boolean}
+        artifact_input_fields: {type: array, items: {type: string}}
+        artifact_output_fields: {type: array, items: {type: string}}
+        status: {type: string, enum: [active, paused]}
+        updated_at: {type: string, format: date-time}
+    RegisterCapabilityRequest:
+      type: object
+      additionalProperties: false
+      required: [name, description, delivery_mode, input_schema, output_schema, pricing, requested_trust_modes]
+      properties:
+        name: {type: string, minLength: 1}
+        description: {type: string, minLength: 1}
+        delivery_mode: {type: string, enum: [instant, async, interactive]}
+        input_schema: {type: object, additionalProperties: true}
+        output_schema: {type: object, additionalProperties: true}
+        pricing: {$ref: '#/components/schemas/Pricing'}
+        tags: {type: array, items: {type: string}}
+        requested_trust_modes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: {$ref: '#/components/schemas/TrustMode'}
+        bindings: {type: array, items: {$ref: '#/components/schemas/CapabilityBinding'}}
+    CreateQuoteRequest:
+      type: object
+      additionalProperties: false
+      required: [capability_id]
+      properties:
+        capability_id: {type: string}
+        input_summary: {type: object, additionalProperties: true}
+        requested_trust_mode: {$ref: '#/components/schemas/RequestedTrustMode'}
+        proof_requirements: {$ref: '#/components/schemas/ProofRequirements'}
+        constraints:
+          type: object
+          additionalProperties: false
+          properties:
+            max_total: {$ref: '#/components/schemas/Money'}
+            deadline: {type: string, format: date-time}
     Quote:
       type: object
+      required: [quote_id, capability_id, capability_version, provider_id, requested_trust_mode, trust_mode, price, settlement, proof, expires_at, requires_confirmation, terms_hash]
       properties:
-        quote_id: { type: string }
-        capability_id: { type: string }
-        capability_version: { type: string }
-        price: { $ref: "#/components/schemas/Price" }
-        expires_at: { type: string, format: date-time }
-        requires_confirmation: { type: boolean }
-        terms_hash: { type: string }
-
-    SubmitRequest:
+        quote_id: {type: string}
+        capability_id: {type: string}
+        capability_version: {type: string}
+        provider_id: {type: string}
+        requested_trust_mode: {$ref: '#/components/schemas/RequestedTrustMode'}
+        trust_mode: {$ref: '#/components/schemas/TrustMode'}
+        proof_profile: {$ref: '#/components/schemas/ProofProfile'}
+        price: {$ref: '#/components/schemas/Price'}
+        settlement: {$ref: '#/components/schemas/SettlementDescriptor'}
+        proof: {$ref: '#/components/schemas/ProofDescriptor'}
+        expires_at: {type: string, format: date-time}
+        requires_confirmation: {type: boolean}
+        terms_hash: {type: string}
+        dispute_policy_hash: {type: string}
+        underlying_service_quote_ref: {type: string}
+    ProofStatus:
       type: object
-      required: [capability_id, quote_id, idempotency_key]
+      required: [quote, escrow, receipt, settlement]
       properties:
-        capability_id: { type: string }
-        quote_id: { type: string }
-        input: { type: object }
-        idempotency_key: { type: string }
-        max_wait_ms:
-          type: integer
-          minimum: 1000
-          maximum: 120000
-          description: Only meaningful for /invocations; ignored by /jobs.
-        confirmed:
-          type: boolean
-          description: >
-            Reissue with the same idempotency_key and confirmed=true after
-            receiving result_type=input_required, per docs/MCP.md's MRTR
-            flow (see internal/service/job.go).
-
+        quote: {type: string}
+        escrow: {type: string}
+        receipt: {type: string}
+        settlement: {type: string}
+    JobArtifact:
+      type: object
+      properties:
+        artifact_id: {type: string}
+        name: {type: string}
+        mime_type: {type: string}
+        content: {type: object, additionalProperties: true}
+        content_commitment: {type: string}
     Job:
       type: object
+      required: [job_id, capability_id, capability_version, provider_id, quote_id, trust_mode, proof_status, state, created_at]
       properties:
-        job_id: { type: string }
-        capability_id: { type: string }
-        quote_id: { type: string }
-        escrow_id: { type: string }
-        state:
-          type: string
-          enum: [submitted, working, input_required, completed, failed, canceled, rejected]
-        output: { type: object }
-        artifacts:
-          type: array
-          items: { type: object }
-        failure_reason: { type: string }
-        created_at: { type: string, format: date-time }
-        estimated_completion_at: { type: string, format: date-time }
-
-    SubmitResponse:
+        job_id: {type: string}
+        invocation_id: {type: string}
+        capability_id: {type: string}
+        capability_version: {type: string}
+        provider_id: {type: string}
+        quote_id: {type: string}
+        escrow_id: {type: string}
+        trust_mode: {$ref: '#/components/schemas/TrustMode'}
+        proof_profile: {$ref: '#/components/schemas/ProofProfile'}
+        proof_status: {$ref: '#/components/schemas/ProofStatus'}
+        state: {type: string, enum: [submitted, working, input_required, completed, failed, canceled, rejected]}
+        output: {type: object, additionalProperties: true}
+        artifacts: {type: array, items: {$ref: '#/components/schemas/JobArtifact'}}
+        failure_reason: {type: string}
+        error_code: {type: string}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: string, format: date-time}
+        estimated_completion_at: {type: string, format: date-time}
+    SubmitWorkRequest:
       type: object
+      additionalProperties: false
+      required: [capability_id, quote_id, input, idempotency_key]
       properties:
-        result_type:
-          type: string
-          enum: [completed, accepted, input_required, failed]
-        job: { $ref: "#/components/schemas/Job" }
-
-    SpendPolicy:
+        capability_id: {type: string}
+        quote_id: {type: string}
+        input: {type: object, additionalProperties: true}
+        idempotency_key: {type: string, minLength: 1}
+        max_wait_ms: {type: integer, minimum: 1000, maximum: 120000}
+        confirmed: {type: boolean, description: Phase 0 continuation after input_required}
+    SubmitWorkResponse:
       type: object
+      required: [result_type, job]
       properties:
-        per_call_autonomous_limit: { $ref: "#/components/schemas/Money" }
-        daily_limit: { $ref: "#/components/schemas/Money" }
-        remaining_today: { $ref: "#/components/schemas/Money" }
-
-    Account:
-      type: object
-      properties:
-        balance: { $ref: "#/components/schemas/Money" }
-        spend_policy: { $ref: "#/components/schemas/SpendPolicy" }
-
-    UsageSummary:
-      type: object
-      properties:
-        total_jobs: { type: integer }
-        completed: { type: integer }
-        failed: { type: integer }
-        canceled: { type: integer }
-        in_progress: { type: integer }
-        total_charged: { $ref: "#/components/schemas/Money" }
-        total_refunded: { $ref: "#/components/schemas/Money" }
-
+        result_type: {type: string, enum: [completed, accepted, input_required, failed]}
+        job: {$ref: '#/components/schemas/Job'}
     Receipt:
       type: object
+      required: [receipt_id, quote_id, escrow_id, job_id, trust_mode, charged, refunded, status, proof_status, created_at]
       properties:
-        receipt_id: { type: string }
-        quote_id: { type: string }
-        escrow_id: { type: string }
-        job_id: { type: string }
-        charged: { $ref: "#/components/schemas/Money" }
-        refunded: { $ref: "#/components/schemas/Money" }
-        status:
-          type: string
-          enum: [settled, released, disputed, settled_after_dispute, released_after_dispute]
-        created_at: { type: string, format: date-time }
-
+        receipt_id: {type: string}
+        quote_id: {type: string}
+        escrow_id: {type: string}
+        job_id: {type: string}
+        trust_mode: {$ref: '#/components/schemas/TrustMode'}
+        proof_profile: {$ref: '#/components/schemas/ProofProfile'}
+        charged: {$ref: '#/components/schemas/Money'}
+        refunded: {$ref: '#/components/schemas/Money'}
+        status: {type: string, enum: [settled, released, disputed, settled_after_dispute, released_after_dispute]}
+        proof_status: {type: string}
+        network_proof_ref: {type: string}
+        execution_signer_id: {type: string}
+        signer_authorization_ref: {type: string}
+        input_commitment: {type: string}
+        output_commitment: {type: string}
+        usage_commitment: {type: string}
+        created_at: {type: string, format: date-time}
+    Account:
+      type: object
+      required: [balance, spend_policy, trust_policy]
+      properties:
+        balance: {$ref: '#/components/schemas/Money'}
+        spend_policy:
+          type: object
+          required: [per_call_autonomous_limit, daily_limit, remaining_today]
+          properties:
+            per_call_autonomous_limit: {$ref: '#/components/schemas/Money'}
+            daily_limit: {$ref: '#/components/schemas/Money'}
+            remaining_today: {$ref: '#/components/schemas/Money'}
+        trust_policy:
+          type: object
+          required: [default_requested_trust_mode]
+          properties:
+            default_requested_trust_mode: {$ref: '#/components/schemas/RequestedTrustMode'}
+            minimum_for_high_value: {$ref: '#/components/schemas/TrustMode'}
+    CreateUploadRequest:
+      type: object
+      additionalProperties: false
+      required: [content_type, size_bytes, purpose]
+      properties:
+        content_type: {type: string, minLength: 1}
+        size_bytes: {type: integer, minimum: 1, maximum: 104857600}
+        purpose: {type: string, enum: [job_input, capability_asset]}
+    UploadTarget:
+      type: object
+      required: [upload_id, upload_url, upload_method, expires_at]
+      properties:
+        upload_id: {type: string}
+        upload_url: {type: string, format: uri}
+        upload_method: {type: string, const: PUT}
+        expires_at: {type: string, format: date-time}
+    StoredArtifact:
+      type: object
+      required: [artifact_id, content_type, size_bytes, status, created_at, expires_at]
+      properties:
+        artifact_id: {type: string}
+        content_type: {type: string}
+        size_bytes: {type: integer}
+        sha256: {type: string}
+        status: {type: string, enum: [uploading, available, expired]}
+        created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+    DownloadTarget:
+      type: object
+      required: [download_url, expires_at, content_type, size_bytes]
+      properties:
+        download_url: {type: string, format: uri}
+        expires_at: {type: string, format: date-time}
+        content_type: {type: string}
+        size_bytes: {type: integer}
+    DeviceAuthorizationRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        client_type: {type: string}
+        client_name: {type: string}
+        requested_scopes: {type: array, uniqueItems: true, items: {type: string}}
+    DeviceAuthorizationResponse:
+      type: object
+      required: [device_code, user_code, verification_uri, verification_uri_complete, expires_in, interval]
+      properties:
+        device_code: {type: string}
+        user_code: {type: string}
+        verification_uri: {type: string, format: uri}
+        verification_uri_complete: {type: string, format: uri}
+        expires_in: {type: integer}
+        interval: {type: integer}
     TokenResponse:
       type: object
+      required: [access_token, token_type, expires_in, refresh_token, principal_id, scopes]
       properties:
-        access_token: { type: string }
-        token_type: { type: string, example: Bearer }
-        expires_in: { type: integer }
-        refresh_token: { type: string }
-        principal_id: { type: string }
-        scopes:
-          type: array
-          items: { type: string }
-
+        access_token: {type: string}
+        token_type: {type: string, const: Bearer}
+        expires_in: {type: integer}
+        refresh_token: {type: string}
+        principal_id: {type: string}
+        scopes: {type: array, items: {type: string}}
     ErrorEnvelope:
       type: object
+      required: [error]
       properties:
         error:
           type: object
+          required: [code, message, retryable]
           properties:
-            code:
-              type: string
-              enum:
-                - authentication_required
-                - permission_denied
-                - rate_limited
-                - validation_failed
-                - capability_unavailable
-                - quote_expired
-                - quote_mismatch
-                - spend_limit_exceeded
-                - insufficient_balance
-                - idempotency_conflict
-                - job_not_cancelable
-                - provider_failed
-                - settlement_failed
-                - not_found
-            message: { type: string }
-            retryable: { type: boolean }
+            code: {type: string}
+            message: {type: string}
+            retryable: {type: boolean}
