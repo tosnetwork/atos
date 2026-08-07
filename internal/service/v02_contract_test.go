@@ -26,6 +26,7 @@ func TestCapabilityModeActivationSeparatesRequestedFromSupported(t *testing.T) {
 			domain.TrustModeVerified,
 			domain.TrustModeNative,
 		},
+		IdempotencyKey: "register-mode-test-v1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -115,8 +116,9 @@ func TestCapabilityArtifactMetadataDerivedFromSchema(t *testing.T) {
 				},
 			},
 		},
-		OutputSchema: map[string]any{"type": "object"},
-		Pricing:      domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "2.00", Currency: "USD"}},
+		OutputSchema:   map[string]any{"type": "object"},
+		Pricing:        domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "2.00", Currency: "USD"}},
+		IdempotencyKey: "register-pdf-analyzer-v1",
 	})
 	if err != nil {
 		t.Fatal(err)
