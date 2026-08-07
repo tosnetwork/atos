@@ -9,21 +9,28 @@ type Price struct {
 	Currency string `json:"currency"`
 }
 
-// Quote is immutable and time-limited (docs/SETTLEMENT.md "Quote Object").
-// Once issued it must never be mutated — a re-quote is a new Quote with a
-// new ID.
+// Quote is the immutable boundary between discovery and financially
+// committing execution. requested_trust_mode records caller intent while
+// trust_mode is always concrete.
 type Quote struct {
-	ID                   string    `json:"quote_id"`
-	CapabilityID         string    `json:"capability_id"`
-	CapabilityVersion    string    `json:"capability_version"`
-	Price                Price     `json:"price"`
-	ExpiresAt            time.Time `json:"expires_at"`
-	RequiresConfirmation bool      `json:"requires_confirmation"`
-	TermsHash            string    `json:"terms_hash"`
-	CreatedAt            time.Time `json:"-"`
+	ID                        string               `json:"quote_id"`
+	CapabilityID              string               `json:"capability_id"`
+	CapabilityVersion         string               `json:"capability_version"`
+	ProviderID                string               `json:"provider_id"`
+	RequestedTrustMode        RequestedTrustMode   `json:"requested_trust_mode"`
+	TrustMode                 TrustMode            `json:"trust_mode"`
+	ProofProfile              ProofProfile         `json:"proof_profile,omitempty"`
+	Price                     Price                `json:"price"`
+	Settlement                SettlementDescriptor `json:"settlement"`
+	Proof                     ProofDescriptor      `json:"proof"`
+	ExpiresAt                 time.Time            `json:"expires_at"`
+	RequiresConfirmation      bool                 `json:"requires_confirmation"`
+	TermsHash                 string               `json:"terms_hash"`
+	DisputePolicyHash         string               `json:"dispute_policy_hash,omitempty"`
+	UnderlyingServiceQuoteRef string               `json:"underlying_service_quote_ref,omitempty"`
+	CreatedAt                 time.Time            `json:"-"`
 }
 
-// Expired reports whether the quote can no longer be committed against.
 func (q Quote) Expired(now time.Time) bool {
 	return !now.Before(q.ExpiresAt)
 }
