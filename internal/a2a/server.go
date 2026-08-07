@@ -7,15 +7,16 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/tosnetwork/atos/internal/auth"
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/service"
 )
 
-// Server implements POST /a2a: JSON-RPC 2.0 methods message/send,
-// tasks/get and tasks/cancel, sharing the same JobService REST and MCP
-// dispatch into — an A2A caller and an MCP caller reach the identical
-// quote -> escrow -> execute -> verify -> settle pipeline.
+// Server exposes A2A Task operations over the same JobService used by REST and
+// MCP. The caller never chooses a new trust mode here: the supplied Quote is
+// authoritative and its concrete mode/profile flow into Task metadata.
 type Server struct {
+	Auth   *auth.Service
 	Quotes *service.QuoteService
 	Jobs   *service.JobService
 	Logger *slog.Logger
@@ -38,6 +39,7 @@ type rpcResponse struct {
 type rpcError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+	Data    any    `json:"data,omitempty"`
 }
 
 const (
@@ -46,38 +48,59 @@ const (
 	codeMethodNotFound = -32601
 	codeInvalidParams  = -32602
 	codeInternalError  = -32603
+	codeUnauthorized   = -32001
+	codeForbidden      = -32003
 )
 
 func (s *Server) Handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		authz := r.Header.Get("Authorization")
-		token, _ := strings.CutPrefix(authz, "Bearer ")
-		principalID := strings.TrimSpace(token)
-
 		var req rpcRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeRPCError(w, nil, codeParseError, "invalid JSON")
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20)).Decode(&req); err != nil {
+			writeRPCError(w, nil, codeParseError, "invalid JSON", nil)
 			return
 		}
 		if req.JSONRPC != "2.0" || req.Method == "" {
-			writeRPCError(w, req.ID, codeInvalidRequest, "expected jsonrpc 2.0 request with a method")
+			writeRPCError(w, req.ID, codeInvalidRequest, "expected jsonrpc 2.0 request with a method", nil)
 			return
 		}
-		if principalID == "" {
-			writeRPCError(w, req.ID, codeInvalidParams, "missing bearer token")
+		if s.Auth == nil {
+			writeRPCError(w, req.ID, codeUnauthorized, "authorization service unavailable", map[string]any{"code": domain.ErrAuthenticationRequired})
+			return
+		}
+		authz := r.Header.Get("Authorization")
+		token, ok := strings.CutPrefix(authz, "Bearer ")
+		if !ok {
+			writeRPCError(w, req.ID, codeUnauthorized, "missing bearer token", map[string]any{"code": domain.ErrAuthenticationRequired})
+			return
+		}
+		principal, err := s.Auth.Authenticate(strings.TrimSpace(token))
+		if err != nil {
+			writeRPCError(w, req.ID, codeUnauthorized, err.Error(), map[string]any{"code": domain.ErrAuthenticationRequired})
 			return
 		}
 
 		ctx := r.Context()
 		switch req.Method {
 		case "message/send":
-			s.handleMessageSend(ctx, w, req, principalID)
+			if !principal.Has(auth.ScopeInvocationsCreate) {
+				writeRPCError(w, req.ID, codeForbidden, "message/send requires invocations:create", map[string]any{"code": domain.ErrPermissionDenied})
+				return
+			}
+			s.handleMessageSend(ctx, w, req, principal.ID)
 		case "tasks/get":
-			s.handleTasksGet(ctx, w, req, principalID)
+			if !principal.Has(auth.ScopeJobsRead) {
+				writeRPCError(w, req.ID, codeForbidden, "tasks/get requires jobs:read", map[string]any{"code": domain.ErrPermissionDenied})
+				return
+			}
+			s.handleTasksGet(ctx, w, req, principal.ID)
 		case "tasks/cancel":
-			s.handleTasksCancel(ctx, w, req, principalID)
+			if !principal.Has(auth.ScopeJobsCancel) {
+				writeRPCError(w, req.ID, codeForbidden, "tasks/cancel requires jobs:cancel", map[string]any{"code": domain.ErrPermissionDenied})
+				return
+			}
+			s.handleTasksCancel(ctx, w, req, principal.ID)
 		default:
-			writeRPCError(w, req.ID, codeMethodNotFound, "unknown method "+req.Method)
+			writeRPCError(w, req.ID, codeMethodNotFound, "unknown method "+req.Method, nil)
 		}
 	}
 }
@@ -86,43 +109,36 @@ type messageSendParams struct {
 	Message Message `json:"message"`
 }
 
-// handleMessageSend implements docs/A2A.md's Task/Message mapping: a new
-// message (no taskId) creates a Job via the same quote/escrow/execute
-// pipeline REST's atos_invoke uses; a message with taskId + the commerce
-// extension's confirmed=true continues an existing input-required Task,
-// mirroring MCP's confirmed-reissue flow (see internal/service/job.go).
 func (s *Server) handleMessageSend(ctx context.Context, w http.ResponseWriter, req rpcRequest, principalID string) {
 	var params messageSendParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
-		writeRPCError(w, req.ID, codeInvalidParams, "malformed message/send params")
+		writeRPCError(w, req.ID, codeInvalidParams, "malformed message/send params", nil)
 		return
 	}
 	ext := params.Message.Commerce()
 	if ext.CapabilityID == "" || ext.QuoteID == "" || ext.IdempotencyKey == "" {
 		writeRPCError(w, req.ID, codeInvalidParams,
-			"message.metadata[\""+CommerceExtensionURI+"\"] must include capability_id, quote_id and idempotency_key")
+			"message.metadata[\""+CommerceExtensionURI+"\"] must include capability_id, quote_id and idempotency_key", nil)
 		return
 	}
 
 	input := map[string]any{}
-	for _, p := range params.Message.Parts {
-		if p.Kind == "text" && p.Text != "" {
-			input["text"] = p.Text
-		}
-		if p.Kind == "data" && p.Data != nil {
-			for k, v := range p.Data {
-				input[k] = v
+	for _, part := range params.Message.Parts {
+		switch part.Kind {
+		case "text":
+			if part.Text != "" {
+				input["text"] = part.Text
+			}
+		case "data":
+			for key, value := range part.Data {
+				input[key] = value
 			}
 		}
 	}
-
 	result, err := s.Jobs.Invoke(ctx, service.SubmitInput{
-		PrincipalID:    principalID,
-		CapabilityID:   ext.CapabilityID,
-		QuoteID:        ext.QuoteID,
-		Input:          input,
-		IdempotencyKey: ext.IdempotencyKey,
-		Confirmed:      ext.Confirmed,
+		PrincipalID: principalID, CapabilityID: ext.CapabilityID,
+		QuoteID: ext.QuoteID, Input: input, IdempotencyKey: ext.IdempotencyKey,
+		Confirmed: ext.Confirmed,
 	})
 	if err != nil {
 		writeDomainErrorAsRPC(w, req.ID, err)
@@ -139,7 +155,7 @@ type taskIDParams struct {
 func (s *Server) handleTasksGet(ctx context.Context, w http.ResponseWriter, req rpcRequest, principalID string) {
 	var params taskIDParams
 	if err := json.Unmarshal(req.Params, &params); err != nil || params.ID == "" {
-		writeRPCError(w, req.ID, codeInvalidParams, "tasks/get requires params.id")
+		writeRPCError(w, req.ID, codeInvalidParams, "tasks/get requires params.id", nil)
 		return
 	}
 	job, err := s.Jobs.Get(ctx, params.ID)
@@ -148,7 +164,7 @@ func (s *Server) handleTasksGet(ctx context.Context, w http.ResponseWriter, req 
 		return
 	}
 	if job.PrincipalID != principalID {
-		writeRPCError(w, req.ID, codeInvalidParams, "not the task's owning principal")
+		writeRPCError(w, req.ID, codeForbidden, "not the task's owning principal", map[string]any{"code": domain.ErrPermissionDenied})
 		return
 	}
 	writeRPCResult(w, req.ID, TaskFromJob(job))
@@ -157,19 +173,12 @@ func (s *Server) handleTasksGet(ctx context.Context, w http.ResponseWriter, req 
 func (s *Server) handleTasksCancel(ctx context.Context, w http.ResponseWriter, req rpcRequest, principalID string) {
 	var params taskIDParams
 	if err := json.Unmarshal(req.Params, &params); err != nil || params.ID == "" {
-		writeRPCError(w, req.ID, codeInvalidParams, "tasks/cancel requires params.id")
+		writeRPCError(w, req.ID, codeInvalidParams, "tasks/cancel requires params.id", nil)
 		return
 	}
-	msg := Message{Metadata: params.Metadata}
-	ext := msg.Commerce()
+	ext := (Message{Metadata: params.Metadata}).Commerce()
 	idempotencyKey := ext.IdempotencyKey
 	if idempotencyKey == "" {
-		// tasks/cancel has no natural idempotency key of its own the way
-		// message/send does (the caller isn't retrying a business
-		// operation, just asking to stop one) — mint one deterministically
-		// from the task id so a client retrying the exact same cancel call
-		// still gets idempotent behavior without being forced to invent a
-		// key for a cancel.
 		idempotencyKey = "a2a-cancel-" + params.ID
 	}
 	job, err := s.Jobs.Cancel(ctx, params.ID, principalID, ext.Reason, idempotencyKey)
@@ -185,19 +194,20 @@ func writeRPCResult(w http.ResponseWriter, id json.RawMessage, result any) {
 	_ = json.NewEncoder(w).Encode(rpcResponse{JSONRPC: "2.0", ID: id, Result: result})
 }
 
-func writeRPCError(w http.ResponseWriter, id json.RawMessage, code int, message string) {
+func writeRPCError(w http.ResponseWriter, id json.RawMessage, code int, message string, data any) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(rpcResponse{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: message}})
+	_ = json.NewEncoder(w).Encode(rpcResponse{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: message, Data: data}})
 }
 
-// writeDomainErrorAsRPC surfaces a domain.Error's machine code/message
-// through the JSON-RPC error envelope instead of collapsing everything to
-// a generic internal error.
 func writeDomainErrorAsRPC(w http.ResponseWriter, id json.RawMessage, err error) {
 	de, ok := err.(*domain.Error)
 	if !ok {
-		writeRPCError(w, id, codeInternalError, err.Error())
+		writeRPCError(w, id, codeInternalError, err.Error(), nil)
 		return
 	}
-	writeRPCError(w, id, codeInvalidParams, string(de.Code)+": "+de.Message)
+	code := codeInvalidParams
+	if de.Code == domain.ErrPermissionDenied {
+		code = codeForbidden
+	}
+	writeRPCError(w, id, code, de.Message, map[string]any{"code": de.Code, "retryable": de.Retryable})
 }
