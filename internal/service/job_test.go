@@ -49,6 +49,7 @@ func registerCapability(t *testing.T, h harness, providerID, priceAmount string)
 			Model:     domain.PricingFixed,
 			PriceHint: domain.PriceHint{Amount: priceAmount, Currency: "USD"},
 		},
+		IdempotencyKey: "register-" + providerID + "-" + priceAmount,
 	})
 	if err != nil {
 		t.Fatalf("Register: %v", err)
