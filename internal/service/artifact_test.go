@@ -28,9 +28,8 @@ func newArtifactHarness(t *testing.T) (*service.ArtifactService, string) {
 }
 
 // TestArtifactOwnershipEnforced guards docs/ARTIFACTS.md's access rule:
-// an artifact is visible only to its owner_principal_id. A different
-// principal must be rejected from completing the upload, reading its
-// metadata, or getting a download URL, even knowing the exact artifact_id.
+// an artifact identifier is not a bearer credential. A different principal
+// must be rejected even when it knows the exact upload/artifact ID.
 func TestArtifactOwnershipEnforced(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := newArtifactHarness(t)
@@ -39,32 +38,32 @@ func TestArtifactOwnershipEnforced(t *testing.T) {
 		PrincipalID: "prn_owner",
 		ContentType: "text/plain",
 		SizeBytes:   5,
+		Purpose:     "job_input",
 	})
 	if err != nil {
 		t.Fatalf("CreateUpload: %v", err)
 	}
 
-	assertPermissionDenied := func(t *testing.T, err error) {
+	assertAccessDenied := func(t *testing.T, err error) {
 		t.Helper()
 		if err == nil {
 			t.Fatal("expected an error, got nil")
 		}
 		de, ok := err.(*domain.Error)
-		if !ok || de.Code != domain.ErrPermissionDenied {
-			t.Fatalf("got error %v, want domain.ErrPermissionDenied", err)
+		if !ok || de.Code != domain.ErrArtifactAccessDenied {
+			t.Fatalf("got error %v, want domain.ErrArtifactAccessDenied", err)
 		}
 	}
 
 	_, err = svc.CompleteUpload(ctx, "prn_attacker", target.UploadID)
-	assertPermissionDenied(t, err)
+	assertAccessDenied(t, err)
 
 	_, err = svc.Get(ctx, "prn_attacker", target.UploadID)
-	assertPermissionDenied(t, err)
+	assertAccessDenied(t, err)
 
 	_, err = svc.GetDownloadURL(ctx, "prn_attacker", target.UploadID)
-	assertPermissionDenied(t, err)
+	assertAccessDenied(t, err)
 
-	// The real owner, meanwhile, is unaffected by those rejected attempts.
 	if _, err := svc.Get(ctx, "prn_owner", target.UploadID); err != nil {
 		t.Errorf("owner's own Get failed: %v", err)
 	}
@@ -78,9 +77,11 @@ func TestCreateUploadValidation(t *testing.T) {
 		name string
 		in   service.CreateUploadInput
 	}{
-		{"missing content_type", service.CreateUploadInput{PrincipalID: "prn_x", SizeBytes: 10}},
-		{"zero size_bytes", service.CreateUploadInput{PrincipalID: "prn_x", ContentType: "text/plain"}},
-		{"negative size_bytes", service.CreateUploadInput{PrincipalID: "prn_x", ContentType: "text/plain", SizeBytes: -1}},
+		{"missing content_type", service.CreateUploadInput{PrincipalID: "prn_x", SizeBytes: 10, Purpose: "job_input"}},
+		{"zero size_bytes", service.CreateUploadInput{PrincipalID: "prn_x", ContentType: "text/plain", Purpose: "job_input"}},
+		{"negative size_bytes", service.CreateUploadInput{PrincipalID: "prn_x", ContentType: "text/plain", SizeBytes: -1, Purpose: "job_input"}},
+		{"missing purpose", service.CreateUploadInput{PrincipalID: "prn_x", ContentType: "text/plain", SizeBytes: 10}},
+		{"invalid purpose", service.CreateUploadInput{PrincipalID: "prn_x", ContentType: "text/plain", SizeBytes: 10, Purpose: "other"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
