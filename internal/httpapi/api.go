@@ -1,7 +1,4 @@
-// Package httpapi implements the REST surface from ~/atos-spec/docs/API.md.
-// It is a thin adapter: every handler validates the transport-level shape
-// of a request and then delegates to internal/service, which owns all
-// business rules.
+// Package httpapi implements the REST surface from atos-spec/docs/API.md.
 package httpapi
 
 import (
@@ -11,11 +8,13 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/tosnetwork/atos/internal/auth"
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/service"
 )
 
 type Server struct {
+	Auth         *auth.Service
 	Capabilities *service.CapabilityService
 	Quotes       *service.QuoteService
 	Jobs         *service.JobService
@@ -27,64 +26,65 @@ type Server struct {
 
 func (s *Server) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
-
 	mux.HandleFunc("GET /livez", s.handleLivez)
-
 	mux.HandleFunc("GET /.well-known/agent-card.json", s.handleAgentCard)
 	mux.HandleFunc("GET /.well-known/agent.json", s.handleAgentCard)
 
 	mux.HandleFunc("POST /v1/auth/device", s.handleAuthDeviceStart)
 	mux.HandleFunc("POST /v1/auth/device/token", s.handleAuthDeviceToken)
 	mux.HandleFunc("POST /v1/auth/token/refresh", s.handleAuthTokenRefresh)
-	mux.HandleFunc("POST /v1/auth/revoke", s.withAuth(s.handleAuthRevoke))
+	mux.HandleFunc("POST /v1/auth/revoke", s.withScopes(s.handleAuthRevoke))
 
-	mux.HandleFunc("GET /v1/capabilities", s.withAuth(s.handleSearchCapabilities))
-	mux.HandleFunc("GET /v1/capabilities/{id}", s.withAuth(s.handleGetCapability))
-	mux.HandleFunc("POST /v1/capabilities", s.withAuth(s.handleRegisterCapability))
-	mux.HandleFunc("PATCH /v1/capabilities/{id}", s.withAuth(s.handleUpdateCapability))
-	mux.HandleFunc("POST /v1/capabilities/{id}/pause", s.withAuth(s.handlePauseCapability))
-	mux.HandleFunc("POST /v1/capabilities/{id}/resume", s.withAuth(s.handleResumeCapability))
+	mux.HandleFunc("GET /v1/capabilities", s.withScopes(s.handleSearchCapabilities, auth.ScopeCapabilitiesRead))
+	mux.HandleFunc("GET /v1/capabilities/{id}", s.withScopes(s.handleGetCapability, auth.ScopeCapabilitiesRead))
+	mux.HandleFunc("POST /v1/capabilities", s.withScopes(s.handleRegisterCapability, auth.ScopeCapabilitiesWrite))
+	mux.HandleFunc("PATCH /v1/capabilities/{id}", s.withScopes(s.handleUpdateCapability, auth.ScopeCapabilitiesWrite))
+	mux.HandleFunc("POST /v1/capabilities/{id}/pause", s.withScopes(s.handlePauseCapability, auth.ScopeCapabilitiesWrite))
+	mux.HandleFunc("POST /v1/capabilities/{id}/resume", s.withScopes(s.handleResumeCapability, auth.ScopeCapabilitiesWrite))
 
-	mux.HandleFunc("POST /v1/quotes", s.withAuth(s.handleCreateQuote))
-	mux.HandleFunc("GET /v1/quotes/{id}", s.withAuth(s.handleGetQuote))
+	mux.HandleFunc("POST /v1/quotes", s.withScopes(s.handleCreateQuote, auth.ScopeQuotesRead))
+	mux.HandleFunc("GET /v1/quotes/{id}", s.withScopes(s.handleGetQuote, auth.ScopeQuotesRead))
 
-	mux.HandleFunc("POST /v1/invocations", s.withAuth(s.handleInvoke))
-	mux.HandleFunc("GET /v1/invocations/{id}", s.withAuth(s.handleGetJob))
+	mux.HandleFunc("POST /v1/invocations", s.withScopes(s.handleInvoke, auth.ScopeInvocationsCreate))
+	mux.HandleFunc("GET /v1/invocations/{id}", s.withScopes(s.handleGetJob, auth.ScopeJobsRead))
+	mux.HandleFunc("POST /v1/jobs", s.withScopes(s.handleCreateJob, auth.ScopeJobsCreate))
+	mux.HandleFunc("GET /v1/jobs/{id}", s.withScopes(s.handleGetJob, auth.ScopeJobsRead))
+	mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.withScopes(s.handleCancelJob, auth.ScopeJobsCancel))
 
-	mux.HandleFunc("POST /v1/jobs", s.withAuth(s.handleCreateJob))
-	mux.HandleFunc("GET /v1/jobs/{id}", s.withAuth(s.handleGetJob))
-	mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.withAuth(s.handleCancelJob))
+	mux.HandleFunc("GET /v1/account", s.withScopes(s.handleGetAccount, auth.ScopeAccountRead))
+	mux.HandleFunc("GET /v1/account/usage", s.withScopes(s.handleGetAccountUsage, auth.ScopeAccountRead))
+	mux.HandleFunc("GET /v1/account/receipts", s.withScopes(s.handleListReceipts, auth.ScopeAccountRead))
+	mux.HandleFunc("GET /v1/receipts/{id}", s.withScopes(s.handleGetReceipt, auth.ScopeAccountRead))
+	mux.HandleFunc("GET /v1/receipts/{id}/settlement-proof", s.withScopes(s.handleSettlementProof, auth.ScopeProofsRead))
 
-	mux.HandleFunc("GET /v1/account", s.withAuth(s.handleGetAccount))
-	mux.HandleFunc("GET /v1/account/usage", s.withAuth(s.handleGetAccountUsage))
-	mux.HandleFunc("GET /v1/account/receipts", s.withAuth(s.handleListReceipts))
-	mux.HandleFunc("GET /v1/receipts/{id}", s.withAuth(s.handleGetReceipt))
-	mux.HandleFunc("GET /v1/receipts/{id}/settlement-proof", s.withAuth(s.handleSettlementProof))
+	mux.HandleFunc("GET /v1/taxonomy", s.withScopes(s.handleTaxonomy, auth.ScopeCapabilitiesRead))
+	mux.HandleFunc("GET /v1/network/status", s.withScopes(s.handleNetworkStatus, auth.ScopeCapabilitiesRead))
+	mux.HandleFunc("GET /v1/providers/{id}/agent-card", s.withScopes(s.handleProviderAgentCard, auth.ScopeCapabilitiesRead))
 
-	mux.HandleFunc("GET /v1/taxonomy", s.withAuth(s.handleTaxonomy))
-	mux.HandleFunc("GET /v1/network/status", s.withAuth(s.handleNetworkStatus))
-	mux.HandleFunc("GET /v1/providers/{id}/agent-card", s.withAuth(s.handleProviderAgentCard))
-
-	mux.HandleFunc("POST /v1/uploads", s.withAuth(s.handleCreateUpload))
-	mux.HandleFunc("POST /v1/uploads/{id}/complete", s.withAuth(s.handleCompleteUpload))
-	mux.HandleFunc("GET /v1/artifacts/{id}", s.withAuth(s.handleGetArtifact))
-	mux.HandleFunc("GET /v1/artifacts/{id}/download-url", s.withAuth(s.handleGetDownloadURL))
-
+	// Artifact authorization is operation/resource-specific and therefore
+	// enforced inside the handler/service after basic authentication.
+	mux.HandleFunc("POST /v1/uploads", s.withScopes(s.handleCreateUpload))
+	mux.HandleFunc("POST /v1/uploads/{id}/complete", s.withScopes(s.handleCompleteUpload))
+	mux.HandleFunc("GET /v1/artifacts/{id}", s.withScopes(s.handleGetArtifact))
+	mux.HandleFunc("GET /v1/artifacts/{id}/download-url", s.withScopes(s.handleGetDownloadURL))
 	return mux
 }
 
-// principalContextKey stores the authenticated principal_id resolved by
-// withAuth so downstream handlers never re-parse the Authorization header.
-type principalContextKeyType struct{}
+type authContext struct {
+	Principal auth.Principal
+	Token     string
+}
 
-var principalContextKey = principalContextKeyType{}
+type authContextKeyType struct{}
 
-// withAuth implements the Bearer-token half of docs/AUTH.md. Phase 0/1
-// simplification: the token *is* the principal_id (no signature, no
-// expiry) — swap this for real Device Auth token verification before this
-// ships anywhere but a local sandbox.
-func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
+var authContextKey = authContextKeyType{}
+
+func (s *Server) withScopes(next http.HandlerFunc, required ...auth.Scope) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if s.Auth == nil {
+			writeError(w, http.StatusServiceUnavailable, domain.ErrAuthenticationRequired, "authorization service unavailable", true)
+			return
+		}
 		authz := r.Header.Get("Authorization")
 		token, ok := strings.CutPrefix(authz, "Bearer ")
 		token = strings.TrimSpace(token)
@@ -92,15 +92,27 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeError(w, http.StatusUnauthorized, domain.ErrAuthenticationRequired, "missing or malformed Authorization header", false)
 			return
 		}
-		ctx := context.WithValue(r.Context(), principalContextKey, token)
+		principal, err := s.Auth.Authenticate(token)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, domain.ErrAuthenticationRequired, err.Error(), false)
+			return
+		}
+		if !principal.HasAll(required...) {
+			writeError(w, http.StatusForbidden, domain.ErrPermissionDenied, "token does not grant the required scope", false)
+			return
+		}
+		ctx := context.WithValue(r.Context(), authContextKey, authContext{Principal: principal, Token: token})
 		next(w, r.WithContext(ctx))
 	}
 }
 
-func principalFrom(r *http.Request) string {
-	v, _ := r.Context().Value(principalContextKey).(string)
-	return v
+func authFrom(r *http.Request) authContext {
+	value, _ := r.Context().Value(authContextKey).(authContext)
+	return value
 }
+
+func principalFrom(r *http.Request) string { return authFrom(r).Principal.ID }
+func scopesFrom(r *http.Request) auth.Principal { return authFrom(r).Principal }
 
 func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
@@ -129,41 +141,37 @@ func writeError(w http.ResponseWriter, status int, code domain.ErrorCode, messag
 	writeJSON(w, status, env)
 }
 
-// writeDomainError maps a domain.Error to the HTTP status docs/API.md
-// implies for its code, falling back to 500 for anything unrecognized —
-// which should only happen for genuine bugs, not expected business
-// outcomes (those all have a domain.ErrorCode).
 func writeDomainErr(w http.ResponseWriter, err error) {
 	de, ok := err.(*domain.Error)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error(), true)
 		return
 	}
-	status := statusForCode(de.Code)
-	writeError(w, status, de.Code, de.Message, de.Retryable)
+	writeError(w, statusForCode(de.Code), de.Code, de.Message, de.Retryable)
 }
 
 func statusForCode(code domain.ErrorCode) int {
 	switch code {
 	case domain.ErrAuthenticationRequired:
 		return http.StatusUnauthorized
-	case domain.ErrPermissionDenied:
+	case domain.ErrPermissionDenied, domain.ErrArtifactAccessDenied:
 		return http.StatusForbidden
 	case domain.ErrRateLimited:
 		return http.StatusTooManyRequests
-	case domain.ErrValidationFailed:
+	case domain.ErrValidationFailed, domain.ErrUploadMismatch:
 		return http.StatusBadRequest
-	case domain.ErrNotFound, domain.ErrCapabilityUnavailable:
+	case domain.ErrNotFound, domain.ErrCapabilityUnavailable, domain.ErrArtifactNotFound:
 		return http.StatusNotFound
-	case domain.ErrQuoteExpired, domain.ErrQuoteMismatch:
+	case domain.ErrUploadExpired:
+		return http.StatusGone
+	case domain.ErrQuoteExpired, domain.ErrQuoteMismatch, domain.ErrQuoteModeMismatch,
+		domain.ErrTrustModeUnavailable, domain.ErrProofRequirementsUnsatisfied,
+		domain.ErrProofProfileUnavailable, domain.ErrRequoteRequired,
+		domain.ErrIdempotencyConflict, domain.ErrJobNotCancelable:
 		return http.StatusConflict
 	case domain.ErrSpendLimitExceeded, domain.ErrInsufficientBalance:
 		return http.StatusPaymentRequired
-	case domain.ErrIdempotencyConflict:
-		return http.StatusConflict
-	case domain.ErrJobNotCancelable:
-		return http.StatusConflict
-	case domain.ErrProviderFailed, domain.ErrSettlementFailed:
+	case domain.ErrProviderFailed, domain.ErrSettlementFailed, domain.ErrNetworkUnavailable:
 		return http.StatusBadGateway
 	default:
 		return http.StatusInternalServerError
