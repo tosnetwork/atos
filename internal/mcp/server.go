@@ -64,6 +64,26 @@ const (
 // version a real client's handshake might reject outright.
 const defaultProtocolVersion = "2025-06-18"
 
+// toolsForPrincipal computes tools/list per the *real* MCP mechanism for
+// per-caller tool visibility: the response is a function of the
+// authenticated session, not a fixed constant. adminToolDefinitions are
+// appended only when the caller actually owns at least one capability —
+// a genuine authorization signal (ownership is enforced identically
+// inside CapabilityService.Pause/ListByProvider), not a cosmetic filter.
+// An unauthenticated or errored lookup degrades to the base list rather
+// than failing tools/list outright.
+func (s *Server) toolsForPrincipal(ctx context.Context, principalID string) []map[string]any {
+	tools := toolDefinitions
+	if principalID == "" {
+		return tools
+	}
+	owned, err := s.Capabilities.ListByProvider(ctx, principalID)
+	if err != nil || len(owned) == 0 {
+		return tools
+	}
+	return append(append([]map[string]any{}, tools...), adminToolDefinitions...)
+}
+
 func negotiateProtocolVersion(params json.RawMessage) string {
 	var p struct {
 		ProtocolVersion string `json:"protocolVersion"`
@@ -100,7 +120,7 @@ func (s *Server) Handler() http.HandlerFunc {
 				"capabilities":    map[string]any{"tools": map[string]any{}},
 			})
 		case "tools/list":
-			writeRPCResult(w, req.ID, map[string]any{"tools": toolDefinitions})
+			writeRPCResult(w, req.ID, map[string]any{"tools": s.toolsForPrincipal(ctx, token)})
 		case "tools/call":
 			s.handleToolCall(ctx, w, req, token)
 		case "resources/list":

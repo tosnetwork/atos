@@ -109,31 +109,15 @@ var toolDefinitions = []map[string]any{
 		"description": "Get account balance, usage and autonomous spending policy.",
 		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
 	},
-}
-
-// adminToolDefinitions are only advertised to callers that pass
-// include_admin_tools — see dispatch()'s comment on why Phase 0 can't yet
-// do real per-principal scope checks. Kept separate from toolDefinitions
-// so the default tools/list response stays the compact 10-tool surface
-// docs/MCP.md calls for.
-var adminToolDefinitions = []map[string]any{
-	{
-		"name":        "atos_list_my_capabilities",
-		"description": "List capabilities owned by the authenticated provider.",
-		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
-	},
-	{
-		"name":        "atos_pause_capability",
-		"description": "Pause one of the authenticated provider's own capabilities so it stops matching new searches.",
-		"inputSchema": map[string]any{"type": "object", "required": []string{"capability_id"}, "properties": map[string]any{"capability_id": map[string]any{"type": "string"}}},
-	},
-}
-
-// fileTransferToolDefinitions implements docs/MCP.md's "Optional File
-// Transfer Tools" — see docs/ARTIFACTS.md. Kept out of the default
-// tools/list for the same compactness reason as adminToolDefinitions:
-// most capabilities exchange plain JSON and never need file I/O.
-var fileTransferToolDefinitions = []map[string]any{
+	// File transfer tools (docs/ARTIFACTS.md). These are NOT gated per
+	// principal like adminToolDefinitions below — file I/O isn't an
+	// authorization concern, any caller might need it for any capability
+	// with a file-typed schema field, so there is no reliable per-caller
+	// signal to conditionally advertise on. An earlier design kept these
+	// out of the default tools/list entirely; real-client testing (a
+	// fresh MCP session genuinely cannot call a tool tools/list never
+	// returned) showed that just makes them permanently unreachable, not
+	// "optional." Always-visible and honest beats hidden and dead.
 	{
 		"name":        "atos_create_upload",
 		"description": "Request a short-lived signed upload target for binary content.",
@@ -164,6 +148,27 @@ var fileTransferToolDefinitions = []map[string]any{
 			"required":   []string{"artifact_id"},
 			"properties": map[string]any{"artifact_id": map[string]any{"type": "string"}},
 		},
+	},
+}
+
+// adminToolDefinitions ARE an authorization concern — unlike file
+// transfer, only a principal that actually owns at least one capability
+// has any use for these, so they are computed into tools/list dynamically
+// per request (see server.go's toolsForPrincipal) rather than statically
+// merged into toolDefinitions. This is the real MCP mechanism for
+// per-caller tool visibility: tools/list is a session-scoped response,
+// not a fixed constant, and a server is expected to tailor it to the
+// authenticated caller.
+var adminToolDefinitions = []map[string]any{
+	{
+		"name":        "atos_list_my_capabilities",
+		"description": "List capabilities owned by the authenticated provider.",
+		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+	},
+	{
+		"name":        "atos_pause_capability",
+		"description": "Pause one of the authenticated provider's own capabilities so it stops matching new searches.",
+		"inputSchema": map[string]any{"type": "object", "required": []string{"capability_id"}, "properties": map[string]any{"capability_id": map[string]any{"type": "string"}}},
 	},
 }
 
