@@ -29,7 +29,17 @@ jobs:
             exit 1
           fi
       - name: Validate OpenAPI YAML
-        run: ruby -e 'require "yaml"; document = YAML.load_file("api/openapi.yaml"); abort "missing OpenAPI version" unless document["openapi"] == "3.1.0"'
+        run: |
+          set +e
+          output="$(ruby -e 'require "yaml"; document = YAML.load_file("api/openapi.yaml"); abort "missing OpenAPI version" unless document["openapi"] == "3.1.0"' 2>&1)"
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            message="$(printf '%s' "$output" | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g')"
+            echo "::error file=api/openapi.yaml::$message"
+            printf '%s\n' "$output"
+            exit "$status"
+          fi
       - name: Vet
         run: go vet ./...
       - name: Test
