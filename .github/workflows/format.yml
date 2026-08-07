@@ -21,6 +21,22 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25.x'
+      - name: Normalize generated specifications
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("api/openapi.yaml")
+          lines = []
+          for line in path.read_text().splitlines():
+              marker = "description: "
+              prefix, sep, value = line.partition(marker)
+              if sep and value.startswith("`"):
+                  value = value.replace("'", "''")
+                  line = f"{prefix}{marker}'{value}'"
+              lines.append(line)
+          path.write_text("\n".join(lines) + "\n")
+          PY
       - name: Format and commit
         run: |
           gofmt -w .
@@ -30,5 +46,5 @@ jobs:
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -A
-          git commit -m "chore: gofmt ATOS v0.2 implementation"
+          git commit -m "chore: normalize ATOS v0.2 sources"
           git push origin HEAD:${{ github.ref_name }}
