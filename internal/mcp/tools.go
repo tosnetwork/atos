@@ -109,44 +109,28 @@ var toolDefinitions = []map[string]any{
 		"description": "Get account balance, usage and autonomous spending policy.",
 		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
 	},
-	// File transfer tools (docs/ARTIFACTS.md). These are NOT gated per
-	// principal like adminToolDefinitions below — file I/O isn't an
-	// authorization concern, any caller might need it for any capability
-	// with a file-typed schema field, so there is no reliable per-caller
-	// signal to conditionally advertise on. An earlier design kept these
-	// out of the default tools/list entirely; real-client testing (a
-	// fresh MCP session genuinely cannot call a tool tools/list never
-	// returned) showed that just makes them permanently unreachable, not
-	// "optional." Always-visible and honest beats hidden and dead.
+	// Artifact transfer (docs/ARTIFACTS.md) is one tool, not three. From a
+	// model's perspective create_upload/complete_upload/get_download_url
+	// are one intent ("work with an ATOS artifact"), not three separate
+	// ones — collapsing them to a single operation-dispatched tool keeps
+	// the default surface at 11 instead of 13 while staying always-visible
+	// (file I/O isn't an authorization concern the way admin tools are, so
+	// there's no reliable per-caller signal to gate it on instead — see
+	// adminToolDefinitions below for the case where gating IS correct).
 	{
-		"name":        "atos_create_upload",
-		"description": "Request a short-lived signed upload target for binary content.",
+		"name":        "atos_artifact",
+		"description": "Work with ATOS artifacts (binary content): create_upload requests a signed upload target, complete_upload finalizes one into a reusable artifact_id, get_download_url returns a signed download link. Use only when a capability's input/output schema references a file field — bytes never travel through this call itself, only through the signed URL it returns.",
 		"inputSchema": map[string]any{
 			"type":     "object",
-			"required": []string{"content_type", "size_bytes"},
+			"required": []string{"operation"},
 			"properties": map[string]any{
-				"content_type": map[string]any{"type": "string"},
-				"size_bytes":   map[string]any{"type": "integer", "minimum": 1},
-				"purpose":      map[string]any{"type": "string", "enum": []string{"job_input", "capability_asset"}},
+				"operation":    map[string]any{"type": "string", "enum": []string{"create_upload", "complete_upload", "get_download_url"}},
+				"content_type": map[string]any{"type": "string", "description": "create_upload only"},
+				"size_bytes":   map[string]any{"type": "integer", "minimum": 1, "description": "create_upload only"},
+				"purpose":      map[string]any{"type": "string", "enum": []string{"job_input", "capability_asset"}, "description": "create_upload only"},
+				"upload_id":    map[string]any{"type": "string", "description": "complete_upload only"},
+				"artifact_id":  map[string]any{"type": "string", "description": "get_download_url only"},
 			},
-		},
-	},
-	{
-		"name":        "atos_complete_upload",
-		"description": "Finalize an upload after PUTing bytes to the signed upload_url, returning a reusable artifact_id.",
-		"inputSchema": map[string]any{
-			"type":       "object",
-			"required":   []string{"upload_id"},
-			"properties": map[string]any{"upload_id": map[string]any{"type": "string"}},
-		},
-	},
-	{
-		"name":        "atos_get_download_url",
-		"description": "Get a short-lived signed download URL for an artifact the caller owns.",
-		"inputSchema": map[string]any{
-			"type":       "object",
-			"required":   []string{"artifact_id"},
-			"properties": map[string]any{"artifact_id": map[string]any{"type": "string"}},
 		},
 	},
 }
@@ -174,14 +158,12 @@ var adminToolDefinitions = []map[string]any{
 
 type toolHandler func(ctx context.Context, principalID string, args map[string]any) (any, error)
 
-// dispatch includes the admin tools even though tools/list (toolDefinitions)
-// does not advertise them by default, per docs/MCP.md: "Optional/admin/
-// provider tools are discoverable only when the authenticated principal has
-// matching permissions." Phase 0 has no real per-principal scope model —
-// every principal already manages only its own capabilities (ownership is
-// enforced inside CapabilityService.Update/Pause/Resume) — so "callable but
-// unlisted" is the closest honest approximation until a real scopes system
-// exists.
+// dispatch is the full set of callable tools, including admin tools that
+// server.go's toolsForPrincipal only advertises in tools/list to
+// principals that own a capability. dispatch itself does not re-check
+// that condition — the individual handlers (e.g. Pause) already enforce
+// real ownership, so gating tools/list is a discoverability nicety, not
+// the security boundary.
 func (s *Server) dispatch() map[string]toolHandler {
 	return map[string]toolHandler{
 		"atos_search":               s.toolSearch,
@@ -196,9 +178,7 @@ func (s *Server) dispatch() map[string]toolHandler {
 		"atos_account":              s.toolAccount,
 		"atos_list_my_capabilities": s.toolListMyCapabilities,
 		"atos_pause_capability":     s.toolPauseCapability,
-		"atos_create_upload":        s.toolCreateUpload,
-		"atos_complete_upload":      s.toolCompleteUpload,
-		"atos_get_download_url":     s.toolGetDownloadURL,
+		"atos_artifact":             s.toolArtifact,
 	}
 }
 
@@ -378,7 +358,34 @@ func (s *Server) toolPauseCapability(ctx context.Context, principalID string, ar
 	return s.Capabilities.Pause(ctx, argString(args, "capability_id"), principalID)
 }
 
-func (s *Server) toolCreateUpload(ctx context.Context, principalID string, args map[string]any) (any, error) {
+// toolArtifact is the single MCP-visible entry point for
+// docs/ARTIFACTS.md's three-step signed-URL flow — see toolDefinitions'
+// atos_artifact entry for why these were consolidated from three tools
+// into one. Each operation validates its own required fields server-side
+// rather than relying on the (necessarily loose, since fields are shared
+// across operations) top-level JSON Schema to catch it.
+func (s *Server) toolArtifact(ctx context.Context, principalID string, args map[string]any) (any, error) {
+	switch op := argString(args, "operation"); op {
+	case "create_upload":
+		return s.artifactCreateUpload(ctx, principalID, args)
+	case "complete_upload":
+		uploadID := argString(args, "upload_id")
+		if uploadID == "" {
+			return nil, fmt.Errorf("upload_id is required for operation=complete_upload")
+		}
+		return s.Artifacts.CompleteUpload(ctx, principalID, uploadID)
+	case "get_download_url":
+		artifactID := argString(args, "artifact_id")
+		if artifactID == "" {
+			return nil, fmt.Errorf("artifact_id is required for operation=get_download_url")
+		}
+		return s.artifactGetDownloadURL(ctx, principalID, artifactID)
+	default:
+		return nil, fmt.Errorf("unknown operation %q; must be one of create_upload, complete_upload, get_download_url", op)
+	}
+}
+
+func (s *Server) artifactCreateUpload(ctx context.Context, principalID string, args map[string]any) (any, error) {
 	target, err := s.Artifacts.CreateUpload(ctx, service.CreateUploadInput{
 		PrincipalID: principalID,
 		ContentType: argString(args, "content_type"),
@@ -396,12 +403,8 @@ func (s *Server) toolCreateUpload(ctx context.Context, principalID string, args 
 	}, nil
 }
 
-func (s *Server) toolCompleteUpload(ctx context.Context, principalID string, args map[string]any) (any, error) {
-	return s.Artifacts.CompleteUpload(ctx, principalID, argString(args, "upload_id"))
-}
-
-func (s *Server) toolGetDownloadURL(ctx context.Context, principalID string, args map[string]any) (any, error) {
-	target, err := s.Artifacts.GetDownloadURL(ctx, principalID, argString(args, "artifact_id"))
+func (s *Server) artifactGetDownloadURL(ctx context.Context, principalID, artifactID string) (any, error) {
+	target, err := s.Artifacts.GetDownloadURL(ctx, principalID, artifactID)
 	if err != nil {
 		return nil, err
 	}
