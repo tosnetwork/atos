@@ -118,6 +118,7 @@ func seedDemoCapability(capabilities *service.CapabilityService) error {
 			Transport: domain.AdapterTOSNative, EndpointRef: "internal:mock",
 			EligibleTrustModes: []domain.TrustMode{domain.TrustModeManaged},
 		}},
+		IdempotencyKey: "seed-echo-sandbox-v1",
 	})
 	return err
 }
