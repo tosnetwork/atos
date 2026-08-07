@@ -11,6 +11,9 @@ import (
 
 func mustRegister(t *testing.T, h harness, in service.RegisterCapabilityInput) domain.Capability {
 	t.Helper()
+	if in.IdempotencyKey == "" {
+		in.IdempotencyKey = "search-test-register-" + in.ProviderID + "-" + in.Name
+	}
 	c, err := h.capabilities.Register(context.Background(), in)
 	if err != nil {
 		t.Fatalf("Register: %v", err)
