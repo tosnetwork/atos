@@ -76,7 +76,7 @@ func main() {
 		Jobs: jobs, Accounts: accounts, Receipts: receipts,
 		Artifacts: artifacts, Logger: logger,
 	}
-	a2aServer := &a2a.Server{Quotes: quotes, Jobs: jobs, Logger: logger}
+	a2aServer := &a2a.Server{Auth: authorization, Quotes: quotes, Jobs: jobs, Logger: logger}
 
 	mux := restServer.Mux()
 	mux.HandleFunc("POST /mcp", mcpServer.Handler())
