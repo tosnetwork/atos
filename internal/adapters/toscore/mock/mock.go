@@ -1,11 +1,11 @@
-// Package mock is a synchronous, in-process stand-in for tos-core: a local
-// ledger that actually enforces the escrow state machine and the
-// verify/settle phase separation from ~/atos-spec/docs/SETTLEMENT.md, just
-// without any real cryptography or chain commitment behind it yet.
+// Package mock is a synchronous in-process stand-in for tos-protocol/tos-core.
+// It enforces the v0.2 state and binding invariants but deliberately does not
+// claim that Managed transactions are TOS-verifiable.
 package mock
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -17,28 +17,23 @@ import (
 	"github.com/tosnetwork/atos/internal/store"
 )
 
-// settlementDecimals is the minor-unit precision assumed for every
-// currency this Phase 0/1 mock handles. Real multi-currency decimal tables
-// arrive alongside a real settlement backend.
 const settlementDecimals = 2
 
 type Core struct {
-	mu    sync.Mutex
-	store store.Store
-	// verified tracks which (escrowID) have passed VerifyExecutionReceipt,
-	// so SettleJob can refuse to run against an unverified receipt — this
-	// is the enforcement point for the phase-separation rule.
+	mu       sync.Mutex
+	store    store.Store
 	verified map[string]domain.ExecutionReceipt
+	quotes   map[string]domain.Quote
 }
 
 func New(s store.Store) *Core {
-	return &Core{store: s, verified: make(map[string]domain.ExecutionReceipt)}
+	return &Core{
+		store: s, verified: make(map[string]domain.ExecutionReceipt),
+		quotes: make(map[string]domain.Quote),
+	}
 }
 
 func (c *Core) ResolveAgent(ctx context.Context, principalID string) (string, error) {
-	// Phase 1/2: principal_id IS the agent identifier (see
-	// docs/AUTH.md "Agent Identity Migration"). A real tos-core binding
-	// replaces this 1:1 passthrough without changing the interface.
 	return principalID, nil
 }
 
@@ -51,8 +46,6 @@ func (c *Core) ResolveCapability(ctx context.Context, capabilityID string) (doma
 }
 
 func (c *Core) ReadReputation(ctx context.Context, providerID string) (domain.Trust, error) {
-	// Phase 0: flat, optimistic reputation for every provider until real
-	// evidence accumulates.
 	return domain.Trust{Score: 0.8, Level: domain.TrustSelfAsserted}, nil
 }
 
@@ -65,22 +58,68 @@ func (c *Core) VerifyCapabilityOwnership(ctx context.Context, capabilityID, prov
 }
 
 func (c *Core) UpdateReputationEvidence(ctx context.Context, providerID string, evidence string) error {
-	// No-op store for Phase 0 — real reputation aggregation is Phase 3+.
 	return nil
 }
 
+func (c *Core) CommitQuote(ctx context.Context, quote domain.Quote) (string, error) {
+	if quote.TrustMode != domain.TrustModeManaged {
+		return "", domain.NewError(domain.ErrNetworkUnavailable, "mock tos-core cannot create a TOS quote commitment", true)
+	}
+	c.mu.Lock()
+	c.quotes[quote.ID] = quote
+	c.mu.Unlock()
+	return "", nil
+}
+
+func (c *Core) ResolveExecutionSignerAuthorization(
+	ctx context.Context,
+	providerID, capabilityID, capabilityVersion, signerID string,
+	at time.Time,
+) (toscore.ExecutionSignerAuthorization, bool, error) {
+	if signerID == "" {
+		return toscore.ExecutionSignerAuthorization{}, false, nil
+	}
+	// The Phase 0 mock signer is local Managed evidence. It is not a TOS
+	// attestation and therefore cannot activate Verified/Native mode.
+	auth := toscore.ExecutionSignerAuthorization{
+		AuthorizationID:    "auth_mock_" + capabilityID,
+		ProviderID:         providerID,
+		CapabilityID:       capabilityID,
+		CapabilityVersion:  capabilityVersion,
+		ExecutionSignerID:  signerID,
+		ValidFrom:          at.Add(-24 * time.Hour),
+		ValidUntil:         at.Add(24 * time.Hour),
+		AuthorizationRef:   "atos:managed:signer:" + signerID,
+	}
+	return auth, true, nil
+}
+
 func (c *Core) CreateEscrow(ctx context.Context, req toscore.CreateEscrowRequest) (domain.Escrow, error) {
+	if req.TrustMode == "" {
+		req.TrustMode = domain.TrustModeManaged
+	}
+	if !req.TrustMode.Valid() {
+		return domain.Escrow{}, domain.NewError(domain.ErrQuoteModeMismatch, "escrow requires a concrete trust mode", false)
+	}
+	if req.TrustMode != domain.TrustModeManaged {
+		return domain.Escrow{}, domain.NewError(domain.ErrNetworkUnavailable, "mock tos-core cannot create enforceable TOS escrow", true)
+	}
 	now := time.Now().UTC()
 	e := domain.Escrow{
-		ID:           "esc_" + uuid.NewString(),
-		QuoteID:      req.QuoteID,
-		PrincipalID:  req.PrincipalID,
-		ProviderID:   req.ProviderID,
-		CapabilityID: req.CapabilityID,
-		Reserved:     req.Reserved,
-		Status:       domain.EscrowReserved,
-		CreatedAt:    now,
-		ExpiresAt:    now.Add(24 * time.Hour),
+		ID:                "esc_" + uuid.NewString(),
+		QuoteID:           req.QuoteID,
+		JobID:             req.JobID,
+		PrincipalID:       req.PrincipalID,
+		ProviderID:        req.ProviderID,
+		CapabilityID:      req.CapabilityID,
+		CapabilityVersion: req.CapabilityVersion,
+		TrustMode:         req.TrustMode,
+		ProofProfile:      req.ProofProfile,
+		Settlement:        req.Settlement,
+		Reserved:          req.Reserved,
+		Status:            domain.EscrowReserved,
+		CreatedAt:         now,
+		ExpiresAt:         now.Add(24 * time.Hour),
 	}
 	if err := c.store.PutEscrow(ctx, e); err != nil {
 		return domain.Escrow{}, err
@@ -88,8 +127,6 @@ func (c *Core) CreateEscrow(ctx context.Context, req toscore.CreateEscrowRequest
 	return e, nil
 }
 
-// ReleaseEscrow returns the full reserved amount to the client — the path
-// taken by cancellation, expiry, or a client-favorable dispute resolution.
 func (c *Core) ReleaseEscrow(ctx context.Context, escrowID string) (domain.Receipt, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -104,23 +141,27 @@ func (c *Core) ReleaseEscrow(ctx context.Context, escrowID string) (domain.Recei
 	now := time.Now().UTC()
 	e.Status = domain.EscrowReleased
 	e.SettledAt = &now
+	if e.TrustMode == domain.TrustModeManaged {
+		e.NetworkProofRef = ""
+	}
 	if err := c.store.PutEscrow(ctx, e); err != nil {
 		return domain.Receipt{}, err
 	}
-	// Clear any prior verification for this escrow — it can no longer be
-	// settled, so a lingering verified entry would be dead state at best
-	// and a confusing footgun at worst.
 	delete(c.verified, escrowID)
 
 	receipt := domain.Receipt{
-		ID:          "rcpt_" + uuid.NewString(),
-		QuoteID:     e.QuoteID,
-		EscrowID:    e.ID,
-		PrincipalID: e.PrincipalID,
-		Charged:     domain.Money{Amount: "0", Currency: e.Reserved.Currency},
-		Refunded:    e.Reserved,
-		Status:      domain.ReceiptReleased,
-		CreatedAt:   now,
+		ID:           "rcpt_" + uuid.NewString(),
+		QuoteID:      e.QuoteID,
+		EscrowID:     e.ID,
+		JobID:        e.JobID,
+		PrincipalID:  e.PrincipalID,
+		TrustMode:    e.TrustMode,
+		ProofProfile: e.ProofProfile,
+		Charged:      domain.Money{Amount: "0", Currency: e.Reserved.Currency},
+		Refunded:     e.Reserved,
+		Status:       domain.ReceiptReleased,
+		ProofStatus:  domain.ProofNotRequired,
+		CreatedAt:    now,
 	}
 	if err := c.store.PutReceipt(ctx, receipt); err != nil {
 		return domain.Receipt{}, err
@@ -128,10 +169,13 @@ func (c *Core) ReleaseEscrow(ctx context.Context, escrowID string) (domain.Recei
 	return receipt, nil
 }
 
-// VerifyExecutionReceipt is stateless and read-only by design (see
-// docs/SETTLEMENT.md): it only checks the receipt against the escrow it
-// claims to belong to and records the outcome for SettleJob to consult. It
-// never moves funds.
+func (c *Core) CommitExecutionReceipt(ctx context.Context, receipt domain.ExecutionReceipt) (string, error) {
+	if receipt.TrustMode != domain.TrustModeManaged {
+		return "", domain.NewError(domain.ErrNetworkUnavailable, "mock tos-core cannot commit receipt evidence to TOS", true)
+	}
+	return "", nil
+}
+
 func (c *Core) VerifyExecutionReceipt(ctx context.Context, escrowID string, receipt domain.ExecutionReceipt) (toscore.VerifyExecutionReceiptResult, error) {
 	e, err := c.store.GetEscrow(ctx, escrowID)
 	if err != nil {
@@ -140,35 +184,50 @@ func (c *Core) VerifyExecutionReceipt(ctx context.Context, escrowID string, rece
 	if e.Status.Terminal() {
 		return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: "escrow already terminal"}, nil
 	}
-	if e.CapabilityID != receipt.CapabilityID {
-		return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: "capability mismatch"}, nil
+	mismatches := []struct {
+		ok     bool
+		reason string
+	}{
+		{receipt.EscrowID == "" || receipt.EscrowID == e.ID, "escrow mismatch"},
+		{receipt.QuoteID == e.QuoteID, "quote mismatch"},
+		{receipt.JobID == e.JobID, "job mismatch"},
+		{receipt.ProviderID == e.ProviderID, "provider mismatch"},
+		{receipt.CapabilityID == e.CapabilityID, "capability mismatch"},
+		{receipt.CapabilityVersion == e.CapabilityVersion, "capability version mismatch"},
+		{receipt.TrustMode == e.TrustMode, "trust mode mismatch"},
+		{receipt.ProofProfile == e.ProofProfile, "proof profile mismatch"},
 	}
-	// Bind verification to the exact provider the escrow was reserved
-	// for and the exact job it was reserved for — without this, a
-	// receipt produced for a different job/provider that happens to
-	// target the same capability could authorize settlement of this
-	// escrow (or be misattributed to the wrong job at settlement time).
-	if e.ProviderID != receipt.ProviderID {
-		return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: "provider mismatch"}, nil
-	}
-	if receipt.JobID == "" {
-		return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: "receipt missing job_id"}, nil
+	for _, check := range mismatches {
+		if !check.ok {
+			return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: check.reason}, nil
+		}
 	}
 	if receipt.Signature == "" || receipt.OutputHash == "" || receipt.InputHash == "" {
-		return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: "receipt missing signature or input/output hash"}, nil
+		return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: "receipt missing signature or input/output commitment"}, nil
+	}
+	if receipt.Result != "" && receipt.Result != domain.ExecutionSuccess {
+		return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: "receipt is not successful"}, nil
+	}
+	auth, authorized, err := c.ResolveExecutionSignerAuthorization(
+		ctx, receipt.ProviderID, receipt.CapabilityID, receipt.CapabilityVersion,
+		receipt.ExecutionSignerID, receipt.CompletedAt,
+	)
+	if err != nil {
+		return toscore.VerifyExecutionReceiptResult{}, err
+	}
+	if !authorized {
+		return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: "execution signer is not authorized"}, nil
+	}
+	if receipt.SignerAuthorizationID != "" && receipt.SignerAuthorizationID != auth.AuthorizationID {
+		return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: "signer authorization mismatch"}, nil
 	}
 
 	c.mu.Lock()
 	c.verified[escrowID] = receipt
 	c.mu.Unlock()
-
 	return toscore.VerifyExecutionReceiptResult{Valid: true}, nil
 }
 
-// SettleJob is the only method in this package allowed to move funds, and
-// only runs if VerifyExecutionReceipt already approved this exact escrow —
-// enforcing the verify/apply separation at the type level, not just by
-// convention.
 func (c *Core) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (toscore.SettleJobResult, error) {
 	c.mu.Lock()
 	verifiedReceipt, ok := c.verified[req.EscrowID]
@@ -176,16 +235,15 @@ func (c *Core) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (tos
 	if !ok {
 		return toscore.SettleJobResult{}, domain.NewError(domain.ErrSettlementFailed, "no verified receipt for this escrow", false)
 	}
-	// The verified receipt must be for the exact job being settled — an
-	// escrow is 1:1 with a job, but this check is the actual enforcement
-	// of that invariant rather than an assumption.
 	if verifiedReceipt.JobID != req.JobID {
 		return toscore.SettleJobResult{}, domain.NewError(domain.ErrSettlementFailed, "verified receipt belongs to a different job", false)
+	}
+	if req.ReceiptID != "" && verifiedReceipt.ID != "" && req.ReceiptID != verifiedReceipt.ID {
+		return toscore.SettleJobResult{}, domain.NewError(domain.ErrSettlementFailed, "verified receipt id mismatch", false)
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
 	e, err := c.store.GetEscrow(ctx, req.EscrowID)
 	if err != nil {
 		return toscore.SettleJobResult{}, err
@@ -220,28 +278,45 @@ func (c *Core) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (tos
 		return toscore.SettleJobResult{}, err
 	}
 
+	proofStatus := domain.ProofNotRequired
+	if e.TrustMode != domain.TrustModeManaged {
+		proofStatus = domain.ProofVerified
+	}
 	receipt := domain.Receipt{
-		ID:          "rcpt_" + uuid.NewString(),
-		QuoteID:     e.QuoteID,
-		EscrowID:    e.ID,
-		JobID:       req.JobID,
-		PrincipalID: e.PrincipalID,
-		Charged:     req.ActualCost,
-		Refunded:    domain.Money{Amount: refunded.String(), Currency: e.Reserved.Currency},
-		Status:      domain.ReceiptSettled,
-		CreatedAt:   now,
+		ID:                     "rcpt_" + uuid.NewString(),
+		QuoteID:                e.QuoteID,
+		EscrowID:               e.ID,
+		JobID:                  req.JobID,
+		PrincipalID:            e.PrincipalID,
+		TrustMode:              e.TrustMode,
+		ProofProfile:           e.ProofProfile,
+		Charged:                req.ActualCost,
+		Refunded:               domain.Money{Amount: refunded.String(), Currency: e.Reserved.Currency},
+		Status:                 domain.ReceiptSettled,
+		ProofStatus:            proofStatus,
+		NetworkProofRef:        verifiedReceipt.NetworkProofRef,
+		ExecutionSignerID:      verifiedReceipt.ExecutionSignerID,
+		SignerAuthorizationRef: verifiedReceipt.SignerAuthorizationRef,
+		InputCommitment:        verifiedReceipt.InputHash,
+		OutputCommitment:       verifiedReceipt.OutputHash,
+		UsageCommitment:        verifiedReceipt.UsageCommitment,
+		CreatedAt:              now,
 	}
 	if err := c.store.PutReceipt(ctx, receipt); err != nil {
 		return toscore.SettleJobResult{}, err
 	}
-
-	// Consume the verification — an escrow only settles once, and clearing
-	// this prevents a stale verified entry from being reused if the same
-	// escrow ID were ever revisited (defense in depth alongside the
-	// escrow's own Terminal() check above).
 	delete(c.verified, req.EscrowID)
-
 	return toscore.SettleJobResult{Receipt: receipt}, nil
+}
+
+func (c *Core) CommitProofOfServiceEvidence(ctx context.Context, receipt domain.ExecutionReceipt) (string, error) {
+	if receipt.ID == "" {
+		return "", domain.NewError(domain.ErrValidationFailed, "receipt_id is required for Proof-of-Service evidence", false)
+	}
+	if receipt.TrustMode == domain.TrustModeManaged {
+		return "atos:managed:pos:" + receipt.ID, nil
+	}
+	return "", domain.NewError(domain.ErrNetworkUnavailable, "mock tos-core cannot commit portable Proof-of-Service evidence", true)
 }
 
 func (c *Core) ReadSettlementStatus(ctx context.Context, escrowID string) (domain.EscrowStatus, error) {
@@ -257,14 +332,14 @@ func (c *Core) ReadProof(ctx context.Context, receiptID string) (map[string]any,
 	if err != nil {
 		return nil, err
 	}
-	// Phase 0/1: no TOS Network commitment exists yet, so the "proof" is
-	// just the receipt itself, explicitly labeled as unattested. Phase 4
-	// replaces this body with a real tos-core settlement-proof payload
-	// without changing ReadProof's signature.
 	return map[string]any{
-		"receipt_id": r.ID,
-		"escrow_id":  r.EscrowID,
-		"attested":   false,
-		"note":       "no TOS Network commitment yet (Phase 0/1 mock tos-core)",
+		"receipt_id":       r.ID,
+		"escrow_id":        r.EscrowID,
+		"trust_mode":       r.TrustMode,
+		"proof_profile":    r.ProofProfile,
+		"proof_status":     r.ProofStatus,
+		"network_proof_ref": r.NetworkProofRef,
+		"attested":        false,
+		"note":            fmt.Sprintf("Phase 0/1 mock evidence; %s is not a TOS network proof", r.TrustMode),
 	}, nil
 }
