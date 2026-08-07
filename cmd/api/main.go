@@ -1,7 +1,4 @@
-// Command api runs the ATOS gateway: REST, MCP and A2A surfaces sharing
-// one service layer, backed by an in-memory or Postgres store (see
-// internal/config) and mock tos-ai/tos-core adapters, per
-// ~/atos-spec/docs/IMPLEMENTATION_ROADMAP.md's Phase 0/1.
+// Command api runs the ATOS REST, MCP and A2A gateway.
 package main
 
 import (
@@ -18,6 +15,7 @@ import (
 	"github.com/tosnetwork/atos/internal/adapters/storage/local"
 	tosaimock "github.com/tosnetwork/atos/internal/adapters/tosai/mock"
 	toscoremock "github.com/tosnetwork/atos/internal/adapters/toscore/mock"
+	"github.com/tosnetwork/atos/internal/auth"
 	"github.com/tosnetwork/atos/internal/config"
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/httpapi"
@@ -48,9 +46,9 @@ func main() {
 		logger.Info("using in-memory store (set ATOS_DATABASE_URL for postgres)")
 	}
 
+	authorization := auth.NewService()
 	tosai := tosaimock.New()
 	toscore := toscoremock.New(st)
-
 	capabilities := service.NewCapabilityService(st)
 	quotes := service.NewQuoteService(st)
 	accounts := service.NewAccountService(st)
@@ -63,35 +61,22 @@ func main() {
 		os.Exit(1)
 	}
 	artifacts := service.NewArtifactService(st, blobStorage)
-
 	if err := seedDemoCapability(capabilities); err != nil {
 		logger.Error("failed to seed demo capability", "error", err)
 		os.Exit(1)
 	}
 
 	restServer := &httpapi.Server{
-		Capabilities: capabilities,
-		Quotes:       quotes,
-		Jobs:         jobs,
-		Accounts:     accounts,
-		Receipts:     receipts,
-		Artifacts:    artifacts,
-		Logger:       logger,
+		Auth: authorization, Capabilities: capabilities, Quotes: quotes,
+		Jobs: jobs, Accounts: accounts, Receipts: receipts,
+		Artifacts: artifacts, Logger: logger,
 	}
 	mcpServer := &mcp.Server{
-		Capabilities: capabilities,
-		Quotes:       quotes,
-		Jobs:         jobs,
-		Accounts:     accounts,
-		Receipts:     receipts,
-		Artifacts:    artifacts,
-		Logger:       logger,
+		Auth: authorization, Capabilities: capabilities, Quotes: quotes,
+		Jobs: jobs, Accounts: accounts, Receipts: receipts,
+		Artifacts: artifacts, Logger: logger,
 	}
-	a2aServer := &a2a.Server{
-		Quotes: quotes,
-		Jobs:   jobs,
-		Logger: logger,
-	}
+	a2aServer := &a2a.Server{Quotes: quotes, Jobs: jobs, Logger: logger}
 
 	mux := restServer.Mux()
 	mux.HandleFunc("POST /mcp", mcpServer.Handler())
@@ -99,14 +84,11 @@ func main() {
 	mux.HandleFunc("/v1/blob/", blobStorage.BlobHandler())
 
 	httpServer := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           observability.Middleware(logger, mux),
+		Addr: cfg.Addr, Handler: observability.Middleware(logger, mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
 	go func() {
 		logger.Info("atos listening", "addr", cfg.Addr)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -114,7 +96,6 @@ func main() {
 			os.Exit(1)
 		}
 	}()
-
 	<-ctx.Done()
 	logger.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -124,22 +105,19 @@ func main() {
 	}
 }
 
-// seedDemoCapability registers one sandbox capability at startup so
-// atos_search/atos_quote/atos_invoke have something real to exercise
-// immediately after `go run ./cmd/api` — see the README quickstart.
 func seedDemoCapability(capabilities *service.CapabilityService) error {
 	_, err := capabilities.Register(context.Background(), service.RegisterCapabilityInput{
-		ProviderID:   "agt_demo",
-		Name:         "Echo Sandbox",
-		Description:  "Returns its input unchanged. For exercising the ATOS contract end to end, not real work.",
+		ProviderID: "agt_demo", Name: "Echo Sandbox",
+		Description: "Returns its input unchanged. For exercising the ATOS v0.2 Managed contract end to end.",
 		DeliveryMode: domain.DeliveryInstant,
-		InputSchema:  map[string]any{"type": "object"},
-		OutputSchema: map[string]any{"type": "object"},
-		Pricing: domain.Pricing{
-			Model:     domain.PricingFixed,
-			PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"},
-		},
+		InputSchema: map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
 		Tags: []string{"sandbox", "demo"},
+		RequestedTrustModes: []domain.TrustMode{domain.TrustModeManaged},
+		Bindings: []domain.CapabilityBinding{{
+			Transport: domain.AdapterTOSNative, EndpointRef: "internal:mock",
+			EligibleTrustModes: []domain.TrustMode{domain.TrustModeManaged},
+		}},
 	})
 	return err
 }
