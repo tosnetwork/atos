@@ -129,6 +129,44 @@ var adminToolDefinitions = []map[string]any{
 	},
 }
 
+// fileTransferToolDefinitions implements docs/MCP.md's "Optional File
+// Transfer Tools" — see docs/ARTIFACTS.md. Kept out of the default
+// tools/list for the same compactness reason as adminToolDefinitions:
+// most capabilities exchange plain JSON and never need file I/O.
+var fileTransferToolDefinitions = []map[string]any{
+	{
+		"name":        "atos_create_upload",
+		"description": "Request a short-lived signed upload target for binary content.",
+		"inputSchema": map[string]any{
+			"type":     "object",
+			"required": []string{"content_type", "size_bytes"},
+			"properties": map[string]any{
+				"content_type": map[string]any{"type": "string"},
+				"size_bytes":   map[string]any{"type": "integer", "minimum": 1},
+				"purpose":      map[string]any{"type": "string", "enum": []string{"job_input", "capability_asset"}},
+			},
+		},
+	},
+	{
+		"name":        "atos_complete_upload",
+		"description": "Finalize an upload after PUTing bytes to the signed upload_url, returning a reusable artifact_id.",
+		"inputSchema": map[string]any{
+			"type":       "object",
+			"required":   []string{"upload_id"},
+			"properties": map[string]any{"upload_id": map[string]any{"type": "string"}},
+		},
+	},
+	{
+		"name":        "atos_get_download_url",
+		"description": "Get a short-lived signed download URL for an artifact the caller owns.",
+		"inputSchema": map[string]any{
+			"type":       "object",
+			"required":   []string{"artifact_id"},
+			"properties": map[string]any{"artifact_id": map[string]any{"type": "string"}},
+		},
+	},
+}
+
 type toolHandler func(ctx context.Context, principalID string, args map[string]any) (any, error)
 
 // dispatch includes the admin tools even though tools/list (toolDefinitions)
@@ -153,6 +191,9 @@ func (s *Server) dispatch() map[string]toolHandler {
 		"atos_account":              s.toolAccount,
 		"atos_list_my_capabilities": s.toolListMyCapabilities,
 		"atos_pause_capability":     s.toolPauseCapability,
+		"atos_create_upload":        s.toolCreateUpload,
+		"atos_complete_upload":      s.toolCompleteUpload,
+		"atos_get_download_url":     s.toolGetDownloadURL,
 	}
 }
 
@@ -330,4 +371,39 @@ func (s *Server) toolListMyCapabilities(ctx context.Context, principalID string,
 
 func (s *Server) toolPauseCapability(ctx context.Context, principalID string, args map[string]any) (any, error) {
 	return s.Capabilities.Pause(ctx, argString(args, "capability_id"), principalID)
+}
+
+func (s *Server) toolCreateUpload(ctx context.Context, principalID string, args map[string]any) (any, error) {
+	target, err := s.Artifacts.CreateUpload(ctx, service.CreateUploadInput{
+		PrincipalID: principalID,
+		ContentType: argString(args, "content_type"),
+		SizeBytes:   argInt64(args, "size_bytes"),
+		Purpose:     argString(args, "purpose"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"upload_id":     target.UploadID,
+		"upload_url":    target.UploadURL,
+		"upload_method": target.UploadMethod,
+		"expires_at":    target.ExpiresAt,
+	}, nil
+}
+
+func (s *Server) toolCompleteUpload(ctx context.Context, principalID string, args map[string]any) (any, error) {
+	return s.Artifacts.CompleteUpload(ctx, principalID, argString(args, "upload_id"))
+}
+
+func (s *Server) toolGetDownloadURL(ctx context.Context, principalID string, args map[string]any) (any, error) {
+	target, err := s.Artifacts.GetDownloadURL(ctx, principalID, argString(args, "artifact_id"))
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"download_url": target.DownloadURL,
+		"expires_at":   target.ExpiresAt,
+		"content_type": target.ContentType,
+		"size_bytes":   target.SizeBytes,
+	}, nil
 }

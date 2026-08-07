@@ -91,6 +91,11 @@ type Accounts interface {
 	UpdateAccount(ctx context.Context, principalID string, seed domain.Account, fn func(a domain.Account, exists bool) (domain.Account, error)) (domain.Account, error)
 }
 
+type Artifacts interface {
+	PutArtifact(ctx context.Context, a domain.StoredArtifact) error
+	GetArtifact(ctx context.Context, id string) (domain.StoredArtifact, error)
+}
+
 type Idempotency interface {
 	// Reserve atomically claims (principalID, key) in the InProgress state.
 	// If the key was already used it returns the prior record and ok=false
@@ -115,5 +120,6 @@ type Store interface {
 	Receipts
 	Jobs
 	Accounts
+	Artifacts
 	Idempotency
 }

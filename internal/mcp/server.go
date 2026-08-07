@@ -24,6 +24,7 @@ type Server struct {
 	Jobs         *service.JobService
 	Accounts     *service.AccountService
 	Receipts     *service.ReceiptService
+	Artifacts    *service.ArtifactService
 	Logger       *slog.Logger
 }
 

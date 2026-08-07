@@ -21,6 +21,7 @@ type Store struct {
 	receiptsByJob map[string]string // jobID -> receiptID
 	jobs          map[string]domain.Job
 	accounts      map[string]domain.Account
+	artifacts     map[string]domain.StoredArtifact
 	idempotency   map[string]store.IdempotencyRecord // principalID+":"+key
 }
 
@@ -33,6 +34,7 @@ func New() *Store {
 		receiptsByJob: make(map[string]string),
 		jobs:          make(map[string]domain.Job),
 		accounts:      make(map[string]domain.Account),
+		artifacts:     make(map[string]domain.StoredArtifact),
 		idempotency:   make(map[string]store.IdempotencyRecord),
 	}
 }
@@ -257,6 +259,23 @@ func (s *Store) UpdateAccount(ctx context.Context, principalID string, seed doma
 	}
 	s.accounts[principalID] = next
 	return next, nil
+}
+
+func (s *Store) PutArtifact(ctx context.Context, a domain.StoredArtifact) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.artifacts[a.ID] = a
+	return nil
+}
+
+func (s *Store) GetArtifact(ctx context.Context, id string) (domain.StoredArtifact, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.artifacts[id]
+	if !ok {
+		return domain.StoredArtifact{}, store.ErrNotFound
+	}
+	return a, nil
 }
 
 func (s *Store) Reserve(ctx context.Context, principalID, key, requestHash string) (store.IdempotencyRecord, bool, error) {

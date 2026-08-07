@@ -21,6 +21,7 @@ type Server struct {
 	Jobs         *service.JobService
 	Accounts     *service.AccountService
 	Receipts     *service.ReceiptService
+	Artifacts    *service.ArtifactService
 	Logger       *slog.Logger
 }
 
@@ -63,6 +64,11 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("GET /v1/taxonomy", s.withAuth(s.handleTaxonomy))
 	mux.HandleFunc("GET /v1/network/status", s.withAuth(s.handleNetworkStatus))
 	mux.HandleFunc("GET /v1/providers/{id}/agent-card", s.withAuth(s.handleProviderAgentCard))
+
+	mux.HandleFunc("POST /v1/uploads", s.withAuth(s.handleCreateUpload))
+	mux.HandleFunc("POST /v1/uploads/{id}/complete", s.withAuth(s.handleCompleteUpload))
+	mux.HandleFunc("GET /v1/artifacts/{id}", s.withAuth(s.handleGetArtifact))
+	mux.HandleFunc("GET /v1/artifacts/{id}/download-url", s.withAuth(s.handleGetDownloadURL))
 
 	return mux
 }

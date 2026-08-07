@@ -450,6 +450,33 @@ func (s *Store) UpdateAccount(ctx context.Context, principalID string, seed doma
 	return next, nil
 }
 
+// --- Artifacts ---
+
+func (s *Store) PutArtifact(ctx context.Context, a domain.StoredArtifact) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO artifacts (id, owner_principal_id, content_type, size_bytes, sha256, status, created_at, expires_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		ON CONFLICT (id) DO UPDATE SET
+			content_type=$3, size_bytes=$4, sha256=$5, status=$6, expires_at=$8
+	`, a.ID, a.OwnerPrincipalID, a.ContentType, a.SizeBytes, a.SHA256, string(a.Status), a.CreatedAt, a.ExpiresAt)
+	return err
+}
+
+func (s *Store) GetArtifact(ctx context.Context, id string) (domain.StoredArtifact, error) {
+	var a domain.StoredArtifact
+	var status string
+	err := s.pool.QueryRow(ctx, `SELECT id, owner_principal_id, content_type, size_bytes, sha256, status, created_at, expires_at FROM artifacts WHERE id=$1`, id).
+		Scan(&a.ID, &a.OwnerPrincipalID, &a.ContentType, &a.SizeBytes, &a.SHA256, &status, &a.CreatedAt, &a.ExpiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StoredArtifact{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.StoredArtifact{}, err
+	}
+	a.Status = domain.ArtifactStatus(status)
+	return a, nil
+}
+
 // --- Idempotency ---
 
 func (s *Store) Reserve(ctx context.Context, principalID, key, requestHash string) (store.IdempotencyRecord, bool, error) {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tosnetwork/atos/internal/a2a"
+	"github.com/tosnetwork/atos/internal/adapters/storage/local"
 	tosaimock "github.com/tosnetwork/atos/internal/adapters/tosai/mock"
 	toscoremock "github.com/tosnetwork/atos/internal/adapters/toscore/mock"
 	"github.com/tosnetwork/atos/internal/config"
@@ -56,6 +57,13 @@ func main() {
 	jobs := service.NewJobService(st, tosai, toscore, accounts)
 	receipts := service.NewReceiptService(st, toscore)
 
+	blobStorage, err := local.New(cfg.BlobDir, cfg.PublicBaseURL, st)
+	if err != nil {
+		logger.Error("storage init failed", "error", err)
+		os.Exit(1)
+	}
+	artifacts := service.NewArtifactService(st, blobStorage)
+
 	if err := seedDemoCapability(capabilities); err != nil {
 		logger.Error("failed to seed demo capability", "error", err)
 		os.Exit(1)
@@ -67,6 +75,7 @@ func main() {
 		Jobs:         jobs,
 		Accounts:     accounts,
 		Receipts:     receipts,
+		Artifacts:    artifacts,
 		Logger:       logger,
 	}
 	mcpServer := &mcp.Server{
@@ -75,6 +84,7 @@ func main() {
 		Jobs:         jobs,
 		Accounts:     accounts,
 		Receipts:     receipts,
+		Artifacts:    artifacts,
 		Logger:       logger,
 	}
 	a2aServer := &a2a.Server{
@@ -86,6 +96,7 @@ func main() {
 	mux := restServer.Mux()
 	mux.HandleFunc("POST /mcp", mcpServer.Handler())
 	mux.HandleFunc("POST /a2a", a2aServer.Handler())
+	mux.HandleFunc("/v1/blob/", blobStorage.BlobHandler())
 
 	httpServer := &http.Server{
 		Addr:              cfg.Addr,
