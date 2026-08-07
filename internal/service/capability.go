@@ -22,17 +22,6 @@ func NewCapabilityService(s store.Store) *CapabilityService {
 	return &CapabilityService{store: s}
 }
 
-// Search implements atos_search / GET /capabilities. Ranking is naive
-// substring matching in Phase 0 (see internal/store/memory) — the
-// "semantic fit + trust + price + latency" scoring from
-// docs/CAPABILITIES.md is a Phase 1+ concern.
-func (s *CapabilityService) Search(ctx context.Context, query string, limit int) ([]domain.Capability, error) {
-	if limit <= 0 || limit > 20 {
-		limit = 5
-	}
-	return s.store.Search(ctx, query, limit)
-}
-
 func (s *CapabilityService) Get(ctx context.Context, id string) (domain.Capability, error) {
 	c, err := s.store.Get(ctx, id)
 	if err != nil {
@@ -158,6 +147,44 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 		return domain.Capability{}, err
 	}
 	return c, nil
+}
+
+// ListByProvider implements atos_list_my_capabilities / a provider's own
+// capability dashboard listing.
+func (s *CapabilityService) ListByProvider(ctx context.Context, providerID string) ([]domain.Capability, error) {
+	return s.store.ByProvider(ctx, providerID)
+}
+
+// Pause implements POST /capabilities/{id}/pause and atos_pause_capability:
+// a capability stops matching new searches without deleting it.
+func (s *CapabilityService) Pause(ctx context.Context, id, requestingProviderID string) (domain.Capability, error) {
+	return s.Update(ctx, id, requestingProviderID, map[string]any{"status": string(domain.CapabilityPaused)})
+}
+
+// Resume implements POST /capabilities/{id}/resume.
+func (s *CapabilityService) Resume(ctx context.Context, id, requestingProviderID string) (domain.Capability, error) {
+	return s.Update(ctx, id, requestingProviderID, map[string]any{"status": string(domain.CapabilityActive)})
+}
+
+// Taxonomy implements GET /taxonomy: the distinct tags currently in use
+// across active capabilities. Phase 0 stand-in for a curated category
+// tree — real taxonomy governance is a Phase 1+ concern.
+func (s *CapabilityService) Taxonomy(ctx context.Context) ([]string, error) {
+	caps, err := s.store.Search(ctx, "", 1000)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	var tags []string
+	for _, c := range caps {
+		for _, t := range c.Tags {
+			if !seen[t] {
+				seen[t] = true
+				tags = append(tags, t)
+			}
+		}
+	}
+	return tags, nil
 }
 
 func samePricing(a, b domain.Pricing) bool {

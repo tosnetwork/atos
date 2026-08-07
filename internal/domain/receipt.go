@@ -15,14 +15,15 @@ const (
 )
 
 type Receipt struct {
-	ID        string        `json:"receipt_id"`
-	QuoteID   string        `json:"quote_id"`
-	EscrowID  string        `json:"escrow_id"`
-	JobID     string        `json:"job_id"`
-	Charged   Money         `json:"charged"`
-	Refunded  Money         `json:"refunded"`
-	Status    ReceiptStatus `json:"status"`
-	CreatedAt time.Time     `json:"created_at"`
+	ID          string        `json:"receipt_id"`
+	QuoteID     string        `json:"quote_id"`
+	EscrowID    string        `json:"escrow_id"`
+	JobID       string        `json:"job_id"`
+	PrincipalID string        `json:"-"`
+	Charged     Money         `json:"charged"`
+	Refunded    Money         `json:"refunded"`
+	Status      ReceiptStatus `json:"status"`
+	CreatedAt   time.Time     `json:"created_at"`
 }
 
 // ExecutionReceipt is what tos-ai signs after running a job — the input to

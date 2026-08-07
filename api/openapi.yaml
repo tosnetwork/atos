@@ -1,0 +1,744 @@
+openapi: 3.0.3
+info:
+  title: ATOS REST API
+  version: 0.1.0
+  description: >
+    REST surface for the ATOS gateway, per ~/atos-spec/docs/API.md. This
+    document describes the Phase 0 implementation in internal/httpapi —
+    every path, method and schema here matches a real handler, not an
+    aspirational future surface. See internal/httpapi/api.go's error
+    envelope and status-code mapping for the authoritative error contract.
+servers:
+  - url: https://api.atos.im/v1
+    description: Production (not yet deployed — Phase 0 is local-only)
+  - url: http://localhost:8080/v1
+    description: Local development (go run ./cmd/api)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: capabilities
+  - name: quotes
+  - name: invocations
+  - name: jobs
+  - name: account
+  - name: receipts
+  - name: metadata
+  - name: auth
+
+paths:
+  /auth/device:
+    post:
+      tags: [auth]
+      summary: Start Device Authorization
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                client_type: { type: string, example: codex }
+                client_name: { type: string }
+                requested_scopes:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200":
+          description: Device code issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  device_code: { type: string }
+                  user_code: { type: string }
+                  verification_uri: { type: string }
+                  verification_uri_complete: { type: string }
+                  expires_in: { type: integer }
+                  interval: { type: integer }
+
+  /auth/device/token:
+    post:
+      tags: [auth]
+      summary: Poll for the Device Authorization access token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_code]
+              properties:
+                device_code: { type: string }
+      responses:
+        "200":
+          description: Access token issued (Phase 0 always succeeds immediately — see internal/httpapi/auth.go)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+
+  /auth/token/refresh:
+    post:
+      tags: [auth]
+      summary: Refresh an access token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "200":
+          description: New access token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /auth/revoke:
+    post:
+      tags: [auth]
+      summary: Revoke the caller's own credentials
+      responses:
+        "204":
+          description: >
+            Acknowledged. Phase 0 has no server-side token store to revoke
+            against yet — see internal/httpapi/auth.go.
+
+  /capabilities:
+    get:
+      tags: [capabilities]
+      summary: Search capabilities
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Natural-language query; text-match + multi-factor ranking in Phase 0/1 (see docs/CAPABILITIES.md).
+        - name: max_price
+          in: query
+          schema: { type: string }
+          description: Hard filter — excludes capabilities priced above this amount.
+        - name: max_price_currency
+          in: query
+          schema: { type: string, default: USD }
+        - name: min_trust_score
+          in: query
+          schema: { type: number }
+          description: Hard filter — excludes capabilities below this trust score.
+        - name: max_latency_ms
+          in: query
+          schema: { type: integer }
+          description: Hard filter — excludes capabilities with a higher target latency (capabilities with no SLA set are not filtered).
+        - name: delivery_mode
+          in: query
+          schema: { type: array, items: { type: string, enum: [instant, async, interactive] } }
+          style: form
+          explode: true
+          description: Hard filter — repeatable; a capability must match one of the given modes.
+      responses:
+        "200":
+          description: Ranked candidates
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  capabilities:
+                    type: array
+                    items: { $ref: "#/components/schemas/Capability" }
+    post:
+      tags: [capabilities]
+      summary: Register a capability (provider-side)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegisterCapabilityRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Capability" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /capabilities/{id}:
+    get:
+      tags: [capabilities]
+      summary: Get one capability
+      parameters: [{ $ref: "#/components/parameters/CapabilityId" }]
+      responses:
+        "200":
+          description: Capability
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Capability" }
+        "404": { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [capabilities]
+      summary: Update a capability (owning provider only)
+      parameters: [{ $ref: "#/components/parameters/CapabilityId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: >
+                Partial patch. provider_id is immutable (rejected). Changing
+                pricing/input_schema/output_schema bumps the capability's
+                version — see docs/CAPABILITIES.md Versioning.
+      responses:
+        "200":
+          description: Updated capability
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Capability" }
+        "403": { $ref: "#/components/responses/Error" }
+
+  /capabilities/{id}/pause:
+    post:
+      tags: [capabilities]
+      summary: Pause a capability (owning provider only)
+      parameters: [{ $ref: "#/components/parameters/CapabilityId" }]
+      responses:
+        "200":
+          description: Paused capability
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Capability" }
+
+  /capabilities/{id}/resume:
+    post:
+      tags: [capabilities]
+      summary: Resume a capability (owning provider only)
+      parameters: [{ $ref: "#/components/parameters/CapabilityId" }]
+      responses:
+        "200":
+          description: Active capability
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Capability" }
+
+  /quotes:
+    post:
+      tags: [quotes]
+      summary: Create a time-limited executable quote
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [capability_id]
+              properties:
+                capability_id: { type: string }
+                constraints:
+                  type: object
+                  properties:
+                    max_total: { $ref: "#/components/schemas/Money" }
+      responses:
+        "201":
+          description: Quote
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Quote" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /quotes/{id}:
+    get:
+      tags: [quotes]
+      summary: Get a quote
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Quote
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Quote" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /invocations:
+    post:
+      tags: [invocations]
+      summary: Invoke a bounded capability synchronously (bounded by max_wait_ms)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubmitRequest" }
+      responses:
+        "200":
+          description: Completed or input_required within the wait window
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SubmitResponse" }
+        "202":
+          description: Still running past max_wait_ms; poll GET /jobs/{id}
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SubmitResponse" }
+        "400": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
+
+  /invocations/{id}:
+    get:
+      tags: [invocations]
+      summary: Get an invocation's current state (shares storage with jobs)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Job
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /jobs:
+    post:
+      tags: [jobs]
+      summary: Create a long-running or interactive job (always returns immediately)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubmitRequest" }
+      responses:
+        "202":
+          description: Accepted or input_required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SubmitResponse" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /jobs/{id}:
+    get:
+      tags: [jobs]
+      summary: Get a job's current state
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Job
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /jobs/{id}/cancel:
+    post:
+      tags: [jobs]
+      summary: Cancel a non-terminal job
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [idempotency_key]
+              properties:
+                reason: { type: string }
+                idempotency_key: { type: string }
+      responses:
+        "200":
+          description: Canceled job
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /account:
+    get:
+      tags: [account]
+      summary: Get account balance and spending policy
+      responses:
+        "200":
+          description: Account
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+
+  /account/usage:
+    get:
+      tags: [account]
+      summary: Aggregate usage for the authenticated principal
+      responses:
+        "200":
+          description: Usage summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UsageSummary" }
+
+  /account/receipts:
+    get:
+      tags: [account, receipts]
+      summary: List the authenticated principal's receipts
+      responses:
+        "200":
+          description: Receipts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  receipts:
+                    type: array
+                    items: { $ref: "#/components/schemas/Receipt" }
+
+  /receipts/{id}:
+    get:
+      tags: [receipts]
+      summary: Get one receipt (owning principal only)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Receipt
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Receipt" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /receipts/{id}/settlement-proof:
+    get:
+      tags: [receipts]
+      summary: Optional advanced verifiability proof for a receipt
+      description: >
+        Phase 0/1: no TOS Network commitment exists yet — this returns an
+        explicitly unattested proof object rather than fabricated chain
+        data. See docs/SETTLEMENT.md "TOS Abstraction Boundary".
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Proof (unattested in Phase 0/1)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  receipt_id: { type: string }
+                  escrow_id: { type: string }
+                  attested: { type: boolean }
+                  note: { type: string }
+
+  /taxonomy:
+    get:
+      tags: [metadata]
+      summary: Distinct tags currently in use across active capabilities
+      responses:
+        "200":
+          description: Tags
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tags:
+                    type: array
+                    items: { type: string }
+
+  /network/status:
+    get:
+      tags: [metadata]
+      summary: Whether this gateway has a live TOS Network connection
+      responses:
+        "200":
+          description: Status (Phase 0/1 always reports not_connected — tos-core is an in-process mock)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  network: { type: string }
+                  status: { type: string, enum: [not_connected, connected] }
+                  note: { type: string }
+
+  /providers/{id}/agent-card:
+    get:
+      tags: [metadata]
+      summary: Per-provider discovery card built from that provider's active capabilities
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Provider agent card
+          content:
+            application/json:
+              schema:
+                type: object
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        Phase 0 simplification (see internal/httpapi/api.go withAuth): the
+        bearer token IS the principal_id, unsigned and non-expiring. Not a
+        real credential — do not rely on this for anything beyond local
+        development.
+
+  parameters:
+    CapabilityId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    Error:
+      description: Machine-coded error envelope
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  schemas:
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount: { type: string, example: "5.25" }
+        currency: { type: string, example: USD }
+
+    Pricing:
+      type: object
+      properties:
+        model:
+          type: string
+          enum: [free, fixed, per_use, per_unit, metered, negotiated]
+        unit: { type: string }
+        price_hint: { $ref: "#/components/schemas/Money" }
+
+    SLA:
+      type: object
+      properties:
+        target_latency_ms: { type: integer }
+        timeout_ms: { type: integer }
+
+    Trust:
+      type: object
+      properties:
+        score: { type: number }
+        level:
+          type: string
+          enum: [self_asserted, atos_verified, tos_attested]
+
+    Capability:
+      type: object
+      properties:
+        id: { type: string }
+        provider_id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        version: { type: string }
+        tags:
+          type: array
+          items: { type: string }
+        modalities:
+          type: array
+          items: { type: string }
+        delivery_mode:
+          type: string
+          enum: [instant, async, interactive]
+        input_schema: { type: object }
+        output_schema: { type: object }
+        pricing: { $ref: "#/components/schemas/Pricing" }
+        sla: { $ref: "#/components/schemas/SLA" }
+        trust: { $ref: "#/components/schemas/Trust" }
+        status:
+          type: string
+          enum: [active, paused]
+        updated_at: { type: string, format: date-time }
+
+    RegisterCapabilityRequest:
+      type: object
+      required: [name, description, delivery_mode, input_schema, output_schema, pricing]
+      properties:
+        name: { type: string }
+        description: { type: string }
+        delivery_mode:
+          type: string
+          enum: [instant, async, interactive]
+        input_schema: { type: object }
+        output_schema: { type: object }
+        pricing: { $ref: "#/components/schemas/Pricing" }
+        tags:
+          type: array
+          items: { type: string }
+
+    Price:
+      type: object
+      properties:
+        subtotal: { type: string }
+        fees: { type: string }
+        total_max: { type: string }
+        currency: { type: string }
+
+    Quote:
+      type: object
+      properties:
+        quote_id: { type: string }
+        capability_id: { type: string }
+        capability_version: { type: string }
+        price: { $ref: "#/components/schemas/Price" }
+        expires_at: { type: string, format: date-time }
+        requires_confirmation: { type: boolean }
+        terms_hash: { type: string }
+
+    SubmitRequest:
+      type: object
+      required: [capability_id, quote_id, idempotency_key]
+      properties:
+        capability_id: { type: string }
+        quote_id: { type: string }
+        input: { type: object }
+        idempotency_key: { type: string }
+        max_wait_ms:
+          type: integer
+          minimum: 1000
+          maximum: 120000
+          description: Only meaningful for /invocations; ignored by /jobs.
+        confirmed:
+          type: boolean
+          description: >
+            Reissue with the same idempotency_key and confirmed=true after
+            receiving result_type=input_required, per docs/MCP.md's MRTR
+            flow (see internal/service/job.go).
+
+    Job:
+      type: object
+      properties:
+        job_id: { type: string }
+        capability_id: { type: string }
+        quote_id: { type: string }
+        escrow_id: { type: string }
+        state:
+          type: string
+          enum: [submitted, working, input_required, completed, failed, canceled, rejected]
+        output: { type: object }
+        artifacts:
+          type: array
+          items: { type: object }
+        failure_reason: { type: string }
+        created_at: { type: string, format: date-time }
+        estimated_completion_at: { type: string, format: date-time }
+
+    SubmitResponse:
+      type: object
+      properties:
+        result_type:
+          type: string
+          enum: [completed, accepted, input_required, failed]
+        job: { $ref: "#/components/schemas/Job" }
+
+    SpendPolicy:
+      type: object
+      properties:
+        per_call_autonomous_limit: { $ref: "#/components/schemas/Money" }
+        daily_limit: { $ref: "#/components/schemas/Money" }
+        remaining_today: { $ref: "#/components/schemas/Money" }
+
+    Account:
+      type: object
+      properties:
+        balance: { $ref: "#/components/schemas/Money" }
+        spend_policy: { $ref: "#/components/schemas/SpendPolicy" }
+
+    UsageSummary:
+      type: object
+      properties:
+        total_jobs: { type: integer }
+        completed: { type: integer }
+        failed: { type: integer }
+        canceled: { type: integer }
+        in_progress: { type: integer }
+        total_charged: { $ref: "#/components/schemas/Money" }
+        total_refunded: { $ref: "#/components/schemas/Money" }
+
+    Receipt:
+      type: object
+      properties:
+        receipt_id: { type: string }
+        quote_id: { type: string }
+        escrow_id: { type: string }
+        job_id: { type: string }
+        charged: { $ref: "#/components/schemas/Money" }
+        refunded: { $ref: "#/components/schemas/Money" }
+        status:
+          type: string
+          enum: [settled, released, disputed, settled_after_dispute, released_after_dispute]
+        created_at: { type: string, format: date-time }
+
+    TokenResponse:
+      type: object
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, example: Bearer }
+        expires_in: { type: integer }
+        refresh_token: { type: string }
+        principal_id: { type: string }
+        scopes:
+          type: array
+          items: { type: string }
+
+    ErrorEnvelope:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              enum:
+                - authentication_required
+                - permission_denied
+                - rate_limited
+                - validation_failed
+                - capability_unavailable
+                - quote_expired
+                - quote_mismatch
+                - spend_limit_exceeded
+                - insufficient_balance
+                - idempotency_conflict
+                - job_not_cancelable
+                - provider_failed
+                - settlement_failed
+                - not_found
+            message: { type: string }
+            retryable: { type: boolean }

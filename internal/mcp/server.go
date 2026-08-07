@@ -23,6 +23,7 @@ type Server struct {
 	Quotes       *service.QuoteService
 	Jobs         *service.JobService
 	Accounts     *service.AccountService
+	Receipts     *service.ReceiptService
 	Logger       *slog.Logger
 }
 
@@ -82,6 +83,10 @@ func (s *Server) Handler() http.HandlerFunc {
 			writeRPCResult(w, req.ID, map[string]any{"tools": toolDefinitions})
 		case "tools/call":
 			s.handleToolCall(ctx, w, req, token)
+		case "resources/list":
+			writeRPCResult(w, req.ID, map[string]any{"resources": resourceDefinitions})
+		case "resources/read":
+			s.handleResourceRead(ctx, w, req, token)
 		default:
 			writeRPCError(w, req.ID, codeMethodNotFound, "unknown method "+req.Method)
 		}

@@ -113,13 +113,14 @@ func (c *Core) ReleaseEscrow(ctx context.Context, escrowID string) (domain.Recei
 	delete(c.verified, escrowID)
 
 	receipt := domain.Receipt{
-		ID:        "rcpt_" + uuid.NewString(),
-		QuoteID:   e.QuoteID,
-		EscrowID:  e.ID,
-		Charged:   domain.Money{Amount: "0", Currency: e.Reserved.Currency},
-		Refunded:  e.Reserved,
-		Status:    domain.ReceiptReleased,
-		CreatedAt: now,
+		ID:          "rcpt_" + uuid.NewString(),
+		QuoteID:     e.QuoteID,
+		EscrowID:    e.ID,
+		PrincipalID: e.PrincipalID,
+		Charged:     domain.Money{Amount: "0", Currency: e.Reserved.Currency},
+		Refunded:    e.Reserved,
+		Status:      domain.ReceiptReleased,
+		CreatedAt:   now,
 	}
 	if err := c.store.PutReceipt(ctx, receipt); err != nil {
 		return domain.Receipt{}, err
@@ -220,14 +221,15 @@ func (c *Core) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (tos
 	}
 
 	receipt := domain.Receipt{
-		ID:        "rcpt_" + uuid.NewString(),
-		QuoteID:   e.QuoteID,
-		EscrowID:  e.ID,
-		JobID:     req.JobID,
-		Charged:   req.ActualCost,
-		Refunded:  domain.Money{Amount: refunded.String(), Currency: e.Reserved.Currency},
-		Status:    domain.ReceiptSettled,
-		CreatedAt: now,
+		ID:          "rcpt_" + uuid.NewString(),
+		QuoteID:     e.QuoteID,
+		EscrowID:    e.ID,
+		JobID:       req.JobID,
+		PrincipalID: e.PrincipalID,
+		Charged:     req.ActualCost,
+		Refunded:    domain.Money{Amount: refunded.String(), Currency: e.Reserved.Currency},
+		Status:      domain.ReceiptSettled,
+		CreatedAt:   now,
 	}
 	if err := c.store.PutReceipt(ctx, receipt); err != nil {
 		return toscore.SettleJobResult{}, err

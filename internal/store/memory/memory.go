@@ -166,6 +166,18 @@ func (s *Store) ReceiptByJob(ctx context.Context, jobID string) (domain.Receipt,
 	return s.receipts[id], nil
 }
 
+func (s *Store) ReceiptsByPrincipal(ctx context.Context, principalID string) ([]domain.Receipt, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []domain.Receipt
+	for _, r := range s.receipts {
+		if r.PrincipalID == principalID {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) PutJob(ctx context.Context, j domain.Job) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -181,6 +193,18 @@ func (s *Store) GetJob(ctx context.Context, id string) (domain.Job, error) {
 		return domain.Job{}, store.ErrNotFound
 	}
 	return j, nil
+}
+
+func (s *Store) JobsByPrincipal(ctx context.Context, principalID string) ([]domain.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []domain.Job
+	for _, j := range s.jobs {
+		if j.PrincipalID == principalID {
+			out = append(out, j)
+		}
+	}
+	return out, nil
 }
 
 // UpdateJob holds the store lock for the whole read-modify-write so two

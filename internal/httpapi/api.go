@@ -20,6 +20,7 @@ type Server struct {
 	Quotes       *service.QuoteService
 	Jobs         *service.JobService
 	Accounts     *service.AccountService
+	Receipts     *service.ReceiptService
 	Logger       *slog.Logger
 }
 
@@ -33,11 +34,15 @@ func (s *Server) Mux() *http.ServeMux {
 
 	mux.HandleFunc("POST /v1/auth/device", s.handleAuthDeviceStart)
 	mux.HandleFunc("POST /v1/auth/device/token", s.handleAuthDeviceToken)
+	mux.HandleFunc("POST /v1/auth/token/refresh", s.handleAuthTokenRefresh)
+	mux.HandleFunc("POST /v1/auth/revoke", s.withAuth(s.handleAuthRevoke))
 
 	mux.HandleFunc("GET /v1/capabilities", s.withAuth(s.handleSearchCapabilities))
 	mux.HandleFunc("GET /v1/capabilities/{id}", s.withAuth(s.handleGetCapability))
 	mux.HandleFunc("POST /v1/capabilities", s.withAuth(s.handleRegisterCapability))
 	mux.HandleFunc("PATCH /v1/capabilities/{id}", s.withAuth(s.handleUpdateCapability))
+	mux.HandleFunc("POST /v1/capabilities/{id}/pause", s.withAuth(s.handlePauseCapability))
+	mux.HandleFunc("POST /v1/capabilities/{id}/resume", s.withAuth(s.handleResumeCapability))
 
 	mux.HandleFunc("POST /v1/quotes", s.withAuth(s.handleCreateQuote))
 	mux.HandleFunc("GET /v1/quotes/{id}", s.withAuth(s.handleGetQuote))
@@ -50,6 +55,14 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.withAuth(s.handleCancelJob))
 
 	mux.HandleFunc("GET /v1/account", s.withAuth(s.handleGetAccount))
+	mux.HandleFunc("GET /v1/account/usage", s.withAuth(s.handleGetAccountUsage))
+	mux.HandleFunc("GET /v1/account/receipts", s.withAuth(s.handleListReceipts))
+	mux.HandleFunc("GET /v1/receipts/{id}", s.withAuth(s.handleGetReceipt))
+	mux.HandleFunc("GET /v1/receipts/{id}/settlement-proof", s.withAuth(s.handleSettlementProof))
+
+	mux.HandleFunc("GET /v1/taxonomy", s.withAuth(s.handleTaxonomy))
+	mux.HandleFunc("GET /v1/network/status", s.withAuth(s.handleNetworkStatus))
+	mux.HandleFunc("GET /v1/providers/{id}/agent-card", s.withAuth(s.handleProviderAgentCard))
 
 	return mux
 }

@@ -19,9 +19,17 @@ var toolDefinitions = []map[string]any{
 		"inputSchema": map[string]any{
 			"type": "object", "required": []string{"query"},
 			"properties": map[string]any{
-				"query":   map[string]any{"type": "string", "minLength": 1},
-				"filters": map[string]any{"type": "object"},
-				"limit":   map[string]any{"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+				"query": map[string]any{"type": "string", "minLength": 1},
+				"filters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"max_price":       map[string]any{"type": "object", "properties": map[string]any{"amount": map[string]any{"type": "string"}, "currency": map[string]any{"type": "string"}}},
+						"delivery_modes":  map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"instant", "async", "interactive"}}},
+						"min_trust_score": map[string]any{"type": "number"},
+						"max_latency_ms":  map[string]any{"type": "integer"},
+					},
+				},
+				"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
 			},
 		},
 	},
@@ -103,20 +111,48 @@ var toolDefinitions = []map[string]any{
 	},
 }
 
+// adminToolDefinitions are only advertised to callers that pass
+// include_admin_tools — see dispatch()'s comment on why Phase 0 can't yet
+// do real per-principal scope checks. Kept separate from toolDefinitions
+// so the default tools/list response stays the compact 10-tool surface
+// docs/MCP.md calls for.
+var adminToolDefinitions = []map[string]any{
+	{
+		"name":        "atos_list_my_capabilities",
+		"description": "List capabilities owned by the authenticated provider.",
+		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+	},
+	{
+		"name":        "atos_pause_capability",
+		"description": "Pause one of the authenticated provider's own capabilities so it stops matching new searches.",
+		"inputSchema": map[string]any{"type": "object", "required": []string{"capability_id"}, "properties": map[string]any{"capability_id": map[string]any{"type": "string"}}},
+	},
+}
+
 type toolHandler func(ctx context.Context, principalID string, args map[string]any) (any, error)
 
+// dispatch includes the admin tools even though tools/list (toolDefinitions)
+// does not advertise them by default, per docs/MCP.md: "Optional/admin/
+// provider tools are discoverable only when the authenticated principal has
+// matching permissions." Phase 0 has no real per-principal scope model —
+// every principal already manages only its own capabilities (ownership is
+// enforced inside CapabilityService.Update/Pause/Resume) — so "callable but
+// unlisted" is the closest honest approximation until a real scopes system
+// exists.
 func (s *Server) dispatch() map[string]toolHandler {
 	return map[string]toolHandler{
-		"atos_search":              s.toolSearch,
-		"atos_get_capability":      s.toolGetCapability,
-		"atos_quote":               s.toolQuote,
-		"atos_invoke":              s.toolInvoke,
-		"atos_create_job":          s.toolCreateJob,
-		"atos_get_job":             s.toolGetJob,
-		"atos_cancel_job":          s.toolCancelJob,
-		"atos_register_capability": s.toolRegisterCapability,
-		"atos_update_capability":   s.toolUpdateCapability,
-		"atos_account":             s.toolAccount,
+		"atos_search":               s.toolSearch,
+		"atos_get_capability":       s.toolGetCapability,
+		"atos_quote":                s.toolQuote,
+		"atos_invoke":               s.toolInvoke,
+		"atos_create_job":           s.toolCreateJob,
+		"atos_get_job":              s.toolGetJob,
+		"atos_cancel_job":           s.toolCancelJob,
+		"atos_register_capability":  s.toolRegisterCapability,
+		"atos_update_capability":    s.toolUpdateCapability,
+		"atos_account":              s.toolAccount,
+		"atos_list_my_capabilities": s.toolListMyCapabilities,
+		"atos_pause_capability":     s.toolPauseCapability,
 	}
 }
 
@@ -147,8 +183,35 @@ func argBool(args map[string]any, key string) bool {
 }
 
 func (s *Server) toolSearch(ctx context.Context, principalID string, args map[string]any) (any, error) {
-	limit := int(argInt64(args, "limit"))
-	caps, err := s.Capabilities.Search(ctx, argString(args, "query"), limit)
+	in := service.SearchInput{
+		Query: argString(args, "query"),
+		Limit: int(argInt64(args, "limit")),
+	}
+	if filters := argObject(args, "filters"); filters != nil {
+		if raw, ok := filters["max_price"].(map[string]any); ok {
+			amount, _ := raw["amount"].(string)
+			currency, _ := raw["currency"].(string)
+			if amount != "" {
+				in.Filters.MaxPrice = &domain.Money{Amount: amount, Currency: currency}
+			}
+		}
+		if raw, ok := filters["min_trust_score"].(float64); ok {
+			in.Filters.MinTrustScore = &raw
+		}
+		if raw, ok := filters["max_latency_ms"].(float64); ok {
+			v := int64(raw)
+			in.Filters.MaxLatencyMS = &v
+		}
+		if raw, ok := filters["delivery_modes"].([]any); ok {
+			for _, m := range raw {
+				if str, ok := m.(string); ok {
+					in.Filters.DeliveryModes = append(in.Filters.DeliveryModes, domain.DeliveryMode(str))
+				}
+			}
+		}
+	}
+
+	caps, err := s.Capabilities.Search(ctx, in)
 	if err != nil {
 		return nil, err
 	}
@@ -255,4 +318,16 @@ func (s *Server) toolUpdateCapability(ctx context.Context, principalID string, a
 
 func (s *Server) toolAccount(ctx context.Context, principalID string, args map[string]any) (any, error) {
 	return s.Accounts.Get(ctx, principalID)
+}
+
+func (s *Server) toolListMyCapabilities(ctx context.Context, principalID string, args map[string]any) (any, error) {
+	caps, err := s.Capabilities.ListByProvider(ctx, principalID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"capabilities": caps}, nil
+}
+
+func (s *Server) toolPauseCapability(ctx context.Context, principalID string, args map[string]any) (any, error) {
+	return s.Capabilities.Pause(ctx, argString(args, "capability_id"), principalID)
 }

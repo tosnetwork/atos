@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -52,8 +53,43 @@ func (s *Server) handleAuthDeviceToken(w http.ResponseWriter, r *http.Request) {
 		"access_token":  principalID,
 		"token_type":    "Bearer",
 		"expires_in":    3600,
-		"refresh_token": "rt_" + uuid.NewString(),
+		"refresh_token": "rt_" + principalID,
 		"principal_id":  principalID,
 		"scopes":        []string{"capabilities:read", "quotes:read", "invocations:create", "jobs:read", "account:read"},
 	})
+}
+
+// handleAuthTokenRefresh implements POST /v1/auth/token/refresh. Phase 0
+// stub: tokens never actually expire in this skeleton (see withAuth), so
+// this just re-derives the same principal_id from the refresh_token
+// convention above rather than tracking real refresh-token state. A real
+// implementation stores refresh tokens server-side and rotates them.
+func (s *Server) handleAuthTokenRefresh(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.RefreshToken == "" {
+		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "refresh_token is required", false)
+		return
+	}
+	principalID, ok := strings.CutPrefix(req.RefreshToken, "rt_")
+	if !ok {
+		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed refresh_token", false)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"access_token":  principalID,
+		"token_type":    "Bearer",
+		"expires_in":    3600,
+		"refresh_token": req.RefreshToken,
+		"principal_id":  principalID,
+	})
+}
+
+// handleAuthRevoke implements POST /v1/auth/revoke. Phase 0 stub: there is
+// no server-side token store to revoke against yet (see withAuth's
+// simplification), so this only validates the caller is authenticated and
+// acknowledges the request rather than actually invalidating anything.
+func (s *Server) handleAuthRevoke(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
 }

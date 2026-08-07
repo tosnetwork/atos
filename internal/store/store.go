@@ -64,11 +64,13 @@ type Receipts interface {
 	PutReceipt(ctx context.Context, r domain.Receipt) error
 	GetReceipt(ctx context.Context, id string) (domain.Receipt, error)
 	ReceiptByJob(ctx context.Context, jobID string) (domain.Receipt, error)
+	ReceiptsByPrincipal(ctx context.Context, principalID string) ([]domain.Receipt, error)
 }
 
 type Jobs interface {
 	PutJob(ctx context.Context, j domain.Job) error
 	GetJob(ctx context.Context, id string) (domain.Job, error)
+	JobsByPrincipal(ctx context.Context, principalID string) ([]domain.Job, error)
 	// UpdateJob atomically applies fn to the job's current stored state (or
 	// domain.Job{} with exists=false if it isn't stored yet) and persists
 	// whatever fn returns. fn returning an error aborts without persisting

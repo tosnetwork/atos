@@ -1,6 +1,7 @@
-// Command api runs the ATOS Phase 0 gateway: REST + MCP surfaces backed by
-// an in-memory store and mock tos-ai/tos-core adapters, per
-// ~/atos-spec/docs/IMPLEMENTATION_ROADMAP.md's "Phase 0 — Contract First".
+// Command api runs the ATOS gateway: REST, MCP and A2A surfaces sharing
+// one service layer, backed by an in-memory or Postgres store (see
+// internal/config) and mock tos-ai/tos-core adapters, per
+// ~/atos-spec/docs/IMPLEMENTATION_ROADMAP.md's Phase 0/1.
 package main
 
 import (
@@ -13,21 +14,39 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tosnetwork/atos/internal/a2a"
 	tosaimock "github.com/tosnetwork/atos/internal/adapters/tosai/mock"
 	toscoremock "github.com/tosnetwork/atos/internal/adapters/toscore/mock"
 	"github.com/tosnetwork/atos/internal/config"
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/httpapi"
 	"github.com/tosnetwork/atos/internal/mcp"
+	"github.com/tosnetwork/atos/internal/observability"
 	"github.com/tosnetwork/atos/internal/service"
+	"github.com/tosnetwork/atos/internal/store"
 	"github.com/tosnetwork/atos/internal/store/memory"
+	"github.com/tosnetwork/atos/internal/store/postgres"
 )
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	cfg := config.Load()
 
-	st := memory.New()
+	var st store.Store
+	if cfg.DatabaseURL != "" {
+		pg, err := postgres.Open(context.Background(), cfg.DatabaseURL)
+		if err != nil {
+			logger.Error("postgres connect failed", "error", err)
+			os.Exit(1)
+		}
+		defer pg.Close()
+		st = pg
+		logger.Info("using postgres store")
+	} else {
+		st = memory.New()
+		logger.Info("using in-memory store (set ATOS_DATABASE_URL for postgres)")
+	}
+
 	tosai := tosaimock.New()
 	toscore := toscoremock.New(st)
 
@@ -35,6 +54,7 @@ func main() {
 	quotes := service.NewQuoteService(st)
 	accounts := service.NewAccountService(st)
 	jobs := service.NewJobService(st, tosai, toscore, accounts)
+	receipts := service.NewReceiptService(st, toscore)
 
 	if err := seedDemoCapability(capabilities); err != nil {
 		logger.Error("failed to seed demo capability", "error", err)
@@ -46,6 +66,7 @@ func main() {
 		Quotes:       quotes,
 		Jobs:         jobs,
 		Accounts:     accounts,
+		Receipts:     receipts,
 		Logger:       logger,
 	}
 	mcpServer := &mcp.Server{
@@ -53,15 +74,22 @@ func main() {
 		Quotes:       quotes,
 		Jobs:         jobs,
 		Accounts:     accounts,
+		Receipts:     receipts,
 		Logger:       logger,
+	}
+	a2aServer := &a2a.Server{
+		Quotes: quotes,
+		Jobs:   jobs,
+		Logger: logger,
 	}
 
 	mux := restServer.Mux()
 	mux.HandleFunc("POST /mcp", mcpServer.Handler())
+	mux.HandleFunc("POST /a2a", a2aServer.Handler())
 
 	httpServer := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           logRequests(logger, mux),
+		Handler:           observability.Middleware(logger, mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -83,14 +111,6 @@ func main() {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
 	}
-}
-
-func logRequests(logger *slog.Logger, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		next.ServeHTTP(w, r)
-		logger.Info("request", "method", r.Method, "path", r.URL.Path, "duration_ms", time.Since(start).Milliseconds())
-	})
 }
 
 // seedDemoCapability registers one sandbox capability at startup so
