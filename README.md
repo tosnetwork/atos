@@ -1,64 +1,169 @@
 # ATOS
 
-Implementation of the ATOS gateway described in `~/atos-spec` and
-`~/TOS_ARCHITECTURE_V2.md`. Public contracts (REST, MCP, A2A, Agent Card)
-are real and wired end to end; execution (tos-ai) and trust/settlement
-(tos-core) are in-process mocks — not a real provider network or a real
-settlement chain yet. See `review.codex.md` for an independent review of
-an earlier pass and the fixes applied since.
+Go implementation of the ATOS Agent Internet gateway defined in
+[`tosnetwork/atos-spec`](https://github.com/tosnetwork/atos-spec).
 
-## What's real vs. mocked
+ATOS exposes one REST + MCP + A2A business protocol for discovering, quoting,
+invoking and settling third-party **Capabilities** under three concrete trust
+modes:
+
+```text
+managed   centralized atos.im execution/accounting
+verified  managed UX with TOS-verifiable trust/economic checkpoints
+native    TOS-backed trust plus gateway-independent canonical resolution
+```
+
+Clients may ask for `requested_trust_mode=auto`, but every Quote freezes one
+concrete `trust_mode`. Jobs, escrows, execution receipts and settlement inherit
+that mode; stronger-mode failure never silently falls back to Managed.
+
+## Current delivery status
+
+This branch implements the Phase 0/1 contract and a complete **Managed Mode**
+happy path. Verified and Native types, RPC boundaries, schemas and fail-closed
+selection rules are implemented, but their modes remain unavailable until the
+real `tos-protocol`/TOS adapters replace the mocks.
 
 | Layer | Status |
 |---|---|
-| REST API (`docs/API.md`, `api/openapi.yaml`) | Implemented — capabilities, quotes, invocations, jobs, account/usage/receipts, taxonomy, network status, provider agent cards, device auth |
-| MCP (`docs/MCP.md`) | Implemented — 10 default tools, 2 admin tools (unlisted but callable), 5 `atos://` resources, over JSON-RPC 2.0. Session resumability and true MRTR elicitation round trips are simplified; `input_required` + a `confirmed`-reissue of the same idempotency_key stands in for it |
-| A2A (`docs/A2A.md`) | Implemented — `message/send`/`tasks/get`/`tasks/cancel` over JSON-RPC 2.0 at `POST /a2a`, sharing the same JobService as REST/MCP. Commerce fields ride in the `https://atos.im/extensions/commerce/v1` message metadata extension |
-| Escrow / settlement state machine (`docs/SETTLEMENT.md`) | Implemented — reserve → verify → settle/release, enforced in code (`internal/adapters/toscore/mock`), not just documented |
-| Persistence | Both real: `internal/store/memory` (Phase 0, zero setup) and `internal/store/postgres` (Phase 1, set `ATOS_DATABASE_URL`) implement the identical `store.Store` interface — swapping one for the other doesn't touch `internal/service` |
-| tos-ai execution | Mocked (`internal/adapters/tosai/mock`) — echoes input back as output; swap for a real provider network in Phase 2 |
-| tos-core trust/settlement | Mocked (`internal/adapters/toscore/mock`) — real state machine (escrow reserve/verify/settle/release), no chain commitment; swap in Phase 4 |
-| Device Auth | Stubbed — always succeeds immediately, no real human verification step |
-| Semantic search / ranking | Naive substring/ILIKE match — real ranking is a Phase 1+ concern |
-| Provider job queue (`GET /provider/jobs`, `atos_provider_jobs`, ...) | Not implemented — Phase 0/1's only adapter type executes synchronously in-process; there is no real queued-provider model to back these yet |
+| REST API | Implemented with scoped Bearer authorization |
+| MCP | Stateless Streamable HTTP JSON-RPC; authorization-derived deterministic `tools/list` |
+| A2A | `message/send`, `tasks/get`, `tasks/cancel`, sharing the canonical Job pipeline |
+| Managed execution | End-to-end Quote → escrow → execution → signed receipt → verify → settle |
+| Artifact transport | Signed HTTP PUT/GET URLs; bytes never travel through MCP/A2A business calls |
+| PostgreSQL | Indexed relational projection + complete v0.2 JSONB payload persistence |
+| `tos-ai` | Phase 0 in-process Managed mock; final topology is ATOS → `tos-protocol` Edge Core → private `tos-ai` Worker RPC |
+| `tos-core` / `tos-protocol` | Fail-closed mock state machine; no fabricated TOS proof |
+| Device Authorization | Scoped in-memory Phase 0 implementation with immediate approval; production UI/consent remains to be wired |
+| Verified / Native | Contract implemented, runtime availability intentionally `unavailable` until real TOS integration |
 
-None of the above requires changing `internal/service` or the public
-REST/MCP/A2A contracts to fix later — that boundary is the point of this
-codebase.
+## MCP surface
 
-## Layout
+A token carrying the recommended ordinary consumer scopes sees **9 tools** in
+stable order:
 
 ```text
-cmd/api/             entrypoint: wires store, adapters, services, HTTP mux
-cmd/migrate/          applies migrations/*.sql to ATOS_DATABASE_URL
-api/openapi.yaml      REST API spec, matches internal/httpapi exactly
-migrations/           Postgres schema (Phase 1)
-internal/domain/      Capability, Quote, Escrow, Receipt, Job, Account
-internal/money/       fixed-point minor-unit arithmetic (no floats for money)
-internal/store/       persistence interface + memory and postgres implementations
-internal/adapters/
-  tosai/              ATOS -> tos-ai interface (execution) + mock impl
-  toscore/            ATOS/tos-ai -> tos-core interface (trust/economy) + mock impl
-internal/service/     business logic: capability/quote/job/account/receipt
-internal/httpapi/     REST handlers (docs/API.md)
-internal/mcp/         MCP JSON-RPC handlers (docs/MCP.md)
-internal/a2a/         A2A JSON-RPC handlers (docs/A2A.md)
+atos_search
+atos_get_capability
+atos_quote
+atos_invoke
+atos_create_job
+atos_get_job
+atos_cancel_job
+atos_account
+atos_artifact
 ```
 
-This mirrors the plane separation in `atos-spec/docs/ARCHITECTURE.md`:
-`internal/service` never imports a TOS Network client directly, only
-`internal/adapters/tosai` and `internal/adapters/toscore`.
+`atos_artifact` uses one operation-dispatched tool for:
 
-## Run it
+```text
+create_upload | complete_upload | get_download_url
+```
+
+Capability-management tools appear only with `capabilities:write`; every
+`tools/call` still re-checks scope and object ownership. `tools/list` is derived
+from authorization on the current request, never session history, and returns:
+
+```json
+{
+  "ttlMs": 30000,
+  "cacheScope": "private"
+}
+```
+
+## Repository layout
+
+```text
+cmd/api/                    gateway entrypoint
+cmd/migrate/                PostgreSQL migration command
+api/openapi.yaml            REST contract
+migrations/                 ordered SQL migrations
+internal/auth/              scoped device/access/refresh tokens
+internal/domain/            v0.2 business objects and trust-mode types
+internal/service/           capability, quote, execution and settlement logic
+internal/httpapi/           REST handlers
+internal/mcp/               MCP catalog, resources and tool handlers
+internal/a2a/               A2A Task/Message mapping
+internal/adapters/tosai/    execution boundary + Phase 0 mock
+internal/adapters/toscore/  trust/economy/proof boundary + Phase 0 mock
+internal/adapters/storage/  signed-URL Artifact storage
+internal/store/             memory and PostgreSQL implementations
+```
+
+## Run locally
+
+The module uses Go 1.25.
 
 ```bash
 go run ./cmd/api
 ```
 
-Starts on `:8080` with one seeded sandbox capability (`Echo Sandbox`,
-`$1.00` fixed price), using the in-memory store by default.
+The gateway listens on `:8080` and seeds one Managed `Echo Sandbox`
+Capability. The in-memory store is used unless `ATOS_DATABASE_URL` is set.
 
-To use Postgres instead:
+### Device Authorization
+
+Start a scoped Phase 0 device flow:
+
+```bash
+DEVICE=$(curl -s -X POST http://localhost:8080/v1/auth/device \
+  -H 'content-type: application/json' \
+  -d '{
+    "client_type":"codex",
+    "client_name":"Codex",
+    "requested_scopes":[
+      "capabilities:read",
+      "quotes:read",
+      "invocations:create",
+      "jobs:create",
+      "jobs:read",
+      "jobs:cancel",
+      "account:read"
+    ]
+  }')
+
+echo "$DEVICE"
+```
+
+Exchange its `device_code`:
+
+```bash
+TOKEN_RESPONSE=$(curl -s -X POST http://localhost:8080/v1/auth/device/token \
+  -H 'content-type: application/json' \
+  -d '{"device_code":"<device_code>"}')
+
+echo "$TOKEN_RESPONSE"
+export TOKEN='<access_token>'
+```
+
+Discover, quote and invoke:
+
+```bash
+curl -s 'http://localhost:8080/v1/capabilities?q=echo' \
+  -H "Authorization: Bearer $TOKEN"
+
+curl -s -X POST http://localhost:8080/v1/quotes \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "capability_id":"<capability_id>",
+    "requested_trust_mode":"auto"
+  }'
+
+curl -s -X POST http://localhost:8080/v1/invocations \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "capability_id":"<capability_id>",
+    "quote_id":"<quote_id>",
+    "input":{"hello":"world"},
+    "idempotency_key":"demo-1"
+  }'
+```
+
+MCP is exposed at `POST /mcp`; A2A is exposed at `POST /a2a`.
+
+## PostgreSQL
 
 ```bash
 createdb atos
@@ -67,43 +172,45 @@ go run ./cmd/migrate
 go run ./cmd/api
 ```
 
-```bash
-# Device auth (always succeeds in this Phase 0 stub)
-curl -s -X POST localhost:8080/v1/auth/device/token -d '{"device_code":"dc_demo"}'
-# -> {"access_token": "prn_dc_demo", ...} — use "prn_dc_demo" as the Bearer token below
+Migration `003_v02_payloads.sql` keeps query-critical relational columns while
+persisting the complete protocol object in JSONB. This prevents new mode,
+proof, signer, settlement and Artifact fields from disappearing after restart.
 
-TOKEN=prn_dc_demo
-
-curl -s "localhost:8080/v1/capabilities?q=echo" -H "Authorization: Bearer $TOKEN"
-curl -s -X POST localhost:8080/v1/quotes -H "Authorization: Bearer $TOKEN" \
-  -d '{"capability_id":"<id from search>"}'
-curl -s -X POST localhost:8080/v1/invocations -H "Authorization: Bearer $TOKEN" \
-  -d '{"capability_id":"<id>","quote_id":"<id>","input":{"hello":"world"},"idempotency_key":"demo-1"}'
-```
-
-MCP is exposed at `POST /mcp`, A2A at `POST /a2a` (both JSON-RPC 2.0).
-
-## Tests
+## Tests and CI
 
 ```bash
+gofmt -w .
+go vet ./...
 go test -race ./...
 ```
 
-Postgres integration tests are skipped unless `ATOS_TEST_DATABASE_URL` is
-set:
+PostgreSQL integration tests are opt-in:
 
 ```bash
 createdb atos_test
 export ATOS_TEST_DATABASE_URL="postgres://$(whoami)@localhost:5432/atos_test?sslmode=disable"
-go run ./cmd/migrate  # against the same URL, or set ATOS_DATABASE_URL to it
+ATOS_DATABASE_URL="$ATOS_TEST_DATABASE_URL" go run ./cmd/migrate
 go test -race ./internal/store/postgres/...
 ```
 
-## Next steps (see atos-spec/docs/IMPLEMENTATION_ROADMAP.md)
+GitHub Actions enforces formatting, vet and race tests.
 
-- Phase 1: real semantic search/ranking, real Device Auth verification step.
-- Phase 2: replace `internal/adapters/tosai/mock` with a real tos-ai
-  provider/worker runtime; add the provider job-queue endpoints once a
-  real queued-provider model exists.
-- Phase 4: replace `internal/adapters/toscore/mock` with real tos-core
-  calls (identity, escrow, receipt verification, settlement).
+## Security invariants already enforced
+
+- `auto` is never a committed transaction mode.
+- Quote mode/profile are immutable and propagate to Job, Escrow and Receipt.
+- Explicit Verified/Native requests fail closed while their infrastructure is unavailable.
+- Provider-requested modes are not public active modes until certification.
+- Tool visibility does not substitute for call-time authorization.
+- Artifact IDs and upload IDs are not bearer credentials.
+- Uploaded byte count must match the declared size.
+- Bulk/private payloads stay off-chain; durable proof uses commitments.
+- Job completion and cancellation cannot overwrite each other inside one gateway process.
+
+## Next implementation boundaries
+
+1. Replace the Phase 0 authorization approval shortcut with production OAuth/device consent and persistent token storage.
+2. Implement `ExecutionGatewayService` in `tos-protocol` and replace direct in-process `tos-ai` mock execution.
+3. Implement the v0.2 trust/settlement/proof protobuf services against TOS Network.
+4. Activate `tos_verified_v1`, then `tos_native_v1`, only after their full guarantee checks pass.
+5. Add provider queueing, webhook callbacks, disputes and federated indexers in their roadmap phases.
