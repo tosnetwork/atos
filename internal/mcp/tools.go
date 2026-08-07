@@ -217,6 +217,7 @@ func (s *Server) toolRegisterCapability(ctx context.Context, principal auth.Prin
 		DeliveryMode: domain.DeliveryMode(argString(args, "delivery_mode")), InputSchema: argObject(args, "input_schema"),
 		OutputSchema: argObject(args, "output_schema"), Pricing: pricing, Tags: tags,
 		RequestedTrustModes: requested, Bindings: bindings,
+		IdempotencyKey: argString(args, "idempotency_key"),
 	})
 }
 
@@ -225,7 +226,10 @@ func (s *Server) toolUpdateCapability(ctx context.Context, principal auth.Princi
 	if patch == nil {
 		return nil, domain.NewError(domain.ErrValidationFailed, "patch is required", false)
 	}
-	return s.Capabilities.Update(ctx, argString(args, "capability_id"), principal.ID, patch)
+	return s.Capabilities.Update(
+		ctx, argString(args, "capability_id"), principal.ID, patch,
+		argString(args, "idempotency_key"),
+	)
 }
 
 func (s *Server) toolListMyCapabilities(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
@@ -237,7 +241,10 @@ func (s *Server) toolListMyCapabilities(ctx context.Context, principal auth.Prin
 }
 
 func (s *Server) toolPauseCapability(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
-	return s.Capabilities.Pause(ctx, argString(args, "capability_id"), principal.ID)
+	return s.Capabilities.Pause(
+		ctx, argString(args, "capability_id"), principal.ID,
+		argString(args, "idempotency_key"),
+	)
 }
 
 func (s *Server) toolArtifact(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
