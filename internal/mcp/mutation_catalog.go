@@ -24,8 +24,8 @@ func requireStringProperty(definition map[string]any, property string) {
 		input["properties"] = properties
 	}
 	properties[property] = map[string]any{
-		"type":      "string",
-		"minLength": 1,
+		"type":        "string",
+		"minLength":   1,
 		"description": "Caller-generated key. Same principal + key + request hash replays the original result; a changed request conflicts.",
 	}
 
