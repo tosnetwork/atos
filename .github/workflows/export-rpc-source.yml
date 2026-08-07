@@ -1,0 +1,24 @@
+name: export-rpc-source
+
+on:
+  push:
+    branches:
+      - agent/atos-tos-protocol-rpc
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atos-rpc-source
+          path: .
+          include-hidden-files: true
+          retention-days: 1
