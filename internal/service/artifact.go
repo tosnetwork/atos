@@ -1,12 +1,11 @@
-// ArtifactService implements the file-transfer flow from
-// ~/atos-spec/docs/ARTIFACTS.md: request a signed upload target, finalize
-// after the client PUTs bytes, and issue signed download URLs — all
-// ownership-checked here, with storage.Provider only moving bytes and
-// signing/verifying URLs.
+// ArtifactService implements signed-URL Artifact transport. IDs are lookup
+// identifiers, never bearer credentials; every operation re-checks access.
 package service
 
 import (
 	"context"
+	"strings"
+	"time"
 
 	"github.com/tosnetwork/atos/internal/adapters/storage"
 	"github.com/tosnetwork/atos/internal/domain"
@@ -29,59 +28,69 @@ type CreateUploadInput struct {
 	Purpose     string
 }
 
-// CreateUpload implements atos_create_upload / POST /uploads.
 func (s *ArtifactService) CreateUpload(ctx context.Context, in CreateUploadInput) (storage.UploadTarget, error) {
-	if in.ContentType == "" {
+	if in.PrincipalID == "" {
+		return storage.UploadTarget{}, domain.NewError(domain.ErrAuthenticationRequired, "principal is required", false)
+	}
+	if strings.TrimSpace(in.ContentType) == "" {
 		return storage.UploadTarget{}, domain.NewError(domain.ErrValidationFailed, "content_type is required", false)
 	}
 	if in.SizeBytes <= 0 {
 		return storage.UploadTarget{}, domain.NewError(domain.ErrValidationFailed, "size_bytes must be positive", false)
 	}
+	if in.Purpose != "job_input" && in.Purpose != "capability_asset" {
+		return storage.UploadTarget{}, domain.NewError(domain.ErrValidationFailed, "purpose must be job_input or capability_asset", false)
+	}
 	target, _, err := s.storage.CreateUpload(ctx, storage.CreateUploadRequest{
-		PrincipalID: in.PrincipalID,
-		ContentType: in.ContentType,
-		SizeBytes:   in.SizeBytes,
-		Purpose:     in.Purpose,
+		PrincipalID: in.PrincipalID, ContentType: in.ContentType,
+		SizeBytes: in.SizeBytes, Purpose: in.Purpose,
 	})
 	if err != nil {
-		return storage.UploadTarget{}, domain.NewError(domain.ErrValidationFailed, err.Error(), false)
+		return storage.UploadTarget{}, domain.NewError(domain.ErrUploadMismatch, err.Error(), false)
 	}
 	return target, nil
 }
 
-// CompleteUpload implements atos_complete_upload / POST /uploads/{id}/complete.
 func (s *ArtifactService) CompleteUpload(ctx context.Context, principalID, uploadID string) (domain.StoredArtifact, error) {
-	if _, err := s.ownedArtifact(ctx, principalID, uploadID); err != nil {
+	artifact, err := s.ownedArtifact(ctx, principalID, uploadID)
+	if err != nil {
 		return domain.StoredArtifact{}, err
 	}
-	artifact, err := s.storage.CompleteUpload(ctx, uploadID)
+	if artifact.Status != domain.ArtifactUploading {
+		return domain.StoredArtifact{}, domain.NewError(domain.ErrUploadMismatch, "upload is not in uploading state", false)
+	}
+	if !time.Now().UTC().Before(artifact.ExpiresAt) {
+		return domain.StoredArtifact{}, domain.NewError(domain.ErrUploadExpired, "upload target has expired", false)
+	}
+	completed, err := s.storage.CompleteUpload(ctx, uploadID)
 	if err != nil {
-		return domain.StoredArtifact{}, domain.NewError(domain.ErrValidationFailed, err.Error(), false)
+		return domain.StoredArtifact{}, domain.NewError(domain.ErrUploadMismatch, err.Error(), false)
+	}
+	return completed, nil
+}
+
+func (s *ArtifactService) Get(ctx context.Context, principalID, artifactID string) (domain.StoredArtifact, error) {
+	artifact, err := s.accessibleArtifact(ctx, principalID, artifactID)
+	if err != nil {
+		return domain.StoredArtifact{}, err
+	}
+	if artifact.Status == domain.ArtifactExpired || !time.Now().UTC().Before(artifact.ExpiresAt) {
+		return domain.StoredArtifact{}, domain.NewError(domain.ErrArtifactNotFound, "artifact has expired", false)
 	}
 	return artifact, nil
 }
 
-// Get implements GET /artifacts/{id}.
-func (s *ArtifactService) Get(ctx context.Context, principalID, artifactID string) (domain.StoredArtifact, error) {
-	return s.ownedArtifact(ctx, principalID, artifactID)
-}
-
-// GetDownloadURL implements atos_get_download_url / GET /artifacts/{id}/download-url.
-//
-// Ownership note (docs/ARTIFACTS.md): the full rule also grants access to
-// a job's owning principal for that job's *output* artifacts, not just
-// the uploader. Nothing in this Phase 0/1 codebase yet produces a
-// StoredArtifact as job output (the mock tos-ai provider only returns
-// inline JSON — see internal/adapters/tosai/mock), so that half of the
-// rule has no real code path to attach to yet; only uploader ownership is
-// enforced here until job-output artifacts are real.
 func (s *ArtifactService) GetDownloadURL(ctx context.Context, principalID, artifactID string) (storage.DownloadTarget, error) {
-	if _, err := s.ownedArtifact(ctx, principalID, artifactID); err != nil {
+	artifact, err := s.Get(ctx, principalID, artifactID)
+	if err != nil {
 		return storage.DownloadTarget{}, err
+	}
+	if artifact.Status != domain.ArtifactAvailable {
+		return storage.DownloadTarget{}, domain.NewError(domain.ErrUploadMismatch, "artifact is not available", false)
 	}
 	target, err := s.storage.GetDownloadURL(ctx, artifactID)
 	if err != nil {
-		return storage.DownloadTarget{}, domain.NewError(domain.ErrValidationFailed, err.Error(), false)
+		return storage.DownloadTarget{}, domain.NewError(domain.ErrUploadMismatch, err.Error(), false)
 	}
 	return target, nil
 }
@@ -90,12 +99,37 @@ func (s *ArtifactService) ownedArtifact(ctx context.Context, principalID, artifa
 	artifact, err := s.store.GetArtifact(ctx, artifactID)
 	if err != nil {
 		if err == store.ErrNotFound {
-			return domain.StoredArtifact{}, domain.NewError(domain.ErrNotFound, "artifact not found", false)
+			return domain.StoredArtifact{}, domain.NewError(domain.ErrArtifactNotFound, "artifact not found", false)
 		}
 		return domain.StoredArtifact{}, err
 	}
 	if artifact.OwnerPrincipalID != principalID {
-		return domain.StoredArtifact{}, domain.NewError(domain.ErrPermissionDenied, "not the artifact's owning principal", false)
+		return domain.StoredArtifact{}, domain.NewError(domain.ErrArtifactAccessDenied, "not the artifact's owning principal", false)
 	}
 	return artifact, nil
+}
+
+func (s *ArtifactService) accessibleArtifact(ctx context.Context, principalID, artifactID string) (domain.StoredArtifact, error) {
+	artifact, err := s.store.GetArtifact(ctx, artifactID)
+	if err != nil {
+		if err == store.ErrNotFound {
+			return domain.StoredArtifact{}, domain.NewError(domain.ErrArtifactNotFound, "artifact not found", false)
+		}
+		return domain.StoredArtifact{}, err
+	}
+	if artifact.OwnerPrincipalID == principalID {
+		return artifact, nil
+	}
+	jobs, err := s.store.JobsByPrincipal(ctx, principalID)
+	if err != nil {
+		return domain.StoredArtifact{}, err
+	}
+	for _, job := range jobs {
+		for _, output := range job.Artifacts {
+			if output.ID == artifactID {
+				return artifact, nil
+			}
+		}
+	}
+	return domain.StoredArtifact{}, domain.NewError(domain.ErrArtifactAccessDenied, "principal is not authorized for this artifact", false)
 }
