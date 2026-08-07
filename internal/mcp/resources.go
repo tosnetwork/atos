@@ -5,25 +5,49 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/tosnetwork/atos/internal/auth"
+	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/service"
 )
 
-// resourceDefinitions mirrors the "MCP Resources" list in
-// ~/atos-spec/docs/MCP.md. All of them are read-only.
-var resourceDefinitions = []map[string]any{
-	{"uri": "atos://taxonomy", "name": "Capability taxonomy", "description": "Distinct tags currently in use across active capabilities.", "mimeType": "application/json"},
-	{"uri": "atos://capabilities/trending", "name": "Trending capabilities", "description": "Phase 0 stand-in: recent search results, not a real trending signal yet.", "mimeType": "application/json"},
-	{"uri": "atos://account/policy", "name": "Account spending policy", "description": "The authenticated principal's autonomous spending policy.", "mimeType": "application/json"},
-	{"uri": "atos://network/status", "name": "TOS Network status", "description": "Whether this gateway has a live TOS Network connection.", "mimeType": "application/json"},
-	{"uri": "atos://docs/protocol-version", "name": "Protocol version", "description": "MCP/ATOS protocol version this server implements.", "mimeType": "application/json"},
+type resourceSpec struct {
+	Definition     map[string]any
+	RequiredScopes []auth.Scope
+	AnyScope       []auth.Scope
 }
 
-func (s *Server) handleResourceRead(ctx context.Context, w http.ResponseWriter, req rpcRequest, principalID string) {
+var orderedResourceSpecs = []resourceSpec{
+	{Definition: map[string]any{"uri": "atos://taxonomy", "name": "Capability taxonomy", "description": "Distinct tags used by active capabilities.", "mimeType": "application/json"}, RequiredScopes: []auth.Scope{auth.ScopeCapabilitiesRead}},
+	{Definition: map[string]any{"uri": "atos://capabilities/trending", "name": "Trending capabilities", "description": "Current gateway projection of notable capabilities.", "mimeType": "application/json"}, RequiredScopes: []auth.Scope{auth.ScopeCapabilitiesRead}},
+	{Definition: map[string]any{"uri": "atos://account/policy", "name": "Account policy", "description": "Authenticated principal spend and trust policy.", "mimeType": "application/json"}, RequiredScopes: []auth.Scope{auth.ScopeAccountRead}},
+	{Definition: map[string]any{"uri": "atos://network/status", "name": "ATOS trust-mode status", "description": "High-level Managed, Verified and Native availability without chain plumbing.", "mimeType": "application/json"}, AnyScope: []auth.Scope{auth.ScopeCapabilitiesRead, auth.ScopeNetworkRead}},
+	{Definition: map[string]any{"uri": "atos://docs/protocol-version", "name": "Protocol version", "description": "MCP and ATOS protocol versions implemented by this gateway.", "mimeType": "application/json"}},
+}
+
+func resourcesForPrincipal(principal auth.Principal) []map[string]any {
+	out := make([]map[string]any, 0, len(orderedResourceSpecs))
+	for _, spec := range orderedResourceSpecs {
+		if !principal.HasAll(spec.RequiredScopes...) {
+			continue
+		}
+		if len(spec.AnyScope) > 0 && !principal.HasAny(spec.AnyScope...) {
+			continue
+		}
+		out = append(out, spec.Definition)
+	}
+	return out
+}
+
+func (s *Server) handleResourceRead(ctx context.Context, w http.ResponseWriter, req rpcRequest, principal auth.Principal) {
 	var params struct {
 		URI string `json:"uri"`
 	}
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		writeRPCError(w, req.ID, codeInvalidParams, "malformed resources/read params")
+	if err := json.Unmarshal(req.Params, &params); err != nil || params.URI == "" {
+		writeRPCError(w, req.ID, codeInvalidParams, "malformed resources/read params", nil)
+		return
+	}
+	if !resourceVisible(params.URI, principal) {
+		writeRPCError(w, req.ID, codeMethodNotFound, "unknown resource uri "+params.URI, nil)
 		return
 	}
 
@@ -39,35 +63,42 @@ func (s *Server) handleResourceRead(ctx context.Context, w http.ResponseWriter, 
 		caps, err = s.Capabilities.Search(ctx, service.SearchInput{Limit: 5})
 		content = map[string]any{"capabilities": caps}
 	case "atos://account/policy":
-		if principalID == "" {
-			writeRPCError(w, req.ID, codeInvalidParams, "missing bearer token")
-			return
-		}
-		var account any
-		account, err = s.Accounts.Get(ctx, principalID)
-		content = account
+		content, err = s.Accounts.Get(ctx, principal.ID)
 	case "atos://network/status":
 		content = map[string]any{
+			"managed": "available",
+			"verified": "unavailable",
+			"native": "unavailable",
 			"network": "TOS",
-			"status":  "not_connected",
-			"note":    "Phase 0/1: tos-core is an in-process mock. No live TOS Network connection exists yet.",
+			"note": "Phase 0/1 uses mock tos-core; Verified/Native are never silently mapped to Managed.",
 		}
 	case "atos://docs/protocol-version":
-		content = map[string]any{"mcp_protocol_version": "2026-07-28", "atos_version": "0.1.0"}
+		content = map[string]any{"mcp_protocol_version": defaultProtocolVersion, "atos_version": "0.2.0"}
 	default:
-		writeRPCError(w, req.ID, codeInvalidParams, "unknown resource uri "+params.URI)
+		writeRPCError(w, req.ID, codeMethodNotFound, "unknown resource uri "+params.URI, nil)
 		return
 	}
 	if err != nil {
-		writeRPCError(w, req.ID, codeInternalError, err.Error())
+		code := domain.ErrProviderFailed
+		if de, ok := err.(*domain.Error); ok {
+			code = de.Code
+		}
+		writeRPCError(w, req.ID, codeInternalError, err.Error(), map[string]any{"code": code})
 		return
 	}
-
 	writeRPCResult(w, req.ID, map[string]any{
-		"contents": []map[string]any{
-			{"uri": params.URI, "mimeType": "application/json", "text": mustJSON(content)},
-		},
+		"contents": []map[string]any{{"uri": params.URI, "mimeType": "application/json", "text": mustJSON(content)}},
 	})
+}
+
+func resourceVisible(uri string, principal auth.Principal) bool {
+	for _, spec := range orderedResourceSpecs {
+		if spec.Definition["uri"] != uri {
+			continue
+		}
+		return principal.HasAll(spec.RequiredScopes...) && (len(spec.AnyScope) == 0 || principal.HasAny(spec.AnyScope...))
+	}
+	return false
 }
 
 func mustJSON(v any) string {
