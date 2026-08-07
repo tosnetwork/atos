@@ -1,11 +1,5 @@
-// Package mcp implements the MCP surface from ~/atos-spec/docs/MCP.md: the
-// 10 default tools over JSON-RPC 2.0. This is a single-request request/
-// response implementation of Streamable HTTP (tools/list, tools/call) —
-// it does not yet implement session resumability or true MRTR
-// (input_required) round trips; input_required is returned as a normal
-// tool result the client is expected to re-issue after user confirmation,
-// which is a reasonable Phase 0 stand-in but not the full MCP elicitation
-// flow described in docs/MCP.md.
+// Package mcp implements the ATOS v0.2 MCP surface over stateless
+// Streamable HTTP JSON-RPC requests.
 package mcp
 
 import (
@@ -15,10 +9,13 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/tosnetwork/atos/internal/auth"
+	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/service"
 )
 
 type Server struct {
+	Auth         *auth.Service
 	Capabilities *service.CapabilityService
 	Quotes       *service.QuoteService
 	Jobs         *service.JobService
@@ -45,6 +42,7 @@ type rpcResponse struct {
 type rpcError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+	Data    any    `json:"data,omitempty"`
 }
 
 const (
@@ -53,36 +51,11 @@ const (
 	codeMethodNotFound = -32601
 	codeInvalidParams  = -32602
 	codeInternalError  = -32603
+	codeUnauthorized   = -32001
+	codeForbidden      = -32003
 )
 
-// defaultProtocolVersion is used only when a client's initialize request
-// omits protocolVersion entirely — real clients always send one. This
-// implementation has no version-specific wire-format dependencies, so
-// negotiateProtocolVersion simply agrees to whatever the client asks for
-// (per the MCP spec's negotiation rule: a server that supports the
-// requested version MUST echo it back) instead of asserting a fixed
-// version a real client's handshake might reject outright.
-const defaultProtocolVersion = "2025-06-18"
-
-// toolsForPrincipal computes tools/list per the *real* MCP mechanism for
-// per-caller tool visibility: the response is a function of the
-// authenticated session, not a fixed constant. adminToolDefinitions are
-// appended only when the caller actually owns at least one capability —
-// a genuine authorization signal (ownership is enforced identically
-// inside CapabilityService.Pause/ListByProvider), not a cosmetic filter.
-// An unauthenticated or errored lookup degrades to the base list rather
-// than failing tools/list outright.
-func (s *Server) toolsForPrincipal(ctx context.Context, principalID string) []map[string]any {
-	tools := toolDefinitions
-	if principalID == "" {
-		return tools
-	}
-	owned, err := s.Capabilities.ListByProvider(ctx, principalID)
-	if err != nil || len(owned) == 0 {
-		return tools
-	}
-	return append(append([]map[string]any{}, tools...), adminToolDefinitions...)
-}
+const defaultProtocolVersion = "2026-07-28"
 
 func negotiateProtocolVersion(params json.RawMessage) string {
 	var p struct {
@@ -94,41 +67,94 @@ func negotiateProtocolVersion(params json.RawMessage) string {
 	return defaultProtocolVersion
 }
 
+func (s *Server) toolsForPrincipal(principal auth.Principal) []map[string]any {
+	tools := make([]map[string]any, 0, len(orderedToolSpecs))
+	for _, spec := range orderedToolSpecs {
+		if principal.HasAll(spec.RequiredScopes...) {
+			tools = append(tools, spec.Definition)
+		}
+	}
+	return tools
+}
+
+func bearerToken(r *http.Request) string {
+	authz := r.Header.Get("Authorization")
+	token, ok := strings.CutPrefix(authz, "Bearer ")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(token)
+}
+
+func (s *Server) authenticate(r *http.Request) (auth.Principal, error) {
+	if s.Auth == nil {
+		return auth.Principal{}, domain.NewError(domain.ErrAuthenticationRequired, "authorization service unavailable", true)
+	}
+	principal, err := s.Auth.Authenticate(bearerToken(r))
+	if err != nil {
+		return auth.Principal{}, domain.NewError(domain.ErrAuthenticationRequired, err.Error(), false)
+	}
+	return principal, nil
+}
+
 func (s *Server) Handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		authz := r.Header.Get("Authorization")
-		token, _ := strings.CutPrefix(authz, "Bearer ")
-		token = strings.TrimSpace(token)
-
 		var req rpcRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeRPCError(w, nil, codeParseError, "invalid JSON")
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20))
+		if err := dec.Decode(&req); err != nil {
+			writeRPCError(w, nil, codeParseError, "invalid JSON", nil)
 			return
 		}
 		if req.JSONRPC != "2.0" || req.Method == "" {
-			writeRPCError(w, req.ID, codeInvalidRequest, "expected jsonrpc 2.0 request with a method")
+			writeRPCError(w, req.ID, codeInvalidRequest, "expected jsonrpc 2.0 request with a method", nil)
 			return
 		}
 
-		ctx := r.Context()
-
-		switch req.Method {
-		case "initialize":
+		if req.Method == "notifications/initialized" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if req.Method == "initialize" {
 			writeRPCResult(w, req.ID, map[string]any{
 				"protocolVersion": negotiateProtocolVersion(req.Params),
-				"serverInfo":      map[string]any{"name": "atos-mcp", "version": "0.1.0"},
-				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"serverInfo": map[string]any{"name": "atos-mcp", "version": "0.2.0"},
+				"capabilities": map[string]any{
+					"tools": map[string]any{"listChanged": false},
+					"resources": map[string]any{"subscribe": false, "listChanged": false},
+				},
 			})
+			return
+		}
+		if req.Method == "ping" {
+			writeRPCResult(w, req.ID, map[string]any{})
+			return
+		}
+
+		principal, err := s.authenticate(r)
+		if err != nil {
+			writeRPCError(w, req.ID, codeUnauthorized, err.Error(), map[string]any{"code": domain.ErrAuthenticationRequired})
+			return
+		}
+		ctx := r.Context()
+		switch req.Method {
 		case "tools/list":
-			writeRPCResult(w, req.ID, map[string]any{"tools": s.toolsForPrincipal(ctx, token)})
+			writeRPCResult(w, req.ID, map[string]any{
+				"tools": s.toolsForPrincipal(principal),
+				"ttlMs": toolsListTTLMS,
+				"cacheScope": toolsCacheScope,
+			})
 		case "tools/call":
-			s.handleToolCall(ctx, w, req, token)
+			s.handleToolCall(ctx, w, req, principal)
 		case "resources/list":
-			writeRPCResult(w, req.ID, map[string]any{"resources": resourceDefinitions})
+			writeRPCResult(w, req.ID, map[string]any{
+				"resources": resourcesForPrincipal(principal),
+				"ttlMs": toolsListTTLMS,
+				"cacheScope": toolsCacheScope,
+			})
 		case "resources/read":
-			s.handleResourceRead(ctx, w, req, token)
+			s.handleResourceRead(ctx, w, req, principal)
 		default:
-			writeRPCError(w, req.ID, codeMethodNotFound, "unknown method "+req.Method)
+			writeRPCError(w, req.ID, codeMethodNotFound, "unknown method "+req.Method, nil)
 		}
 	}
 }
@@ -138,39 +164,47 @@ type toolCallParams struct {
 	Arguments map[string]any `json:"arguments"`
 }
 
-func (s *Server) handleToolCall(ctx context.Context, w http.ResponseWriter, req rpcRequest, principalID string) {
+func (s *Server) handleToolCall(ctx context.Context, w http.ResponseWriter, req rpcRequest, principal auth.Principal) {
 	var params toolCallParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		writeRPCError(w, req.ID, codeInvalidParams, "malformed tools/call params")
+	if err := json.Unmarshal(req.Params, &params); err != nil || params.Name == "" {
+		writeRPCError(w, req.ID, codeInvalidParams, "malformed tools/call params", nil)
 		return
 	}
-	if principalID == "" {
-		writeRPCError(w, req.ID, codeInvalidParams, "missing bearer token")
+	spec, known := toolSpecByName(params.Name)
+	if !known {
+		writeRPCError(w, req.ID, codeMethodNotFound, "unknown tool "+params.Name, nil)
 		return
 	}
-
+	if !principal.HasAll(spec.RequiredScopes...) {
+		// Do not reveal a scope-gated tool that was absent from this caller's list.
+		writeRPCError(w, req.ID, codeMethodNotFound, "unknown tool "+params.Name, nil)
+		return
+	}
 	handler, ok := s.dispatch()[params.Name]
 	if !ok {
-		writeRPCError(w, req.ID, codeMethodNotFound, "unknown tool "+params.Name)
+		writeRPCError(w, req.ID, codeMethodNotFound, "tool is not implemented", nil)
 		return
 	}
-
-	result, toolErr := handler(ctx, principalID, params.Arguments)
+	result, toolErr := handler(ctx, principal, params.Arguments)
 	if toolErr != nil {
-		// MCP convention: tool-level errors are structured content with
-		// isError, not a JSON-RPC transport error — the call itself
-		// succeeded, the underlying operation did not.
+		code := domain.ErrProviderFailed
+		retryable := false
+		if de, ok := toolErr.(*domain.Error); ok {
+			code = de.Code
+			retryable = de.Retryable
+		}
 		writeRPCResult(w, req.ID, map[string]any{
-			"isError":           true,
-			"content":           []map[string]any{{"type": "text", "text": toolErr.Error()}},
-			"structuredContent": map[string]any{"error": toolErr.Error()},
+			"isError": true,
+			"content": []map[string]any{{"type": "text", "text": toolErr.Error()}},
+			"structuredContent": map[string]any{
+				"error": map[string]any{"code": code, "message": toolErr.Error(), "retryable": retryable},
+			},
 		})
 		return
 	}
-
 	writeRPCResult(w, req.ID, map[string]any{
-		"isError":           false,
-		"content":           []map[string]any{{"type": "text", "text": "ok"}},
+		"isError": false,
+		"content": []map[string]any{{"type": "text", "text": "ATOS operation completed"}},
 		"structuredContent": result,
 	})
 }
@@ -180,7 +214,9 @@ func writeRPCResult(w http.ResponseWriter, id json.RawMessage, result any) {
 	_ = json.NewEncoder(w).Encode(rpcResponse{JSONRPC: "2.0", ID: id, Result: result})
 }
 
-func writeRPCError(w http.ResponseWriter, id json.RawMessage, code int, message string) {
+func writeRPCError(w http.ResponseWriter, id json.RawMessage, code int, message string, data any) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(rpcResponse{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: message}})
+	_ = json.NewEncoder(w).Encode(rpcResponse{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: message, Data: data}})
 }
+
+var _ = codeForbidden // reserved for future protocol-level authorization responses
