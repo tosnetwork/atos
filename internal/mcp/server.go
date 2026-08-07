@@ -54,6 +54,25 @@ const (
 	codeInternalError  = -32603
 )
 
+// defaultProtocolVersion is used only when a client's initialize request
+// omits protocolVersion entirely — real clients always send one. This
+// implementation has no version-specific wire-format dependencies, so
+// negotiateProtocolVersion simply agrees to whatever the client asks for
+// (per the MCP spec's negotiation rule: a server that supports the
+// requested version MUST echo it back) instead of asserting a fixed
+// version a real client's handshake might reject outright.
+const defaultProtocolVersion = "2025-06-18"
+
+func negotiateProtocolVersion(params json.RawMessage) string {
+	var p struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if err := json.Unmarshal(params, &p); err == nil && p.ProtocolVersion != "" {
+		return p.ProtocolVersion
+	}
+	return defaultProtocolVersion
+}
+
 func (s *Server) Handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		authz := r.Header.Get("Authorization")
@@ -75,7 +94,7 @@ func (s *Server) Handler() http.HandlerFunc {
 		switch req.Method {
 		case "initialize":
 			writeRPCResult(w, req.ID, map[string]any{
-				"protocolVersion": "2026-07-28",
+				"protocolVersion": negotiateProtocolVersion(req.Params),
 				"serverInfo":      map[string]any{"name": "atos-mcp", "version": "0.1.0"},
 				"capabilities":    map[string]any{"tools": map[string]any{}},
 			})
