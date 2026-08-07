@@ -110,6 +110,7 @@ func (s *Server) handleRegisterCapability(w http.ResponseWriter, r *http.Request
 		DeliveryMode: req.DeliveryMode, InputSchema: req.InputSchema,
 		OutputSchema: req.OutputSchema, Pricing: req.Pricing, Tags: req.Tags,
 		RequestedTrustModes: req.RequestedTrustModes, Bindings: req.Bindings,
+		IdempotencyKey: idempotencyKeyFrom(r),
 	})
 	if err != nil {
 		writeDomainErr(w, err)
@@ -120,11 +121,15 @@ func (s *Server) handleRegisterCapability(w http.ResponseWriter, r *http.Request
 
 func (s *Server) handleUpdateCapability(w http.ResponseWriter, r *http.Request) {
 	var patch map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&patch); err != nil {
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed JSON body", false)
 		return
 	}
-	cap, err := s.Capabilities.Update(r.Context(), r.PathValue("id"), principalFrom(r), patch)
+	cap, err := s.Capabilities.Update(
+		r.Context(), r.PathValue("id"), principalFrom(r), patch, idempotencyKeyFrom(r),
+	)
 	if err != nil {
 		writeDomainErr(w, err)
 		return
@@ -133,7 +138,9 @@ func (s *Server) handleUpdateCapability(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handlePauseCapability(w http.ResponseWriter, r *http.Request) {
-	cap, err := s.Capabilities.Pause(r.Context(), r.PathValue("id"), principalFrom(r))
+	cap, err := s.Capabilities.Pause(
+		r.Context(), r.PathValue("id"), principalFrom(r), idempotencyKeyFrom(r),
+	)
 	if err != nil {
 		writeDomainErr(w, err)
 		return
@@ -142,10 +149,16 @@ func (s *Server) handlePauseCapability(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleResumeCapability(w http.ResponseWriter, r *http.Request) {
-	cap, err := s.Capabilities.Resume(r.Context(), r.PathValue("id"), principalFrom(r))
+	cap, err := s.Capabilities.Resume(
+		r.Context(), r.PathValue("id"), principalFrom(r), idempotencyKeyFrom(r),
+	)
 	if err != nil {
 		writeDomainErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, cap)
+}
+
+func idempotencyKeyFrom(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 }
