@@ -2,8 +2,11 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -30,24 +33,22 @@ func (s *CapabilityService) Get(ctx context.Context, id string) (domain.Capabili
 		}
 		return domain.Capability{}, err
 	}
-	return c, nil
+	return normalizeCapability(c), nil
 }
 
 type RegisterCapabilityInput struct {
-	ProviderID   string
-	Name         string
-	Description  string
-	DeliveryMode domain.DeliveryMode
-	InputSchema  map[string]any
-	OutputSchema map[string]any
-	Pricing      domain.Pricing
-	Tags         []string
+	ProviderID          string
+	Name                string
+	Description         string
+	DeliveryMode        domain.DeliveryMode
+	InputSchema         map[string]any
+	OutputSchema        map[string]any
+	Pricing             domain.Pricing
+	Tags                []string
+	RequestedTrustModes []domain.TrustMode
+	Bindings            []domain.CapabilityBinding
 }
 
-// Register implements atos_register_capability / POST /capabilities. New
-// capabilities start self_asserted trust and version 1.0.0 — see
-// docs/CAPABILITIES.md "Ownership Anchoring": stronger trust levels are
-// earned later through tos-core, not granted at registration.
 func (s *CapabilityService) Register(ctx context.Context, in RegisterCapabilityInput) (domain.Capability, error) {
 	if in.ProviderID == "" || in.Name == "" || in.Description == "" {
 		return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "provider_id, name and description are required", false)
@@ -58,33 +59,50 @@ func (s *CapabilityService) Register(ctx context.Context, in RegisterCapabilityI
 	if in.InputSchema == nil || in.OutputSchema == nil {
 		return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "input_schema and output_schema are required", false)
 	}
-
-	c := domain.Capability{
-		ID:           "cap_" + uuid.NewString(),
-		ProviderID:   in.ProviderID,
-		Name:         in.Name,
-		Description:  in.Description,
-		Version:      "1.0.0",
-		Tags:         in.Tags,
-		DeliveryMode: in.DeliveryMode,
-		InputSchema:  in.InputSchema,
-		OutputSchema: in.OutputSchema,
-		Pricing:      in.Pricing,
-		AdapterType:  domain.AdapterTOSNative,
-		Trust:        domain.Trust{Score: 0, Level: domain.TrustSelfAsserted},
-		Status:       domain.CapabilityActive,
-		UpdatedAt:    time.Now().UTC(),
+	requested, err := normalizeRequestedModes(in.RequestedTrustModes)
+	if err != nil {
+		return domain.Capability{}, err
 	}
+	bindings, err := normalizeBindings(in.Bindings, requested)
+	if err != nil {
+		return domain.Capability{}, err
+	}
+
+	inputArtifacts := artifactFields(in.InputSchema)
+	outputArtifacts := artifactFields(in.OutputSchema)
+	now := time.Now().UTC()
+	id := "cap_" + uuid.NewString()
+	c := domain.Capability{
+		ID:                       id,
+		CanonicalURI:             "atos://capability/" + id,
+		ProviderID:               in.ProviderID,
+		Name:                     in.Name,
+		Description:              in.Description,
+		Version:                  "1.0.0",
+		Tags:                     append([]string(nil), in.Tags...),
+		DeliveryMode:             in.DeliveryMode,
+		InputSchema:              in.InputSchema,
+		OutputSchema:             in.OutputSchema,
+		Pricing:                  in.Pricing,
+		AdapterType:              bindings[0].Transport,
+		Trust:                    domain.Trust{Score: 0, Level: domain.TrustSelfAsserted},
+		RequestedTrustModes:      requested,
+		ModeSupport:              initialModeSupport(requested),
+		Bindings:                 bindings,
+		RequiresArtifactTransfer: len(inputArtifacts)+len(outputArtifacts) > 0,
+		ArtifactInputFields:      inputArtifacts,
+		ArtifactOutputFields:     outputArtifacts,
+		Status:                   domain.CapabilityActive,
+		UpdatedAt:                now,
+	}
+	c.SupportedTrustModes = c.ModeSupport.ActiveModes()
+	c.ManifestCommitment = capabilityManifestCommitment(c)
 	if err := s.store.Put(ctx, c); err != nil {
 		return domain.Capability{}, err
 	}
 	return c, nil
 }
 
-// Update implements atos_update_capability / PATCH /capabilities/{id}.
-// Ownership and identity fields are immutable here on purpose (see
-// docs/CAPABILITIES.md "Ownership Anchoring": reassigning provider_id must
-// go through a new registration, never a patch).
 func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID string, patch map[string]any) (domain.Capability, error) {
 	c, err := s.Get(ctx, id)
 	if err != nil {
@@ -93,8 +111,10 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 	if c.ProviderID != requestingProviderID {
 		return domain.Capability{}, domain.NewError(domain.ErrPermissionDenied, "not the owning provider", false)
 	}
-	if _, attemptsOwnerChange := patch["provider_id"]; attemptsOwnerChange {
-		return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "provider_id cannot change via update; register a new capability instead", false)
+	for _, immutable := range []string{"provider_id", "supported_trust_modes", "mode_support", "manifest_commitment", "canonical_uri"} {
+		if _, attempted := patch[immutable]; attempted {
+			return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, immutable+" cannot be set through a generic update", false)
+		}
 	}
 
 	if name, ok := patch["name"].(string); ok && name != "" {
@@ -112,11 +132,6 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 		}
 	}
 
-	// Pricing/schema changes are terms changes, not metadata changes — see
-	// docs/CAPABILITIES.md "Versioning": a breaking contract change bumps
-	// the version so quotes/jobs created against the old terms can be
-	// rejected at execution time (see JobService.executeJob's version
-	// check) instead of silently running against new terms.
 	termsChanged := false
 	if pricing, ok := patch["pricing"]; ok {
 		var p domain.Pricing
@@ -137,11 +152,33 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 		c.OutputSchema = outputSchema
 		termsChanged = true
 	}
+	if raw, ok := patch["requested_trust_modes"]; ok {
+		modes, err := decodeTrustModes(raw)
+		if err != nil {
+			return domain.Capability{}, err
+		}
+		c.RequestedTrustModes = modes
+		c.ModeSupport = reconcileModeSupport(c.ModeSupport, modes)
+	}
+	if raw, ok := patch["bindings"]; ok {
+		bindings, err := decodeBindings(raw, c.RequestedTrustModes)
+		if err != nil {
+			return domain.Capability{}, err
+		}
+		c.Bindings = bindings
+		c.AdapterType = bindings[0].Transport
+		termsChanged = true
+	}
 	if termsChanged {
 		c.Version = bumpMinorVersion(c.Version)
 	}
 
+	c.ArtifactInputFields = artifactFields(c.InputSchema)
+	c.ArtifactOutputFields = artifactFields(c.OutputSchema)
+	c.RequiresArtifactTransfer = len(c.ArtifactInputFields)+len(c.ArtifactOutputFields) > 0
+	c.SupportedTrustModes = c.ModeSupport.ActiveModes()
 	c.UpdatedAt = time.Now().UTC()
+	c.ManifestCommitment = capabilityManifestCommitment(c)
 
 	if err := s.store.Put(ctx, c); err != nil {
 		return domain.Capability{}, err
@@ -149,26 +186,25 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 	return c, nil
 }
 
-// ListByProvider implements atos_list_my_capabilities / a provider's own
-// capability dashboard listing.
 func (s *CapabilityService) ListByProvider(ctx context.Context, providerID string) ([]domain.Capability, error) {
-	return s.store.ByProvider(ctx, providerID)
+	caps, err := s.store.ByProvider(ctx, providerID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range caps {
+		caps[i] = normalizeCapability(caps[i])
+	}
+	return caps, nil
 }
 
-// Pause implements POST /capabilities/{id}/pause and atos_pause_capability:
-// a capability stops matching new searches without deleting it.
 func (s *CapabilityService) Pause(ctx context.Context, id, requestingProviderID string) (domain.Capability, error) {
 	return s.Update(ctx, id, requestingProviderID, map[string]any{"status": string(domain.CapabilityPaused)})
 }
 
-// Resume implements POST /capabilities/{id}/resume.
 func (s *CapabilityService) Resume(ctx context.Context, id, requestingProviderID string) (domain.Capability, error) {
 	return s.Update(ctx, id, requestingProviderID, map[string]any{"status": string(domain.CapabilityActive)})
 }
 
-// Taxonomy implements GET /taxonomy: the distinct tags currently in use
-// across active capabilities. Phase 0 stand-in for a curated category
-// tree — real taxonomy governance is a Phase 1+ concern.
 func (s *CapabilityService) Taxonomy(ctx context.Context) ([]string, error) {
 	caps, err := s.store.Search(ctx, "", 1000)
 	if err != nil {
@@ -184,18 +220,237 @@ func (s *CapabilityService) Taxonomy(ctx context.Context) ([]string, error) {
 			}
 		}
 	}
+	sort.Strings(tags)
 	return tags, nil
 }
 
-func samePricing(a, b domain.Pricing) bool {
-	return a.Model == b.Model && a.Unit == b.Unit &&
-		a.PriceHint.Amount == b.PriceHint.Amount && a.PriceHint.Currency == b.PriceHint.Currency
+func normalizeRequestedModes(in []domain.TrustMode) ([]domain.TrustMode, error) {
+	if len(in) == 0 {
+		return []domain.TrustMode{domain.TrustModeManaged}, nil
+	}
+	seen := make(map[domain.TrustMode]bool)
+	out := make([]domain.TrustMode, 0, len(in))
+	for _, mode := range in {
+		if !mode.Valid() {
+			return nil, domain.NewError(domain.ErrValidationFailed, fmt.Sprintf("invalid requested trust mode %q", mode), false)
+		}
+		if !seen[mode] {
+			seen[mode] = true
+			out = append(out, mode)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return trustModeOrder(out[i]) < trustModeOrder(out[j]) })
+	return out, nil
 }
 
-// bumpMinorVersion increments the middle component of a "major.minor.patch"
-// version string, resetting patch to 0 — good enough to make quotes issued
-// against the old terms detectably stale (JobService.executeJob rejects a
-// version mismatch) without a full semver policy debate for Phase 0.
+func trustModeOrder(mode domain.TrustMode) int {
+	switch mode {
+	case domain.TrustModeManaged:
+		return 0
+	case domain.TrustModeVerified:
+		return 1
+	case domain.TrustModeNative:
+		return 2
+	default:
+		return 99
+	}
+}
+
+func initialModeSupport(requested []domain.TrustMode) domain.ModeSupport {
+	out := domain.ModeSupport{
+		domain.TrustModeManaged:  {Status: domain.ModeSupportUnsupported},
+		domain.TrustModeVerified: {Status: domain.ModeSupportUnsupported, ProofProfile: domain.ProofProfileTOSVerifiedV1},
+		domain.TrustModeNative:   {Status: domain.ModeSupportUnsupported, ProofProfile: domain.ProofProfileTOSNativeV1},
+	}
+	for _, mode := range requested {
+		entry := out[mode]
+		if mode == domain.TrustModeManaged {
+			entry.Status = domain.ModeSupportActive
+		} else {
+			entry.Status = domain.ModeSupportPending
+			entry.Reason = "awaiting identity, ownership, signer, proof and settlement readiness"
+		}
+		out[mode] = entry
+	}
+	return out
+}
+
+func reconcileModeSupport(current domain.ModeSupport, requested []domain.TrustMode) domain.ModeSupport {
+	if current == nil {
+		return initialModeSupport(requested)
+	}
+	requestedSet := make(map[domain.TrustMode]bool, len(requested))
+	for _, mode := range requested {
+		requestedSet[mode] = true
+	}
+	for _, mode := range []domain.TrustMode{domain.TrustModeManaged, domain.TrustModeVerified, domain.TrustModeNative} {
+		entry := current.Entry(mode)
+		if !requestedSet[mode] {
+			entry.Status = domain.ModeSupportUnsupported
+			entry.Reason = "not requested by provider"
+		} else if entry.Status == domain.ModeSupportUnsupported {
+			if mode == domain.TrustModeManaged {
+				entry.Status = domain.ModeSupportActive
+				entry.Reason = ""
+			} else {
+				entry.Status = domain.ModeSupportPending
+				entry.ProofProfile = domain.StandardProofProfile(mode)
+				entry.Reason = "awaiting certification"
+			}
+		}
+		current[mode] = entry
+	}
+	return current
+}
+
+func normalizeBindings(in []domain.CapabilityBinding, requested []domain.TrustMode) ([]domain.CapabilityBinding, error) {
+	if len(in) == 0 {
+		return []domain.CapabilityBinding{{
+			Transport: domain.AdapterTOSNative, EndpointRef: "internal:mock",
+			EligibleTrustModes: append([]domain.TrustMode(nil), requested...),
+		}}, nil
+	}
+	out := make([]domain.CapabilityBinding, len(in))
+	copy(out, in)
+	for i := range out {
+		if out[i].EndpointRef == "" {
+			return nil, domain.NewError(domain.ErrValidationFailed, "binding endpoint_ref is required", false)
+		}
+		switch out[i].Transport {
+		case domain.AdapterHTTP, domain.AdapterMCP, domain.AdapterA2A, domain.AdapterHuman, domain.AdapterTOSNative:
+		default:
+			return nil, domain.NewError(domain.ErrValidationFailed, "invalid binding transport", false)
+		}
+		modes, err := normalizeRequestedModes(out[i].EligibleTrustModes)
+		if err != nil {
+			return nil, err
+		}
+		out[i].EligibleTrustModes = modes
+	}
+	return out, nil
+}
+
+func decodeTrustModes(raw any) ([]domain.TrustMode, error) {
+	b, _ := json.Marshal(raw)
+	var modes []domain.TrustMode
+	if err := json.Unmarshal(b, &modes); err != nil {
+		return nil, domain.NewError(domain.ErrValidationFailed, "requested_trust_modes must be an array of concrete modes", false)
+	}
+	return normalizeRequestedModes(modes)
+}
+
+func decodeBindings(raw any, requested []domain.TrustMode) ([]domain.CapabilityBinding, error) {
+	b, _ := json.Marshal(raw)
+	var bindings []domain.CapabilityBinding
+	if err := json.Unmarshal(b, &bindings); err != nil {
+		return nil, domain.NewError(domain.ErrValidationFailed, "invalid bindings", false)
+	}
+	return normalizeBindings(bindings, requested)
+}
+
+func normalizeCapability(c domain.Capability) domain.Capability {
+	if len(c.RequestedTrustModes) == 0 {
+		c.RequestedTrustModes = []domain.TrustMode{domain.TrustModeManaged}
+	}
+	if c.ModeSupport == nil {
+		c.ModeSupport = initialModeSupport(c.RequestedTrustModes)
+	}
+	c.SupportedTrustModes = c.ModeSupport.ActiveModes()
+	if c.CanonicalURI == "" && c.ID != "" {
+		c.CanonicalURI = "atos://capability/" + c.ID
+	}
+	if c.ManifestCommitment == "" {
+		c.ManifestCommitment = capabilityManifestCommitment(c)
+	}
+	if len(c.Bindings) == 0 {
+		transport := c.AdapterType
+		if transport == "" {
+			transport = domain.AdapterTOSNative
+		}
+		c.Bindings = []domain.CapabilityBinding{{Transport: transport, EndpointRef: "internal:legacy", EligibleTrustModes: c.SupportedTrustModes}}
+	}
+	c.ArtifactInputFields = artifactFields(c.InputSchema)
+	c.ArtifactOutputFields = artifactFields(c.OutputSchema)
+	c.RequiresArtifactTransfer = len(c.ArtifactInputFields)+len(c.ArtifactOutputFields) > 0
+	return c
+}
+
+func capabilityManifestCommitment(c domain.Capability) string {
+	payload := struct {
+		ID           string                     `json:"id"`
+		ProviderID   string                     `json:"provider_id"`
+		Version      string                     `json:"version"`
+		InputSchema  map[string]any             `json:"input_schema"`
+		OutputSchema map[string]any             `json:"output_schema"`
+		Pricing      domain.Pricing             `json:"pricing"`
+		DeliveryMode domain.DeliveryMode        `json:"delivery_mode"`
+		Bindings     []domain.CapabilityBinding `json:"bindings"`
+	}{c.ID, c.ProviderID, c.Version, c.InputSchema, c.OutputSchema, c.Pricing, c.DeliveryMode, c.Bindings}
+	b, _ := json.Marshal(payload)
+	h := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(h[:])
+}
+
+func artifactFields(schema map[string]any) []string {
+	var out []string
+	walkArtifactSchema(schema, "", &out)
+	sort.Strings(out)
+	return out
+}
+
+func walkArtifactSchema(node any, path string, out *[]string) {
+	obj, ok := node.(map[string]any)
+	if !ok {
+		return
+	}
+	if isArtifactSchema(obj) && path != "" {
+		*out = append(*out, path)
+		return
+	}
+	if properties, ok := obj["properties"].(map[string]any); ok {
+		for name, child := range properties {
+			childPath := name
+			if path != "" {
+				childPath = path + "." + name
+			}
+			walkArtifactSchema(child, childPath, out)
+		}
+	}
+	if items, ok := obj["items"]; ok {
+		walkArtifactSchema(items, path+"[]", out)
+	}
+	for _, keyword := range []string{"oneOf", "anyOf", "allOf"} {
+		if variants, ok := obj[keyword].([]any); ok {
+			for _, variant := range variants {
+				walkArtifactSchema(variant, path, out)
+			}
+		}
+	}
+}
+
+func isArtifactSchema(obj map[string]any) bool {
+	if marked, _ := obj["x-atos-artifact"].(bool); marked {
+		return true
+	}
+	format, _ := obj["format"].(string)
+	if format == "binary" || format == "byte" {
+		return true
+	}
+	if ref, _ := obj["$ref"].(string); strings.Contains(strings.ToLower(ref), "artifact") {
+		return true
+	}
+	if properties, ok := obj["properties"].(map[string]any); ok {
+		if _, exists := properties["artifact_id"]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+func samePricing(a, b domain.Pricing) bool {
+	return a.Model == b.Model && a.Unit == b.Unit && a.PriceHint.Amount == b.PriceHint.Amount && a.PriceHint.Currency == b.PriceHint.Currency
+}
+
 func bumpMinorVersion(version string) string {
 	parts := strings.SplitN(version, ".", 3)
 	if len(parts) != 3 {
