@@ -216,17 +216,17 @@ func (s *Store) GetQuote(ctx context.Context, id string) (domain.Quote, error) {
 
 // --- Escrows ---
 
-const escrowColumns = `id, quote_id, principal_id, provider_id, capability_id, reserved, status, created_at, expires_at, settled_at, payload`
+const escrowColumns = `id, quote_id, job_id, principal_id, provider_id, capability_id, reserved, status, created_at, expires_at, settled_at, payload`
 
 func (s *Store) PutEscrow(ctx context.Context, e domain.Escrow) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO escrows (
-			id, quote_id, principal_id, provider_id, capability_id, reserved,
+			id, quote_id, job_id, principal_id, provider_id, capability_id, reserved,
 			status, created_at, expires_at, settled_at, payload
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		ON CONFLICT (id) DO UPDATE SET
-			reserved=$6, status=$7, expires_at=$9, settled_at=$10, payload=$11
-	`, e.ID, e.QuoteID, e.PrincipalID, e.ProviderID, e.CapabilityID,
+			job_id=$3, reserved=$7, status=$8, expires_at=$10, settled_at=$11, payload=$12
+	`, e.ID, e.QuoteID, e.JobID, e.PrincipalID, e.ProviderID, e.CapabilityID,
 		mustMarshal(e.Reserved), string(e.Status), e.CreatedAt, e.ExpiresAt,
 		e.SettledAt, mustMarshal(e))
 	return err
@@ -237,7 +237,7 @@ func scanEscrow(row pgx.Row) (domain.Escrow, error) {
 	var reserved, payload []byte
 	var status string
 	if err := row.Scan(
-		&e.ID, &e.QuoteID, &e.PrincipalID, &e.ProviderID, &e.CapabilityID,
+		&e.ID, &e.QuoteID, &e.JobID, &e.PrincipalID, &e.ProviderID, &e.CapabilityID,
 		&reserved, &status, &e.CreatedAt, &e.ExpiresAt, &e.SettledAt, &payload,
 	); err != nil {
 		return domain.Escrow{}, err
@@ -261,6 +261,14 @@ func (s *Store) GetEscrow(ctx context.Context, id string) (domain.Escrow, error)
 // --- Receipts ---
 
 const receiptColumns = `id, quote_id, escrow_id, job_id, principal_id, charged, refunded, status, created_at, payload`
+
+func (s *Store) EscrowByJob(ctx context.Context, jobID string) (domain.Escrow, error) {
+	e, err := scanEscrow(s.pool.QueryRow(ctx, `SELECT `+escrowColumns+` FROM escrows WHERE job_id=$1`, jobID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Escrow{}, store.ErrNotFound
+	}
+	return e, err
+}
 
 func (s *Store) PutReceipt(ctx context.Context, r domain.Receipt) error {
 	_, err := s.pool.Exec(ctx, `
@@ -329,14 +337,10 @@ func (s *Store) ReceiptsByPrincipal(ctx context.Context, principalID string) ([]
 
 // --- Jobs ---
 
-const jobColumns = `id, capability_id, quote_id, escrow_id, principal_id, state, input, output, artifacts, idempotency_key, failure_reason, created_at, updated_at, estimated_completion_at, payload`
+const jobColumns = `id, capability_id, quote_id, escrow_id, principal_id, state, input, output, artifacts, idempotency_key, failure_reason, created_at, updated_at, estimated_completion_at, economic_state, pending_credit, reconciliation_target, payload`
 
 func (s *Store) PutJob(ctx context.Context, j domain.Job) error {
-	_, err := s.pool.Exec(ctx, upsertJobSQL,
-		j.ID, j.CapabilityID, j.QuoteID, j.EscrowID, j.PrincipalID,
-		string(j.State), mustMarshal(j.Input), nullableJSON(j.Output),
-		mustMarshal(j.Artifacts), j.IdempotencyKey, j.FailureReason,
-		j.CreatedAt, j.UpdatedAt, j.EstimatedCompletionAt, mustMarshal(j))
+	_, err := s.pool.Exec(ctx, upsertJobSQL, jobWriteArgs(j)...)
 	return err
 }
 
@@ -344,34 +348,67 @@ const upsertJobSQL = `
 	INSERT INTO jobs (
 		id, capability_id, quote_id, escrow_id, principal_id, state, input,
 		output, artifacts, idempotency_key, failure_reason, created_at,
-		updated_at, estimated_completion_at, payload
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+		updated_at, estimated_completion_at, economic_state, pending_credit,
+		reconciliation_target, payload
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
 	ON CONFLICT (id) DO UPDATE SET
 		escrow_id=$4, state=$6, input=$7, output=$8, artifacts=$9,
 		failure_reason=$11, updated_at=$13, estimated_completion_at=$14,
-		payload=$15
+		economic_state=$15, pending_credit=$16, reconciliation_target=$17,
+		payload=$18
 `
+
+func jobWriteArgs(j domain.Job) []any {
+	var pendingCredit any
+	if j.PendingCredit != nil {
+		pendingCredit = mustMarshal(j.PendingCredit)
+	}
+	return []any{
+		j.ID, j.CapabilityID, j.QuoteID, j.EscrowID, j.PrincipalID,
+		string(j.State), mustMarshal(j.Input), nullableJSON(j.Output),
+		mustMarshal(j.Artifacts), j.IdempotencyKey, j.FailureReason,
+		j.CreatedAt, j.UpdatedAt, j.EstimatedCompletionAt, string(j.EconomicState),
+		pendingCredit, string(j.ReconciliationTarget), mustMarshal(j),
+	}
+}
 
 func scanJob(row pgx.Row) (domain.Job, error) {
 	var j domain.Job
-	var input, output, artifacts, payload []byte
-	var state string
+	var input, output, artifacts, pendingCredit, payload []byte
+	var state, economicState, reconciliationTarget string
 	if err := row.Scan(
 		&j.ID, &j.CapabilityID, &j.QuoteID, &j.EscrowID, &j.PrincipalID,
 		&state, &input, &output, &artifacts, &j.IdempotencyKey,
 		&j.FailureReason, &j.CreatedAt, &j.UpdatedAt,
-		&j.EstimatedCompletionAt, &payload,
+		&j.EstimatedCompletionAt, &economicState, &pendingCredit,
+		&reconciliationTarget, &payload,
 	); err != nil {
 		return domain.Job{}, err
 	}
 	j.State = domain.JobState(state)
+	j.EconomicState = domain.EconomicState(economicState)
+	j.ReconciliationTarget = domain.JobState(reconciliationTarget)
 	_ = json.Unmarshal(input, &j.Input)
 	if output != nil {
 		_ = json.Unmarshal(output, &j.Output)
 	}
 	_ = json.Unmarshal(artifacts, &j.Artifacts)
+	if pendingCredit != nil {
+		var credit domain.Money
+		if err := json.Unmarshal(pendingCredit, &credit); err != nil {
+			return domain.Job{}, fmt.Errorf("postgres: decode pending credit: %w", err)
+		}
+		j.PendingCredit = &credit
+	}
 	if err := applyPayload(payload, &j); err != nil {
 		return domain.Job{}, err
+	}
+	// Internal economic recovery fields are deliberately stored in dedicated
+	// columns because they are not part of the public Job JSON contract.
+	j.EconomicState = domain.EconomicState(economicState)
+	j.ReconciliationTarget = domain.JobState(reconciliationTarget)
+	if pendingCredit == nil {
+		j.PendingCredit = nil
 	}
 	return j, nil
 }
@@ -391,6 +428,32 @@ func (s *Store) JobsByPrincipal(ctx context.Context, principalID string) ([]doma
 	}
 	defer rows.Close()
 	var out []domain.Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) JobsForRecovery(ctx context.Context, updatedBefore time.Time, limit int) ([]domain.Job, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+jobColumns+` FROM jobs
+		WHERE state IN ('submitted','working','canceling','reconciling')
+		  AND updated_at <= $1
+		ORDER BY updated_at ASC, id ASC
+		LIMIT $2
+	`, updatedBefore.UTC(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]domain.Job, 0, limit)
 	for rows.Next() {
 		j, err := scanJob(rows)
 		if err != nil {
@@ -451,18 +514,88 @@ func (s *Store) UpdateJob(ctx context.Context, id string, fn func(domain.Job, bo
 	if err != nil {
 		return domain.Job{}, err
 	}
-	if _, err := tx.Exec(ctx, upsertJobSQL,
-		next.ID, next.CapabilityID, next.QuoteID, next.EscrowID,
-		next.PrincipalID, string(next.State), mustMarshal(next.Input),
-		nullableJSON(next.Output), mustMarshal(next.Artifacts), next.IdempotencyKey,
-		next.FailureReason, next.CreatedAt, next.UpdatedAt,
-		next.EstimatedCompletionAt, mustMarshal(next)); err != nil {
+	if _, err := tx.Exec(ctx, upsertJobSQL, jobWriteArgs(next)...); err != nil {
 		return domain.Job{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.Job{}, err
 	}
 	return next, nil
+}
+
+func (s *Store) UpdateJobAndAccount(
+	ctx context.Context, jobID, principalID string, seed domain.Account,
+	fn func(domain.Job, bool, domain.Account, bool) (domain.Job, domain.Account, error),
+) (domain.Job, domain.Account, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Job{}, domain.Account{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	// All multi-object economic transactions lock Account first, then Job.
+	// Single-object mutations take only one of these locks, so this order is
+	// deadlock-free across concurrent jobs for the same principal.
+	if err := lockTransactionKey(ctx, tx, "account", principalID); err != nil {
+		return domain.Job{}, domain.Account{}, err
+	}
+	if err := lockTransactionKey(ctx, tx, "job", jobID); err != nil {
+		return domain.Job{}, domain.Account{}, err
+	}
+
+	job, err := scanJob(tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=$1 FOR UPDATE`, jobID))
+	jobExists := true
+	if errors.Is(err, pgx.ErrNoRows) {
+		job = domain.Job{}
+		jobExists = false
+		err = nil
+	}
+	if err != nil {
+		return domain.Job{}, domain.Account{}, err
+	}
+
+	var account domain.Account
+	account.PrincipalID = principalID
+	var balance, spendPolicy, payload []byte
+	err = tx.QueryRow(ctx, `SELECT balance, spend_policy, payload FROM accounts WHERE principal_id=$1 FOR UPDATE`, principalID).
+		Scan(&balance, &spendPolicy, &payload)
+	accountExists := true
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		accountExists = false
+		account = seed
+	case err != nil:
+		return domain.Job{}, domain.Account{}, err
+	default:
+		_ = json.Unmarshal(balance, &account.Balance)
+		_ = json.Unmarshal(spendPolicy, &account.SpendPolicy)
+		if err := applyPayload(payload, &account); err != nil {
+			return domain.Job{}, domain.Account{}, err
+		}
+	}
+	account.PrincipalID = principalID
+
+	nextJob, nextAccount, err := fn(job, jobExists, account, accountExists)
+	if err != nil {
+		return domain.Job{}, domain.Account{}, err
+	}
+	if nextJob.ID != jobID || nextAccount.PrincipalID != principalID {
+		return domain.Job{}, domain.Account{}, store.ErrConflict
+	}
+	if _, err := tx.Exec(ctx, upsertJobSQL, jobWriteArgs(nextJob)...); err != nil {
+		return domain.Job{}, domain.Account{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO accounts (principal_id, balance, spend_policy, payload)
+		VALUES ($1,$2,$3,$4)
+		ON CONFLICT (principal_id) DO UPDATE SET
+			balance=$2, spend_policy=$3, payload=$4
+	`, principalID, mustMarshal(nextAccount.Balance), mustMarshal(nextAccount.SpendPolicy), mustMarshal(nextAccount)); err != nil {
+		return domain.Job{}, domain.Account{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Job{}, domain.Account{}, err
+	}
+	return nextJob, nextAccount, nil
 }
 
 // --- Accounts ---

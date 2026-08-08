@@ -109,8 +109,8 @@ func TestPhase1PublicHTTPFlowAgainstPostgres(t *testing.T) {
 
 	principalID := "prn_phase1_pg_" + suffix
 	decision := phase01Request(t, client, http.MethodPost, httpServer.URL+"/v1/auth/device/decision", "", map[string]any{
-		"user_code": grant.UserCode, "principal_id": principalID, "decision": "approve",
-	}, map[string]string{"X-ATOS-Approval-Token": approvalToken})
+		"user_code": grant.UserCode, "decision": "approve",
+	}, map[string]string{"X-ATOS-Approval-Token": approvalToken, "X-ATOS-Principal-ID": principalID})
 	if decision.Status != http.StatusOK {
 		t.Fatalf("device decision = %d %s", decision.Status, decision.Body)
 	}

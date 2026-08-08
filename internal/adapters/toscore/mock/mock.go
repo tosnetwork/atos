@@ -143,6 +143,18 @@ func (c *Core) CreateEscrow(ctx context.Context, req toscore.CreateEscrowRequest
 	if err := domain.ValidateCommittedTrust(req.TrustMode, req.ProofProfile); err != nil {
 		return domain.Escrow{}, err
 	}
+	if existing, err := c.store.EscrowByJob(ctx, req.JobID); err == nil {
+		if existing.QuoteID != req.QuoteID || existing.PrincipalID != req.PrincipalID ||
+			existing.ProviderID != req.ProviderID || existing.CapabilityID != req.CapabilityID ||
+			existing.CapabilityVersion != req.CapabilityVersion || existing.TrustMode != req.TrustMode ||
+			existing.ProofProfile != req.ProofProfile || existing.Reserved != req.Reserved {
+			return domain.Escrow{}, domain.NewError(domain.ErrIdempotencyConflict, "existing escrow does not match replayed request", false)
+		}
+		return existing, nil
+	} else if err != store.ErrNotFound {
+		return domain.Escrow{}, err
+	}
+
 	now := time.Now().UTC()
 	e := domain.Escrow{
 		ID:                "esc_" + uuid.NewString(),
@@ -177,6 +189,11 @@ func (c *Core) ReleaseEscrow(ctx context.Context, escrowID string) (domain.Recei
 	if err != nil {
 		return domain.Receipt{}, err
 	}
+	if e.Status == domain.EscrowReleased {
+		if receipt, replayErr := c.store.ReceiptByJob(ctx, e.JobID); replayErr == nil && receipt.EscrowID == e.ID && receipt.Status == domain.ReceiptReleased {
+			return receipt, nil
+		}
+	}
 	if e.Status.Terminal() {
 		return domain.Receipt{}, domain.NewError(domain.ErrSettlementFailed, "escrow already in a terminal state", false)
 	}
@@ -192,7 +209,7 @@ func (c *Core) ReleaseEscrow(ctx context.Context, escrowID string) (domain.Recei
 	delete(c.verified, escrowID)
 
 	receipt := domain.Receipt{
-		ID:           "rcpt_" + uuid.NewString(),
+		ID:           "rcpt_release_" + e.ID,
 		QuoteID:      e.QuoteID,
 		EscrowID:     e.ID,
 		JobID:        e.JobID,
@@ -277,7 +294,13 @@ func (c *Core) VerifyExecutionReceipt(ctx context.Context, escrowID string, rece
 	return toscore.VerifyExecutionReceiptResult{Valid: true, ProofRef: proofRef}, nil
 }
 
+// SettleJob is replayable: a lost response after a committed settlement
+// returns the original terminal receipt instead of requiring the caller to
+// guess whether the economic side effect happened.
 func (c *Core) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (toscore.SettleJobResult, error) {
+	if receipt, err := c.store.ReceiptByJob(ctx, req.JobID); err == nil && receipt.EscrowID == req.EscrowID && receipt.Status == domain.ReceiptSettled {
+		return toscore.SettleJobResult{Receipt: receipt}, nil
+	}
 	c.mu.Lock()
 	verifiedReceipt, ok := c.verified[req.EscrowID]
 	c.mu.Unlock()
@@ -331,7 +354,7 @@ func (c *Core) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (tos
 	if e.TrustMode != domain.TrustModeManaged {
 		proofStatus = domain.ProofVerified
 	}
-	settlementReceiptID := "rcpt_" + uuid.NewString()
+	settlementReceiptID := "rcpt_settle_" + e.ID
 	receipt := domain.Receipt{
 		ID:                     settlementReceiptID,
 		QuoteID:                e.QuoteID,

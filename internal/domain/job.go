@@ -16,6 +16,19 @@ const (
 	JobRejected      JobState = "rejected"
 )
 
+type EconomicState string
+
+const (
+	EconomicNone              EconomicState = ""
+	EconomicDebited           EconomicState = "debited"
+	EconomicEscrowPending     EconomicState = "escrow_pending"
+	EconomicEscrowReserved    EconomicState = "escrow_reserved"
+	EconomicSettlementPending EconomicState = "settlement_pending"
+	EconomicReleasePending    EconomicState = "release_pending"
+	EconomicSettled           EconomicState = "settled"
+	EconomicReleased          EconomicState = "released"
+)
+
 func (s JobState) Terminal() bool {
 	switch s {
 	case JobCompleted, JobFailed, JobCanceled, JobRejected:
@@ -80,6 +93,7 @@ type Job struct {
 	IdempotencyKey         string             `json:"-"`
 	FailureReason          string             `json:"failure_reason,omitempty"`
 	ErrorCode              ErrorCode          `json:"error_code,omitempty"`
+	EconomicState          EconomicState      `json:"-"`
 	ReconciliationRequired bool               `json:"reconciliation_required,omitempty"`
 	PendingCredit          *Money             `json:"-"`
 	ReconciliationTarget   JobState           `json:"-"`

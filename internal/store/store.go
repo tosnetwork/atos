@@ -61,6 +61,7 @@ type Quotes interface {
 type Escrows interface {
 	PutEscrow(ctx context.Context, e domain.Escrow) error
 	GetEscrow(ctx context.Context, id string) (domain.Escrow, error)
+	EscrowByJob(ctx context.Context, jobID string) (domain.Escrow, error)
 }
 
 type Receipts interface {
@@ -74,6 +75,7 @@ type Jobs interface {
 	PutJob(ctx context.Context, j domain.Job) error
 	GetJob(ctx context.Context, id string) (domain.Job, error)
 	JobsByPrincipal(ctx context.Context, principalID string) ([]domain.Job, error)
+	JobsForRecovery(ctx context.Context, updatedBefore time.Time, limit int) ([]domain.Job, error)
 	JobByConfirmationCode(ctx context.Context, userCode string) (domain.Job, error)
 	JobByIdempotencyKey(ctx context.Context, principalID, key string) (domain.Job, error)
 	// UpdateJob atomically applies fn to the job's current stored state (or
@@ -83,6 +85,14 @@ type Jobs interface {
 	// move to failed if not already terminal") without a read/write race
 	// between the execution pipeline and cancellation.
 	UpdateJob(ctx context.Context, id string, fn func(j domain.Job, exists bool) (domain.Job, error)) (domain.Job, error)
+	// UpdateJobAndAccount commits one Job checkpoint and one Managed Account
+	// mutation in the same storage transaction. This is the Phase 1 economic
+	// atomicity boundary: a crash cannot persist a debit/credit without the
+	// corresponding durable Job checkpoint, or vice versa.
+	UpdateJobAndAccount(
+		ctx context.Context, jobID, principalID string, seed domain.Account,
+		fn func(job domain.Job, jobExists bool, account domain.Account, accountExists bool) (domain.Job, domain.Account, error),
+	) (domain.Job, domain.Account, error)
 }
 
 type Accounts interface {

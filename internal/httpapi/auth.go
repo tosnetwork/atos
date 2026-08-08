@@ -90,10 +90,14 @@ func (s *Server) handleAuthDeviceDecision(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusUnauthorized, domain.ErrAuthenticationRequired, "trusted consent authorization is required", false)
 		return
 	}
+	principalID := strings.TrimSpace(r.Header.Get("X-ATOS-Principal-ID"))
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, domain.ErrAuthenticationRequired, "authenticated consent principal is required", false)
+		return
+	}
 	var req struct {
-		UserCode    string `json:"user_code"`
-		PrincipalID string `json:"principal_id,omitempty"`
-		Decision    string `json:"decision"`
+		UserCode string `json:"user_code"`
+		Decision string `json:"decision"`
 	}
 	if err := decodeRequestJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed device decision", false)
@@ -104,7 +108,7 @@ func (s *Server) handleAuthDeviceDecision(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "decision must be approve or deny", false)
 		return
 	}
-	grant, err := s.Auth.DecideDevice(req.UserCode, req.PrincipalID, approve)
+	grant, err := s.Auth.DecideDevice(req.UserCode, principalID, approve)
 	if err != nil {
 		writeError(w, http.StatusConflict, domain.ErrValidationFailed, err.Error(), false)
 		return

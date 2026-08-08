@@ -173,6 +173,10 @@ paths:
           in: header
           required: true
           schema: {type: string}
+        - name: X-ATOS-Principal-ID
+          in: header
+          required: true
+          schema: {type: string}
       requestBody:
         required: true
         content:
@@ -183,7 +187,6 @@ paths:
               required: [user_code, decision]
               properties:
                 user_code: {type: string}
-                principal_id: {type: string}
                 decision: {type: string, enum: [approve, deny]}
       responses:
         '200': {description: Device decision recorded}

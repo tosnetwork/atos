@@ -141,6 +141,17 @@ func (s *Store) GetEscrow(ctx context.Context, id string) (domain.Escrow, error)
 	return e, nil
 }
 
+func (s *Store) EscrowByJob(ctx context.Context, jobID string) (domain.Escrow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range s.escrows {
+		if e.JobID == jobID {
+			return e, nil
+		}
+	}
+	return domain.Escrow{}, store.ErrNotFound
+}
+
 func (s *Store) PutReceipt(ctx context.Context, r domain.Receipt) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -205,6 +216,28 @@ func (s *Store) JobsByPrincipal(ctx context.Context, principalID string) ([]doma
 	for _, j := range s.jobs {
 		if j.PrincipalID == principalID {
 			out = append(out, j)
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) JobsForRecovery(ctx context.Context, updatedBefore time.Time, limit int) ([]domain.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 {
+		limit = 100
+	}
+	out := make([]domain.Job, 0, limit)
+	for _, j := range s.jobs {
+		if j.State.Terminal() || j.State == domain.JobInputRequired {
+			continue
+		}
+		if !j.UpdatedAt.IsZero() && j.UpdatedAt.After(updatedBefore) {
+			continue
+		}
+		out = append(out, j)
+		if len(out) >= limit {
+			break
 		}
 	}
 	return out, nil
@@ -282,6 +315,29 @@ func (s *Store) UpdateAccount(ctx context.Context, principalID string, seed doma
 	}
 	s.accounts[principalID] = next
 	return next, nil
+}
+
+func (s *Store) UpdateJobAndAccount(
+	ctx context.Context, jobID, principalID string, seed domain.Account,
+	fn func(domain.Job, bool, domain.Account, bool) (domain.Job, domain.Account, error),
+) (domain.Job, domain.Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, jobExists := s.jobs[jobID]
+	account, accountExists := s.accounts[principalID]
+	if !accountExists {
+		account = seed
+	}
+	nextJob, nextAccount, err := fn(job, jobExists, account, accountExists)
+	if err != nil {
+		return domain.Job{}, domain.Account{}, err
+	}
+	if nextJob.ID != jobID || nextAccount.PrincipalID != principalID {
+		return domain.Job{}, domain.Account{}, store.ErrConflict
+	}
+	s.jobs[jobID] = nextJob
+	s.accounts[principalID] = nextAccount
+	return nextJob, nextAccount, nil
 }
 
 func (s *Store) PutArtifact(ctx context.Context, a domain.StoredArtifact) error {
