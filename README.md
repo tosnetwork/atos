@@ -1,7 +1,6 @@
 <img src="ATOS.png" alt="ATOS" width="220">
 
-Go implementation of the ATOS Agent Internet gateway defined in
-[`tosnetwork/atos-spec`](https://github.com/tosnetwork/atos-spec).
+Go implementation of the ATOS Agent Internet gateway.
 
 ATOS exposes one REST + MCP + A2A business protocol for discovering, quoting,
 invoking and settling third-party **Capabilities** under three concrete trust
