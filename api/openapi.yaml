@@ -947,11 +947,12 @@ components:
         balance: {$ref: '#/components/schemas/Money'}
         spend_policy:
           type: object
-          required: [per_call_autonomous_limit, daily_limit, remaining_today]
+          required: [per_call_autonomous_limit, daily_limit, remaining_today, reset_at]
           properties:
             per_call_autonomous_limit: {$ref: '#/components/schemas/Money'}
             daily_limit: {$ref: '#/components/schemas/Money'}
             remaining_today: {$ref: '#/components/schemas/Money'}
+            reset_at: {type: string, format: date-time}
         trust_policy:
           type: object
           required: [default_requested_trust_mode]

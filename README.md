@@ -265,3 +265,22 @@ settlement and idempotent replay through the ATOS service layer.
 3. Replace the Phase 0 authorization approval shortcut with production OAuth/device consent and persistent token storage.
 4. Activate `tos_verified_v1`, then `tos_native_v1`, only after their complete network guarantees and conformance tests pass.
 5. Add provider queueing, webhook callbacks, disputes, canonical commitment encoding and federated indexers in their roadmap phases.
+
+
+## Validation
+
+Every proposed revision is checked at its exact Git commit with:
+
+```text
+gofmt
+OpenAPI 3.1 YAML validation
+go vet ./...
+go test -race ./...
+PostgreSQL 16 migrations
+go test -race ./internal/store/postgres
+```
+
+The acceptance suite includes the Phase 0 three-mode contract fixture and the
+Phase 1 HTTP flow from Skill retrieval and Device Authorization through Quote,
+spending confirmation, Managed execution, signed receipt, settlement and exact
+account mutation.
