@@ -128,6 +128,11 @@ func main() {
 	quotes.WithAccountService(accounts)
 	jobs := service.NewJobService(st, execution, core, accounts)
 	receipts := service.NewReceiptService(st, core)
+	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
+	defer reconcileCancel()
+	go jobs.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
+		logger.Error("managed economic reconciliation pending", "error", reconcileErr)
+	})
 
 	blobStorage, err := local.New(cfg.BlobDir, cfg.PublicBaseURL, st)
 	if err != nil {

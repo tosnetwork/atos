@@ -165,6 +165,79 @@ func (s *AccountService) RequiresConfirmation(ctx context.Context, principalID, 
 	return total.Cmp(limit) > 0, nil
 }
 
+func (s *AccountService) debitAccountValue(a domain.Account, amountStr, currency string) (domain.Account, error) {
+	amount, err := money.Parse(amountStr, currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, domain.NewError(domain.ErrValidationFailed, "invalid amount", false)
+	}
+	a = s.normalizeAccount(a)
+	balance, err := money.Parse(a.Balance.Amount, a.Balance.Currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	remaining, err := money.Parse(a.SpendPolicy.RemainingToday.Amount, a.SpendPolicy.RemainingToday.Currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	if amount.Currency != balance.Currency {
+		return domain.Account{}, domain.NewError(domain.ErrValidationFailed, "currency mismatch with account balance", false)
+	}
+	if amount.Cmp(remaining) > 0 {
+		return domain.Account{}, domain.NewError(domain.ErrSpendLimitExceeded, "daily autonomous spend limit exceeded", false)
+	}
+	newBalance, err := balance.Sub(amount)
+	if err != nil {
+		return domain.Account{}, domain.NewError(domain.ErrInsufficientBalance, "insufficient balance", false)
+	}
+	newRemaining, err := remaining.Sub(amount)
+	if err != nil {
+		return domain.Account{}, domain.NewError(domain.ErrSpendLimitExceeded, "daily autonomous spend limit exceeded", false)
+	}
+	a.Balance = domain.Money{Amount: newBalance.String(), Currency: newBalance.Currency}
+	a.SpendPolicy.RemainingToday = domain.Money{Amount: newRemaining.String(), Currency: newRemaining.Currency}
+	return a, nil
+}
+
+func (s *AccountService) creditAccountValue(a domain.Account, amountStr, currency string) (domain.Account, error) {
+	amount, err := money.Parse(amountStr, currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, domain.NewError(domain.ErrValidationFailed, "invalid amount", false)
+	}
+	a = s.normalizeAccount(a)
+	if amount.IsZero() {
+		return a, nil
+	}
+	balance, err := money.Parse(a.Balance.Amount, a.Balance.Currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	remaining, err := money.Parse(a.SpendPolicy.RemainingToday.Amount, a.SpendPolicy.RemainingToday.Currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	dailyLimit, err := money.Parse(a.SpendPolicy.DailyLimit.Amount, a.SpendPolicy.DailyLimit.Currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	if amount.Currency != balance.Currency {
+		return domain.Account{}, domain.NewError(domain.ErrValidationFailed, "currency mismatch with account balance", false)
+	}
+	newBalance, err := balance.Add(amount)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	newRemaining, err := remaining.Add(amount)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	if newRemaining.Cmp(dailyLimit) > 0 {
+		newRemaining = dailyLimit
+	}
+	a.Balance = domain.Money{Amount: newBalance.String(), Currency: newBalance.Currency}
+	a.SpendPolicy.RemainingToday = domain.Money{Amount: newRemaining.String(), Currency: newRemaining.Currency}
+	return a, nil
+}
+
 func (s *AccountService) Debit(ctx context.Context, principalID, amountStr, currency string) error {
 	amount, err := money.Parse(amountStr, currency, accountDecimals)
 	if err != nil {

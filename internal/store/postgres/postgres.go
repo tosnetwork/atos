@@ -337,7 +337,7 @@ func (s *Store) ReceiptsByPrincipal(ctx context.Context, principalID string) ([]
 
 // --- Jobs ---
 
-const jobColumns = `id, capability_id, quote_id, escrow_id, principal_id, state, input, output, artifacts, idempotency_key, failure_reason, created_at, updated_at, estimated_completion_at, economic_state, pending_credit, reconciliation_target, payload`
+const jobColumns = `id, capability_id, quote_id, escrow_id, principal_id, state, input, output, artifacts, idempotency_key, failure_reason, created_at, updated_at, estimated_completion_at, economic_state, execution_receipt, pending_credit, reconciliation_target, payload`
 
 func (s *Store) PutJob(ctx context.Context, j domain.Job) error {
 	_, err := s.pool.Exec(ctx, upsertJobSQL, jobWriteArgs(j)...)
@@ -348,18 +348,21 @@ const upsertJobSQL = `
 	INSERT INTO jobs (
 		id, capability_id, quote_id, escrow_id, principal_id, state, input,
 		output, artifacts, idempotency_key, failure_reason, created_at,
-		updated_at, estimated_completion_at, economic_state, pending_credit,
-		reconciliation_target, payload
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+		updated_at, estimated_completion_at, economic_state, execution_receipt,
+		pending_credit, reconciliation_target, payload
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
 	ON CONFLICT (id) DO UPDATE SET
 		escrow_id=$4, state=$6, input=$7, output=$8, artifacts=$9,
 		failure_reason=$11, updated_at=$13, estimated_completion_at=$14,
-		economic_state=$15, pending_credit=$16, reconciliation_target=$17,
-		payload=$18
+		economic_state=$15, execution_receipt=$16, pending_credit=$17,
+		reconciliation_target=$18, payload=$19
 `
 
 func jobWriteArgs(j domain.Job) []any {
-	var pendingCredit any
+	var executionReceipt, pendingCredit any
+	if j.ExecutionReceipt != nil {
+		executionReceipt = mustMarshal(j.ExecutionReceipt)
+	}
 	if j.PendingCredit != nil {
 		pendingCredit = mustMarshal(j.PendingCredit)
 	}
@@ -368,19 +371,19 @@ func jobWriteArgs(j domain.Job) []any {
 		string(j.State), mustMarshal(j.Input), nullableJSON(j.Output),
 		mustMarshal(j.Artifacts), j.IdempotencyKey, j.FailureReason,
 		j.CreatedAt, j.UpdatedAt, j.EstimatedCompletionAt, string(j.EconomicState),
-		pendingCredit, string(j.ReconciliationTarget), mustMarshal(j),
+		executionReceipt, pendingCredit, string(j.ReconciliationTarget), mustMarshal(j),
 	}
 }
 
 func scanJob(row pgx.Row) (domain.Job, error) {
 	var j domain.Job
-	var input, output, artifacts, pendingCredit, payload []byte
+	var input, output, artifacts, executionReceipt, pendingCredit, payload []byte
 	var state, economicState, reconciliationTarget string
 	if err := row.Scan(
 		&j.ID, &j.CapabilityID, &j.QuoteID, &j.EscrowID, &j.PrincipalID,
 		&state, &input, &output, &artifacts, &j.IdempotencyKey,
 		&j.FailureReason, &j.CreatedAt, &j.UpdatedAt,
-		&j.EstimatedCompletionAt, &economicState, &pendingCredit,
+		&j.EstimatedCompletionAt, &economicState, &executionReceipt, &pendingCredit,
 		&reconciliationTarget, &payload,
 	); err != nil {
 		return domain.Job{}, err
@@ -393,6 +396,13 @@ func scanJob(row pgx.Row) (domain.Job, error) {
 		_ = json.Unmarshal(output, &j.Output)
 	}
 	_ = json.Unmarshal(artifacts, &j.Artifacts)
+	if executionReceipt != nil {
+		var receipt domain.ExecutionReceipt
+		if err := json.Unmarshal(executionReceipt, &receipt); err != nil {
+			return domain.Job{}, fmt.Errorf("postgres: decode execution receipt: %w", err)
+		}
+		j.ExecutionReceipt = &receipt
+	}
 	if pendingCredit != nil {
 		var credit domain.Money
 		if err := json.Unmarshal(pendingCredit, &credit); err != nil {
@@ -407,6 +417,9 @@ func scanJob(row pgx.Row) (domain.Job, error) {
 	// columns because they are not part of the public Job JSON contract.
 	j.EconomicState = domain.EconomicState(economicState)
 	j.ReconciliationTarget = domain.JobState(reconciliationTarget)
+	if executionReceipt == nil {
+		j.ExecutionReceipt = nil
+	}
 	if pendingCredit == nil {
 		j.PendingCredit = nil
 	}

@@ -354,80 +354,20 @@ func (s *JobService) resumeConfirmedJob(ctx context.Context, jobID string, waitI
 }
 
 func (s *JobService) executeJob(ctx context.Context, jobID string, waitInline bool, maxWaitMS int64) (SubmitResult, error) {
-	job, claimed, err := s.claimForExecution(ctx, jobID)
-	if err != nil {
-		return SubmitResult{}, err
-	}
-	if !claimed {
-		return SubmitResult{Type: resultTypeFor(job), Job: job}, nil
-	}
-
 	lock := s.jobLock(jobID)
 	lock.Lock()
-	quote, err := s.getQuote(ctx, job.QuoteID)
-	now := time.Now().UTC()
-	if err != nil || quote.Expired(now) || (!quote.ExecutionDeadline.IsZero() && !now.Before(quote.ExecutionDeadline)) {
-		failed := s.failUnderLock(ctx, job.ID, domain.ErrQuoteExpired, "quote unavailable or expired before execution")
-		lock.Unlock()
-		return failed, nil
-	}
-	capability, err := s.store.Get(ctx, job.CapabilityID)
+	job, capability, err := s.prepareExecutionUnderLock(ctx, jobID)
+	lock.Unlock()
 	if err != nil {
-		failed := s.failUnderLock(ctx, job.ID, domain.ErrCapabilityUnavailable, "capability lookup failed during execution")
-		lock.Unlock()
-		return failed, nil
-	}
-	capability = normalizeCapability(capability)
-	if capability.Version != quote.CapabilityVersion || capability.ProviderID != quote.ProviderID ||
-		job.TrustMode != quote.TrustMode || job.ProofProfile != quote.ProofProfile {
-		failed := s.failUnderLock(ctx, job.ID, domain.ErrQuoteMismatch, "execution contract no longer matches quote")
-		lock.Unlock()
-		return failed, nil
-	}
-	if quote.PrincipalID == "" {
-		quote.PrincipalID = job.PrincipalID
-	}
-	if _, err := s.core.CommitQuote(ctx, quote); err != nil {
-		failed := s.failUnderLock(ctx, job.ID, errCode(err), "quote commitment failed: "+err.Error())
-		lock.Unlock()
-		return failed, nil
-	}
-	job.ProofStatus.Quote = proofCheckpointForCommittedQuote(job.TrustMode)
-	if err := s.accounts.Debit(ctx, job.PrincipalID, quote.Price.TotalMax, quote.Price.Currency); err != nil {
-		failed := s.failUnderLock(ctx, job.ID, errCode(err), err.Error())
-		lock.Unlock()
-		return failed, nil
-	}
-	escrow, err := s.core.CreateEscrow(ctx, toscore.CreateEscrowRequest{
-		QuoteID: quote.ID, JobID: job.ID,
-		CapabilityID: capability.ID, CapabilityVersion: capability.Version,
-		PrincipalID: job.PrincipalID, ProviderID: capability.ProviderID,
-		TrustMode: quote.TrustMode, ProofProfile: quote.ProofProfile,
-		Settlement: quote.Settlement,
-		Reserved:   domain.Money{Amount: quote.Price.TotalMax, Currency: quote.Price.Currency},
-	})
-	if err != nil {
-		_ = s.accounts.Credit(ctx, job.PrincipalID, quote.Price.TotalMax, quote.Price.Currency)
-		failed := s.failUnderLock(ctx, job.ID, errCode(err), "escrow creation failed: "+err.Error())
-		lock.Unlock()
-		return failed, nil
-	}
-	job.EscrowID = escrow.ID
-	job.ProofStatus.Escrow = domain.ProofReserved
-	job.UpdatedAt = time.Now().UTC()
-	if err := s.store.PutJob(ctx, job); err != nil {
-		releaseReceipt, releaseErr := s.core.ReleaseEscrow(context.Background(), escrow.ID)
-		creditErr := error(nil)
-		if releaseErr == nil {
-			creditErr = s.accounts.Credit(context.Background(), job.PrincipalID, releaseReceipt.Refunded.Amount, releaseReceipt.Refunded.Currency)
-		}
-		lock.Unlock()
-		if releaseErr != nil || creditErr != nil {
-			return SubmitResult{}, domain.NewError(domain.ErrSettlementFailed, "job persistence failed after escrow creation and compensation was incomplete", true)
+		current, getErr := s.store.GetJob(ctx, jobID)
+		if getErr == nil {
+			return SubmitResult{Type: resultTypeFor(current), Job: current}, err
 		}
 		return SubmitResult{}, err
 	}
-	lock.Unlock()
+	if job.State != domain.JobWorking || job.EconomicState != domain.EconomicEscrowReserved {
+		return SubmitResult{Type: resultTypeFor(job), Job: job}, nil
+	}
 
 	done := make(chan domain.Job, 1)
 	go func(snapshot domain.Job, capability domain.Capability) {
@@ -457,114 +397,26 @@ func (s *JobService) executeJob(ctx context.Context, jobID string, waitInline bo
 		if err != nil {
 			return SubmitResult{}, err
 		}
-		return SubmitResult{Type: ResultAccepted, Job: current}, nil
+		return SubmitResult{Type: resultTypeFor(current), Job: current}, nil
 	case <-ctx.Done():
 		current, err := s.store.GetJob(context.Background(), job.ID)
 		if err != nil {
 			return SubmitResult{}, ctx.Err()
 		}
-		return SubmitResult{Type: ResultAccepted, Job: current}, nil
+		return SubmitResult{Type: resultTypeFor(current), Job: current}, nil
 	}
 }
 
 func (s *JobService) runToCompletion(ctx context.Context, snapshot domain.Job, capability domain.Capability) domain.Job {
-	result, err := s.provider.SubmitJob(ctx, tosai.SubmitJobRequest{
-		JobID: snapshot.ID, InvocationID: snapshot.InvocationID,
-		QuoteID: snapshot.QuoteID, ServiceQuoteID: snapshot.ServiceQuoteID,
-		EscrowID: snapshot.EscrowID, PrincipalID: snapshot.PrincipalID,
-		CapabilityID: snapshot.CapabilityID, CapabilityVersion: snapshot.CapabilityVersion,
-		ProviderID: snapshot.ProviderID, TrustMode: snapshot.TrustMode,
-		ProofProfile: snapshot.ProofProfile, Input: snapshot.Input,
-		InputCommitment:   hashCommitment(snapshot.Input),
-		ExecutionDeadline: snapshot.ExecutionDeadline,
-		RetainUntil:       time.Now().UTC().Add(executionRetention),
-	})
+	_ = capability
+	recovered, err := s.recoverProviderExecution(ctx, snapshot.ID, true)
 	if err != nil {
-		return s.fail(ctx, snapshot.ID, errCode(err), "execution gateway failed: "+err.Error()).Job
-	}
-	if result.Receipt == nil {
-		return s.fail(ctx, snapshot.ID, domain.ErrProviderFailed, "execution gateway returned no receipt").Job
-	}
-
-	lock := s.jobLock(snapshot.ID)
-	lock.Lock()
-	defer lock.Unlock()
-	current, err := s.store.GetJob(ctx, snapshot.ID)
-	if err != nil {
+		if current, getErr := s.store.GetJob(context.Background(), snapshot.ID); getErr == nil {
+			return current
+		}
 		return snapshot
 	}
-	if current.State != domain.JobWorking {
-		return current
-	}
-	quote, err := s.getQuote(ctx, current.QuoteID)
-	if err != nil {
-		return s.failUnderLock(ctx, current.ID, domain.ErrQuoteMismatch, "quote lookup failed during settlement").Job
-	}
-
-	execReceipt := *result.Receipt
-	execReceipt.Cost = domain.Money{Amount: quote.Price.TotalMax, Currency: quote.Price.Currency}
-	current.ProofStatus.Receipt = domain.ProofSigned
-	current.UpdatedAt = time.Now().UTC()
-	if err := s.store.PutJob(ctx, current); err != nil {
-		return current
-	}
-	proofRef, err := s.core.CommitExecutionReceipt(ctx, execReceipt)
-	if err != nil {
-		return s.failUnderLock(ctx, current.ID, errCode(err), "execution receipt commitment failed: "+err.Error()).Job
-	}
-	if proofRef != "" {
-		execReceipt.NetworkProofRef = proofRef
-	}
-	verify, err := s.core.VerifyExecutionReceipt(ctx, current.EscrowID, execReceipt)
-	if err != nil || !verify.Valid {
-		reason := "execution receipt failed verification"
-		if err != nil {
-			reason += ": " + err.Error()
-		} else if verify.Reason != "" {
-			reason += ": " + verify.Reason
-		}
-		return s.failUnderLock(ctx, current.ID, domain.ErrSettlementFailed, reason).Job
-	}
-	if verify.ProofRef != "" {
-		execReceipt.NetworkProofRef = verify.ProofRef
-	}
-	current.ProofStatus.Receipt = domain.ProofVerified
-	current.UpdatedAt = time.Now().UTC()
-	if err := s.store.PutJob(ctx, current); err != nil {
-		return current
-	}
-
-	settled, err := s.core.SettleJob(ctx, toscore.SettleJobRequest{
-		EscrowID: current.EscrowID, JobID: current.ID, ReceiptID: execReceipt.ID,
-		ActualCost: execReceipt.Cost,
-	})
-	if err != nil {
-		return s.failUnderLock(ctx, current.ID, domain.ErrSettlementFailed, "settlement failed: "+err.Error()).Job
-	}
-	current.Output = cloneMap(result.Output)
-	current.Artifacts = append([]domain.Artifact(nil), result.Artifacts...)
-	current.ProofStatus.Receipt = domain.ProofVerified
-	current.ProofStatus.Settlement = domain.ProofSettled
-	if nonZeroMoney(settled.Receipt.Refunded) {
-		if err := s.accounts.Credit(ctx, current.PrincipalID, settled.Receipt.Refunded.Amount, settled.Receipt.Refunded.Currency); err != nil {
-			return s.markReconciliationUnderLock(ctx, current, settled.Receipt.Refunded, domain.JobCompleted, "settlement completed but account refund reconciliation is pending")
-		}
-	}
-	_, _ = s.core.CommitProofOfServiceEvidence(ctx, execReceipt)
-
-	now := time.Now().UTC()
-	current.State = domain.JobCompleted
-	current.ErrorCode = ""
-	current.FailureReason = ""
-	current.ReconciliationRequired = false
-	current.PendingCredit = nil
-	current.ReconciliationTarget = ""
-	current.UpdatedAt = now
-	current.CompletedAt = &now
-	if err := s.store.PutJob(ctx, current); err != nil {
-		return current
-	}
-	return current
+	return recovered
 }
 
 func (s *JobService) claimForExecution(ctx context.Context, jobID string) (domain.Job, bool, error) {
@@ -617,39 +469,15 @@ func (s *JobService) fail(ctx context.Context, jobID string, code domain.ErrorCo
 }
 
 func (s *JobService) failUnderLock(ctx context.Context, jobID string, code domain.ErrorCode, reason string) SubmitResult {
-	job, applied, err := s.transitionIfActive(ctx, jobID, func(job domain.Job) domain.Job {
-		now := time.Now().UTC()
-		job.State = domain.JobFailed
-		job.FailureReason = reason
-		job.ErrorCode = code
-		job.ProofStatus.Receipt = domain.ProofFailed
-		job.UpdatedAt = now
-		job.CompletedAt = &now
-		return job
-	})
-	if err != nil || !applied {
-		return SubmitResult{Type: resultTypeFor(job), Job: job}
+	job, err := s.store.GetJob(ctx, jobID)
+	if err != nil {
+		return SubmitResult{Type: ResultFailed, Job: domain.Job{ID: jobID}}
 	}
-	if job.EscrowID != "" {
-		receipt, releaseErr := s.core.ReleaseEscrow(ctx, job.EscrowID)
-		if releaseErr != nil {
-			job.ProofStatus.Settlement = domain.ProofFailed
-			job.ReconciliationRequired = true
-			job.FailureReason += "; escrow release requires reconciliation: " + releaseErr.Error()
-			_ = s.store.PutJob(ctx, job)
-			return SubmitResult{Type: ResultFailed, Job: job}
-		}
-		if nonZeroMoney(receipt.Refunded) {
-			if creditErr := s.accounts.Credit(ctx, job.PrincipalID, receipt.Refunded.Amount, receipt.Refunded.Currency); creditErr != nil {
-				job = s.markReconciliationUnderLock(ctx, job, receipt.Refunded, domain.JobFailed, reason+"; refund reconciliation is pending")
-				return SubmitResult{Type: ResultAccepted, Job: job}
-			}
-		}
-		job.ProofStatus.Escrow = domain.ProofReleased
-		job.ProofStatus.Settlement = domain.ProofReleased
-		_ = s.store.PutJob(ctx, job)
+	terminal, releaseErr := s.releaseForTerminalUnderLock(ctx, job, domain.JobFailed, code, reason)
+	if releaseErr != nil {
+		return SubmitResult{Type: ResultAccepted, Job: terminal}
 	}
-	return SubmitResult{Type: resultTypeFor(job), Job: job}
+	return SubmitResult{Type: resultTypeFor(terminal), Job: terminal}
 }
 
 func (s *JobService) Get(ctx context.Context, jobID string) (domain.Job, error) {
@@ -661,7 +489,11 @@ func (s *JobService) Get(ctx context.Context, jobID string) (domain.Job, error) 
 		return domain.Job{}, err
 	}
 	if job.State == domain.JobReconciling {
-		return s.reconcileCredit(ctx, jobID)
+		reconciled, reconcileErr := s.ReconcileJob(ctx, jobID)
+		if reconcileErr == nil {
+			return reconciled, nil
+		}
+		return reconciled, domain.NewError(domain.ErrSettlementFailed, "job economic reconciliation is still pending: "+reconcileErr.Error(), true)
 	}
 	return job, nil
 }
@@ -702,66 +534,52 @@ func (s *JobService) Cancel(ctx context.Context, jobID, principalID, reason, ide
 	if job.PrincipalID != principalID {
 		return domain.Job{}, domain.NewError(domain.ErrPermissionDenied, "not the job's owning principal", false)
 	}
-	if job.State.Terminal() || job.State == domain.JobReconciling {
-		return domain.Job{}, domain.NewError(domain.ErrJobNotCancelable, "job is already terminal or reconciling", false)
+	if job.State.Terminal() {
+		return domain.Job{}, domain.NewError(domain.ErrJobNotCancelable, "job is already terminal", false)
 	}
-	if job.State == domain.JobInputRequired || job.State == domain.JobSubmitted {
-		if job.Confirmation != nil && job.Confirmation.Status == domain.ConfirmationPending {
-			confirmation := *job.Confirmation
-			confirmation.Status = domain.ConfirmationDenied
-			confirmation.DecidedAt = &now
-			job.Confirmation = &confirmation
-		}
+
+	if job.State == domain.JobInputRequired && job.EconomicState == domain.EconomicNone {
 		job = finalizeCanceled(job, reason, now)
 		if err := s.store.PutJob(ctx, job); err != nil {
 			return domain.Job{}, err
 		}
-		if err := s.store.Finish(ctx, principalID, idempotencyKey, jobID); err != nil {
-			return domain.Job{}, err
-		}
-		committed = true
-		return job, nil
-	}
-
-	originalState := job.State
-	if job.State != domain.JobCanceling {
-		job.State = domain.JobCanceling
-		job.UpdatedAt = now
-		job.ErrorCode = ""
-		job.FailureReason = reason
-		if err := s.store.PutJob(ctx, job); err != nil {
-			return domain.Job{}, err
-		}
-	}
-	if err := s.provider.CancelJob(ctx, jobID, reason); err != nil {
-		if originalState != domain.JobCanceling {
-			job.State = originalState
-			job.UpdatedAt = time.Now().UTC()
-			_ = s.store.PutJob(ctx, job)
-		}
-		return domain.Job{}, domain.NewError(domain.ErrProviderFailed, "provider cancellation failed: "+err.Error(), true)
-	}
-	if job.EscrowID != "" {
-		receipt, releaseErr := s.core.ReleaseEscrow(ctx, job.EscrowID)
-		if releaseErr != nil {
-			return domain.Job{}, domain.NewError(domain.ErrSettlementFailed, "provider canceled but escrow release failed: "+releaseErr.Error(), true)
-		}
-		job.ProofStatus.Escrow = domain.ProofReleased
-		job.ProofStatus.Settlement = domain.ProofReleased
-		if nonZeroMoney(receipt.Refunded) {
-			if creditErr := s.accounts.Credit(ctx, job.PrincipalID, receipt.Refunded.Amount, receipt.Refunded.Currency); creditErr != nil {
-				job = s.markReconciliationUnderLock(ctx, job, receipt.Refunded, domain.JobCanceled, "provider canceled and escrow released; refund reconciliation is pending")
-				if err := s.store.Finish(ctx, principalID, idempotencyKey, jobID); err != nil {
-					return domain.Job{}, err
+	} else {
+		if job.State == domain.JobWorking || job.State == domain.JobCanceling {
+			job.State = domain.JobCanceling
+			job.ReconciliationRequired = true
+			job.ReconciliationTarget = domain.JobCanceled
+			job.FailureReason = reason
+			job.UpdatedAt = now
+			if err := s.store.PutJob(ctx, job); err != nil {
+				return domain.Job{}, err
+			}
+			if cancelErr := s.provider.CancelJob(ctx, job.ID, reason); cancelErr != nil {
+				providerResult, statusErr := s.provider.GetJob(ctx, job.ID)
+				if statusErr == nil && providerResult.State == domain.JobCompleted {
+					settled := s.settleProviderResultUnderLock(ctx, job, providerResult)
+					_ = s.store.Finish(ctx, principalID, idempotencyKey, jobID)
+					committed = true
+					return settled, domain.NewError(domain.ErrJobNotCancelable, "job completed before cancellation could be established", false)
 				}
-				committed = true
-				return job, domain.NewError(domain.ErrSettlementFailed, "refund reconciliation is pending", true)
+				if statusErr != nil && !domainErrorIs(statusErr, domain.ErrNotFound) {
+					pending := s.markEconomicReconciliationUnderLock(ctx, job.ID, job.EconomicState, domain.JobCanceled, domain.ErrProviderFailed, reason+"; provider cancellation outcome requires recovery: "+cancelErr.Error())
+					if finishErr := s.store.Finish(ctx, principalID, idempotencyKey, jobID); finishErr != nil {
+						return domain.Job{}, finishErr
+					}
+					committed = true
+					return pending, domain.NewError(domain.ErrProviderFailed, "provider cancellation requires reconciliation", true)
+				}
 			}
 		}
-	}
-	job = finalizeCanceled(job, reason, time.Now().UTC())
-	if err := s.store.PutJob(ctx, job); err != nil {
-		return domain.Job{}, err
+		terminal, releaseErr := s.releaseForTerminalUnderLock(ctx, job, domain.JobCanceled, "", reason)
+		job = terminal
+		if releaseErr != nil {
+			if finishErr := s.store.Finish(ctx, principalID, idempotencyKey, jobID); finishErr != nil {
+				return domain.Job{}, finishErr
+			}
+			committed = true
+			return job, domain.NewError(domain.ErrSettlementFailed, "cancellation economic release requires reconciliation", true)
+		}
 	}
 	if err := s.store.Finish(ctx, principalID, idempotencyKey, jobID); err != nil {
 		return domain.Job{}, err
@@ -781,26 +599,23 @@ func (s *JobService) reconcileCredit(ctx context.Context, jobID string) (domain.
 	if job.State != domain.JobReconciling || job.PendingCredit == nil {
 		return job, nil
 	}
-	if err := s.accounts.Credit(ctx, job.PrincipalID, job.PendingCredit.Amount, job.PendingCredit.Currency); err != nil {
-		return job, domain.NewError(domain.ErrSettlementFailed, "account reconciliation is still pending: "+err.Error(), true)
-	}
-	now := time.Now().UTC()
-	job.State = job.ReconciliationTarget
-	job.PendingCredit = nil
-	job.ReconciliationTarget = ""
-	job.ReconciliationRequired = false
-	job.ErrorCode = ""
-	if job.State == domain.JobCompleted || job.State == domain.JobCanceled || job.State == domain.JobFailed {
-		job.CompletedAt = &now
-	}
-	job.UpdatedAt = now
-	if job.State == domain.JobCompleted || job.State == domain.JobCanceled {
-		job.FailureReason = ""
-	}
-	if err := s.store.PutJob(ctx, job); err != nil {
-		return domain.Job{}, err
-	}
-	return job, nil
+	credit := *job.PendingCredit
+	updated, _, err := s.store.UpdateJobAndAccount(ctx, job.ID, job.PrincipalID, s.accounts.defaultAccount(job.PrincipalID), func(current domain.Job, exists bool, account domain.Account, _ bool) (domain.Job, domain.Account, error) {
+		if !exists || current.PendingCredit == nil {
+			return domain.Job{}, domain.Account{}, store.ErrConflict
+		}
+		nextAccount, err := s.accounts.creditAccountValue(account, credit.Amount, credit.Currency)
+		if err != nil {
+			return domain.Job{}, domain.Account{}, err
+		}
+		target := current.ReconciliationTarget
+		if target == "" {
+			target = domain.JobFailed
+		}
+		current = finalizeTerminalJob(current, target, current.ErrorCode, current.FailureReason, current.EconomicState)
+		return current, nextAccount, nil
+	})
+	return updated, err
 }
 
 func (s *JobService) markReconciliationUnderLock(ctx context.Context, job domain.Job, credit domain.Money, target domain.JobState, reason string) domain.Job {

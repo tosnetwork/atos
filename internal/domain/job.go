@@ -94,6 +94,7 @@ type Job struct {
 	FailureReason          string             `json:"failure_reason,omitempty"`
 	ErrorCode              ErrorCode          `json:"error_code,omitempty"`
 	EconomicState          EconomicState      `json:"-"`
+	ExecutionReceipt       *ExecutionReceipt  `json:"-"`
 	ReconciliationRequired bool               `json:"reconciliation_required,omitempty"`
 	PendingCredit          *Money             `json:"-"`
 	ReconciliationTarget   JobState           `json:"-"`

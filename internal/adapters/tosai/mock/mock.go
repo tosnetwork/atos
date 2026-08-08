@@ -51,6 +51,15 @@ func (p *Provider) GetProviderStatus(ctx context.Context, providerID string) (bo
 }
 
 func (p *Provider) SubmitJob(ctx context.Context, req tosai.SubmitJobRequest) (tosai.SubmitJobResult, error) {
+	p.mu.Lock()
+	if existing, ok := p.jobs[req.JobID]; ok {
+		p.mu.Unlock()
+		if existing.Receipt != nil && (existing.Receipt.QuoteID != req.QuoteID || existing.Receipt.EscrowID != req.EscrowID || existing.Receipt.PrincipalID != req.PrincipalID || existing.Receipt.CapabilityID != req.CapabilityID) {
+			return tosai.SubmitJobResult{}, domain.NewError(domain.ErrIdempotencyConflict, "job replay does not match original execution", false)
+		}
+		return existing, nil
+	}
+	p.mu.Unlock()
 	if !p.modes[req.TrustMode] {
 		return tosai.SubmitJobResult{}, fmt.Errorf("mock tos-ai is not configured for %s mode", req.TrustMode)
 	}
@@ -129,7 +138,7 @@ func (p *Provider) GetJob(ctx context.Context, jobID string) (tosai.SubmitJobRes
 	defer p.mu.Unlock()
 	result, ok := p.jobs[jobID]
 	if !ok {
-		return tosai.SubmitJobResult{}, fmt.Errorf("mock tosai: unknown job %q", jobID)
+		return tosai.SubmitJobResult{}, domain.NewError(domain.ErrNotFound, fmt.Sprintf("mock tosai: unknown job %q", jobID), false)
 	}
 	return result, nil
 }
