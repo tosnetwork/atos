@@ -163,7 +163,8 @@ func TestFullJobLifecycleAgainstPostgres(t *testing.T) {
 	quotes.WithAccountService(accounts)
 	jobs := service.NewJobService(s, provider, core, accounts)
 
-	principalID := "prn_pg_lifecycle_" + randSuffix()
+	suffix := randSuffix()
+	principalID := "prn_pg_lifecycle_" + suffix
 	cap, err := capabilities.Register(ctx, service.RegisterCapabilityInput{
 		ProviderID:   "agt_pg_lifecycle",
 		Name:         "PG Lifecycle Cap",
@@ -175,12 +176,13 @@ func TestFullJobLifecycleAgainstPostgres(t *testing.T) {
 			Model:     domain.PricingFixed,
 			PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"},
 		},
+		IdempotencyKey: "register-pg-lifecycle-" + suffix,
 	})
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
-	quote, err := quotes.Create(ctx, service.CreateQuoteInput{CapabilityID: cap.ID})
+	quote, err := quotes.Create(ctx, service.CreateQuoteInput{PrincipalID: principalID, CapabilityID: cap.ID})
 	if err != nil {
 		t.Fatalf("Create quote: %v", err)
 	}
@@ -190,7 +192,7 @@ func TestFullJobLifecycleAgainstPostgres(t *testing.T) {
 		CapabilityID:   cap.ID,
 		QuoteID:        quote.ID,
 		Input:          map[string]any{"x": 1},
-		IdempotencyKey: "pg-lifecycle-1",
+		IdempotencyKey: "pg-lifecycle-1-" + suffix,
 	})
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
@@ -214,7 +216,7 @@ func TestFullJobLifecycleAgainstPostgres(t *testing.T) {
 		CapabilityID:   cap.ID,
 		QuoteID:        quote.ID,
 		Input:          map[string]any{"x": 1},
-		IdempotencyKey: "pg-lifecycle-1",
+		IdempotencyKey: "pg-lifecycle-1-" + suffix,
 	})
 	if err != nil {
 		t.Fatalf("replay Invoke: %v", err)
