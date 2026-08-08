@@ -88,5 +88,5 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
       - name: Apply embedded migrations
         run: go run ./cmd/migrate
-      - name: Run PostgreSQL integration and public HTTP acceptance tests
-        run: go test -race ./internal/store/postgres ./internal/httpapi
+      - name: Run PostgreSQL integration, public HTTP and crash-recovery gates
+        run: go test -race ./internal/store/postgres ./internal/httpapi ./internal/service
