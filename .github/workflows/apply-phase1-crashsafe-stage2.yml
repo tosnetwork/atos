@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/apply-phase1-crashsafe-stage2.yml
       - tools/apply_phase1_crashsafe_stage2.py
+      - tools/fix_phase1_stage2_reconcile_progress.py
 
 permissions:
   contents: write
@@ -44,6 +45,7 @@ jobs:
       - name: Apply crash-safe economic state machine
         run: |
           python3 tools/apply_phase1_crashsafe_stage2.py
+          python3 tools/fix_phase1_stage2_reconcile_progress.py
           gofmt -w internal/domain/job.go internal/store/postgres/postgres.go internal/service/account.go internal/service/economic_recovery.go internal/service/economic_crash_safety_test.go internal/service/job.go internal/adapters/tosai/mock/mock.go cmd/api/main.go
           git diff --check
       - name: Apply migrations
