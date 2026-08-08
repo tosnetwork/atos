@@ -46,10 +46,10 @@ jobs:
           python3 tools/apply_phase1_crashsafe_stage1.py
           gofmt -w internal/domain/job.go internal/store/store.go internal/store/memory/memory.go internal/store/postgres/postgres.go internal/store/postgres/crash_safety_test.go internal/adapters/toscore/mock/mock.go internal/adapters/tosprotocol/core.go internal/httpapi/auth.go internal/httpapi/phase01_postgres_acceptance_test.go internal/httpapi/auth_decision_security_test.go
           git diff --check
-      - name: Unit and race tests
-        run: go test -race ./...
       - name: Apply migrations
         run: go run ./cmd/migrate
+      - name: Unit and race tests
+        run: go test -race ./...
       - name: PostgreSQL crash-safety tests
         run: go test -race ./internal/store/postgres ./internal/httpapi
       - name: Commit validated primitives
