@@ -1,0 +1,40 @@
+name: repair-phase01-fix-runner
+
+on:
+  push:
+    branches:
+      - agent/phase0-phase1-completion
+    paths:
+      - .github/workflows/repair-phase01-fix-runner.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/phase0-phase1-completion
+          fetch-depth: 0
+      - name: Repair and retrigger the validated fixer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.github/workflows/apply-phase01-final-fixes.yml')
+          text = path.read_text()
+          old = "concurrency_tests = r'''"
+          new = "concurrency_tests = '''"
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one raw concurrency test literal, found {text.count(old)}')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          git rm .github/workflows/repair-phase01-fix-runner.yml
+          git add .github/workflows/apply-phase01-final-fixes.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'ci: repair Phase 0/1 fix runner'
+          git push origin HEAD:agent/phase0-phase1-completion
