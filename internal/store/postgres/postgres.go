@@ -62,6 +62,26 @@ func nullableJSON(v map[string]any) any {
 	return mustMarshal(v)
 }
 
+// lockTransactionKey serializes a logical mutation even before its row
+// exists. SELECT ... FOR UPDATE cannot lock a missing row, so relying on
+// it alone permits concurrent first-writers to derive state from the same
+// seed. PostgreSQL advisory transaction locks are shared by all gateway
+// replicas and are released automatically on commit or rollback.
+func lockTransactionKey(ctx context.Context, tx pgx.Tx, namespace string, parts ...string) error {
+	if namespace == "" || len(parts) == 0 {
+		return errors.New("postgres: advisory lock identity is empty")
+	}
+	identity := namespace
+	for _, part := range parts {
+		if part == "" {
+			return errors.New("postgres: advisory lock identity contains an empty part")
+		}
+		identity += fmt.Sprintf(":%d:%s", len(part), part)
+	}
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, identity)
+	return err
+}
+
 // --- Capabilities ---
 
 const capabilityColumns = `id, provider_id, name, description, version, tags, modalities, delivery_mode, input_schema, output_schema, pricing, sla, trust, status, updated_at, payload`
@@ -413,6 +433,9 @@ func (s *Store) UpdateJob(ctx context.Context, id string, fn func(domain.Job, bo
 		return domain.Job{}, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := lockTransactionKey(ctx, tx, "job", id); err != nil {
+		return domain.Job{}, err
+	}
 
 	current, err := scanJob(tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=$1 FOR UPDATE`, id))
 	exists := true
@@ -481,6 +504,9 @@ func (s *Store) UpdateAccount(ctx context.Context, principalID string, seed doma
 		return domain.Account{}, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := lockTransactionKey(ctx, tx, "account", principalID); err != nil {
+		return domain.Account{}, err
+	}
 
 	var current domain.Account
 	current.PrincipalID = principalID
@@ -568,6 +594,9 @@ func (s *Store) Reserve(ctx context.Context, principalID, key, requestHash strin
 		return store.IdempotencyRecord{}, false, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := lockTransactionKey(ctx, tx, "idempotency", principalID, key); err != nil {
+		return store.IdempotencyRecord{}, false, err
+	}
 
 	var rec store.IdempotencyRecord
 	var status string

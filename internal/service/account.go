@@ -120,17 +120,20 @@ func (s *AccountService) Get(ctx context.Context, principalID string) (domain.Ac
 	a, err := s.store.GetAccount(ctx, principalID)
 	if err == nil {
 		normalized := s.normalizeAccount(a)
-		if accountNormalizationChanged(a, normalized) {
-			if err := s.store.PutAccount(ctx, normalized); err != nil {
-				return domain.Account{}, err
-			}
+		if !accountNormalizationChanged(a, normalized) {
+			return normalized, nil
 		}
-		return normalized, nil
+		// Re-read and normalize under the store's atomic mutation boundary.
+		// Persisting the earlier snapshot with PutAccount could overwrite a
+		// concurrent debit or credit at the UTC policy-reset boundary.
+		return s.store.UpdateAccount(ctx, principalID, s.defaultAccount(principalID), func(current domain.Account, _ bool) (domain.Account, error) {
+			return s.normalizeAccount(current), nil
+		})
 	}
 	if err != store.ErrNotFound {
 		return domain.Account{}, err
 	}
-	return s.store.UpdateAccount(ctx, principalID, s.defaultAccount(principalID), func(a domain.Account, exists bool) (domain.Account, error) {
+	return s.store.UpdateAccount(ctx, principalID, s.defaultAccount(principalID), func(a domain.Account, _ bool) (domain.Account, error) {
 		return s.normalizeAccount(a), nil
 	})
 }
