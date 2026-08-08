@@ -55,3 +55,38 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test -race ./...
+
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: atos
+          POSTGRES_PASSWORD: atos
+          POSTGRES_DB: atos_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U atos -d atos_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      ATOS_DATABASE_URL: postgres://atos:atos@127.0.0.1:5432/atos_test?sslmode=disable
+      ATOS_TEST_DATABASE_URL: postgres://atos:atos@127.0.0.1:5432/atos_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: Verify checked-out revision
+        run: test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
+      - name: Apply embedded migrations
+        run: go run ./cmd/migrate
+      - name: Run PostgreSQL integration tests
+        run: go test -race ./internal/store/postgres
