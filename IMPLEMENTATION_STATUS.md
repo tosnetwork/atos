@@ -30,6 +30,7 @@ Implemented and tested:
 - embedded installable Skill served from `/skills/atos/SKILL.md`;
 - OAuth-style Device Authorization with pending approval, browser consent, polling intervals, `slow_down`, denial, expiry and bounded codes;
 - scoped access tokens, rotating refresh tokens, revocation and durable owner-private bbolt auth state;
+- trusted consent decisions derive the principal from the authenticated `X-ATOS-Principal-ID` boundary rather than a caller-supplied JSON field;
 - stateless Streamable HTTP MCP with nine deterministic ordinary consumer tools;
 - Capability search/retrieval, Commercial Quote, invocation, jobs and account;
 - PostgreSQL capability/search/business storage with complete v0.2 JSON payloads;
@@ -44,22 +45,76 @@ Implemented and tested:
 - production configuration gates requiring PostgreSQL, HTTPS public URL, explicit user approval, durable auth state and the RPC backend;
 - a full HTTP acceptance test from Skill retrieval and authorization through search, Quote, payment-policy handling, invocation, Receipt/settlement and exact balance mutation.
 
+### Crash-safe Managed economic state machine
+
+Managed economic mutations now use explicit durable private checkpoints:
+
+```text
+none
+  -> debited
+  -> escrow_pending
+  -> escrow_reserved
+  -> settlement_pending
+  -> settled
+
+failure/cancellation path:
+  escrow_pending / escrow_reserved
+  -> release_pending
+  -> released
+```
+
+The checkpoints are intentionally internal implementation state rather than new public ATOS protocol states.
+
+Crash-safety guarantees implemented by the gateway include:
+
+- Account debit and its Job `debited` checkpoint commit in one storage transaction;
+- Account refund/credit and the corresponding terminal Job checkpoint commit in one storage transaction;
+- PostgreSQL transaction-scoped advisory locks serialize Account, Job and idempotency mutation identities even before a logical row exists;
+- `working` is not persisted until the exact escrow has been created/recovered and its reference is durable;
+- `escrow_pending` means an external CreateEscrow result may be ambiguous and therefore MUST be recovered by idempotent replay rather than guessed or immediately refunded;
+- Job-to-Escrow is uniquely recoverable through the durable `job_id` relation;
+- escrow create, release and settlement adapters support stable replay semantics;
+- the exact verified Execution Receipt is privately persisted before the `settlement_pending` external effect;
+- a lost settlement response can be recovered after process restart without re-executing provider work;
+- a lost release response can be replayed without applying the Account refund twice;
+- settlement/refund finalization and Account mutation are atomic locally;
+- an immediate startup sweep plus a periodic reconciler resumes stale `submitted`, `working`, `canceling` and `reconciling` Jobs;
+- ambiguous external outcomes remain visibly `reconciling` and fail closed instead of being converted into a false terminal success/failure;
+- permanent CI runs the crash-recovery service tests against PostgreSQL 16 in addition to the in-memory failure-injection suite.
+
+Failure-injection coverage includes:
+
+```text
+lost CreateEscrow response after the escrow side effect committed
+lost SettleJob response after settlement committed
+lost ReleaseEscrow response after release committed
+process restart with settlement_pending + persisted Execution Receipt
+provider unavailable after that restart
+debited Job recovered before escrow creation
+stale Job discovery by the periodic reconciliation scan
+repeated recovery proving no double debit or double credit
+```
+
 ## Runtime boundary
 
 ```text
 Agent client
     -> REST / MCP / A2A
     -> ATOS Commercial Quote and Managed account policy
+    -> durable economic checkpoint
     -> tos-protocol ExecutionGatewayService
     -> private Unix-socket tos-ai Worker
     -> signed Execution Receipt
-    -> verification and Managed settlement
+    -> verification
+    -> durable settlement checkpoint
+    -> Managed settlement
+    -> atomic Account/Job finalization
 ```
 
 The deterministic mock backend remains available only as an explicit local-development/test deployment. Production configuration rejects it.
 
 ## Completion boundary
 
-“Phase 0/1 code complete” means the roadmap contracts, services, persistence, authorization, Managed economy and acceptance tests are implemented. It does not mean a public production environment has automatically been provisioned. A hosted launch still requires operator-controlled domains, certificates, PostgreSQL, secrets, backups, monitoring, billing policy, support and incident response.
+“Phase 0/1 code complete” means the roadmap contracts, services, persistence, authorization, Managed economy, crash recovery and executable acceptance criteria are implemented and permanently regression-tested. It does not mean a public production environment has automatically been provisioned. A hosted launch still requires operator-controlled domains, certificates, PostgreSQL, secrets, backups, monitoring, billing policy, support and incident response.
 
 Verified and Native work continues in later roadmap phases. Stronger-mode requests remain fail-closed unless the configured TOS backends provide the required guarantees.
