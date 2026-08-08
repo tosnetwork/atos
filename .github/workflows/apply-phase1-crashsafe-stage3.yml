@@ -54,9 +54,9 @@ jobs:
         run: go test -race -run 'CrashRecovery|PostgresRestart|Reconcile' ./internal/service
       - name: PostgreSQL and HTTP acceptance gates
         run: go test -race ./internal/store/postgres ./internal/httpapi ./internal/service
-      - name: Commit validated tests and permanent gate
+      - name: Commit validated tests
         run: |
-          git add internal/service/economic_crash_safety_test.go .github/workflows/ci.yml
+          git add internal/service/economic_crash_safety_test.go
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git commit -m 'test: close Phase 1 crash-recovery gates'
