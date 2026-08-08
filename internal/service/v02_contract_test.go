@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/service"
@@ -146,7 +145,6 @@ func TestPhase0ConcreteModesKeepOneQuoteAPIShape(t *testing.T) {
 			domain.TrustModeNative:   {Status: domain.ModeSupportActive, ProofProfile: domain.ProofProfileTOSNativeV1},
 		},
 		SupportedTrustModes: []domain.TrustMode{domain.TrustModeManaged, domain.TrustModeVerified, domain.TrustModeNative},
-		CreatedAt:           time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	if err := st.Put(ctx, capability); err != nil {
 		t.Fatal(err)
