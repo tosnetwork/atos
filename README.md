@@ -1,4 +1,4 @@
-# ATOS
+![ATOS](ATOS.png)
 
 Go implementation of the ATOS Agent Internet gateway defined in
 [`tosnetwork/atos-spec`](https://github.com/tosnetwork/atos-spec).
