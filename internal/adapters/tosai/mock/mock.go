@@ -17,12 +17,29 @@ import (
 )
 
 type Provider struct {
-	mu   sync.Mutex
-	jobs map[string]tosai.SubmitJobResult
+	mu        sync.Mutex
+	jobs      map[string]tosai.SubmitJobResult
+	modes     map[domain.TrustMode]bool
+	simulated bool
 }
 
 func New() *Provider {
-	return &Provider{jobs: make(map[string]tosai.SubmitJobResult)}
+	return newProvider(false, domain.TrustModeManaged)
+}
+
+// NewContractFixture creates a deliberately simulated provider that accepts
+// every concrete v0.2 mode. It exists only for Phase 0 contract/conformance
+// tests; runtime composition continues to use New, which is Managed-only.
+func NewContractFixture() *Provider {
+	return newProvider(true, domain.TrustModeManaged, domain.TrustModeVerified, domain.TrustModeNative)
+}
+
+func newProvider(simulated bool, modes ...domain.TrustMode) *Provider {
+	allowed := make(map[domain.TrustMode]bool, len(modes))
+	for _, mode := range modes {
+		allowed[mode] = true
+	}
+	return &Provider{jobs: make(map[string]tosai.SubmitJobResult), modes: allowed, simulated: simulated}
 }
 
 func (p *Provider) RegisterProvider(ctx context.Context, providerID string, capability domain.Capability) error {
@@ -34,8 +51,11 @@ func (p *Provider) GetProviderStatus(ctx context.Context, providerID string) (bo
 }
 
 func (p *Provider) SubmitJob(ctx context.Context, req tosai.SubmitJobRequest) (tosai.SubmitJobResult, error) {
-	if req.TrustMode != domain.TrustModeManaged {
-		return tosai.SubmitJobResult{}, fmt.Errorf("mock tos-ai is certified for managed mode only")
+	if !p.modes[req.TrustMode] {
+		return tosai.SubmitJobResult{}, fmt.Errorf("mock tos-ai is not configured for %s mode", req.TrustMode)
+	}
+	if err := domain.ValidateCommittedTrust(req.TrustMode, req.ProofProfile); err != nil {
+		return tosai.SubmitJobResult{}, err
 	}
 	started := time.Now().UTC()
 	output := map[string]any{
@@ -63,6 +83,12 @@ func (p *Provider) SubmitJob(ctx context.Context, req tosai.SubmitJobRequest) (t
 	receiptID := "xrcpt_" + uuid.NewString()
 	signerID := "sig_mock_tos_ai"
 	authorizationID := "auth_mock_" + req.CapabilityID
+	authorizationRef := "atos:managed:signer:" + signerID
+	networkProofRef := ""
+	if p.simulated && req.TrustMode != domain.TrustModeManaged {
+		authorizationRef = simulatedRef("signer", req.TrustMode, authorizationID)
+		networkProofRef = simulatedRef("execution", req.TrustMode, receiptID)
+	}
 	receipt := &domain.ExecutionReceipt{
 		ID:                     receiptID,
 		QuoteID:                req.QuoteID,
@@ -83,9 +109,10 @@ func (p *Provider) SubmitJob(ctx context.Context, req tosai.SubmitJobRequest) (t
 		CompletedAt:            completed,
 		ExecutionSignerID:      signerID,
 		SignerAuthorizationID:  authorizationID,
-		SignerAuthorizationRef: "atos:managed:signer:" + signerID,
+		SignerAuthorizationRef: authorizationRef,
 		SignatureAlgorithm:     "mock-sha256",
 		Signature:              mockSignature(receiptID, req.QuoteID, req.JobID, inputHash, outputHash, usageCommitment),
+		NetworkProofRef:        networkProofRef,
 	}
 
 	result := tosai.SubmitJobResult{
@@ -150,4 +177,8 @@ func mockSignature(parts ...string) string {
 	}
 	_, _ = h.Write([]byte(uuid.NewString()))
 	return "mock-unsigned:" + hex.EncodeToString(h.Sum(nil))
+}
+
+func simulatedRef(kind string, mode domain.TrustMode, id string) string {
+	return "simulated:atos-v0.2:" + string(mode) + ":" + kind + ":" + id
 }
