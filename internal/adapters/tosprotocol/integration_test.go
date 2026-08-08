@@ -88,6 +88,7 @@ func TestATOSConnectRPCManagedLifecycle(t *testing.T) {
 
 	quotes := service.NewQuoteService(st, client)
 	accounts := service.NewAccountService(st)
+	quotes.WithAccountService(accounts)
 	jobs := service.NewJobService(st, client, client, accounts)
 	input := map[string]any{"message": "hello over real RPC"}
 	quote, err := quotes.Create(ctx, service.CreateQuoteInput{

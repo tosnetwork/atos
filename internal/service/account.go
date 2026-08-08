@@ -10,22 +10,66 @@ import (
 
 const accountDecimals = 2
 
+type AccountDefaults struct {
+	InitialBalance domain.Money
+	PerCallLimit   domain.Money
+	DailyLimit     domain.Money
+}
+
+func DefaultAccountDefaults() AccountDefaults {
+	return AccountDefaults{
+		InitialBalance: domain.Money{Amount: "25.00", Currency: "USD"},
+		PerCallLimit:   domain.Money{Amount: "2.00", Currency: "USD"},
+		DailyLimit:     domain.Money{Amount: "20.00", Currency: "USD"},
+	}
+}
+
+func ValidateAccountDefaults(defaults AccountDefaults) error {
+	balance, err := money.Parse(defaults.InitialBalance.Amount, defaults.InitialBalance.Currency, accountDecimals)
+	if err != nil || balance.IsZero() {
+		return domain.NewError(domain.ErrValidationFailed, "invalid managed initial balance", false)
+	}
+	perCall, err := money.Parse(defaults.PerCallLimit.Amount, defaults.PerCallLimit.Currency, accountDecimals)
+	if err != nil {
+		return domain.NewError(domain.ErrValidationFailed, "invalid managed per-call limit", false)
+	}
+	daily, err := money.Parse(defaults.DailyLimit.Amount, defaults.DailyLimit.Currency, accountDecimals)
+	if err != nil || daily.IsZero() {
+		return domain.NewError(domain.ErrValidationFailed, "invalid managed daily limit", false)
+	}
+	if balance.Currency != perCall.Currency || balance.Currency != daily.Currency {
+		return domain.NewError(domain.ErrValidationFailed, "managed account defaults must use one currency", false)
+	}
+	if perCall.Cmp(daily) > 0 {
+		return domain.NewError(domain.ErrValidationFailed, "managed per-call limit exceeds daily limit", false)
+	}
+	return nil
+}
+
 type AccountService struct {
-	store store.Store
+	store    store.Store
+	defaults AccountDefaults
 }
 
-func NewAccountService(s store.Store) *AccountService {
-	return &AccountService{store: s}
+func NewAccountService(s store.Store, configured ...AccountDefaults) *AccountService {
+	defaults := DefaultAccountDefaults()
+	if len(configured) > 0 {
+		defaults = configured[0]
+	}
+	if err := ValidateAccountDefaults(defaults); err != nil {
+		panic(err)
+	}
+	return &AccountService{store: s, defaults: defaults}
 }
 
-func defaultAccount(principalID string) domain.Account {
+func (s *AccountService) defaultAccount(principalID string) domain.Account {
 	return domain.Account{
 		PrincipalID: principalID,
-		Balance:     domain.Money{Amount: "25.00", Currency: "USD"},
+		Balance:     s.defaults.InitialBalance,
 		SpendPolicy: domain.SpendPolicy{
-			PerCallAutonomousLimit: domain.Money{Amount: "2.00", Currency: "USD"},
-			DailyLimit:             domain.Money{Amount: "20.00", Currency: "USD"},
-			RemainingToday:         domain.Money{Amount: "20.00", Currency: "USD"},
+			PerCallAutonomousLimit: s.defaults.PerCallLimit,
+			DailyLimit:             s.defaults.DailyLimit,
+			RemainingToday:         s.defaults.DailyLimit,
 		},
 		TrustPolicy: domain.TrustPolicy{
 			DefaultRequestedTrustMode: domain.RequestedTrustAuto,
@@ -34,9 +78,9 @@ func defaultAccount(principalID string) domain.Account {
 	}
 }
 
-func normalizeAccount(a domain.Account) domain.Account {
+func (s *AccountService) normalizeAccount(a domain.Account) domain.Account {
 	if a.TrustPolicy.DefaultRequestedTrustMode == "" {
-		a.TrustPolicy = defaultAccount(a.PrincipalID).TrustPolicy
+		a.TrustPolicy = s.defaultAccount(a.PrincipalID).TrustPolicy
 	}
 	return a
 }
@@ -44,7 +88,7 @@ func normalizeAccount(a domain.Account) domain.Account {
 func (s *AccountService) Get(ctx context.Context, principalID string) (domain.Account, error) {
 	a, err := s.store.GetAccount(ctx, principalID)
 	if err == nil {
-		normalized := normalizeAccount(a)
+		normalized := s.normalizeAccount(a)
 		if normalized.TrustPolicy.DefaultRequestedTrustMode != a.TrustPolicy.DefaultRequestedTrustMode {
 			_ = s.store.PutAccount(ctx, normalized)
 		}
@@ -53,8 +97,8 @@ func (s *AccountService) Get(ctx context.Context, principalID string) (domain.Ac
 	if err != store.ErrNotFound {
 		return domain.Account{}, err
 	}
-	return s.store.UpdateAccount(ctx, principalID, defaultAccount(principalID), func(a domain.Account, exists bool) (domain.Account, error) {
-		return normalizeAccount(a), nil
+	return s.store.UpdateAccount(ctx, principalID, s.defaultAccount(principalID), func(a domain.Account, exists bool) (domain.Account, error) {
+		return s.normalizeAccount(a), nil
 	})
 }
 
@@ -83,8 +127,8 @@ func (s *AccountService) Debit(ctx context.Context, principalID, amountStr, curr
 		return domain.NewError(domain.ErrValidationFailed, "invalid amount", false)
 	}
 
-	_, err = s.store.UpdateAccount(ctx, principalID, defaultAccount(principalID), func(a domain.Account, exists bool) (domain.Account, error) {
-		a = normalizeAccount(a)
+	_, err = s.store.UpdateAccount(ctx, principalID, s.defaultAccount(principalID), func(a domain.Account, exists bool) (domain.Account, error) {
+		a = s.normalizeAccount(a)
 		balance, err := money.Parse(a.Balance.Amount, a.Balance.Currency, accountDecimals)
 		if err != nil {
 			return domain.Account{}, err
@@ -124,8 +168,8 @@ func (s *AccountService) Credit(ctx context.Context, principalID, amountStr, cur
 		return nil
 	}
 
-	_, err = s.store.UpdateAccount(ctx, principalID, defaultAccount(principalID), func(a domain.Account, exists bool) (domain.Account, error) {
-		a = normalizeAccount(a)
+	_, err = s.store.UpdateAccount(ctx, principalID, s.defaultAccount(principalID), func(a domain.Account, exists bool) (domain.Account, error) {
+		a = s.normalizeAccount(a)
 		balance, err := money.Parse(a.Balance.Amount, a.Balance.Currency, accountDecimals)
 		if err != nil {
 			return domain.Account{}, err

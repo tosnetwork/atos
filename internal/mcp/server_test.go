@@ -17,7 +17,7 @@ func accessToken(t *testing.T, svc *auth.Service, scopes ...auth.Scope) string {
 	for i, scope := range scopes {
 		raw[i] = string(scope)
 	}
-	grant, err := svc.StartDevice(raw)
+	grant, err := svc.StartDevice("test", "MCP Test", raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,10 @@ func names(tools []map[string]any) []string {
 }
 
 func TestOrdinaryConsumerSeesNineStableTools(t *testing.T) {
-	authorization := auth.NewService()
+	authorization, err := auth.Open(auth.Config{AutoApprove: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	token := accessToken(t, authorization,
 		auth.ScopeCapabilitiesRead,
 		auth.ScopeQuotesRead,
@@ -96,7 +99,10 @@ func TestOrdinaryConsumerSeesNineStableTools(t *testing.T) {
 }
 
 func TestProviderScopeAddsCapabilityManagementTools(t *testing.T) {
-	authorization := auth.NewService()
+	authorization, err := auth.Open(auth.Config{AutoApprove: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	token := accessToken(t, authorization,
 		auth.ScopeCapabilitiesRead,
 		auth.ScopeQuotesRead,
@@ -118,7 +124,10 @@ func TestProviderScopeAddsCapabilityManagementTools(t *testing.T) {
 }
 
 func TestScopeGatedToolIsUnreachableToConsumer(t *testing.T) {
-	authorization := auth.NewService()
+	authorization, err := auth.Open(auth.Config{AutoApprove: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	token := accessToken(t, authorization, auth.ScopeCapabilitiesRead)
 	body := bytes.NewBufferString(`{
 	  "jsonrpc":"2.0",

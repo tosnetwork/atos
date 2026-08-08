@@ -28,6 +28,7 @@ tags:
   - name: receipts
   - name: artifacts
   - name: metadata
+  - name: confirmations
 paths:
   /livez:
     get:
@@ -51,6 +52,71 @@ paths:
           content:
             application/json:
               schema: {type: object, additionalProperties: true}
+  /skills/atos/SKILL.md:
+    get:
+      tags: [metadata]
+      summary: Installable ATOS client skill
+      security: []
+      responses:
+        '200':
+          description: Canonical Markdown instructions for Codex and compatible agents
+          content:
+            text/markdown:
+              schema: {type: string}
+  /activate:
+    get:
+      tags: [auth]
+      summary: Device Authorization verification page
+      security: []
+      parameters:
+        - {name: code, in: query, schema: {type: string}}
+      responses:
+        '200':
+          description: Human-readable authorization status
+          content:
+            text/html:
+              schema: {type: string}
+    post:
+      tags: [auth]
+      summary: Record a browser consent decision behind the trusted ATOS login proxy
+      security: []
+      parameters:
+        - name: X-ATOS-Approval-Token
+          in: header
+          required: true
+          schema: {type: string}
+        - name: X-ATOS-Principal-ID
+          in: header
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [user_code, decision, csrf_token]
+              properties:
+                user_code: {type: string}
+                decision: {type: string, enum: [approve, deny]}
+                csrf_token: {type: string, minLength: 64, maxLength: 64}
+      responses:
+        '303': {description: Decision recorded and redirected to the activation status page}
+        default: {$ref: '#/components/responses/Error'}
+  /confirm:
+    get:
+      tags: [confirmations]
+      summary: Human-readable spend-confirmation page
+      security: []
+      parameters:
+        - {name: code, in: query, schema: {type: string}}
+      responses:
+        '200':
+          description: Confirmation instructions
+          content:
+            text/html:
+              schema: {type: string}
   /v1/auth/device:
     post:
       tags: [auth]
@@ -91,7 +157,36 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/TokenResponse'}
-        '202': {$ref: '#/components/responses/Error'}
+        '400':
+          description: OAuth Device Authorization status (`authorization_pending`, `slow_down`, `access_denied`, or `expired_token`)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OAuthError'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/auth/device/decision:
+    post:
+      tags: [auth]
+      summary: Trusted atos.im consent surface approves or denies a device code
+      security: []
+      parameters:
+        - name: X-ATOS-Approval-Token
+          in: header
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [user_code, decision]
+              properties:
+                user_code: {type: string}
+                principal_id: {type: string}
+                decision: {type: string, enum: [approve, deny]}
+      responses:
+        '200': {description: Device decision recorded}
         default: {$ref: '#/components/responses/Error'}
   /v1/auth/token/refresh:
     post:
@@ -121,6 +216,30 @@ paths:
       summary: Revoke the current access token
       responses:
         '204': {description: Revoked}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/auth/devices:
+    get:
+      tags: [auth]
+      summary: List the caller's authorized devices
+      responses:
+        '200':
+          description: Device inventory
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [devices]
+                properties:
+                  devices: {type: array, items: {$ref: '#/components/schemas/AuthorizedDevice'}}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/auth/devices/{id}:
+    delete:
+      tags: [auth]
+      summary: Revoke one authorized device and all of its credentials
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        '204': {description: Device revoked}
         default: {$ref: '#/components/responses/Error'}
   /v1/capabilities:
     get:
@@ -338,6 +457,34 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Job'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/confirmations/{code}:
+    parameters:
+      - {name: code, in: path, required: true, schema: {type: string}}
+    get:
+      tags: [confirmations]
+      summary: Read a spend confirmation owned by the caller
+      responses:
+        '200': {description: Bound spend confirmation}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/confirmations/{code}/decision:
+    parameters:
+      - {name: code, in: path, required: true, schema: {type: string}}
+    post:
+      tags: [confirmations]
+      summary: Approve or deny an exact paid request
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [decision]
+              properties:
+                decision: {type: string, enum: [approve, deny]}
+      responses:
+        '200': {description: Decision recorded}
         default: {$ref: '#/components/responses/Error'}
   /v1/account:
     get:
@@ -719,6 +866,18 @@ components:
         mime_type: {type: string}
         content: {type: object, additionalProperties: true}
         content_commitment: {type: string}
+    SpendConfirmation:
+      type: object
+      required: [confirmation_id, user_code, status, maximum, created_at, expires_at]
+      properties:
+        confirmation_id: {type: string}
+        user_code: {type: string}
+        status: {type: string, enum: [pending, approved, denied, expired, consumed]}
+        maximum: {$ref: '#/components/schemas/Money'}
+        created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+        decided_at: {type: string, format: date-time}
+        consumed_at: {type: string, format: date-time}
     Job:
       type: object
       required: [job_id, capability_id, capability_version, provider_id, quote_id, trust_mode, proof_status, state, created_at]
@@ -733,9 +892,11 @@ components:
         trust_mode: {$ref: '#/components/schemas/TrustMode'}
         proof_profile: {$ref: '#/components/schemas/ProofProfile'}
         proof_status: {$ref: '#/components/schemas/ProofStatus'}
-        state: {type: string, enum: [submitted, working, input_required, completed, failed, canceled, rejected]}
+        state: {type: string, enum: [submitted, working, input_required, canceling, reconciling, completed, failed, canceled, rejected]}
         output: {type: object, additionalProperties: true}
         artifacts: {type: array, items: {$ref: '#/components/schemas/JobArtifact'}}
+        confirmation: {$ref: '#/components/schemas/SpendConfirmation'}
+        reconciliation_required: {type: boolean}
         failure_reason: {type: string}
         error_code: {type: string}
         created_at: {type: string, format: date-time}
@@ -751,13 +912,13 @@ components:
         input: {type: object, additionalProperties: true}
         idempotency_key: {type: string, minLength: 1}
         max_wait_ms: {type: integer, minimum: 1000, maximum: 120000}
-        confirmed: {type: boolean, description: Phase 0 continuation after input_required}
     SubmitWorkResponse:
       type: object
       required: [result_type, job]
       properties:
         result_type: {type: string, enum: [completed, accepted, input_required, failed]}
         job: {$ref: '#/components/schemas/Job'}
+        confirmation_uri: {type: string, format: uri}
     Receipt:
       type: object
       required: [receipt_id, quote_id, escrow_id, job_id, trust_mode, charged, refunded, status, proof_status, created_at]
@@ -851,14 +1012,34 @@ components:
         interval: {type: integer}
     TokenResponse:
       type: object
-      required: [access_token, token_type, expires_in, refresh_token, principal_id, scopes]
+      required: [access_token, token_type, expires_in, refresh_token, principal_id, device_id, scopes]
       properties:
         access_token: {type: string}
         token_type: {type: string, const: Bearer}
         expires_in: {type: integer}
         refresh_token: {type: string}
         principal_id: {type: string}
+        device_id: {type: string}
         scopes: {type: array, items: {type: string}}
+    OAuthError:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error: {type: string, enum: [invalid_request, invalid_grant, authorization_pending, slow_down, access_denied, expired_token, temporarily_unavailable]}
+        error_description: {type: string}
+    AuthorizedDevice:
+      type: object
+      required: [device_id, principal_id, client_type, client_name, scopes, created_at, last_used_at]
+      properties:
+        device_id: {type: string}
+        principal_id: {type: string}
+        client_type: {type: string}
+        client_name: {type: string}
+        scopes: {type: array, items: {type: string}}
+        created_at: {type: string, format: date-time}
+        last_used_at: {type: string, format: date-time}
+        revoked_at: {type: string, format: date-time}
     ErrorEnvelope:
       type: object
       required: [error]

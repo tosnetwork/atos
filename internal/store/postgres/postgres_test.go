@@ -160,6 +160,7 @@ func TestFullJobLifecycleAgainstPostgres(t *testing.T) {
 	capabilities := service.NewCapabilityService(s)
 	quotes := service.NewQuoteService(s)
 	accounts := service.NewAccountService(s)
+	quotes.WithAccountService(accounts)
 	jobs := service.NewJobService(s, provider, core, accounts)
 
 	principalID := "prn_pg_lifecycle_" + randSuffix()

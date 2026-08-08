@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -380,6 +381,32 @@ func (s *Store) JobsByPrincipal(ctx context.Context, principalID string) ([]doma
 	return out, rows.Err()
 }
 
+func (s *Store) JobByConfirmationCode(ctx context.Context, userCode string) (domain.Job, error) {
+	j, err := scanJob(s.pool.QueryRow(ctx, `
+		SELECT `+jobColumns+` FROM jobs
+		WHERE payload #>> '{confirmation,user_code}' = $1
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, userCode))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Job{}, store.ErrNotFound
+	}
+	return j, err
+}
+
+func (s *Store) JobByIdempotencyKey(ctx context.Context, principalID, key string) (domain.Job, error) {
+	j, err := scanJob(s.pool.QueryRow(ctx, `
+		SELECT `+jobColumns+` FROM jobs
+		WHERE principal_id=$1 AND idempotency_key=$2
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, principalID, key))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Job{}, store.ErrNotFound
+	}
+	return j, err
+}
+
 func (s *Store) UpdateJob(ctx context.Context, id string, fn func(domain.Job, bool) (domain.Job, error)) (domain.Job, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -535,31 +562,70 @@ func (s *Store) GetArtifact(ctx context.Context, id string) (domain.StoredArtifa
 
 // --- Idempotency ---
 
-func (s *Store) Reserve(ctx context.Context, principalID, key, requestHash string) (store.IdempotencyRecord, bool, error) {
-	var rec store.IdempotencyRecord
-	var status string
-	err := s.pool.QueryRow(ctx, `
-		INSERT INTO idempotency_records (principal_id, key, request_hash, status)
-		VALUES ($1,$2,$3,$4)
-		ON CONFLICT (principal_id, key) DO NOTHING
-		RETURNING request_hash, response_key, status
-	`, principalID, key, requestHash, string(store.IdempotencyInProgress)).
-		Scan(&rec.RequestHash, &rec.ResponseKey, &status)
-	if err == nil {
-		rec.Status = store.IdempotencyStatus(status)
-		return rec, true, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+func (s *Store) Reserve(ctx context.Context, principalID, key, requestHash string, leaseUntil time.Time) (store.IdempotencyRecord, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
 		return store.IdempotencyRecord{}, false, err
 	}
-	err = s.pool.QueryRow(ctx, `
-		SELECT request_hash, response_key, status
-		FROM idempotency_records WHERE principal_id=$1 AND key=$2
-	`, principalID, key).Scan(&rec.RequestHash, &rec.ResponseKey, &status)
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var rec store.IdempotencyRecord
+	var status string
+	err = tx.QueryRow(ctx, `
+		SELECT request_hash, response_key, status, reserved_at, lease_expires_at
+		FROM idempotency_records
+		WHERE principal_id=$1 AND key=$2
+		FOR UPDATE
+	`, principalID, key).Scan(
+		&rec.RequestHash, &rec.ResponseKey, &status,
+		&rec.ReservedAt, &rec.LeaseExpires,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		now := time.Now().UTC()
+		_, err = tx.Exec(ctx, `
+			INSERT INTO idempotency_records (
+				principal_id, key, request_hash, status, reserved_at, lease_expires_at
+			) VALUES ($1,$2,$3,$4,$5,$6)
+		`, principalID, key, requestHash, string(store.IdempotencyInProgress), now, leaseUntil.UTC())
+		if err != nil {
+			return store.IdempotencyRecord{}, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return store.IdempotencyRecord{}, false, err
+		}
+		return store.IdempotencyRecord{
+			RequestHash:  requestHash,
+			Status:       store.IdempotencyInProgress,
+			ReservedAt:   now,
+			LeaseExpires: leaseUntil.UTC(),
+		}, true, nil
+	}
 	if err != nil {
 		return store.IdempotencyRecord{}, false, err
 	}
 	rec.Status = store.IdempotencyStatus(status)
+	now := time.Now().UTC()
+	if rec.Status == store.IdempotencyInProgress &&
+		rec.RequestHash == requestHash &&
+		!rec.LeaseExpires.IsZero() && !now.Before(rec.LeaseExpires) {
+		_, err = tx.Exec(ctx, `
+			UPDATE idempotency_records
+			SET reserved_at=$3, lease_expires_at=$4
+			WHERE principal_id=$1 AND key=$2
+		`, principalID, key, now, leaseUntil.UTC())
+		if err != nil {
+			return store.IdempotencyRecord{}, false, err
+		}
+		rec.ReservedAt = now
+		rec.LeaseExpires = leaseUntil.UTC()
+		if err := tx.Commit(ctx); err != nil {
+			return store.IdempotencyRecord{}, false, err
+		}
+		return rec, true, nil
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.IdempotencyRecord{}, false, err
+	}
 	return rec, false, nil
 }
 

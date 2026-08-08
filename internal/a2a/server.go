@@ -138,7 +138,6 @@ func (s *Server) handleMessageSend(ctx context.Context, w http.ResponseWriter, r
 	result, err := s.Jobs.Invoke(ctx, service.SubmitInput{
 		PrincipalID: principalID, CapabilityID: ext.CapabilityID,
 		QuoteID: ext.QuoteID, Input: input, IdempotencyKey: ext.IdempotencyKey,
-		Confirmed: ext.Confirmed,
 	})
 	if err != nil {
 		writeDomainErrorAsRPC(w, req.ID, err)

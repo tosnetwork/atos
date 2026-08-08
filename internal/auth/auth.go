@@ -1,11 +1,15 @@
-// Package auth implements the Phase 0/1 scoped gateway identity boundary.
-// It keeps tokens in memory but enforces the same principal/scope semantics the
-// production OAuth-compatible service must preserve.
+// Package auth implements ATOS's scoped Device Authorization boundary.
+// Device grants are pending until a trusted consent surface approves them;
+// development auto-approval is an explicit option rather than an implicit
+// production fallback.
 package auth
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -53,6 +57,7 @@ var defaultConsumerScopes = []Scope{
 
 type Principal struct {
 	ID        string
+	DeviceID  string
 	Scopes    map[Scope]struct{}
 	ExpiresAt time.Time
 }
@@ -89,12 +94,39 @@ func (p Principal) ScopeStrings() []string {
 	return out
 }
 
+type DeviceGrantStatus string
+
+const (
+	DeviceGrantPending  DeviceGrantStatus = "pending"
+	DeviceGrantApproved DeviceGrantStatus = "approved"
+	DeviceGrantDenied   DeviceGrantStatus = "denied"
+	DeviceGrantConsumed DeviceGrantStatus = "consumed"
+)
+
 type DeviceGrant struct {
-	DeviceCode string
-	UserCode   string
-	Scopes     []Scope
-	ExpiresAt  time.Time
-	Authorized bool
+	DeviceCodeHash string            `json:"device_code_hash"`
+	DeviceCode     string            `json:"-"`
+	UserCode       string            `json:"user_code"`
+	ClientType     string            `json:"client_type"`
+	ClientName     string            `json:"client_name"`
+	Scopes         []Scope           `json:"scopes"`
+	Status         DeviceGrantStatus `json:"status"`
+	PrincipalID    string            `json:"principal_id,omitempty"`
+	CreatedAt      time.Time         `json:"created_at"`
+	ExpiresAt      time.Time         `json:"expires_at"`
+	LastPolledAt   time.Time         `json:"last_polled_at,omitempty"`
+	DecidedAt      *time.Time        `json:"decided_at,omitempty"`
+}
+
+type Device struct {
+	ID          string     `json:"device_id"`
+	PrincipalID string     `json:"principal_id"`
+	ClientType  string     `json:"client_type"`
+	ClientName  string     `json:"client_name"`
+	Scopes      []Scope    `json:"scopes"`
+	CreatedAt   time.Time  `json:"created_at"`
+	LastUsedAt  time.Time  `json:"last_used_at"`
+	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
 }
 
 type TokenPair struct {
@@ -104,129 +136,467 @@ type TokenPair struct {
 	ExpiresIn    int64
 }
 
+type OAuthError struct {
+	Code        string
+	Description string
+	Retryable   bool
+}
+
+func (e *OAuthError) Error() string {
+	if e.Description == "" {
+		return e.Code
+	}
+	return e.Code + ": " + e.Description
+}
+
+type credential struct {
+	PrincipalID string    `json:"principal_id"`
+	DeviceID    string    `json:"device_id"`
+	Scopes      []Scope   `json:"scopes"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
+type snapshot struct {
+	Grants  map[string]DeviceGrant `json:"grants"`
+	Devices map[string]Device      `json:"devices"`
+	Access  map[string]credential  `json:"access"`
+	Refresh map[string]credential  `json:"refresh"`
+}
+
+type Persistence interface {
+	Load() (snapshot, error)
+	Save(snapshot) error
+	Close() error
+}
+
+type Config struct {
+	AutoApprove  bool
+	TokenTTL     time.Duration
+	DeviceTTL    time.Duration
+	PollInterval time.Duration
+	Persistence  Persistence
+	Now          func() time.Time
+}
+
 type Service struct {
-	mu       sync.Mutex
-	devices  map[string]DeviceGrant
-	access   map[string]Principal
-	refresh  map[string]Principal
-	revoked  map[string]struct{}
-	now      func() time.Time
-	tokenTTL time.Duration
+	mu           sync.Mutex
+	grants       map[string]DeviceGrant // keyed by hash(device_code)
+	userCodes    map[string]string      // user_code -> device-code hash
+	devices      map[string]Device
+	access       map[string]credential // keyed by hash(token)
+	refresh      map[string]credential
+	now          func() time.Time
+	tokenTTL     time.Duration
+	deviceTTL    time.Duration
+	pollInterval time.Duration
+	autoApprove  bool
+	persistence  Persistence
 }
 
 func NewService() *Service {
-	return &Service{
-		devices: make(map[string]DeviceGrant), access: make(map[string]Principal),
-		refresh: make(map[string]Principal), revoked: make(map[string]struct{}),
-		now: time.Now, tokenTTL: time.Hour,
+	svc, err := Open(Config{})
+	if err != nil {
+		panic(err)
 	}
+	return svc
 }
 
-func (s *Service) StartDevice(requested []string) (DeviceGrant, error) {
+func Open(cfg Config) (*Service, error) {
+	if cfg.TokenTTL == 0 {
+		cfg.TokenTTL = time.Hour
+	}
+	if cfg.DeviceTTL == 0 {
+		cfg.DeviceTTL = 15 * time.Minute
+	}
+	if cfg.PollInterval == 0 {
+		cfg.PollInterval = 5 * time.Second
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	if cfg.TokenTTL <= 0 || cfg.TokenTTL > 30*24*time.Hour ||
+		cfg.DeviceTTL <= 0 || cfg.DeviceTTL > time.Hour ||
+		cfg.PollInterval < time.Second || cfg.PollInterval > time.Minute {
+		return nil, errors.New("invalid authorization timing configuration")
+	}
+	s := &Service{
+		grants: make(map[string]DeviceGrant), userCodes: make(map[string]string),
+		devices: make(map[string]Device), access: make(map[string]credential),
+		refresh: make(map[string]credential), now: cfg.Now,
+		tokenTTL: cfg.TokenTTL, deviceTTL: cfg.DeviceTTL,
+		pollInterval: cfg.PollInterval, autoApprove: cfg.AutoApprove,
+		persistence: cfg.Persistence,
+	}
+	if cfg.Persistence != nil {
+		state, err := cfg.Persistence.Load()
+		if err != nil {
+			return nil, fmt.Errorf("load authorization state: %w", err)
+		}
+		s.restore(state)
+	}
+	return s, nil
+}
+
+func (s *Service) Close() error {
+	if s == nil || s.persistence == nil {
+		return nil
+	}
+	return s.persistence.Close()
+}
+
+func (s *Service) PollInterval() time.Duration { return s.pollInterval }
+
+func (s *Service) StartDevice(clientType, clientName string, requested []string) (DeviceGrant, error) {
 	scopes, err := normalizeScopes(requested)
 	if err != nil {
 		return DeviceGrant{}, err
 	}
-	now := s.now().UTC()
-	deviceCode := "dc_" + opaqueToken(24)
-	grant := DeviceGrant{
-		DeviceCode: deviceCode,
-		UserCode:   strings.ToUpper(uuid.NewString()[0:8]),
-		Scopes:     scopes, ExpiresAt: now.Add(15 * time.Minute),
-		// Phase 0: authorization is immediate. Production replaces this flag
-		// with the user-facing verification flow without changing token scopes.
-		Authorized: true,
+	clientType = strings.TrimSpace(clientType)
+	clientName = strings.TrimSpace(clientName)
+	if clientType == "" || len(clientType) > 64 || clientName == "" || len(clientName) > 128 {
+		return DeviceGrant{}, errors.New("client_type and client_name are required and bounded")
 	}
+	now := s.now().UTC()
 	s.mu.Lock()
-	s.devices[deviceCode] = grant
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+
+	var deviceCode, deviceCodeHash, code string
+	for attempt := 0; attempt < 16; attempt++ {
+		candidateDevice := "dc_" + opaqueToken(32)
+		candidateHash := tokenHash(candidateDevice)
+		candidateCode := userCode()
+		if _, exists := s.grants[candidateHash]; exists {
+			continue
+		}
+		if _, exists := s.userCodes[candidateCode]; exists {
+			continue
+		}
+		deviceCode, deviceCodeHash, code = candidateDevice, candidateHash, candidateCode
+		break
+	}
+	if deviceCode == "" {
+		return DeviceGrant{}, errors.New("could not allocate a unique device authorization code")
+	}
+	grant := DeviceGrant{
+		DeviceCodeHash: deviceCodeHash, DeviceCode: deviceCode,
+		UserCode: code, ClientType: clientType, ClientName: clientName,
+		Scopes: scopes, Status: DeviceGrantPending,
+		CreatedAt: now, ExpiresAt: now.Add(s.deviceTTL),
+	}
+	if s.autoApprove {
+		grant.Status = DeviceGrantApproved
+		grant.PrincipalID = "prn_" + uuid.NewString()
+		grant.DecidedAt = &now
+	}
+	s.grants[grant.DeviceCodeHash] = grant
+	s.userCodes[grant.UserCode] = grant.DeviceCodeHash
+	if err := s.persistLocked(); err != nil {
+		delete(s.grants, grant.DeviceCodeHash)
+		delete(s.userCodes, grant.UserCode)
+		return DeviceGrant{}, err
+	}
+	return grant, nil
+}
+
+func (s *Service) GrantByUserCode(userCode string) (DeviceGrant, error) {
+	now := s.now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	hash, ok := s.userCodes[normalizeUserCode(userCode)]
+	if !ok {
+		return DeviceGrant{}, errors.New("device authorization not found")
+	}
+	grant, ok := s.grants[hash]
+	if !ok {
+		return DeviceGrant{}, errors.New("device authorization not found")
+	}
+	grant.DeviceCode = ""
+	return grant, nil
+}
+
+func (s *Service) DecideDevice(userCode, principalID string, approve bool) (DeviceGrant, error) {
+	now := s.now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	hash, ok := s.userCodes[normalizeUserCode(userCode)]
+	if !ok {
+		return DeviceGrant{}, errors.New("device authorization not found")
+	}
+	grant, ok := s.grants[hash]
+	if !ok || !now.Before(grant.ExpiresAt) {
+		return DeviceGrant{}, errors.New("device authorization expired")
+	}
+	if grant.Status != DeviceGrantPending {
+		return DeviceGrant{}, errors.New("device authorization was already decided")
+	}
+	grant.DecidedAt = &now
+	if approve {
+		grant.Status = DeviceGrantApproved
+		principalID = strings.TrimSpace(principalID)
+		if principalID == "" {
+			principalID = "prn_" + uuid.NewString()
+		}
+		if len(principalID) > 160 {
+			return DeviceGrant{}, errors.New("principal_id is too long")
+		}
+		grant.PrincipalID = principalID
+	} else {
+		grant.Status = DeviceGrantDenied
+	}
+	s.grants[hash] = grant
+	if err := s.persistLocked(); err != nil {
+		return DeviceGrant{}, err
+	}
+	grant.DeviceCode = ""
 	return grant, nil
 }
 
 func (s *Service) ExchangeDevice(deviceCode string) (TokenPair, error) {
 	now := s.now().UTC()
+	hash := tokenHash(strings.TrimSpace(deviceCode))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	grant, ok := s.devices[deviceCode]
+	s.cleanupLocked(now)
+	grant, ok := s.grants[hash]
 	if !ok {
-		return TokenPair{}, fmt.Errorf("invalid device_code")
+		return TokenPair{}, &OAuthError{Code: "invalid_grant", Description: "invalid device_code"}
 	}
 	if !now.Before(grant.ExpiresAt) {
-		delete(s.devices, deviceCode)
-		return TokenPair{}, fmt.Errorf("device_code expired")
+		s.deleteGrantLocked(hash, grant)
+		_ = s.persistLocked()
+		return TokenPair{}, &OAuthError{Code: "expired_token", Description: "device_code expired"}
 	}
-	if !grant.Authorized {
-		return TokenPair{}, fmt.Errorf("authorization_pending")
+	if !grant.LastPolledAt.IsZero() && now.Sub(grant.LastPolledAt) < s.pollInterval {
+		grant.LastPolledAt = now
+		s.grants[hash] = grant
+		_ = s.persistLocked()
+		return TokenPair{}, &OAuthError{Code: "slow_down", Description: "polling faster than the advertised interval", Retryable: true}
 	}
-	delete(s.devices, deviceCode)
-	principal := Principal{
-		ID: "prn_" + uuid.NewString(), Scopes: scopeSet(grant.Scopes),
-		ExpiresAt: now.Add(s.tokenTTL),
+	grant.LastPolledAt = now
+	s.grants[hash] = grant
+	switch grant.Status {
+	case DeviceGrantPending:
+		_ = s.persistLocked()
+		return TokenPair{}, &OAuthError{Code: "authorization_pending", Retryable: true}
+	case DeviceGrantDenied:
+		s.deleteGrantLocked(hash, grant)
+		_ = s.persistLocked()
+		return TokenPair{}, &OAuthError{Code: "access_denied", Description: "the user denied this device"}
+	case DeviceGrantApproved:
+		deviceID := "dev_" + uuid.NewString()
+		device := Device{
+			ID: deviceID, PrincipalID: grant.PrincipalID,
+			ClientType: grant.ClientType, ClientName: grant.ClientName,
+			Scopes: append([]Scope(nil), grant.Scopes...), CreatedAt: now, LastUsedAt: now,
+		}
+		s.devices[deviceID] = device
+		grant.Status = DeviceGrantConsumed
+		s.grants[hash] = grant
+		s.deleteGrantLocked(hash, grant)
+		principal := Principal{
+			ID: grant.PrincipalID, DeviceID: deviceID,
+			Scopes: scopeSet(grant.Scopes), ExpiresAt: now.Add(s.tokenTTL),
+		}
+		pair := s.issueLocked(principal)
+		if err := s.persistLocked(); err != nil {
+			return TokenPair{}, err
+		}
+		return pair, nil
+	default:
+		return TokenPair{}, &OAuthError{Code: "invalid_grant", Description: "device_code already consumed"}
 	}
-	return s.issueLocked(principal), nil
 }
 
 func (s *Service) Refresh(refreshToken string) (TokenPair, error) {
 	now := s.now().UTC()
+	hash := tokenHash(strings.TrimSpace(refreshToken))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, revoked := s.revoked[refreshToken]; revoked {
-		return TokenPair{}, fmt.Errorf("refresh token revoked")
+	cred, ok := s.refresh[hash]
+	if !ok || !now.Before(cred.ExpiresAt) {
+		delete(s.refresh, hash)
+		_ = s.persistLocked()
+		return TokenPair{}, &OAuthError{Code: "invalid_grant", Description: "invalid or expired refresh_token"}
 	}
-	principal, ok := s.refresh[refreshToken]
-	if !ok {
-		return TokenPair{}, fmt.Errorf("invalid refresh_token")
+	device, ok := s.devices[cred.DeviceID]
+	if !ok || device.RevokedAt != nil {
+		delete(s.refresh, hash)
+		_ = s.persistLocked()
+		return TokenPair{}, &OAuthError{Code: "access_denied", Description: "device has been revoked"}
 	}
-	delete(s.refresh, refreshToken)
-	s.revoked[refreshToken] = struct{}{}
-	principal.ExpiresAt = now.Add(s.tokenTTL)
-	return s.issueLocked(principal), nil
+	delete(s.refresh, hash)
+	principal := Principal{
+		ID: cred.PrincipalID, DeviceID: cred.DeviceID,
+		Scopes: scopeSet(cred.Scopes), ExpiresAt: now.Add(s.tokenTTL),
+	}
+	device.LastUsedAt = now
+	s.devices[device.ID] = device
+	pair := s.issueLocked(principal)
+	if err := s.persistLocked(); err != nil {
+		return TokenPair{}, err
+	}
+	return pair, nil
 }
 
 func (s *Service) Authenticate(accessToken string) (Principal, error) {
-	if accessToken == "" {
-		return Principal{}, fmt.Errorf("missing bearer token")
+	if strings.TrimSpace(accessToken) == "" {
+		return Principal{}, errors.New("missing bearer token")
 	}
 	now := s.now().UTC()
+	hash := tokenHash(strings.TrimSpace(accessToken))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, revoked := s.revoked[accessToken]; revoked {
-		return Principal{}, fmt.Errorf("access token revoked")
-	}
-	principal, ok := s.access[accessToken]
+	cred, ok := s.access[hash]
 	if !ok {
-		return Principal{}, fmt.Errorf("invalid access token")
+		return Principal{}, errors.New("invalid access token")
 	}
-	if !now.Before(principal.ExpiresAt) {
-		delete(s.access, accessToken)
-		return Principal{}, fmt.Errorf("access token expired")
+	if !now.Before(cred.ExpiresAt) {
+		delete(s.access, hash)
+		_ = s.persistLocked()
+		return Principal{}, errors.New("access token expired")
 	}
-	principal.Scopes = cloneScopeSet(principal.Scopes)
-	return principal, nil
+	device, ok := s.devices[cred.DeviceID]
+	if !ok || device.RevokedAt != nil {
+		delete(s.access, hash)
+		_ = s.persistLocked()
+		return Principal{}, errors.New("device has been revoked")
+	}
+	device.LastUsedAt = now
+	s.devices[device.ID] = device
+	_ = s.persistLocked()
+	return Principal{
+		ID: cred.PrincipalID, DeviceID: cred.DeviceID,
+		Scopes: scopeSet(cred.Scopes), ExpiresAt: cred.ExpiresAt,
+	}, nil
 }
 
 func (s *Service) Revoke(token string) {
-	if token == "" {
+	if strings.TrimSpace(token) == "" {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.access, token)
-	delete(s.refresh, token)
-	s.revoked[token] = struct{}{}
+	hash := tokenHash(strings.TrimSpace(token))
+	delete(s.access, hash)
+	delete(s.refresh, hash)
+	_ = s.persistLocked()
+}
+
+func (s *Service) Devices(principalID string) []Device {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Device, 0)
+	for _, device := range s.devices {
+		if device.PrincipalID == principalID {
+			copy := device
+			copy.Scopes = append([]Scope(nil), device.Scopes...)
+			out = append(out, copy)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out
+}
+
+func (s *Service) RevokeDevice(principalID, deviceID string) error {
+	now := s.now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	device, ok := s.devices[deviceID]
+	if !ok || device.PrincipalID != principalID {
+		return errors.New("device not found")
+	}
+	if device.RevokedAt == nil {
+		device.RevokedAt = &now
+		s.devices[deviceID] = device
+	}
+	for key, cred := range s.access {
+		if cred.DeviceID == deviceID {
+			delete(s.access, key)
+		}
+	}
+	for key, cred := range s.refresh {
+		if cred.DeviceID == deviceID {
+			delete(s.refresh, key)
+		}
+	}
+	return s.persistLocked()
 }
 
 func (s *Service) issueLocked(principal Principal) TokenPair {
 	accessToken := "at_" + opaqueToken(32)
 	refreshToken := "rt_" + opaqueToken(32)
-	stored := principal
-	stored.Scopes = cloneScopeSet(principal.Scopes)
-	s.access[accessToken] = stored
-	s.refresh[refreshToken] = stored
+	cred := credential{
+		PrincipalID: principal.ID, DeviceID: principal.DeviceID,
+		Scopes: principalScopes(principal), ExpiresAt: principal.ExpiresAt,
+	}
+	s.access[tokenHash(accessToken)] = cred
+	// Phase 1 keeps refresh lifetime equal to access lifetime. A production
+	// policy can lengthen it without changing the public flow.
+	s.refresh[tokenHash(refreshToken)] = cred
 	return TokenPair{
 		AccessToken: accessToken, RefreshToken: refreshToken,
 		Principal: principal, ExpiresIn: int64(s.tokenTTL.Seconds()),
 	}
+}
+
+func (s *Service) cleanupLocked(now time.Time) {
+	for key, grant := range s.grants {
+		if !now.Before(grant.ExpiresAt) {
+			s.deleteGrantLocked(key, grant)
+		}
+	}
+	for key, cred := range s.access {
+		if !now.Before(cred.ExpiresAt) {
+			delete(s.access, key)
+		}
+	}
+	for key, cred := range s.refresh {
+		if !now.Before(cred.ExpiresAt) {
+			delete(s.refresh, key)
+		}
+	}
+}
+
+func (s *Service) deleteGrantLocked(hash string, grant DeviceGrant) {
+	delete(s.grants, hash)
+	delete(s.userCodes, grant.UserCode)
+}
+
+func (s *Service) restore(state snapshot) {
+	if state.Grants != nil {
+		s.grants = state.Grants
+	}
+	if state.Devices != nil {
+		s.devices = state.Devices
+	}
+	if state.Access != nil {
+		s.access = state.Access
+	}
+	if state.Refresh != nil {
+		s.refresh = state.Refresh
+	}
+	for hash, grant := range s.grants {
+		s.userCodes[grant.UserCode] = hash
+	}
+	s.cleanupLocked(s.now().UTC())
+}
+
+func (s *Service) persistLocked() error {
+	if s.persistence == nil {
+		return nil
+	}
+	return s.persistence.Save(snapshot{
+		Grants: cloneGrantMap(s.grants), Devices: cloneDeviceMap(s.devices),
+		Access: cloneCredentialMap(s.access), Refresh: cloneCredentialMap(s.refresh),
+	})
 }
 
 func normalizeScopes(requested []string) ([]Scope, error) {
@@ -258,10 +628,39 @@ func scopeSet(scopes []Scope) map[Scope]struct{} {
 	return out
 }
 
-func cloneScopeSet(in map[Scope]struct{}) map[Scope]struct{} {
-	out := make(map[Scope]struct{}, len(in))
-	for scope := range in {
-		out[scope] = struct{}{}
+func principalScopes(principal Principal) []Scope {
+	out := make([]Scope, 0, len(principal.Scopes))
+	for scope := range principal.Scopes {
+		out = append(out, scope)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+func cloneGrantMap(in map[string]DeviceGrant) map[string]DeviceGrant {
+	out := make(map[string]DeviceGrant, len(in))
+	for key, value := range in {
+		value.DeviceCode = ""
+		value.Scopes = append([]Scope(nil), value.Scopes...)
+		out[key] = value
+	}
+	return out
+}
+
+func cloneDeviceMap(in map[string]Device) map[string]Device {
+	out := make(map[string]Device, len(in))
+	for key, value := range in {
+		value.Scopes = append([]Scope(nil), value.Scopes...)
+		out[key] = value
+	}
+	return out
+}
+
+func cloneCredentialMap(in map[string]credential) map[string]credential {
+	out := make(map[string]credential, len(in))
+	for key, value := range in {
+		value.Scopes = append([]Scope(nil), value.Scopes...)
+		out[key] = value
 	}
 	return out
 }
@@ -272,4 +671,31 @@ func opaqueToken(bytes int) string {
 		return strings.ReplaceAll(uuid.NewString()+uuid.NewString(), "-", "")
 	}
 	return base64.RawURLEncoding.EncodeToString(buf)
+}
+
+func tokenHash(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func userCode() string {
+	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	buf := make([]byte, 8)
+	random := make([]byte, len(buf))
+	if _, err := rand.Read(random); err != nil {
+		random = []byte(strings.ReplaceAll(uuid.NewString(), "-", ""))[:len(buf)]
+	}
+	for i := range buf {
+		buf[i] = alphabet[int(random[i])%len(alphabet)]
+	}
+	return string(buf[:4]) + "-" + string(buf[4:])
+}
+
+func normalizeUserCode(value string) string {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, " ", "")
+	if len(value) == 8 && !strings.Contains(value, "-") {
+		value = value[:4] + "-" + value[4:]
+	}
+	return value
 }

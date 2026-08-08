@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -99,9 +98,7 @@ type registerCapabilityRequest struct {
 
 func (s *Server) handleRegisterCapability(w http.ResponseWriter, r *http.Request) {
 	var req registerCapabilityRequest
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
+	if err := decodeRequestJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed capability request: "+err.Error(), false)
 		return
 	}
@@ -121,9 +118,7 @@ func (s *Server) handleRegisterCapability(w http.ResponseWriter, r *http.Request
 
 func (s *Server) handleUpdateCapability(w http.ResponseWriter, r *http.Request) {
 	var patch map[string]any
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&patch); err != nil {
+	if err := decodeRequestJSON(r, &patch); err != nil {
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed JSON body", false)
 		return
 	}

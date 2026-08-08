@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"github.com/tosnetwork/atos/internal/auth"
@@ -17,9 +16,7 @@ type createUploadRequest struct {
 
 func (s *Server) handleCreateUpload(w http.ResponseWriter, r *http.Request) {
 	var req createUploadRequest
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
+	if err := decodeRequestJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed upload request: "+err.Error(), false)
 		return
 	}

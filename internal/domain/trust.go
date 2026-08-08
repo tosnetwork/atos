@@ -74,6 +74,21 @@ func StandardProofProfile(mode TrustMode) ProofProfile {
 	}
 }
 
+// ValidateCommittedTrust validates a trust mode/profile pair after Quote
+// resolution. Auto is not representable as TrustMode; Managed must carry no
+// network proof profile, while Verified and Native must carry their normative
+// v0.2 profiles. This helper is used at every committed persistence boundary.
+func ValidateCommittedTrust(mode TrustMode, profile ProofProfile) error {
+	if !mode.Valid() {
+		return fmt.Errorf("invalid committed trust_mode %q", mode)
+	}
+	want := StandardProofProfile(mode)
+	if profile != want {
+		return fmt.Errorf("proof_profile %q does not match trust_mode %q (want %q)", profile, mode, want)
+	}
+	return nil
+}
+
 type ModeSupportStatus string
 
 const (

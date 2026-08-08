@@ -77,7 +77,7 @@ func (s *CapabilityService) Register(ctx context.Context, in RegisterCapabilityI
 		in.DeliveryMode, in.InputSchema, in.OutputSchema, in.Pricing,
 		in.Tags, requested, bindings,
 	)
-	record, reserved, err := s.store.Reserve(ctx, in.ProviderID, in.IdempotencyKey, requestHash)
+	record, reserved, err := s.store.Reserve(ctx, in.ProviderID, in.IdempotencyKey, requestHash, time.Now().UTC().Add(idempotencyLease))
 	if err != nil {
 		return domain.Capability{}, err
 	}
@@ -141,7 +141,7 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 		return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "idempotency_key is required", false)
 	}
 	requestHash := hashRequest("update-capability", id, patch)
-	record, reserved, err := s.store.Reserve(ctx, requestingProviderID, idempotencyKey, requestHash)
+	record, reserved, err := s.store.Reserve(ctx, requestingProviderID, idempotencyKey, requestHash, time.Now().UTC().Add(idempotencyLease))
 	if err != nil {
 		return domain.Capability{}, err
 	}

@@ -1,8 +1,9 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/service"
@@ -14,9 +15,6 @@ type submitRequest struct {
 	Input          map[string]any `json:"input"`
 	IdempotencyKey string         `json:"idempotency_key"`
 	MaxWaitMS      int64          `json:"max_wait_ms"`
-	// Confirmed lets a client reissue the same idempotency_key after
-	// seeing result_type=input_required, per docs/MCP.md's MRTR flow.
-	Confirmed bool `json:"confirmed"`
 }
 
 func (r submitRequest) validate() *domain.Error {
@@ -27,21 +25,26 @@ func (r submitRequest) validate() *domain.Error {
 }
 
 type submitResponse struct {
-	ResultType string     `json:"result_type"`
-	Job        domain.Job `json:"job"`
+	ResultType      string     `json:"result_type"`
+	Job             domain.Job `json:"job"`
+	ConfirmationURI string     `json:"confirmation_uri,omitempty"`
 }
 
-func writeSubmitResult(w http.ResponseWriter, result service.SubmitResult) {
+func (s *Server) writeSubmitResult(w http.ResponseWriter, result service.SubmitResult) {
 	status := http.StatusOK
 	if result.Type == service.ResultAccepted {
 		status = http.StatusAccepted
 	}
-	writeJSON(w, status, submitResponse{ResultType: string(result.Type), Job: result.Job})
+	response := submitResponse{ResultType: string(result.Type), Job: result.Job}
+	if result.Job.Confirmation != nil {
+		response.ConfirmationURI = strings.TrimRight(s.PublicBaseURL, "/") + "/confirm?code=" + url.QueryEscape(result.Job.Confirmation.UserCode)
+	}
+	writeJSON(w, status, response)
 }
 
 func (s *Server) handleInvoke(w http.ResponseWriter, r *http.Request) {
 	var req submitRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeRequestJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed JSON body", false)
 		return
 	}
@@ -56,18 +59,17 @@ func (s *Server) handleInvoke(w http.ResponseWriter, r *http.Request) {
 		Input:          req.Input,
 		IdempotencyKey: req.IdempotencyKey,
 		MaxWaitMS:      req.MaxWaitMS,
-		Confirmed:      req.Confirmed,
 	})
 	if err != nil {
 		writeDomainErr(w, err)
 		return
 	}
-	writeSubmitResult(w, result)
+	s.writeSubmitResult(w, result)
 }
 
 func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	var req submitRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeRequestJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed JSON body", false)
 		return
 	}
@@ -81,13 +83,12 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		QuoteID:        req.QuoteID,
 		Input:          req.Input,
 		IdempotencyKey: req.IdempotencyKey,
-		Confirmed:      req.Confirmed,
 	})
 	if err != nil {
 		writeDomainErr(w, err)
 		return
 	}
-	writeSubmitResult(w, result)
+	s.writeSubmitResult(w, result)
 }
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
@@ -112,7 +113,7 @@ type cancelRequest struct {
 func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req cancelRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeRequestJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed JSON body", false)
 		return
 	}

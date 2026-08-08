@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"github.com/tosnetwork/atos/internal/domain"
@@ -21,9 +20,7 @@ type createQuoteRequest struct {
 
 func (s *Server) handleCreateQuote(w http.ResponseWriter, r *http.Request) {
 	var req createQuoteRequest
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
+	if err := decodeRequestJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed quote request: "+err.Error(), false)
 		return
 	}
@@ -50,6 +47,10 @@ func (s *Server) handleGetQuote(w http.ResponseWriter, r *http.Request) {
 	q, err := s.Quotes.Get(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeDomainErr(w, err)
+		return
+	}
+	if q.PrincipalID != "" && q.PrincipalID != principalFrom(r) {
+		writeError(w, http.StatusForbidden, domain.ErrPermissionDenied, "not the Quote's owning principal", false)
 		return
 	}
 	writeJSON(w, http.StatusOK, q)

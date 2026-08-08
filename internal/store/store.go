@@ -8,6 +8,7 @@ package store
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/tosnetwork/atos/internal/domain"
 )
@@ -34,9 +35,11 @@ const (
 // retried request with the same key returns the original outcome instead
 // of re-executing (docs/MCP.md "Idempotency").
 type IdempotencyRecord struct {
-	RequestHash string
-	ResponseKey string // opaque pointer the caller resolves (e.g. a job/invocation ID); only meaningful once Status is Completed
-	Status      IdempotencyStatus
+	RequestHash  string
+	ResponseKey  string // opaque pointer the caller resolves (e.g. a job/invocation ID); only meaningful once Status is Completed
+	Status       IdempotencyStatus
+	ReservedAt   time.Time
+	LeaseExpires time.Time
 }
 
 // Method names are qualified per collection (PutQuote, not Put) because
@@ -71,6 +74,8 @@ type Jobs interface {
 	PutJob(ctx context.Context, j domain.Job) error
 	GetJob(ctx context.Context, id string) (domain.Job, error)
 	JobsByPrincipal(ctx context.Context, principalID string) ([]domain.Job, error)
+	JobByConfirmationCode(ctx context.Context, userCode string) (domain.Job, error)
+	JobByIdempotencyKey(ctx context.Context, principalID, key string) (domain.Job, error)
 	// UpdateJob atomically applies fn to the job's current stored state (or
 	// domain.Job{} with exists=false if it isn't stored yet) and persists
 	// whatever fn returns. fn returning an error aborts without persisting
@@ -101,7 +106,7 @@ type Idempotency interface {
 	// If the key was already used it returns the prior record and ok=false
 	// so the caller can return the cached result (Completed) or a
 	// retry-later conflict (still InProgress).
-	Reserve(ctx context.Context, principalID, key, requestHash string) (rec IdempotencyRecord, ok bool, err error)
+	Reserve(ctx context.Context, principalID, key, requestHash string, leaseUntil time.Time) (rec IdempotencyRecord, ok bool, err error)
 	// Finish marks a reservation Completed with its response_key, so a
 	// later replay resolves to the real result.
 	Finish(ctx context.Context, principalID, key, responseKey string) error

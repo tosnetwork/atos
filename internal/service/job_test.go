@@ -32,6 +32,7 @@ func newHarness() harness {
 	capabilities := service.NewCapabilityService(st)
 	quotes := service.NewQuoteService(st)
 	accounts := service.NewAccountService(st)
+	quotes.WithAccountService(accounts)
 	jobs := service.NewJobService(st, provider, core, accounts)
 	return harness{capabilities: capabilities, quotes: quotes, accounts: accounts, jobs: jobs, st: st}
 }
@@ -178,13 +179,18 @@ func TestJobLifecycleConfirmationFlow(t *testing.T) {
 		t.Errorf("balance before confirmation = %q, want unchanged 25.00", before.Balance.Amount)
 	}
 
+	if pending.Job.Confirmation == nil {
+		t.Fatal("input_required job did not include a server-issued confirmation")
+	}
+	if _, err := h.jobs.DecideConfirmation(ctx, pending.Job.Confirmation.UserCode, "prn_client2", true); err != nil {
+		t.Fatalf("approve confirmation: %v", err)
+	}
 	confirmed, err := h.jobs.Invoke(ctx, service.SubmitInput{
 		PrincipalID:    "prn_client2",
 		CapabilityID:   cap.ID,
 		QuoteID:        quote.ID,
 		Input:          map[string]any{},
 		IdempotencyKey: "confirm-1",
-		Confirmed:      true,
 	})
 	if err != nil {
 		t.Fatalf("confirmed Invoke: %v", err)
@@ -235,6 +241,9 @@ func TestJobCancelBeforeConfirmation(t *testing.T) {
 	if canceled.State != domain.JobCanceled {
 		t.Fatalf("job state after cancel = %q, want canceled", canceled.State)
 	}
+	if canceled.ErrorCode != "" {
+		t.Fatalf("successful cancel returned error_code %q", canceled.ErrorCode)
+	}
 
 	// Idempotent replay of the cancel must return the same result, not error.
 	replay, err := h.jobs.Cancel(ctx, pending.Job.ID, "prn_client3", "changed my mind", "cancel-op-1")
@@ -264,5 +273,60 @@ func TestJobCancelBeforeConfirmation(t *testing.T) {
 	}
 	if acct.Balance.Amount != "25.00" {
 		t.Errorf("balance = %q, want unchanged 25.00 (canceled before any escrow existed)", acct.Balance.Amount)
+	}
+}
+
+func TestSpendConfirmationCannotBeApprovedByAnotherPrincipal(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness()
+	cap := registerCapability(t, h, "agt_confirmation_owner", "5.00")
+	quote := createQuote(t, h, cap.ID)
+	pending, err := h.jobs.Invoke(ctx, service.SubmitInput{
+		PrincipalID: "prn_owner", CapabilityID: cap.ID, QuoteID: quote.ID,
+		Input: map[string]any{"sensitive": true}, IdempotencyKey: "owner-confirmation",
+	})
+	if err != nil || pending.Job.Confirmation == nil {
+		t.Fatalf("pending confirmation = %+v err=%v", pending, err)
+	}
+	if _, err := h.jobs.DecideConfirmation(ctx, pending.Job.Confirmation.UserCode, "prn_attacker", true); err == nil {
+		t.Fatal("another principal approved the spend confirmation")
+	}
+	replay, err := h.jobs.Invoke(ctx, service.SubmitInput{
+		PrincipalID: "prn_owner", CapabilityID: cap.ID, QuoteID: quote.ID,
+		Input: map[string]any{"sensitive": true}, IdempotencyKey: "owner-confirmation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.Type != service.ResultInputRequired {
+		t.Fatalf("replay type = %q, want input_required", replay.Type)
+	}
+}
+
+func TestSpendConfirmationIsBoundToOriginalRequest(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness()
+	cap := registerCapability(t, h, "agt_binding", "5.00")
+	quote := createQuote(t, h, cap.ID)
+	pending, err := h.jobs.Invoke(ctx, service.SubmitInput{
+		PrincipalID: "prn_binding", CapabilityID: cap.ID, QuoteID: quote.ID,
+		Input: map[string]any{"value": "original"}, IdempotencyKey: "binding-key",
+	})
+	if err != nil || pending.Job.Confirmation == nil {
+		t.Fatalf("pending = %+v err=%v", pending, err)
+	}
+	if _, err := h.jobs.DecideConfirmation(ctx, pending.Job.Confirmation.UserCode, "prn_binding", true); err != nil {
+		t.Fatal(err)
+	}
+	_, err = h.jobs.Invoke(ctx, service.SubmitInput{
+		PrincipalID: "prn_binding", CapabilityID: cap.ID, QuoteID: quote.ID,
+		Input: map[string]any{"value": "substituted"}, IdempotencyKey: "binding-key",
+	})
+	if err == nil {
+		t.Fatal("changed input reused an approved idempotency identity")
+	}
+	de, ok := err.(*domain.Error)
+	if !ok || de.Code != domain.ErrIdempotencyConflict {
+		t.Fatalf("error = %v, want idempotency_conflict", err)
 	}
 }
