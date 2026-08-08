@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"time"
 
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/money"
@@ -49,6 +50,7 @@ func ValidateAccountDefaults(defaults AccountDefaults) error {
 type AccountService struct {
 	store    store.Store
 	defaults AccountDefaults
+	now      func() time.Time
 }
 
 func NewAccountService(s store.Store, configured ...AccountDefaults) *AccountService {
@@ -59,10 +61,26 @@ func NewAccountService(s store.Store, configured ...AccountDefaults) *AccountSer
 	if err := ValidateAccountDefaults(defaults); err != nil {
 		panic(err)
 	}
-	return &AccountService{store: s, defaults: defaults}
+	return &AccountService{store: s, defaults: defaults, now: time.Now}
+}
+
+// WithClock replaces the service clock for deterministic policy-window tests.
+// Runtime code should use the default UTC wall clock.
+func (s *AccountService) WithClock(now func() time.Time) *AccountService {
+	if now != nil {
+		s.now = now
+	}
+	return s
+}
+
+func nextUTCReset(now time.Time) time.Time {
+	now = now.UTC()
+	year, month, day := now.Date()
+	return time.Date(year, month, day+1, 0, 0, 0, 0, time.UTC)
 }
 
 func (s *AccountService) defaultAccount(principalID string) domain.Account {
+	now := s.now().UTC()
 	return domain.Account{
 		PrincipalID: principalID,
 		Balance:     s.defaults.InitialBalance,
@@ -70,6 +88,7 @@ func (s *AccountService) defaultAccount(principalID string) domain.Account {
 			PerCallAutonomousLimit: s.defaults.PerCallLimit,
 			DailyLimit:             s.defaults.DailyLimit,
 			RemainingToday:         s.defaults.DailyLimit,
+			ResetAt:                nextUTCReset(now),
 		},
 		TrustPolicy: domain.TrustPolicy{
 			DefaultRequestedTrustMode: domain.RequestedTrustAuto,
@@ -79,8 +98,20 @@ func (s *AccountService) defaultAccount(principalID string) domain.Account {
 }
 
 func (s *AccountService) normalizeAccount(a domain.Account) domain.Account {
+	now := s.now().UTC()
+	defaults := s.defaultAccount(a.PrincipalID)
 	if a.TrustPolicy.DefaultRequestedTrustMode == "" {
-		a.TrustPolicy = s.defaultAccount(a.PrincipalID).TrustPolicy
+		a.TrustPolicy = defaults.TrustPolicy
+	}
+	if a.SpendPolicy.DailyLimit.Amount == "" {
+		a.SpendPolicy.DailyLimit = defaults.SpendPolicy.DailyLimit
+	}
+	if a.SpendPolicy.PerCallAutonomousLimit.Amount == "" {
+		a.SpendPolicy.PerCallAutonomousLimit = defaults.SpendPolicy.PerCallAutonomousLimit
+	}
+	if a.SpendPolicy.RemainingToday.Amount == "" || a.SpendPolicy.ResetAt.IsZero() || !now.Before(a.SpendPolicy.ResetAt) {
+		a.SpendPolicy.RemainingToday = a.SpendPolicy.DailyLimit
+		a.SpendPolicy.ResetAt = nextUTCReset(now)
 	}
 	return a
 }
@@ -89,8 +120,10 @@ func (s *AccountService) Get(ctx context.Context, principalID string) (domain.Ac
 	a, err := s.store.GetAccount(ctx, principalID)
 	if err == nil {
 		normalized := s.normalizeAccount(a)
-		if normalized.TrustPolicy.DefaultRequestedTrustMode != a.TrustPolicy.DefaultRequestedTrustMode {
-			_ = s.store.PutAccount(ctx, normalized)
+		if accountNormalizationChanged(a, normalized) {
+			if err := s.store.PutAccount(ctx, normalized); err != nil {
+				return domain.Account{}, err
+			}
 		}
 		return normalized, nil
 	}
@@ -100,6 +133,14 @@ func (s *AccountService) Get(ctx context.Context, principalID string) (domain.Ac
 	return s.store.UpdateAccount(ctx, principalID, s.defaultAccount(principalID), func(a domain.Account, exists bool) (domain.Account, error) {
 		return s.normalizeAccount(a), nil
 	})
+}
+
+func accountNormalizationChanged(before, after domain.Account) bool {
+	return before.TrustPolicy != after.TrustPolicy ||
+		before.SpendPolicy.PerCallAutonomousLimit != after.SpendPolicy.PerCallAutonomousLimit ||
+		before.SpendPolicy.DailyLimit != after.SpendPolicy.DailyLimit ||
+		before.SpendPolicy.RemainingToday != after.SpendPolicy.RemainingToday ||
+		!before.SpendPolicy.ResetAt.Equal(after.SpendPolicy.ResetAt)
 }
 
 func (s *AccountService) RequiresConfirmation(ctx context.Context, principalID, totalMax, currency string) (bool, error) {
