@@ -1,0 +1,575 @@
+name: apply-phase01-final-fixes
+
+on:
+  push:
+    branches:
+      - agent/phase0-phase1-completion
+    paths:
+      - .github/workflows/apply-phase01-final-fixes.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: atos
+          POSTGRES_PASSWORD: atos
+          POSTGRES_DB: atos_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U atos -d atos_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/phase0-phase1-completion
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: Apply correctness and acceptance fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text()
+              if text.count(old) != 1:
+                  raise SystemExit(f"{path}: expected one replacement target, found {text.count(old)}")
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "internal/store/postgres/postgres.go",
+              '''func nullableJSON(v map[string]any) any {
+          \tif v == nil {
+          \t\treturn nil
+          \t}
+          \treturn mustMarshal(v)
+          }
+
+          // --- Capabilities ---
+          ''',
+              '''func nullableJSON(v map[string]any) any {
+          \tif v == nil {
+          \t\treturn nil
+          \t}
+          \treturn mustMarshal(v)
+          }
+
+          // lockTransactionKey serializes a logical mutation even before its row
+          // exists. SELECT ... FOR UPDATE cannot lock a missing row, so relying on
+          // it alone permits concurrent first-writers to derive state from the same
+          // seed. PostgreSQL advisory transaction locks are shared by all gateway
+          // replicas and are released automatically on commit or rollback.
+          func lockTransactionKey(ctx context.Context, tx pgx.Tx, namespace string, parts ...string) error {
+          \tif namespace == "" || len(parts) == 0 {
+          \t\treturn errors.New("postgres: advisory lock identity is empty")
+          \t}
+          \tidentity := namespace
+          \tfor _, part := range parts {
+          \t\tif part == "" {
+          \t\t\treturn errors.New("postgres: advisory lock identity contains an empty part")
+          \t\t}
+          \t\tidentity += fmt.Sprintf(":%d:%s", len(part), part)
+          \t}
+          \t_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, identity)
+          \treturn err
+          }
+
+          // --- Capabilities ---
+          ''',
+          )
+
+          replace_once(
+              "internal/store/postgres/postgres.go",
+              '''func (s *Store) UpdateJob(ctx context.Context, id string, fn func(domain.Job, bool) (domain.Job, error)) (domain.Job, error) {
+          \ttx, err := s.pool.Begin(ctx)
+          \tif err != nil {
+          \t\treturn domain.Job{}, err
+          \t}
+          \tdefer tx.Rollback(ctx) //nolint:errcheck
+
+          \tcurrent, err := scanJob(tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=$1 FOR UPDATE`, id))
+          ''',
+              '''func (s *Store) UpdateJob(ctx context.Context, id string, fn func(domain.Job, bool) (domain.Job, error)) (domain.Job, error) {
+          \ttx, err := s.pool.Begin(ctx)
+          \tif err != nil {
+          \t\treturn domain.Job{}, err
+          \t}
+          \tdefer tx.Rollback(ctx) //nolint:errcheck
+          \tif err := lockTransactionKey(ctx, tx, "job", id); err != nil {
+          \t\treturn domain.Job{}, err
+          \t}
+
+          \tcurrent, err := scanJob(tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=$1 FOR UPDATE`, id))
+          ''',
+          )
+
+          replace_once(
+              "internal/store/postgres/postgres.go",
+              '''func (s *Store) UpdateAccount(ctx context.Context, principalID string, seed domain.Account, fn func(domain.Account, bool) (domain.Account, error)) (domain.Account, error) {
+          \ttx, err := s.pool.Begin(ctx)
+          \tif err != nil {
+          \t\treturn domain.Account{}, err
+          \t}
+          \tdefer tx.Rollback(ctx) //nolint:errcheck
+
+          \tvar current domain.Account
+          ''',
+              '''func (s *Store) UpdateAccount(ctx context.Context, principalID string, seed domain.Account, fn func(domain.Account, bool) (domain.Account, error)) (domain.Account, error) {
+          \ttx, err := s.pool.Begin(ctx)
+          \tif err != nil {
+          \t\treturn domain.Account{}, err
+          \t}
+          \tdefer tx.Rollback(ctx) //nolint:errcheck
+          \tif err := lockTransactionKey(ctx, tx, "account", principalID); err != nil {
+          \t\treturn domain.Account{}, err
+          \t}
+
+          \tvar current domain.Account
+          ''',
+          )
+
+          replace_once(
+              "internal/store/postgres/postgres.go",
+              '''func (s *Store) Reserve(ctx context.Context, principalID, key, requestHash string, leaseUntil time.Time) (store.IdempotencyRecord, bool, error) {
+          \ttx, err := s.pool.Begin(ctx)
+          \tif err != nil {
+          \t\treturn store.IdempotencyRecord{}, false, err
+          \t}
+          \tdefer tx.Rollback(ctx) //nolint:errcheck
+
+          \tvar rec store.IdempotencyRecord
+          ''',
+              '''func (s *Store) Reserve(ctx context.Context, principalID, key, requestHash string, leaseUntil time.Time) (store.IdempotencyRecord, bool, error) {
+          \ttx, err := s.pool.Begin(ctx)
+          \tif err != nil {
+          \t\treturn store.IdempotencyRecord{}, false, err
+          \t}
+          \tdefer tx.Rollback(ctx) //nolint:errcheck
+          \tif err := lockTransactionKey(ctx, tx, "idempotency", principalID, key); err != nil {
+          \t\treturn store.IdempotencyRecord{}, false, err
+          \t}
+
+          \tvar rec store.IdempotencyRecord
+          ''',
+          )
+
+          replace_once(
+              "internal/service/account.go",
+              '''func (s *AccountService) Get(ctx context.Context, principalID string) (domain.Account, error) {
+          \ta, err := s.store.GetAccount(ctx, principalID)
+          \tif err == nil {
+          \t\tnormalized := s.normalizeAccount(a)
+          \t\tif accountNormalizationChanged(a, normalized) {
+          \t\t\tif err := s.store.PutAccount(ctx, normalized); err != nil {
+          \t\t\t\treturn domain.Account{}, err
+          \t\t\t}
+          \t\t}
+          \t\treturn normalized, nil
+          \t}
+          \tif err != store.ErrNotFound {
+          \t\treturn domain.Account{}, err
+          \t}
+          \treturn s.store.UpdateAccount(ctx, principalID, s.defaultAccount(principalID), func(a domain.Account, exists bool) (domain.Account, error) {
+          \t\treturn s.normalizeAccount(a), nil
+          \t})
+          }
+          ''',
+              '''func (s *AccountService) Get(ctx context.Context, principalID string) (domain.Account, error) {
+          \ta, err := s.store.GetAccount(ctx, principalID)
+          \tif err == nil {
+          \t\tnormalized := s.normalizeAccount(a)
+          \t\tif !accountNormalizationChanged(a, normalized) {
+          \t\t\treturn normalized, nil
+          \t\t}
+          \t\t// Re-read and normalize under the store's atomic mutation boundary.
+          \t\t// Persisting the earlier snapshot with PutAccount could overwrite a
+          \t\t// concurrent debit or credit at the UTC policy-reset boundary.
+          \t\treturn s.store.UpdateAccount(ctx, principalID, s.defaultAccount(principalID), func(current domain.Account, _ bool) (domain.Account, error) {
+          \t\t\treturn s.normalizeAccount(current), nil
+          \t\t})
+          \t}
+          \tif err != store.ErrNotFound {
+          \t\treturn domain.Account{}, err
+          \t}
+          \treturn s.store.UpdateAccount(ctx, principalID, s.defaultAccount(principalID), func(a domain.Account, _ bool) (domain.Account, error) {
+          \t\treturn s.normalizeAccount(a), nil
+          \t})
+          }
+          ''',
+          )
+
+          replace_once(
+              "internal/store/postgres/postgres_test.go",
+              '''\t"sync"
+          \t"testing"
+          ''',
+              '''\t"sync"
+          \t"testing"
+          \t"time"
+          ''',
+          )
+
+          concurrency_tests = r'''
+          // TestUpdateJobConcurrentCreateHasSingleWinner proves the atomic mutation
+          // boundary also serializes the first writer, when no row exists yet.
+          func TestUpdateJobConcurrentCreateHasSingleWinner(t *testing.T) {
+          \tctx := context.Background()
+          \ts := openTestStore(t)
+          \tsuffix := randSuffix()
+          \tjobID := "job_pg_create_" + suffix
+
+          \tconst attempts = 24
+          \tvar wg sync.WaitGroup
+          \tvar mu sync.Mutex
+          \twinners := 0
+          \tvar unexpected error
+
+          \tfor range attempts {
+          \t\twg.Add(1)
+          \t\tgo func() {
+          \t\t\tdefer wg.Done()
+          \t\t\t_, err := s.UpdateJob(ctx, jobID, func(_ domain.Job, exists bool) (domain.Job, error) {
+          \t\t\t\tif exists {
+          \t\t\t\t\treturn domain.Job{}, store.ErrConflict
+          \t\t\t\t}
+          \t\t\t\tnow := time.Now().UTC()
+          \t\t\t\treturn domain.Job{
+          \t\t\t\t\tID: jobID, CapabilityID: "cap_pg_create_" + suffix,
+          \t\t\t\t\tQuoteID: "quote_pg_create_" + suffix,
+          \t\t\t\t\tPrincipalID: "prn_pg_create_" + suffix,
+          \t\t\t\t\tState: domain.JobSubmitted, Input: map[string]any{},
+          \t\t\t\t\tArtifacts: []domain.Artifact{}, IdempotencyKey: "idem_pg_create_" + suffix,
+          \t\t\t\t\tCreatedAt: now, UpdatedAt: now,
+          \t\t\t\t}, nil
+          \t\t\t})
+          \t\t\tmu.Lock()
+          \t\t\tdefer mu.Unlock()
+          \t\t\tif err == nil {
+          \t\t\t\twinners++
+          \t\t\t} else if err != store.ErrConflict && unexpected == nil {
+          \t\t\t\tunexpected = err
+          \t\t\t}
+          \t\t}()
+          \t}
+          \twg.Wait()
+          \tif unexpected != nil {
+          \t\tt.Fatalf("unexpected concurrent UpdateJob error: %v", unexpected)
+          \t}
+          \tif winners != 1 {
+          \t\tt.Fatalf("concurrent first-writer winners = %d, want exactly 1", winners)
+          \t}
+          \tif _, err := s.GetJob(ctx, jobID); err != nil {
+          \t\tt.Fatalf("GetJob after concurrent create: %v", err)
+          \t}
+          }
+
+          // TestReserveConcurrentClaimHasSingleWinner proves missing idempotency
+          // rows are serialized instead of surfacing unique-key races or allowing
+          // more than one caller to believe it owns the economic mutation.
+          func TestReserveConcurrentClaimHasSingleWinner(t *testing.T) {
+          \tctx := context.Background()
+          \ts := openTestStore(t)
+          \tsuffix := randSuffix()
+          \tprincipalID := "prn_pg_reserve_" + suffix
+          \tkey := "reserve-" + suffix
+          \trequestHash := "sha256:reserve-" + suffix
+          \tleaseUntil := time.Now().UTC().Add(time.Minute)
+
+          \tconst attempts = 24
+          \tvar wg sync.WaitGroup
+          \tvar mu sync.Mutex
+          \twinners := 0
+          \tvar unexpected error
+
+          \tfor range attempts {
+          \t\twg.Add(1)
+          \t\tgo func() {
+          \t\t\tdefer wg.Done()
+          \t\t\trec, ok, err := s.Reserve(ctx, principalID, key, requestHash, leaseUntil)
+          \t\t\tmu.Lock()
+          \t\t\tdefer mu.Unlock()
+          \t\t\tif err != nil {
+          \t\t\t\tif unexpected == nil {
+          \t\t\t\t\tunexpected = err
+          \t\t\t\t}
+          \t\t\t\treturn
+          \t\t\t}
+          \t\t\tif rec.RequestHash != requestHash {
+          \t\t\t\tif unexpected == nil {
+          \t\t\t\t\tunexpected = errors.New("idempotency reservation returned the wrong request hash")
+          \t\t\t\t}
+          \t\t\t\treturn
+          \t\t\t}
+          \t\t\tif ok {
+          \t\t\t\twinners++
+          \t\t\t}
+          \t\t}()
+          \t}
+          \twg.Wait()
+          \tif unexpected != nil {
+          \t\tt.Fatalf("unexpected concurrent Reserve result: %v", unexpected)
+          \t}
+          \tif winners != 1 {
+          \t\tt.Fatalf("concurrent idempotency winners = %d, want exactly 1", winners)
+          \t}
+          }
+
+          '''
+          replace_once(
+              "internal/store/postgres/postgres_test.go",
+              "func mustParseWholeDollars(t *testing.T, s string) int {\n",
+              concurrency_tests + "func mustParseWholeDollars(t *testing.T, s string) int {\n",
+          )
+
+          replace_once(
+              "internal/store/postgres/postgres_test.go",
+              '''import (
+          \t"context"
+          \t"os"
+          ''',
+              '''import (
+          \t"context"
+          \t"errors"
+          \t"os"
+          ''',
+          )
+          PY
+
+          cat > internal/httpapi/phase01_postgres_acceptance_test.go <<'EOF'
+          package httpapi
+
+          import (
+          	"bytes"
+          	"context"
+          	"io"
+          	"log/slog"
+          	"net/http"
+          	"net/http/httptest"
+          	"os"
+          	"strconv"
+          	"strings"
+          	"testing"
+          	"time"
+
+          	tosaimock "github.com/tosnetwork/atos/internal/adapters/tosai/mock"
+          	toscoremock "github.com/tosnetwork/atos/internal/adapters/toscore/mock"
+          	"github.com/tosnetwork/atos/internal/auth"
+          	"github.com/tosnetwork/atos/internal/domain"
+          	"github.com/tosnetwork/atos/internal/service"
+          	"github.com/tosnetwork/atos/internal/store/postgres"
+          )
+
+          // TestPhase1PublicHTTPFlowAgainstPostgres is the persistent-store
+          // acceptance gate for the Phase 1 success criterion. It exercises the
+          // public HTTP boundary rather than calling the service layer directly.
+          func TestPhase1PublicHTTPFlowAgainstPostgres(t *testing.T) {
+          	databaseURL := os.Getenv("ATOS_TEST_DATABASE_URL")
+          	if databaseURL == "" {
+          		t.Skip("ATOS_TEST_DATABASE_URL not set; skipping Postgres HTTP acceptance test")
+          	}
+          	ctx := context.Background()
+          	st, err := postgres.Open(ctx, databaseURL)
+          	if err != nil {
+          		t.Fatal(err)
+          	}
+          	t.Cleanup(st.Close)
+
+          	suffix := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
+          	clock := &phase01Clock{now: time.Now().UTC()}
+          	authorization, err := auth.Open(auth.Config{PollInterval: time.Second, Now: clock.Now})
+          	if err != nil {
+          		t.Fatal(err)
+          	}
+          	t.Cleanup(func() { _ = authorization.Close() })
+
+          	capabilities := service.NewCapabilityService(st)
+          	accounts := service.NewAccountService(st)
+          	quotes := service.NewQuoteService(st).WithAccountService(accounts)
+          	provider := tosaimock.New()
+          	core := toscoremock.New(st)
+          	jobs := service.NewJobService(st, provider, core, accounts)
+          	receipts := service.NewReceiptService(st, core)
+
+          	capability, err := capabilities.Register(ctx, service.RegisterCapabilityInput{
+          		ProviderID: "agt_phase1_pg_" + suffix,
+          		Name: "Postgres Echo " + suffix,
+          		Description: "persistent Phase 1 HTTP acceptance fixture",
+          		DeliveryMode: domain.DeliveryInstant,
+          		InputSchema: map[string]any{"type": "object"},
+          		OutputSchema: map[string]any{"type": "object"},
+          		Pricing: domain.Pricing{
+          			Model: domain.PricingFixed,
+          			PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"},
+          		},
+          		RequestedTrustModes: []domain.TrustMode{domain.TrustModeManaged},
+          		IdempotencyKey: "register-phase1-pg-" + suffix,
+          	})
+          	if err != nil {
+          		t.Fatal(err)
+          	}
+
+          	approvalToken := strings.Repeat("p", 32)
+          	server := &Server{
+          		Auth: authorization, Capabilities: capabilities, Quotes: quotes,
+          		Jobs: jobs, Accounts: accounts, Receipts: receipts,
+          		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+          		ApprovalToken: approvalToken,
+          	}
+          	httpServer := httptest.NewServer(server.Mux())
+          	defer httpServer.Close()
+          	server.PublicBaseURL = httpServer.URL
+          	client := httpServer.Client()
+
+          	skill := phase01Request(t, client, http.MethodGet, httpServer.URL+"/skills/atos/SKILL.md", "", nil, nil)
+          	if skill.Status != http.StatusOK || skill.Header.Get("ETag") == "" || !bytes.Contains(skill.Body, []byte("atos_quote")) {
+          		t.Fatalf("skill endpoint = %d %q", skill.Status, skill.Body)
+          	}
+
+          	start := phase01Request(t, client, http.MethodPost, httpServer.URL+"/v1/auth/device", "", map[string]any{
+          		"client_type": "codex", "client_name": "Postgres Phase 1 Acceptance",
+          		"requested_scopes": []string{
+          			"capabilities:read", "quotes:read", "invocations:create",
+          			"jobs:create", "jobs:read", "jobs:cancel", "account:read",
+          		},
+          	}, nil)
+          	if start.Status != http.StatusOK {
+          		t.Fatalf("device start = %d %s", start.Status, start.Body)
+          	}
+          	grant := phase01Decode[struct {
+          		DeviceCode string `json:"device_code"`
+          		UserCode string `json:"user_code"`
+          	}](t, start)
+
+          	pending := phase01Request(t, client, http.MethodPost, httpServer.URL+"/v1/auth/device/token", "", map[string]any{"device_code": grant.DeviceCode}, nil)
+          	if pending.Status != http.StatusBadRequest || !bytes.Contains(pending.Body, []byte("authorization_pending")) {
+          		t.Fatalf("pending authorization = %d %s", pending.Status, pending.Body)
+          	}
+
+          	principalID := "prn_phase1_pg_" + suffix
+          	decision := phase01Request(t, client, http.MethodPost, httpServer.URL+"/v1/auth/device/decision", "", map[string]any{
+          		"user_code": grant.UserCode, "principal_id": principalID, "decision": "approve",
+          	}, map[string]string{"X-ATOS-Approval-Token": approvalToken})
+          	if decision.Status != http.StatusOK {
+          		t.Fatalf("device decision = %d %s", decision.Status, decision.Body)
+          	}
+          	clock.Advance(2 * time.Second)
+
+          	tokenResponse := phase01Request(t, client, http.MethodPost, httpServer.URL+"/v1/auth/device/token", "", map[string]any{"device_code": grant.DeviceCode}, nil)
+          	if tokenResponse.Status != http.StatusOK {
+          		t.Fatalf("token exchange = %d %s", tokenResponse.Status, tokenResponse.Body)
+          	}
+          	tokens := phase01Decode[struct {
+          		AccessToken string `json:"access_token"`
+          		PrincipalID string `json:"principal_id"`
+          	}](t, tokenResponse)
+          	if tokens.AccessToken == "" || tokens.PrincipalID != principalID {
+          		t.Fatalf("invalid token response: %+v", tokens)
+          	}
+
+          	search := phase01Request(t, client, http.MethodGet, httpServer.URL+"/v1/capabilities?q=Postgres+Echo", tokens.AccessToken, nil, nil)
+          	if search.Status != http.StatusOK || !bytes.Contains(search.Body, []byte(capability.ID)) {
+          		t.Fatalf("search = %d %s", search.Status, search.Body)
+          	}
+
+          	for _, mode := range []string{"verified", "native"} {
+          		response := phase01Request(t, client, http.MethodPost, httpServer.URL+"/v1/quotes", tokens.AccessToken, map[string]any{
+          			"capability_id": capability.ID, "requested_trust_mode": mode,
+          		}, nil)
+          		if response.Status == http.StatusCreated || !bytes.Contains(response.Body, []byte("trust_mode_unavailable")) {
+          			t.Fatalf("explicit %s did not fail closed: %d %s", mode, response.Status, response.Body)
+          		}
+          	}
+
+          	quoteResponse := phase01Request(t, client, http.MethodPost, httpServer.URL+"/v1/quotes", tokens.AccessToken, map[string]any{
+          		"capability_id": capability.ID, "requested_trust_mode": "auto",
+          	}, nil)
+          	if quoteResponse.Status != http.StatusCreated {
+          		t.Fatalf("auto quote = %d %s", quoteResponse.Status, quoteResponse.Body)
+          	}
+          	quote := phase01Decode[domain.Quote](t, quoteResponse)
+          	if quote.TrustMode != domain.TrustModeManaged || quote.RequestedTrustMode != domain.RequestedTrustAuto {
+          		t.Fatalf("auto quote did not resolve to managed: %+v", quote)
+          	}
+
+          	invokeBody := map[string]any{
+          		"capability_id": capability.ID, "quote_id": quote.ID,
+          		"input": map[string]any{"persistent": true},
+          		"idempotency_key": "phase1-pg-invoke-" + suffix,
+          	}
+          	first := phase01Request(t, client, http.MethodPost, httpServer.URL+"/v1/invocations", tokens.AccessToken, invokeBody, nil)
+          	if first.Status != http.StatusOK {
+          		t.Fatalf("first invocation = %d %s", first.Status, first.Body)
+          	}
+          	firstResult := phase01Decode[submitResponse](t, first)
+          	if firstResult.ResultType != string(service.ResultCompleted) || firstResult.Job.State != domain.JobCompleted {
+          		t.Fatalf("first invocation result = %+v", firstResult)
+          	}
+
+          	replay := phase01Request(t, client, http.MethodPost, httpServer.URL+"/v1/invocations", tokens.AccessToken, invokeBody, nil)
+          	if replay.Status != http.StatusOK {
+          		t.Fatalf("replay invocation = %d %s", replay.Status, replay.Body)
+          	}
+          	replayResult := phase01Decode[submitResponse](t, replay)
+          	if replayResult.Job.ID != firstResult.Job.ID {
+          		t.Fatalf("idempotent replay created another job: %s vs %s", replayResult.Job.ID, firstResult.Job.ID)
+          	}
+
+          	accountResponse := phase01Request(t, client, http.MethodGet, httpServer.URL+"/v1/account", tokens.AccessToken, nil, nil)
+          	if accountResponse.Status != http.StatusOK {
+          		t.Fatalf("account = %d %s", accountResponse.Status, accountResponse.Body)
+          	}
+          	account := phase01Decode[domain.Account](t, accountResponse)
+          	if account.Balance.Amount != "23.95" {
+          		t.Fatalf("balance after replay = %s, want 23.95", account.Balance.Amount)
+          	}
+          }
+          EOF
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/workflows/ci.yml')
+          text = p.read_text()
+          old = '      - name: Run PostgreSQL integration tests\n        run: go test -race ./internal/store/postgres\n'
+          new = '      - name: Run PostgreSQL integration and public HTTP acceptance tests\n        run: go test -race ./internal/store/postgres ./internal/httpapi\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'ci.yml: expected one Postgres test command, found {text.count(old)}')
+          p.write_text(text.replace(old, new, 1))
+          PY
+
+          gofmt -w internal/store/postgres/postgres.go internal/store/postgres/postgres_test.go internal/service/account.go internal/httpapi/phase01_postgres_acceptance_test.go
+          git diff --check
+      - name: Run unit and race tests
+        run: go test -race ./...
+      - name: Apply migrations
+        env:
+          ATOS_DATABASE_URL: postgres://atos:atos@127.0.0.1:5432/atos_test?sslmode=disable
+        run: go run ./cmd/migrate
+      - name: Run PostgreSQL and public HTTP acceptance gates
+        env:
+          ATOS_TEST_DATABASE_URL: postgres://atos:atos@127.0.0.1:5432/atos_test?sslmode=disable
+        run: go test -race ./internal/store/postgres ./internal/httpapi
+      - name: Commit validated fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/apply-phase01-final-fixes.yml
+          git add .github/workflows/ci.yml internal/store/postgres/postgres.go internal/store/postgres/postgres_test.go internal/service/account.go internal/httpapi/phase01_postgres_acceptance_test.go
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix: close Phase 0 and Phase 1 correctness gates'
+          git push origin HEAD:agent/phase0-phase1-completion
