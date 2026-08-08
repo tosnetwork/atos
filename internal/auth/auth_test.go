@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -128,7 +129,11 @@ func TestDeviceVisibilityAndRevocation(t *testing.T) {
 }
 
 func TestBoltPersistenceSurvivesRestartWithoutRawTokenLookup(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "auth.db")
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "auth.db")
 	persistence, err := OpenBoltPersistence(path)
 	if err != nil {
 		t.Fatal(err)
