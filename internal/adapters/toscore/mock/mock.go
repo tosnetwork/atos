@@ -188,7 +188,7 @@ func (c *Core) VerifyExecutionReceipt(ctx context.Context, escrowID string, rece
 		ok     bool
 		reason string
 	}{
-		{receipt.EscrowID == "" || receipt.EscrowID == e.ID, "escrow mismatch"},
+		{receipt.EscrowID == e.ID, "escrow mismatch"},
 		{receipt.QuoteID == e.QuoteID, "quote mismatch"},
 		{receipt.JobID == e.JobID, "job mismatch"},
 		{receipt.ProviderID == e.ProviderID, "provider mismatch"},

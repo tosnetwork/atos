@@ -20,21 +20,33 @@ This document tracks the implementation boundary of the Go gateway against
 - artifact ownership, declared-size and expiry enforcement;
 - PostgreSQL v0.2 payload persistence through embedded migrations;
 - v0.2 Agent Card, provider cards, REST OpenAPI and A2A commerce extension;
+- a real `atos -> tos-protocol` ConnectRPC client covering all six ATOS/TOS v0.2 services;
+- an explicit `ATOS_TOS_BACKEND=mock|rpc` switch with no failure fallback;
+- TLS/custom CA/mTLS, bearer authentication, bounded messages, deadlines and readiness checks;
+- two-layer Service Execution Quote -> ATOS Commercial Quote binding;
+- real Managed execution through `tos-protocol` -> private Unix-socket `tos-ai` Worker RPC;
+- cross-service integration coverage for Quote -> Escrow -> Worker -> Receipt -> Verify -> Settle and idempotent replay;
 - formatting, OpenAPI parsing, vet and race-test CI.
 
-## Intentionally unavailable until cross-repository integration
+## Current runtime boundary
 
-The gateway does not claim Verified or Native availability merely because their
-types exist. Activation requires the real implementations described by the
-ATOS/TOS protobuf contract:
+The cross-repository Managed path now exists:
 
-1. `tos-protocol` Edge/Core `ExecutionGatewayService`;
-2. private Edge Core -> `tos-ai` Worker execution;
-3. TOS-backed identity and Capability ownership resolution;
-4. enforceable TOS escrow/release/settlement;
-5. execution-signer authorization and receipt proof commitment;
-6. portable Proof-of-Service evidence;
-7. Native global resolution and independent index reconstruction.
+```text
+ATOS -> ConnectRPC -> tos-protocol ExecutionGatewayService
+     -> private Unix-socket tos-ai Worker
+     -> signed Execution Receipt -> verification -> settlement
+```
+
+The current `tos-protocol` binary still supplies `NewLocalAuthority("tos-local")`,
+which supports Managed mode only. Therefore the gateway does not claim Verified
+or Native availability merely because their RPC types and verification logic
+exist. Remaining activation requirements are:
+
+1. a configurable TOS Network-backed Authority rather than the local Authority;
+2. TOS-backed identity and Capability ownership/finality;
+3. enforceable network escrow/release/settlement and portable proof references;
+4. Native global resolution, independent index reconstruction and federation tests.
 
 Until those guarantees exist, explicit `verified` or `native` requests fail
 instead of falling back to Managed.

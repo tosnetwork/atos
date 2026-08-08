@@ -110,6 +110,7 @@ func (s *Server) toolGetCapability(ctx context.Context, principal auth.Principal
 
 func (s *Server) toolQuote(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
 	input := service.CreateQuoteInput{
+		PrincipalID:        principal.ID,
 		CapabilityID:       argString(args, "capability_id"),
 		InputSummary:       argObject(args, "input_summary"),
 		RequestedTrustMode: domain.RequestedTrustMode(argString(args, "requested_trust_mode")),

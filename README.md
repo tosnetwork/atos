@@ -20,9 +20,22 @@ that mode; stronger-mode failure never silently falls back to Managed.
 ## Current delivery status
 
 This branch implements the Phase 0/1 contract and a complete **Managed Mode**
-happy path. Verified and Native types, RPC boundaries, schemas and fail-closed
-selection rules are implemented, but their modes remain unavailable until the
-real `tos-protocol`/TOS adapters replace the mocks.
+happy path in two explicit deployments:
+
+```text
+ATOS_TOS_BACKEND=mock  local development/test adapter
+ATOS_TOS_BACKEND=rpc   real ConnectRPC path through tos-protocol and its private tos-ai Worker RPC
+```
+
+The RPC path binds an Edge/provider Service Execution Quote into the client-facing
+ATOS Commercial Quote, then carries the same principal, capability version,
+trust mode, proof profile, deadline and commitments through execution, receipt
+verification and settlement. RPC configuration or readiness failure stops
+startup; it never falls back to the mock backend.
+
+Verified and Native protocol logic remains fail-closed because the current
+`tos-protocol` runtime still uses its Managed-only `tos-local` Authority rather
+than a final TOS Network trust anchor.
 
 | Layer | Status |
 |---|---|
@@ -32,8 +45,8 @@ real `tos-protocol`/TOS adapters replace the mocks.
 | Managed execution | End-to-end Quote → escrow → execution → signed receipt → verify → settle |
 | Artifact transport | Signed HTTP PUT/GET URLs; bytes never travel through MCP/A2A business calls |
 | PostgreSQL | Indexed relational projection + complete v0.2 JSONB payload persistence |
-| `tos-ai` | Phase 0 in-process Managed mock; final topology is ATOS → `tos-protocol` Edge Core → private `tos-ai` Worker RPC |
-| `tos-core` / `tos-protocol` | Fail-closed mock state machine; no fabricated TOS proof |
+| `tos-ai` | Explicit mock for local development, or real private Unix-socket Worker execution behind `tos-protocol` in RPC mode |
+| `tos-core` / `tos-protocol` | Real typed ConnectRPC clients for Identity, Capability, Trust, Settlement, Proof and ExecutionGateway services; current Authority is Managed-only `tos-local` |
 | Device Authorization | Scoped in-memory Phase 0 implementation with immediate approval; production UI/consent remains to be wired |
 | Verified / Native | Contract implemented, runtime availability intentionally `unavailable` until real TOS integration |
 
@@ -74,20 +87,21 @@ from authorization on the current request, never session history, and returns:
 ## Repository layout
 
 ```text
-cmd/api/                    gateway entrypoint
-cmd/migrate/                PostgreSQL migration command
-api/openapi.yaml            REST contract
-migrations/                 ordered SQL migrations
-internal/auth/              scoped device/access/refresh tokens
-internal/domain/            v0.2 business objects and trust-mode types
-internal/service/           capability, quote, execution and settlement logic
-internal/httpapi/           REST handlers
-internal/mcp/               MCP catalog, resources and tool handlers
-internal/a2a/               A2A Task/Message mapping
-internal/adapters/tosai/    execution boundary + Phase 0 mock
-internal/adapters/toscore/  trust/economy/proof boundary + Phase 0 mock
-internal/adapters/storage/  signed-URL Artifact storage
-internal/store/             memory and PostgreSQL implementations
+cmd/api/                       gateway entrypoint
+cmd/migrate/                   PostgreSQL migration command
+api/openapi.yaml               REST contract
+migrations/                    ordered SQL migrations
+internal/auth/                 scoped device/access/refresh tokens
+internal/domain/               v0.2 business objects and trust-mode types
+internal/service/              capability, quote, execution and settlement logic
+internal/httpapi/              REST handlers
+internal/mcp/                  MCP catalog, resources and tool handlers
+internal/a2a/                  A2A Task/Message mapping
+internal/adapters/tosai/       execution boundary + Phase 0 mock
+internal/adapters/toscore/     trust/economy/proof boundary + Phase 0 mock
+internal/adapters/tosprotocol/ real ConnectRPC execution/trust/economy/proof client
+internal/adapters/storage/     signed-URL Artifact storage
+internal/store/                memory and PostgreSQL implementations
 ```
 
 ## Run locally
@@ -100,6 +114,40 @@ go run ./cmd/api
 
 The gateway listens on `:8080` and seeds one Managed `Echo Sandbox`
 Capability. The in-memory store is used unless `ATOS_DATABASE_URL` is set.
+When `ATOS_TOS_BACKEND` is omitted, the development default is `mock`.
+
+### Real tos-protocol backend
+
+Run `tos-protocol` with its ATOS RPC server and private `tos-ai` Worker, then
+start ATOS with an explicit RPC backend:
+
+```bash
+export ATOS_TOS_BACKEND=rpc
+export ATOS_TOS_RPC_URL=http://127.0.0.1:8090
+export ATOS_TOS_RPC_TOKEN='<shared-internal-token>'
+export ATOS_TOS_RPC_INSECURE=true   # local plaintext only
+
+go run ./cmd/api
+```
+
+For non-loopback deployments use HTTPS. Optional trust and mTLS settings are:
+
+```text
+ATOS_TOS_RPC_SERVER_NAME
+ATOS_TOS_RPC_CA_FILE
+ATOS_TOS_RPC_CLIENT_CERT_FILE
+ATOS_TOS_RPC_CLIENT_KEY_FILE
+ATOS_TOS_RPC_TIMEOUT
+ATOS_TOS_RPC_MAX_MESSAGE_BYTES
+```
+
+Client certificate and key must be configured together. Plaintext HTTP is
+rejected unless `ATOS_TOS_RPC_INSECURE=true`. A configured RPC backend must pass
+its startup readiness probe; connection failure never selects the mock backend.
+
+The default inline execution output bound is 1 MiB, below the private Worker's
+2 MiB default message policy. Larger outputs should be returned through the
+Artifact flow rather than embedded in an RPC/MCP/A2A response.
 
 ### Device Authorization
 
@@ -193,7 +241,10 @@ ATOS_DATABASE_URL="$ATOS_TEST_DATABASE_URL" go run ./cmd/migrate
 go test -race ./internal/store/postgres/...
 ```
 
-GitHub Actions enforces formatting, vet and race tests.
+GitHub Actions enforces formatting, vet and race tests. The RPC integration
+test starts a real `tos-protocol` ConnectRPC server and a private Unix-socket
+Worker, then verifies Quote → Escrow → execution → Receipt → verification →
+settlement and idempotent replay through the ATOS service layer.
 
 ## Security invariants already enforced
 
@@ -201,6 +252,7 @@ GitHub Actions enforces formatting, vet and race tests.
 - Quote mode/profile are immutable and propagate to Job, Escrow and Receipt.
 - Explicit Verified/Native requests fail closed while their infrastructure is unavailable.
 - Provider-requested modes are not public active modes until certification.
+- A configured RPC backend never falls back to mock after configuration or readiness failure.
 - Tool visibility does not substitute for call-time authorization.
 - Artifact IDs and upload IDs are not bearer credentials.
 - Uploaded byte count must match the declared size.
@@ -209,8 +261,8 @@ GitHub Actions enforces formatting, vet and race tests.
 
 ## Next implementation boundaries
 
-1. Replace the Phase 0 authorization approval shortcut with production OAuth/device consent and persistent token storage.
-2. Implement `ExecutionGatewayService` in `tos-protocol` and replace direct in-process `tos-ai` mock execution.
-3. Implement the v0.2 trust/settlement/proof protobuf services against TOS Network.
-4. Activate `tos_verified_v1`, then `tos_native_v1`, only after their full guarantee checks pass.
-5. Add provider queueing, webhook callbacks, disputes and federated indexers in their roadmap phases.
+1. Replace `tos-protocol`'s Managed-only `tos-local` Authority with a configurable chain-backed Authority that reuses the repository's existing TOS chain/finality primitives.
+2. Add durable ATOS ↔ tos-protocol reconciliation for cross-process crash windows and repair the PostgreSQL `in_progress` idempotency lease gap identified by the security review.
+3. Replace the Phase 0 authorization approval shortcut with production OAuth/device consent and persistent token storage.
+4. Activate `tos_verified_v1`, then `tos_native_v1`, only after their complete network guarantees and conformance tests pass.
+5. Add provider queueing, webhook callbacks, disputes, canonical commitment encoding and federated indexers in their roadmap phases.

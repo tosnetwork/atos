@@ -38,6 +38,7 @@ type Job struct {
 	CapabilityVersion     string         `json:"capability_version"`
 	ProviderID            string         `json:"provider_id"`
 	QuoteID               string         `json:"quote_id"`
+	ServiceQuoteID        string         `json:"service_quote_id,omitempty"`
 	EscrowID              string         `json:"escrow_id"`
 	PrincipalID           string         `json:"-"`
 	TrustMode             TrustMode      `json:"trust_mode"`
@@ -54,4 +55,5 @@ type Job struct {
 	UpdatedAt             time.Time      `json:"-"`
 	CompletedAt           *time.Time     `json:"completed_at,omitempty"`
 	EstimatedCompletionAt *time.Time     `json:"estimated_completion_at,omitempty"`
+	ExecutionDeadline     time.Time      `json:"execution_deadline,omitempty"`
 }

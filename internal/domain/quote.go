@@ -17,6 +17,7 @@ type Quote struct {
 	CapabilityID              string               `json:"capability_id"`
 	CapabilityVersion         string               `json:"capability_version"`
 	ProviderID                string               `json:"provider_id"`
+	PrincipalID               string               `json:"principal_id,omitempty"`
 	RequestedTrustMode        RequestedTrustMode   `json:"requested_trust_mode"`
 	TrustMode                 TrustMode            `json:"trust_mode"`
 	ProofProfile              ProofProfile         `json:"proof_profile,omitempty"`
@@ -27,7 +28,10 @@ type Quote struct {
 	RequiresConfirmation      bool                 `json:"requires_confirmation"`
 	TermsHash                 string               `json:"terms_hash"`
 	DisputePolicyHash         string               `json:"dispute_policy_hash,omitempty"`
+	ServiceQuoteID            string               `json:"service_quote_id,omitempty"`
 	UnderlyingServiceQuoteRef string               `json:"underlying_service_quote_ref,omitempty"`
+	InputSummaryCommitment    string               `json:"input_summary_commitment,omitempty"`
+	ExecutionDeadline         time.Time            `json:"execution_deadline,omitempty"`
 	CreatedAt                 time.Time            `json:"-"`
 }
 

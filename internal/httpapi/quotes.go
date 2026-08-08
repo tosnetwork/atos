@@ -32,6 +32,7 @@ func (s *Server) handleCreateQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q, err := s.Quotes.Create(r.Context(), service.CreateQuoteInput{
+		PrincipalID:        principalFrom(r),
 		CapabilityID:       req.CapabilityID,
 		InputSummary:       req.InputSummary,
 		RequestedTrustMode: req.RequestedTrustMode,
