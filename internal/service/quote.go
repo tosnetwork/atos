@@ -31,18 +31,13 @@ func NewQuoteService(s store.Store) *QuoteService {
 }
 
 type CreateQuoteInput struct {
-	CapabilityID string
-	// MaxTotal, if set, caps the quote per the caller's constraints
-	// (docs/MCP.md atos_quote "constraints.max_total"). A quote priced
-	// above it, or quoted in a different currency than requested, is
-	// rejected rather than silently capped or reinterpreted.
-	MaxTotal *domain.Money
+	CapabilityID       string
+	InputSummary       map[string]any
+	RequestedTrustMode domain.RequestedTrustMode
+	ProofRequirements  domain.ProofRequirements
+	MaxTotal           *domain.Money
 }
 
-// Create implements atos_quote / POST /quotes. Pricing is derived from the
-// capability's price_hint — real usage-based pricing (metered/per_unit)
-// needs an input_summary to size the job, which is out of scope for this
-// Phase 0 skeleton and left as a TODO for whoever wires in real providers.
 func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.Quote, error) {
 	cap, err := s.store.Get(ctx, in.CapabilityID)
 	if err != nil {
@@ -51,8 +46,24 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 		}
 		return domain.Quote{}, err
 	}
+	cap = normalizeCapability(cap)
 	if cap.Status != domain.CapabilityActive {
 		return domain.Quote{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability is not active", false)
+	}
+
+	requested := in.RequestedTrustMode
+	if requested == "" {
+		requested = domain.RequestedTrustAuto
+	}
+	mode, profile, resolveErr := domain.ResolveTrustMode(requested, in.ProofRequirements, cap.ModeSupport)
+	if resolveErr != nil {
+		if concrete, ok := requested.Concrete(); ok && !cap.Supports(concrete) {
+			return domain.Quote{}, domain.NewError(domain.ErrTrustModeUnavailable, resolveErr.Error(), true)
+		}
+		return domain.Quote{}, domain.NewError(domain.ErrProofRequirementsUnsatisfied, resolveErr.Error(), true)
+	}
+	if mode != domain.TrustModeManaged && profile == domain.ProofProfileNone {
+		return domain.Quote{}, domain.NewError(domain.ErrProofProfileUnavailable, "selected mode has no active proof profile", true)
 	}
 
 	subtotal, err := money.Parse(cap.Pricing.PriceHint.Amount, cap.Pricing.PriceHint.Currency, quoteDecimals)
@@ -85,25 +96,57 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 		}
 	}
 
+	settlement, proof := quoteGuarantees(mode, subtotal.Currency)
 	now := time.Now().UTC()
+	disputePolicyHash := termsHash("atos-dispute-policy", "v0.2", "72h")
 	q := domain.Quote{
-		ID:                "q_" + uuid.NewString(),
-		CapabilityID:      cap.ID,
-		CapabilityVersion: cap.Version,
+		ID:                 "q_" + uuid.NewString(),
+		CapabilityID:       cap.ID,
+		CapabilityVersion:  cap.Version,
+		ProviderID:         cap.ProviderID,
+		RequestedTrustMode: requested,
+		TrustMode:          mode,
+		ProofProfile:       profile,
 		Price: domain.Price{
 			Subtotal: subtotal.String(),
 			Fees:     fees.String(),
 			TotalMax: totalMax.String(),
 			Currency: subtotal.Currency,
 		},
-		ExpiresAt: now.Add(quoteTTL),
-		TermsHash: termsHash(cap.ID, cap.Version, totalMax.String()),
-		CreatedAt: now,
+		Settlement:        settlement,
+		Proof:             proof,
+		ExpiresAt:         now.Add(quoteTTL),
+		DisputePolicyHash: disputePolicyHash,
+		CreatedAt:         now,
 	}
+	q.TermsHash = termsHash(
+		q.CapabilityID, q.CapabilityVersion, q.ProviderID,
+		string(q.TrustMode), string(q.ProofProfile),
+		q.Price.TotalMax, q.Price.Currency,
+		string(q.Settlement.Backend), string(q.Settlement.FundingModel),
+		q.ExpiresAt.Format(time.RFC3339Nano), q.DisputePolicyHash,
+	)
 	if err := s.store.PutQuote(ctx, q); err != nil {
 		return domain.Quote{}, err
 	}
 	return q, nil
+}
+
+func quoteGuarantees(mode domain.TrustMode, clientAsset string) (domain.SettlementDescriptor, domain.ProofDescriptor) {
+	if mode == domain.TrustModeManaged {
+		return domain.SettlementDescriptor{
+			Backend: domain.SettlementATOSManaged, Escrow: true,
+			FundingModel: domain.FundingManagedBalance, ClientAsset: clientAsset,
+		}, domain.ProofDescriptor{ExecutionReceipt: true}
+	}
+	return domain.SettlementDescriptor{
+			Backend: domain.SettlementTOS, Escrow: true,
+			FundingModel: domain.FundingGatewaySponsored,
+			ClientAsset:  clientAsset, ProviderAsset: "TOS",
+		}, domain.ProofDescriptor{
+			QuoteCommitment: true, ExecutionReceipt: true,
+			SettlementProof: true, ProofOfService: true,
+		}
 }
 
 func (s *QuoteService) Get(ctx context.Context, id string) (domain.Quote, error) {
@@ -114,12 +157,14 @@ func (s *QuoteService) Get(ctx context.Context, id string) (domain.Quote, error)
 		}
 		return domain.Quote{}, err
 	}
+	if q.TrustMode == "" {
+		q.RequestedTrustMode = domain.RequestedTrustManaged
+		q.TrustMode = domain.TrustModeManaged
+		q.Settlement, q.Proof = quoteGuarantees(q.TrustMode, q.Price.Currency)
+	}
 	return q, nil
 }
 
-// applyFeeRate computes amount * ratePerMille / 1000 entirely in integer
-// big.Int arithmetic — the fee rate constant is the only float in this
-// path, and it never touches a money.Amount value directly.
 func applyFeeRate(amount money.Amount, rate float64) (money.Amount, error) {
 	ratePerMille := big.NewInt(int64(rate * 1000))
 	scaled := new(big.Int).Mul(amount.Minor, ratePerMille)

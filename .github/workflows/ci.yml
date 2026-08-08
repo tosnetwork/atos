@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - agent/**
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # pull_request events normally check out GitHub's synthetic merge
+          # ref. ATOS validates the exact proposed implementation here; PR
+          # mergeability is checked independently by GitHub.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: Verify checked-out revision
+        run: |
+          echo "event=${{ github.event_name }}"
+          echo "expected=${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "actual=$(git rev-parse HEAD)"
+          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
+      - name: Verify formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: Validate OpenAPI YAML
+        run: |
+          set +e
+          output="$(ruby -e 'require "yaml"; document = YAML.load_file("api/openapi.yaml"); abort "missing OpenAPI version" unless document["openapi"] == "3.1.0"' 2>&1)"
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            message="$(printf '%s' "$output" | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g')"
+            echo "::error file=api/openapi.yaml::$message"
+            printf '%s\n' "$output"
+            exit "$status"
+          fi
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...

@@ -3,44 +3,47 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
-	"strings"
-
-	"github.com/google/uuid"
+	"time"
 
 	"github.com/tosnetwork/atos/internal/domain"
 )
 
-// handleAuthDeviceStart implements POST /v1/auth/device from docs/AUTH.md.
-// Phase 0 stub: it always immediately "authorizes" the device instead of
-// waiting for a human to visit verification_uri — good enough to exercise
-// the rest of the API locally, not a real auth flow. Wire in a real
-// verification step (and a real signed access_token, not principal_id
-// echoed back as the bearer value) before this leaves a sandbox.
 func (s *Server) handleAuthDeviceStart(w http.ResponseWriter, r *http.Request) {
+	if s.Auth == nil {
+		writeError(w, http.StatusServiceUnavailable, domain.ErrAuthenticationRequired, "authorization service unavailable", true)
+		return
+	}
 	var req struct {
 		ClientType      string   `json:"client_type"`
 		ClientName      string   `json:"client_name"`
 		RequestedScopes []string `json:"requested_scopes"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed JSON body", false)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed device authorization request: "+err.Error(), false)
 		return
 	}
-	deviceCode := "dc_" + uuid.NewString()
+	grant, err := s.Auth.StartDevice(req.RequestedScopes)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, err.Error(), false)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"device_code":               deviceCode,
-		"user_code":                 "DEMO-" + deviceCode[3:7],
+		"device_code":               grant.DeviceCode,
+		"user_code":                 grant.UserCode,
 		"verification_uri":          "https://atos.im/activate",
-		"verification_uri_complete": "https://atos.im/activate?code=" + deviceCode,
-		"expires_in":                900,
+		"verification_uri_complete": "https://atos.im/activate?code=" + grant.UserCode,
+		"expires_in":                int64(time.Until(grant.ExpiresAt).Seconds()),
 		"interval":                  1,
 	})
 }
 
-// handleAuthDeviceToken always succeeds immediately (see handleAuthDeviceStart)
-// and mints principal_id == the device_code the caller polled with, so the
-// same client always gets the same principal across a session.
 func (s *Server) handleAuthDeviceToken(w http.ResponseWriter, r *http.Request) {
+	if s.Auth == nil {
+		writeError(w, http.StatusServiceUnavailable, domain.ErrAuthenticationRequired, "authorization service unavailable", true)
+		return
+	}
 	var req struct {
 		DeviceCode string `json:"device_code"`
 	}
@@ -48,23 +51,34 @@ func (s *Server) handleAuthDeviceToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "device_code is required", false)
 		return
 	}
-	principalID := "prn_" + req.DeviceCode
+	pair, err := s.Auth.ExchangeDevice(req.DeviceCode)
+	if err != nil {
+		code := domain.ErrValidationFailed
+		status := http.StatusBadRequest
+		retryable := false
+		if err.Error() == "authorization_pending" {
+			code = domain.ErrAuthenticationRequired
+			status = http.StatusAccepted
+			retryable = true
+		}
+		writeError(w, status, code, err.Error(), retryable)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"access_token":  principalID,
+		"access_token":  pair.AccessToken,
 		"token_type":    "Bearer",
-		"expires_in":    3600,
-		"refresh_token": "rt_" + principalID,
-		"principal_id":  principalID,
-		"scopes":        []string{"capabilities:read", "quotes:read", "invocations:create", "jobs:read", "account:read"},
+		"expires_in":    pair.ExpiresIn,
+		"refresh_token": pair.RefreshToken,
+		"principal_id":  pair.Principal.ID,
+		"scopes":        pair.Principal.ScopeStrings(),
 	})
 }
 
-// handleAuthTokenRefresh implements POST /v1/auth/token/refresh. Phase 0
-// stub: tokens never actually expire in this skeleton (see withAuth), so
-// this just re-derives the same principal_id from the refresh_token
-// convention above rather than tracking real refresh-token state. A real
-// implementation stores refresh tokens server-side and rotates them.
 func (s *Server) handleAuthTokenRefresh(w http.ResponseWriter, r *http.Request) {
+	if s.Auth == nil {
+		writeError(w, http.StatusServiceUnavailable, domain.ErrAuthenticationRequired, "authorization service unavailable", true)
+		return
+	}
 	var req struct {
 		RefreshToken string `json:"refresh_token"`
 	}
@@ -72,24 +86,24 @@ func (s *Server) handleAuthTokenRefresh(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "refresh_token is required", false)
 		return
 	}
-	principalID, ok := strings.CutPrefix(req.RefreshToken, "rt_")
-	if !ok {
-		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed refresh_token", false)
+	pair, err := s.Auth.Refresh(req.RefreshToken)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, domain.ErrAuthenticationRequired, err.Error(), false)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"access_token":  principalID,
+		"access_token":  pair.AccessToken,
 		"token_type":    "Bearer",
-		"expires_in":    3600,
-		"refresh_token": req.RefreshToken,
-		"principal_id":  principalID,
+		"expires_in":    pair.ExpiresIn,
+		"refresh_token": pair.RefreshToken,
+		"principal_id":  pair.Principal.ID,
+		"scopes":        pair.Principal.ScopeStrings(),
 	})
 }
 
-// handleAuthRevoke implements POST /v1/auth/revoke. Phase 0 stub: there is
-// no server-side token store to revoke against yet (see withAuth's
-// simplification), so this only validates the caller is authenticated and
-// acknowledges the request rather than actually invalidating anything.
 func (s *Server) handleAuthRevoke(w http.ResponseWriter, r *http.Request) {
+	if s.Auth != nil {
+		s.Auth.Revoke(authFrom(r).Token)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }

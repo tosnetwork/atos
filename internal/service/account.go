@@ -27,33 +27,37 @@ func defaultAccount(principalID string) domain.Account {
 			DailyLimit:             domain.Money{Amount: "20.00", Currency: "USD"},
 			RemainingToday:         domain.Money{Amount: "20.00", Currency: "USD"},
 		},
+		TrustPolicy: domain.TrustPolicy{
+			DefaultRequestedTrustMode: domain.RequestedTrustAuto,
+			MinimumForHighValue:       domain.TrustModeVerified,
+		},
 	}
 }
 
-// Get implements atos_account / GET /account, seeding a default account on
-// first access so a brand-new principal_id from Device Auth can transact
-// immediately in this Phase 0 skeleton. A real accounts service would
-// reject unknown principals instead.
+func normalizeAccount(a domain.Account) domain.Account {
+	if a.TrustPolicy.DefaultRequestedTrustMode == "" {
+		a.TrustPolicy = defaultAccount(a.PrincipalID).TrustPolicy
+	}
+	return a
+}
+
 func (s *AccountService) Get(ctx context.Context, principalID string) (domain.Account, error) {
 	a, err := s.store.GetAccount(ctx, principalID)
 	if err == nil {
-		return a, nil
+		normalized := normalizeAccount(a)
+		if normalized.TrustPolicy.DefaultRequestedTrustMode != a.TrustPolicy.DefaultRequestedTrustMode {
+			_ = s.store.PutAccount(ctx, normalized)
+		}
+		return normalized, nil
 	}
 	if err != store.ErrNotFound {
 		return domain.Account{}, err
 	}
-	// UpdateAccount (not GetAccount+PutAccount) so two concurrent first
-	// requests for the same brand-new principal can't both "win" a
-	// double-seed race — the store lock serializes them.
 	return s.store.UpdateAccount(ctx, principalID, defaultAccount(principalID), func(a domain.Account, exists bool) (domain.Account, error) {
-		return a, nil
+		return normalizeAccount(a), nil
 	})
 }
 
-// RequiresConfirmation reports whether totalMax exceeds the account's
-// per-call autonomous limit, mirroring the Spending Policy flow in
-// README.md: under the limit invokes silently, over it must come back as
-// MCP input_required / a client-side confirmation prompt.
 func (s *AccountService) RequiresConfirmation(ctx context.Context, principalID, totalMax, currency string) (bool, error) {
 	a, err := s.Get(ctx, principalID)
 	if err != nil {
@@ -73,10 +77,6 @@ func (s *AccountService) RequiresConfirmation(ctx context.Context, principalID, 
 	return total.Cmp(limit) > 0, nil
 }
 
-// Debit atomically checks balance + daily limit and reserves amount, all
-// under the store's single UpdateAccount lock — no separate read then
-// write, so two concurrent debits for the same principal can never both
-// observe the pre-debit balance and overspend.
 func (s *AccountService) Debit(ctx context.Context, principalID, amountStr, currency string) error {
 	amount, err := money.Parse(amountStr, currency, accountDecimals)
 	if err != nil {
@@ -84,6 +84,7 @@ func (s *AccountService) Debit(ctx context.Context, principalID, amountStr, curr
 	}
 
 	_, err = s.store.UpdateAccount(ctx, principalID, defaultAccount(principalID), func(a domain.Account, exists bool) (domain.Account, error) {
+		a = normalizeAccount(a)
 		balance, err := money.Parse(a.Balance.Amount, a.Balance.Currency, accountDecimals)
 		if err != nil {
 			return domain.Account{}, err
@@ -114,12 +115,6 @@ func (s *AccountService) Debit(ctx context.Context, principalID, amountStr, curr
 	return err
 }
 
-// Credit reverses a Debit — used when an escrow releases or refunds unused
-// funds back to the client. It restores both Balance and RemainingToday:
-// a released/refunded amount was never actually spent, so it must not go
-// on consuming the caller's daily autonomous-spend allowance (a fully
-// refunded canceled job must not permanently eat into today's limit).
-// RemainingToday is capped at DailyLimit in case of any rounding drift.
 func (s *AccountService) Credit(ctx context.Context, principalID, amountStr, currency string) error {
 	amount, err := money.Parse(amountStr, currency, accountDecimals)
 	if err != nil {
@@ -130,6 +125,7 @@ func (s *AccountService) Credit(ctx context.Context, principalID, amountStr, cur
 	}
 
 	_, err = s.store.UpdateAccount(ctx, principalID, defaultAccount(principalID), func(a domain.Account, exists bool) (domain.Account, error) {
+		a = normalizeAccount(a)
 		balance, err := money.Parse(a.Balance.Amount, a.Balance.Currency, accountDecimals)
 		if err != nil {
 			return domain.Account{}, err

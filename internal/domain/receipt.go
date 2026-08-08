@@ -2,8 +2,6 @@ package domain
 
 import "time"
 
-// ReceiptStatus mirrors the escrow's terminal state plus dispute outcomes
-// (docs/SETTLEMENT.md "Receipt").
 type ReceiptStatus string
 
 const (
@@ -15,29 +13,71 @@ const (
 )
 
 type Receipt struct {
-	ID          string        `json:"receipt_id"`
-	QuoteID     string        `json:"quote_id"`
-	EscrowID    string        `json:"escrow_id"`
-	JobID       string        `json:"job_id"`
-	PrincipalID string        `json:"-"`
-	Charged     Money         `json:"charged"`
-	Refunded    Money         `json:"refunded"`
-	Status      ReceiptStatus `json:"status"`
-	CreatedAt   time.Time     `json:"created_at"`
+	ID                     string          `json:"receipt_id"`
+	QuoteID                string          `json:"quote_id"`
+	EscrowID               string          `json:"escrow_id"`
+	JobID                  string          `json:"job_id"`
+	PrincipalID            string          `json:"-"`
+	TrustMode              TrustMode       `json:"trust_mode"`
+	ProofProfile           ProofProfile    `json:"proof_profile,omitempty"`
+	Charged                Money           `json:"charged"`
+	Refunded               Money           `json:"refunded"`
+	Status                 ReceiptStatus   `json:"status"`
+	ProofStatus            ProofCheckpoint `json:"proof_status"`
+	NetworkProofRef        string          `json:"network_proof_ref,omitempty"`
+	ExecutionSignerID      string          `json:"execution_signer_id,omitempty"`
+	SignerAuthorizationRef string          `json:"signer_authorization_ref,omitempty"`
+	InputCommitment        string          `json:"input_commitment,omitempty"`
+	OutputCommitment       string          `json:"output_commitment,omitempty"`
+	UsageCommitment        string          `json:"usage_commitment,omitempty"`
+	CreatedAt              time.Time       `json:"created_at"`
 }
 
-// ExecutionReceipt is what tos-ai signs after running a job — the input to
-// tos-core.VerifyExecutionReceipt. It is intentionally distinct from the
-// client-facing Receipt above: this one carries execution facts, the other
-// carries billing facts.
+type ExecutionResult string
+
+const (
+	ExecutionSuccess  ExecutionResult = "success"
+	ExecutionFailed   ExecutionResult = "failed"
+	ExecutionCanceled ExecutionResult = "canceled"
+	ExecutionTimedOut ExecutionResult = "timed_out"
+	ExecutionRejected ExecutionResult = "rejected"
+)
+
+type Usage struct {
+	InputBytes      uint64 `json:"input_bytes,omitempty"`
+	OutputBytes     uint64 `json:"output_bytes,omitempty"`
+	InputTokens     uint64 `json:"input_tokens,omitempty"`
+	OutputTokens    uint64 `json:"output_tokens,omitempty"`
+	ExecutionMillis uint64 `json:"execution_millis,omitempty"`
+}
+
+// ExecutionReceipt is signed execution evidence. The Provider and the
+// authorized execution signer may be different identities.
 type ExecutionReceipt struct {
-	JobID        string    `json:"job_id"`
-	ProviderID   string    `json:"provider_id"`
-	CapabilityID string    `json:"capability_id"`
-	InputHash    string    `json:"input_hash"`
-	OutputHash   string    `json:"output_hash"`
-	StartedAt    time.Time `json:"started_at"`
-	CompletedAt  time.Time `json:"completed_at"`
-	Cost         Money     `json:"cost"`
-	Signature    string    `json:"signature"`
+	ID                     string          `json:"receipt_id"`
+	QuoteID                string          `json:"quote_id"`
+	EscrowID               string          `json:"escrow_id"`
+	JobID                  string          `json:"job_id"`
+	PrincipalID            string          `json:"principal_id,omitempty"`
+	ProviderID             string          `json:"provider_id"`
+	CapabilityID           string          `json:"capability_id"`
+	CapabilityVersion      string          `json:"capability_version"`
+	TrustMode              TrustMode       `json:"trust_mode"`
+	ProofProfile           ProofProfile    `json:"proof_profile,omitempty"`
+	Result                 ExecutionResult `json:"result"`
+	InputHash              string          `json:"input_commitment"`
+	OutputHash             string          `json:"output_commitment"`
+	UsageCommitment        string          `json:"usage_commitment,omitempty"`
+	Artifacts              []Artifact      `json:"artifacts,omitempty"`
+	Usage                  Usage           `json:"usage"`
+	StartedAt              time.Time       `json:"started_at"`
+	CompletedAt            time.Time       `json:"completed_at"`
+	Cost                   Money           `json:"cost"`
+	ExecutionSignerID      string          `json:"execution_signer_id"`
+	SignerAuthorizationID  string          `json:"signer_authorization_id,omitempty"`
+	SignerAuthorizationRef string          `json:"signer_authorization_ref,omitempty"`
+	SignatureAlgorithm     string          `json:"signature_algorithm,omitempty"`
+	Signature              string          `json:"signature"`
+	NetworkProofRef        string          `json:"network_proof_ref,omitempty"`
+	ErrorCode              ErrorCode       `json:"error_code,omitempty"`
 }

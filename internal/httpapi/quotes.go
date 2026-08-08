@@ -9,33 +9,35 @@ import (
 )
 
 type createQuoteRequest struct {
-	CapabilityID string         `json:"capability_id"`
-	Constraints  map[string]any `json:"constraints"`
+	CapabilityID       string                    `json:"capability_id"`
+	InputSummary       map[string]any            `json:"input_summary"`
+	RequestedTrustMode domain.RequestedTrustMode `json:"requested_trust_mode"`
+	ProofRequirements  domain.ProofRequirements  `json:"proof_requirements"`
+	Constraints        struct {
+		MaxTotal *domain.Money `json:"max_total"`
+		Deadline string        `json:"deadline"`
+	} `json:"constraints"`
 }
 
 func (s *Server) handleCreateQuote(w http.ResponseWriter, r *http.Request) {
 	var req createQuoteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed JSON body", false)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed quote request: "+err.Error(), false)
 		return
 	}
 	if req.CapabilityID == "" {
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "capability_id is required", false)
 		return
 	}
-
-	in := service.CreateQuoteInput{CapabilityID: req.CapabilityID}
-	if req.Constraints != nil {
-		if maxTotal, ok := req.Constraints["max_total"].(map[string]any); ok {
-			amount, _ := maxTotal["amount"].(string)
-			currency, _ := maxTotal["currency"].(string)
-			if amount != "" {
-				in.MaxTotal = &domain.Money{Amount: amount, Currency: currency}
-			}
-		}
-	}
-
-	q, err := s.Quotes.Create(r.Context(), in)
+	q, err := s.Quotes.Create(r.Context(), service.CreateQuoteInput{
+		CapabilityID:       req.CapabilityID,
+		InputSummary:       req.InputSummary,
+		RequestedTrustMode: req.RequestedTrustMode,
+		ProofRequirements:  req.ProofRequirements,
+		MaxTotal:           req.Constraints.MaxTotal,
+	})
 	if err != nil {
 		writeDomainErr(w, err)
 		return
@@ -44,8 +46,7 @@ func (s *Server) handleCreateQuote(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetQuote(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	q, err := s.Quotes.Get(r.Context(), id)
+	q, err := s.Quotes.Get(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeDomainErr(w, err)
 		return

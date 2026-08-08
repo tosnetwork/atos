@@ -1,21 +1,15 @@
-// Package postgres implements store.Store against Postgres, the "Phase 1
-// — centralized Postgres registry" deliverable from
-// ~/atos-spec/docs/IMPLEMENTATION_ROADMAP.md. It satisfies the exact same
-// interface internal/store/memory does, so internal/service never changes
-// when this replaces the in-memory store.
-//
-// Atomicity: the in-memory store gets UpdateAccount/UpdateJob's
-// compare-and-swap semantics from a single process-wide mutex. Here the
-// same guarantee comes from `SELECT ... FOR UPDATE` inside a transaction —
-// the row lock blocks a concurrent updater until the first transaction
-// commits or rolls back, which is the same "only one caller wins" property
-// the concurrency tests in internal/store/memory/memory_test.go assert.
+// Package postgres implements store.Store with indexed relational columns for
+// gateway queries plus a complete JSONB payload for the evolving ATOS v0.2
+// protocol object. The payload is authoritative for fields such as trust mode,
+// proof profile, signer authorization and settlement evidence; legacy columns
+// remain useful for indexes, constraints and rolling migration compatibility.
 package postgres
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -40,45 +34,65 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	return &Store{pool: pool}, nil
 }
 
-func (s *Store) Close() {
-	s.pool.Close()
-}
+func (s *Store) Close() { s.pool.Close() }
 
 func mustMarshal(v any) []byte {
 	b, err := json.Marshal(v)
 	if err != nil {
-		// Every value passed here is one of our own domain types with no
-		// unmarshalable fields (channels, funcs) — a failure here is a
-		// programming error, not a runtime condition callers can recover
-		// from, so it is not worth threading an error return through every
-		// call site for.
 		panic("postgres: marshal domain value: " + err.Error())
 	}
 	return b
 }
 
+func applyPayload(payload []byte, target any) error {
+	if len(payload) == 0 || string(payload) == "{}" || string(payload) == "null" {
+		return nil
+	}
+	if err := json.Unmarshal(payload, target); err != nil {
+		return fmt.Errorf("postgres: decode v0.2 payload: %w", err)
+	}
+	return nil
+}
+
+func nullableJSON(v map[string]any) any {
+	if v == nil {
+		return nil
+	}
+	return mustMarshal(v)
+}
+
 // --- Capabilities ---
+
+const capabilityColumns = `id, provider_id, name, description, version, tags, modalities, delivery_mode, input_schema, output_schema, pricing, sla, trust, status, updated_at, payload`
 
 func (s *Store) Put(ctx context.Context, c domain.Capability) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO capabilities (id, provider_id, name, description, version, tags, modalities, delivery_mode, input_schema, output_schema, pricing, sla, trust, status, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+		INSERT INTO capabilities (
+			id, provider_id, name, description, version, tags, modalities,
+			delivery_mode, input_schema, output_schema, pricing, sla, trust,
+			status, updated_at, payload
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
 		ON CONFLICT (id) DO UPDATE SET
-			name=$3, description=$4, version=$5, tags=$6, modalities=$7, delivery_mode=$8,
-			input_schema=$9, output_schema=$10, pricing=$11, sla=$12, trust=$13, status=$14, updated_at=$15
-	`, c.ID, c.ProviderID, c.Name, c.Description, c.Version, mustMarshal(c.Tags), mustMarshal(c.Modalities),
-		string(c.DeliveryMode), mustMarshal(c.InputSchema), mustMarshal(c.OutputSchema), mustMarshal(c.Pricing),
-		mustMarshal(c.SLA), mustMarshal(c.Trust), string(c.Status), c.UpdatedAt)
+			name=$3, description=$4, version=$5, tags=$6, modalities=$7,
+			delivery_mode=$8, input_schema=$9, output_schema=$10, pricing=$11,
+			sla=$12, trust=$13, status=$14, updated_at=$15, payload=$16
+	`, c.ID, c.ProviderID, c.Name, c.Description, c.Version,
+		mustMarshal(c.Tags), mustMarshal(c.Modalities), string(c.DeliveryMode),
+		mustMarshal(c.InputSchema), mustMarshal(c.OutputSchema), mustMarshal(c.Pricing),
+		mustMarshal(c.SLA), mustMarshal(c.Trust), string(c.Status), c.UpdatedAt,
+		mustMarshal(c))
 	return err
 }
 
 func scanCapability(row pgx.Row) (domain.Capability, error) {
 	var c domain.Capability
-	var tags, modalities, inputSchema, outputSchema, pricing, sla, trust []byte
+	var tags, modalities, inputSchema, outputSchema, pricing, sla, trust, payload []byte
 	var deliveryMode, status string
-	err := row.Scan(&c.ID, &c.ProviderID, &c.Name, &c.Description, &c.Version, &tags, &modalities,
-		&deliveryMode, &inputSchema, &outputSchema, &pricing, &sla, &trust, &status, &c.UpdatedAt)
-	if err != nil {
+	if err := row.Scan(
+		&c.ID, &c.ProviderID, &c.Name, &c.Description, &c.Version,
+		&tags, &modalities, &deliveryMode, &inputSchema, &outputSchema,
+		&pricing, &sla, &trust, &status, &c.UpdatedAt, &payload,
+	); err != nil {
 		return domain.Capability{}, err
 	}
 	c.DeliveryMode = domain.DeliveryMode(deliveryMode)
@@ -90,30 +104,27 @@ func scanCapability(row pgx.Row) (domain.Capability, error) {
 	_ = json.Unmarshal(pricing, &c.Pricing)
 	_ = json.Unmarshal(sla, &c.SLA)
 	_ = json.Unmarshal(trust, &c.Trust)
+	if err := applyPayload(payload, &c); err != nil {
+		return domain.Capability{}, err
+	}
 	return c, nil
 }
 
-const capabilityColumns = `id, provider_id, name, description, version, tags, modalities, delivery_mode, input_schema, output_schema, pricing, sla, trust, status, updated_at`
-
 func (s *Store) Get(ctx context.Context, id string) (domain.Capability, error) {
-	row := s.pool.QueryRow(ctx, `SELECT `+capabilityColumns+` FROM capabilities WHERE id=$1`, id)
-	c, err := scanCapability(row)
+	c, err := scanCapability(s.pool.QueryRow(ctx, `SELECT `+capabilityColumns+` FROM capabilities WHERE id=$1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Capability{}, store.ErrNotFound
 	}
 	return c, err
 }
 
-// Search does a naive ILIKE match, same Phase 0/1 simplification as
-// internal/store/memory — see docs/CAPABILITIES.md for the real semantic
-// ranking this is a stand-in for.
 func (s *Store) Search(ctx context.Context, query string, limit int) ([]domain.Capability, error) {
-	pattern := "%" + query + "%"
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+capabilityColumns+` FROM capabilities
 		WHERE status='active' AND (name ILIKE $1 OR description ILIKE $1 OR tags::text ILIKE $1)
+		ORDER BY updated_at DESC, id ASC
 		LIMIT $2
-	`, pattern, limit)
+	`, "%"+query+"%", limit)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +141,7 @@ func (s *Store) Search(ctx context.Context, query string, limit int) ([]domain.C
 }
 
 func (s *Store) ByProvider(ctx context.Context, providerID string) ([]domain.Capability, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+capabilityColumns+` FROM capabilities WHERE provider_id=$1`, providerID)
+	rows, err := s.pool.Query(ctx, `SELECT `+capabilityColumns+` FROM capabilities WHERE provider_id=$1 ORDER BY updated_at DESC, id ASC`, providerID)
 	if err != nil {
 		return nil, err
 	}
@@ -150,18 +161,25 @@ func (s *Store) ByProvider(ctx context.Context, providerID string) ([]domain.Cap
 
 func (s *Store) PutQuote(ctx context.Context, q domain.Quote) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO quotes (id, capability_id, capability_version, price, expires_at, requires_confirmation, terms_hash, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		INSERT INTO quotes (
+			id, capability_id, capability_version, price, expires_at,
+			requires_confirmation, terms_hash, created_at, payload
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		ON CONFLICT (id) DO NOTHING
-	`, q.ID, q.CapabilityID, q.CapabilityVersion, mustMarshal(q.Price), q.ExpiresAt, q.RequiresConfirmation, q.TermsHash, q.CreatedAt)
+	`, q.ID, q.CapabilityID, q.CapabilityVersion, mustMarshal(q.Price),
+		q.ExpiresAt, q.RequiresConfirmation, q.TermsHash, q.CreatedAt, mustMarshal(q))
 	return err
 }
 
 func (s *Store) GetQuote(ctx context.Context, id string) (domain.Quote, error) {
 	var q domain.Quote
-	var price []byte
-	err := s.pool.QueryRow(ctx, `SELECT id, capability_id, capability_version, price, expires_at, requires_confirmation, terms_hash, created_at FROM quotes WHERE id=$1`, id).
-		Scan(&q.ID, &q.CapabilityID, &q.CapabilityVersion, &price, &q.ExpiresAt, &q.RequiresConfirmation, &q.TermsHash, &q.CreatedAt)
+	var price, payload []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, capability_id, capability_version, price, expires_at,
+		       requires_confirmation, terms_hash, created_at, payload
+		FROM quotes WHERE id=$1
+	`, id).Scan(&q.ID, &q.CapabilityID, &q.CapabilityVersion, &price,
+		&q.ExpiresAt, &q.RequiresConfirmation, &q.TermsHash, &q.CreatedAt, &payload)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Quote{}, store.ErrNotFound
 	}
@@ -169,38 +187,50 @@ func (s *Store) GetQuote(ctx context.Context, id string) (domain.Quote, error) {
 		return domain.Quote{}, err
 	}
 	_ = json.Unmarshal(price, &q.Price)
+	if err := applyPayload(payload, &q); err != nil {
+		return domain.Quote{}, err
+	}
 	return q, nil
 }
 
 // --- Escrows ---
 
+const escrowColumns = `id, quote_id, principal_id, provider_id, capability_id, reserved, status, created_at, expires_at, settled_at, payload`
+
 func (s *Store) PutEscrow(ctx context.Context, e domain.Escrow) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO escrows (id, quote_id, principal_id, provider_id, capability_id, reserved, status, created_at, expires_at, settled_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-		ON CONFLICT (id) DO UPDATE SET reserved=$6, status=$7, expires_at=$9, settled_at=$10
-	`, e.ID, e.QuoteID, e.PrincipalID, e.ProviderID, e.CapabilityID, mustMarshal(e.Reserved), string(e.Status), e.CreatedAt, e.ExpiresAt, e.SettledAt)
+		INSERT INTO escrows (
+			id, quote_id, principal_id, provider_id, capability_id, reserved,
+			status, created_at, expires_at, settled_at, payload
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		ON CONFLICT (id) DO UPDATE SET
+			reserved=$6, status=$7, expires_at=$9, settled_at=$10, payload=$11
+	`, e.ID, e.QuoteID, e.PrincipalID, e.ProviderID, e.CapabilityID,
+		mustMarshal(e.Reserved), string(e.Status), e.CreatedAt, e.ExpiresAt,
+		e.SettledAt, mustMarshal(e))
 	return err
 }
 
 func scanEscrow(row pgx.Row) (domain.Escrow, error) {
 	var e domain.Escrow
-	var reserved []byte
+	var reserved, payload []byte
 	var status string
-	err := row.Scan(&e.ID, &e.QuoteID, &e.PrincipalID, &e.ProviderID, &e.CapabilityID, &reserved, &status, &e.CreatedAt, &e.ExpiresAt, &e.SettledAt)
-	if err != nil {
+	if err := row.Scan(
+		&e.ID, &e.QuoteID, &e.PrincipalID, &e.ProviderID, &e.CapabilityID,
+		&reserved, &status, &e.CreatedAt, &e.ExpiresAt, &e.SettledAt, &payload,
+	); err != nil {
 		return domain.Escrow{}, err
 	}
 	e.Status = domain.EscrowStatus(status)
 	_ = json.Unmarshal(reserved, &e.Reserved)
+	if err := applyPayload(payload, &e); err != nil {
+		return domain.Escrow{}, err
+	}
 	return e, nil
 }
 
-const escrowColumns = `id, quote_id, principal_id, provider_id, capability_id, reserved, status, created_at, expires_at, settled_at`
-
 func (s *Store) GetEscrow(ctx context.Context, id string) (domain.Escrow, error) {
-	row := s.pool.QueryRow(ctx, `SELECT `+escrowColumns+` FROM escrows WHERE id=$1`, id)
-	e, err := scanEscrow(row)
+	e, err := scanEscrow(s.pool.QueryRow(ctx, `SELECT `+escrowColumns+` FROM escrows WHERE id=$1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Escrow{}, store.ErrNotFound
 	}
@@ -209,34 +239,42 @@ func (s *Store) GetEscrow(ctx context.Context, id string) (domain.Escrow, error)
 
 // --- Receipts ---
 
+const receiptColumns = `id, quote_id, escrow_id, job_id, principal_id, charged, refunded, status, created_at, payload`
+
 func (s *Store) PutReceipt(ctx context.Context, r domain.Receipt) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO receipts (id, quote_id, escrow_id, job_id, principal_id, charged, refunded, status, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		INSERT INTO receipts (
+			id, quote_id, escrow_id, job_id, principal_id, charged, refunded,
+			status, created_at, payload
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		ON CONFLICT (id) DO NOTHING
-	`, r.ID, r.QuoteID, r.EscrowID, r.JobID, r.PrincipalID, mustMarshal(r.Charged), mustMarshal(r.Refunded), string(r.Status), r.CreatedAt)
+	`, r.ID, r.QuoteID, r.EscrowID, r.JobID, r.PrincipalID,
+		mustMarshal(r.Charged), mustMarshal(r.Refunded), string(r.Status),
+		r.CreatedAt, mustMarshal(r))
 	return err
 }
 
 func scanReceipt(row pgx.Row) (domain.Receipt, error) {
 	var r domain.Receipt
-	var charged, refunded []byte
+	var charged, refunded, payload []byte
 	var status string
-	err := row.Scan(&r.ID, &r.QuoteID, &r.EscrowID, &r.JobID, &r.PrincipalID, &charged, &refunded, &status, &r.CreatedAt)
-	if err != nil {
+	if err := row.Scan(
+		&r.ID, &r.QuoteID, &r.EscrowID, &r.JobID, &r.PrincipalID,
+		&charged, &refunded, &status, &r.CreatedAt, &payload,
+	); err != nil {
 		return domain.Receipt{}, err
 	}
 	r.Status = domain.ReceiptStatus(status)
 	_ = json.Unmarshal(charged, &r.Charged)
 	_ = json.Unmarshal(refunded, &r.Refunded)
+	if err := applyPayload(payload, &r); err != nil {
+		return domain.Receipt{}, err
+	}
 	return r, nil
 }
 
-const receiptColumns = `id, quote_id, escrow_id, job_id, principal_id, charged, refunded, status, created_at`
-
 func (s *Store) GetReceipt(ctx context.Context, id string) (domain.Receipt, error) {
-	row := s.pool.QueryRow(ctx, `SELECT `+receiptColumns+` FROM receipts WHERE id=$1`, id)
-	r, err := scanReceipt(row)
+	r, err := scanReceipt(s.pool.QueryRow(ctx, `SELECT `+receiptColumns+` FROM receipts WHERE id=$1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Receipt{}, store.ErrNotFound
 	}
@@ -244,8 +282,7 @@ func (s *Store) GetReceipt(ctx context.Context, id string) (domain.Receipt, erro
 }
 
 func (s *Store) ReceiptByJob(ctx context.Context, jobID string) (domain.Receipt, error) {
-	row := s.pool.QueryRow(ctx, `SELECT `+receiptColumns+` FROM receipts WHERE job_id=$1`, jobID)
-	r, err := scanReceipt(row)
+	r, err := scanReceipt(s.pool.QueryRow(ctx, `SELECT `+receiptColumns+` FROM receipts WHERE job_id=$1`, jobID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Receipt{}, store.ErrNotFound
 	}
@@ -253,7 +290,7 @@ func (s *Store) ReceiptByJob(ctx context.Context, jobID string) (domain.Receipt,
 }
 
 func (s *Store) ReceiptsByPrincipal(ctx context.Context, principalID string) ([]domain.Receipt, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+receiptColumns+` FROM receipts WHERE principal_id=$1`, principalID)
+	rows, err := s.pool.Query(ctx, `SELECT `+receiptColumns+` FROM receipts WHERE principal_id=$1 ORDER BY created_at DESC, id ASC`, principalID)
 	if err != nil {
 		return nil, err
 	}
@@ -271,31 +308,39 @@ func (s *Store) ReceiptsByPrincipal(ctx context.Context, principalID string) ([]
 
 // --- Jobs ---
 
+const jobColumns = `id, capability_id, quote_id, escrow_id, principal_id, state, input, output, artifacts, idempotency_key, failure_reason, created_at, updated_at, estimated_completion_at, payload`
+
 func (s *Store) PutJob(ctx context.Context, j domain.Job) error {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO jobs (id, capability_id, quote_id, escrow_id, principal_id, state, input, output, artifacts, idempotency_key, failure_reason, created_at, updated_at, estimated_completion_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-		ON CONFLICT (id) DO UPDATE SET
-			escrow_id=$4, state=$6, input=$7, output=$8, artifacts=$9, failure_reason=$11, updated_at=$13, estimated_completion_at=$14
-	`, j.ID, j.CapabilityID, j.QuoteID, j.EscrowID, j.PrincipalID, string(j.State), mustMarshal(j.Input),
-		nullableJSON(j.Output), mustMarshal(j.Artifacts), j.IdempotencyKey, j.FailureReason, j.CreatedAt, j.UpdatedAt, j.EstimatedCompletionAt)
+	_, err := s.pool.Exec(ctx, upsertJobSQL,
+		j.ID, j.CapabilityID, j.QuoteID, j.EscrowID, j.PrincipalID,
+		string(j.State), mustMarshal(j.Input), nullableJSON(j.Output),
+		mustMarshal(j.Artifacts), j.IdempotencyKey, j.FailureReason,
+		j.CreatedAt, j.UpdatedAt, j.EstimatedCompletionAt, mustMarshal(j))
 	return err
 }
 
-func nullableJSON(v map[string]any) any {
-	if v == nil {
-		return nil
-	}
-	return mustMarshal(v)
-}
+const upsertJobSQL = `
+	INSERT INTO jobs (
+		id, capability_id, quote_id, escrow_id, principal_id, state, input,
+		output, artifacts, idempotency_key, failure_reason, created_at,
+		updated_at, estimated_completion_at, payload
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+	ON CONFLICT (id) DO UPDATE SET
+		escrow_id=$4, state=$6, input=$7, output=$8, artifacts=$9,
+		failure_reason=$11, updated_at=$13, estimated_completion_at=$14,
+		payload=$15
+`
 
 func scanJob(row pgx.Row) (domain.Job, error) {
 	var j domain.Job
-	var input, output, artifacts []byte
+	var input, output, artifacts, payload []byte
 	var state string
-	err := row.Scan(&j.ID, &j.CapabilityID, &j.QuoteID, &j.EscrowID, &j.PrincipalID, &state, &input, &output,
-		&artifacts, &j.IdempotencyKey, &j.FailureReason, &j.CreatedAt, &j.UpdatedAt, &j.EstimatedCompletionAt)
-	if err != nil {
+	if err := row.Scan(
+		&j.ID, &j.CapabilityID, &j.QuoteID, &j.EscrowID, &j.PrincipalID,
+		&state, &input, &output, &artifacts, &j.IdempotencyKey,
+		&j.FailureReason, &j.CreatedAt, &j.UpdatedAt,
+		&j.EstimatedCompletionAt, &payload,
+	); err != nil {
 		return domain.Job{}, err
 	}
 	j.State = domain.JobState(state)
@@ -304,14 +349,14 @@ func scanJob(row pgx.Row) (domain.Job, error) {
 		_ = json.Unmarshal(output, &j.Output)
 	}
 	_ = json.Unmarshal(artifacts, &j.Artifacts)
+	if err := applyPayload(payload, &j); err != nil {
+		return domain.Job{}, err
+	}
 	return j, nil
 }
 
-const jobColumns = `id, capability_id, quote_id, escrow_id, principal_id, state, input, output, artifacts, idempotency_key, failure_reason, created_at, updated_at, estimated_completion_at`
-
 func (s *Store) GetJob(ctx context.Context, id string) (domain.Job, error) {
-	row := s.pool.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=$1`, id)
-	j, err := scanJob(row)
+	j, err := scanJob(s.pool.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=$1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Job{}, store.ErrNotFound
 	}
@@ -319,7 +364,7 @@ func (s *Store) GetJob(ctx context.Context, id string) (domain.Job, error) {
 }
 
 func (s *Store) JobsByPrincipal(ctx context.Context, principalID string) ([]domain.Job, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+jobColumns+` FROM jobs WHERE principal_id=$1`, principalID)
+	rows, err := s.pool.Query(ctx, `SELECT `+jobColumns+` FROM jobs WHERE principal_id=$1 ORDER BY created_at DESC, id ASC`, principalID)
 	if err != nil {
 		return nil, err
 	}
@@ -335,42 +380,33 @@ func (s *Store) JobsByPrincipal(ctx context.Context, principalID string) ([]doma
 	return out, rows.Err()
 }
 
-// UpdateJob locks the row with SELECT ... FOR UPDATE inside a transaction,
-// so a concurrent caller trying to update the same job blocks until this
-// transaction commits or rolls back — the same exclusivity
-// internal/store/memory's process-wide mutex gives claimForExecution and
-// transitionIfNotTerminal in internal/service/job.go.
-func (s *Store) UpdateJob(ctx context.Context, id string, fn func(j domain.Job, exists bool) (domain.Job, error)) (domain.Job, error) {
+func (s *Store) UpdateJob(ctx context.Context, id string, fn func(domain.Job, bool) (domain.Job, error)) (domain.Job, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return domain.Job{}, err
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck // no-op if already committed
+	defer tx.Rollback(ctx) //nolint:errcheck
 
-	row := tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=$1 FOR UPDATE`, id)
-	current, err := scanJob(row)
+	current, err := scanJob(tx.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=$1 FOR UPDATE`, id))
 	exists := true
 	if errors.Is(err, pgx.ErrNoRows) {
+		current = domain.Job{}
 		exists = false
 		err = nil
 	}
 	if err != nil {
 		return domain.Job{}, err
 	}
-
 	next, err := fn(current, exists)
 	if err != nil {
 		return domain.Job{}, err
 	}
-
-	_, err = tx.Exec(ctx, `
-		INSERT INTO jobs (id, capability_id, quote_id, escrow_id, principal_id, state, input, output, artifacts, idempotency_key, failure_reason, created_at, updated_at, estimated_completion_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-		ON CONFLICT (id) DO UPDATE SET
-			escrow_id=$4, state=$6, input=$7, output=$8, artifacts=$9, failure_reason=$11, updated_at=$13, estimated_completion_at=$14
-	`, next.ID, next.CapabilityID, next.QuoteID, next.EscrowID, next.PrincipalID, string(next.State), mustMarshal(next.Input),
-		nullableJSON(next.Output), mustMarshal(next.Artifacts), next.IdempotencyKey, next.FailureReason, next.CreatedAt, next.UpdatedAt, next.EstimatedCompletionAt)
-	if err != nil {
+	if _, err := tx.Exec(ctx, upsertJobSQL,
+		next.ID, next.CapabilityID, next.QuoteID, next.EscrowID,
+		next.PrincipalID, string(next.State), mustMarshal(next.Input),
+		nullableJSON(next.Output), mustMarshal(next.Artifacts), next.IdempotencyKey,
+		next.FailureReason, next.CreatedAt, next.UpdatedAt,
+		next.EstimatedCompletionAt, mustMarshal(next)); err != nil {
 		return domain.Job{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -384,8 +420,9 @@ func (s *Store) UpdateJob(ctx context.Context, id string, fn func(j domain.Job, 
 func (s *Store) GetAccount(ctx context.Context, principalID string) (domain.Account, error) {
 	var a domain.Account
 	a.PrincipalID = principalID
-	var balance, spendPolicy []byte
-	err := s.pool.QueryRow(ctx, `SELECT balance, spend_policy FROM accounts WHERE principal_id=$1`, principalID).Scan(&balance, &spendPolicy)
+	var balance, spendPolicy, payload []byte
+	err := s.pool.QueryRow(ctx, `SELECT balance, spend_policy, payload FROM accounts WHERE principal_id=$1`, principalID).
+		Scan(&balance, &spendPolicy, &payload)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Account{}, store.ErrNotFound
 	}
@@ -394,21 +431,24 @@ func (s *Store) GetAccount(ctx context.Context, principalID string) (domain.Acco
 	}
 	_ = json.Unmarshal(balance, &a.Balance)
 	_ = json.Unmarshal(spendPolicy, &a.SpendPolicy)
+	if err := applyPayload(payload, &a); err != nil {
+		return domain.Account{}, err
+	}
+	a.PrincipalID = principalID
 	return a, nil
 }
 
 func (s *Store) PutAccount(ctx context.Context, a domain.Account) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO accounts (principal_id, balance, spend_policy) VALUES ($1,$2,$3)
-		ON CONFLICT (principal_id) DO UPDATE SET balance=$2, spend_policy=$3
-	`, a.PrincipalID, mustMarshal(a.Balance), mustMarshal(a.SpendPolicy))
+		INSERT INTO accounts (principal_id, balance, spend_policy, payload)
+		VALUES ($1,$2,$3,$4)
+		ON CONFLICT (principal_id) DO UPDATE SET
+			balance=$2, spend_policy=$3, payload=$4
+	`, a.PrincipalID, mustMarshal(a.Balance), mustMarshal(a.SpendPolicy), mustMarshal(a))
 	return err
 }
 
-// UpdateAccount mirrors UpdateJob's SELECT ... FOR UPDATE pattern — see
-// that method's comment for why this gives the same atomicity guarantee
-// the in-memory store's mutex does.
-func (s *Store) UpdateAccount(ctx context.Context, principalID string, seed domain.Account, fn func(a domain.Account, exists bool) (domain.Account, error)) (domain.Account, error) {
+func (s *Store) UpdateAccount(ctx context.Context, principalID string, seed domain.Account, fn func(domain.Account, bool) (domain.Account, error)) (domain.Account, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return domain.Account{}, err
@@ -417,8 +457,9 @@ func (s *Store) UpdateAccount(ctx context.Context, principalID string, seed doma
 
 	var current domain.Account
 	current.PrincipalID = principalID
-	var balance, spendPolicy []byte
-	err = tx.QueryRow(ctx, `SELECT balance, spend_policy FROM accounts WHERE principal_id=$1 FOR UPDATE`, principalID).Scan(&balance, &spendPolicy)
+	var balance, spendPolicy, payload []byte
+	err = tx.QueryRow(ctx, `SELECT balance, spend_policy, payload FROM accounts WHERE principal_id=$1 FOR UPDATE`, principalID).
+		Scan(&balance, &spendPolicy, &payload)
 	exists := true
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
@@ -429,24 +470,27 @@ func (s *Store) UpdateAccount(ctx context.Context, principalID string, seed doma
 	default:
 		_ = json.Unmarshal(balance, &current.Balance)
 		_ = json.Unmarshal(spendPolicy, &current.SpendPolicy)
+		if err := applyPayload(payload, &current); err != nil {
+			return domain.Account{}, err
+		}
 	}
-
+	current.PrincipalID = principalID
 	next, err := fn(current, exists)
 	if err != nil {
 		return domain.Account{}, err
 	}
-
-	_, err = tx.Exec(ctx, `
-		INSERT INTO accounts (principal_id, balance, spend_policy) VALUES ($1,$2,$3)
-		ON CONFLICT (principal_id) DO UPDATE SET balance=$2, spend_policy=$3
-	`, principalID, mustMarshal(next.Balance), mustMarshal(next.SpendPolicy))
-	if err != nil {
+	next.PrincipalID = principalID
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO accounts (principal_id, balance, spend_policy, payload)
+		VALUES ($1,$2,$3,$4)
+		ON CONFLICT (principal_id) DO UPDATE SET
+			balance=$2, spend_policy=$3, payload=$4
+	`, principalID, mustMarshal(next.Balance), mustMarshal(next.SpendPolicy), mustMarshal(next)); err != nil {
 		return domain.Account{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.Account{}, err
 	}
-	next.PrincipalID = principalID
 	return next, nil
 }
 
@@ -454,19 +498,28 @@ func (s *Store) UpdateAccount(ctx context.Context, principalID string, seed doma
 
 func (s *Store) PutArtifact(ctx context.Context, a domain.StoredArtifact) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO artifacts (id, owner_principal_id, content_type, size_bytes, sha256, status, created_at, expires_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		INSERT INTO artifacts (
+			id, owner_principal_id, content_type, size_bytes, sha256, status,
+			created_at, expires_at, payload
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		ON CONFLICT (id) DO UPDATE SET
-			content_type=$3, size_bytes=$4, sha256=$5, status=$6, expires_at=$8
-	`, a.ID, a.OwnerPrincipalID, a.ContentType, a.SizeBytes, a.SHA256, string(a.Status), a.CreatedAt, a.ExpiresAt)
+			content_type=$3, size_bytes=$4, sha256=$5, status=$6,
+			expires_at=$8, payload=$9
+	`, a.ID, a.OwnerPrincipalID, a.ContentType, a.SizeBytes, a.SHA256,
+		string(a.Status), a.CreatedAt, a.ExpiresAt, mustMarshal(a))
 	return err
 }
 
 func (s *Store) GetArtifact(ctx context.Context, id string) (domain.StoredArtifact, error) {
 	var a domain.StoredArtifact
 	var status string
-	err := s.pool.QueryRow(ctx, `SELECT id, owner_principal_id, content_type, size_bytes, sha256, status, created_at, expires_at FROM artifacts WHERE id=$1`, id).
-		Scan(&a.ID, &a.OwnerPrincipalID, &a.ContentType, &a.SizeBytes, &a.SHA256, &status, &a.CreatedAt, &a.ExpiresAt)
+	var payload []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, owner_principal_id, content_type, size_bytes, sha256,
+		       status, created_at, expires_at, payload
+		FROM artifacts WHERE id=$1
+	`, id).Scan(&a.ID, &a.OwnerPrincipalID, &a.ContentType, &a.SizeBytes,
+		&a.SHA256, &status, &a.CreatedAt, &a.ExpiresAt, &payload)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.StoredArtifact{}, store.ErrNotFound
 	}
@@ -474,6 +527,9 @@ func (s *Store) GetArtifact(ctx context.Context, id string) (domain.StoredArtifa
 		return domain.StoredArtifact{}, err
 	}
 	a.Status = domain.ArtifactStatus(status)
+	if err := applyPayload(payload, &a); err != nil {
+		return domain.StoredArtifact{}, err
+	}
 	return a, nil
 }
 
@@ -481,22 +537,25 @@ func (s *Store) GetArtifact(ctx context.Context, id string) (domain.StoredArtifa
 
 func (s *Store) Reserve(ctx context.Context, principalID, key, requestHash string) (store.IdempotencyRecord, bool, error) {
 	var rec store.IdempotencyRecord
+	var status string
 	err := s.pool.QueryRow(ctx, `
 		INSERT INTO idempotency_records (principal_id, key, request_hash, status)
 		VALUES ($1,$2,$3,$4)
 		ON CONFLICT (principal_id, key) DO NOTHING
 		RETURNING request_hash, response_key, status
-	`, principalID, key, requestHash, string(store.IdempotencyInProgress)).Scan(&rec.RequestHash, &rec.ResponseKey, &rec.Status)
+	`, principalID, key, requestHash, string(store.IdempotencyInProgress)).
+		Scan(&rec.RequestHash, &rec.ResponseKey, &status)
 	if err == nil {
+		rec.Status = store.IdempotencyStatus(status)
 		return rec, true, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return store.IdempotencyRecord{}, false, err
 	}
-	// Conflict: a record already exists. Fetch and return it.
-	var status string
-	err = s.pool.QueryRow(ctx, `SELECT request_hash, response_key, status FROM idempotency_records WHERE principal_id=$1 AND key=$2`, principalID, key).
-		Scan(&rec.RequestHash, &rec.ResponseKey, &status)
+	err = s.pool.QueryRow(ctx, `
+		SELECT request_hash, response_key, status
+		FROM idempotency_records WHERE principal_id=$1 AND key=$2
+	`, principalID, key).Scan(&rec.RequestHash, &rec.ResponseKey, &status)
 	if err != nil {
 		return store.IdempotencyRecord{}, false, err
 	}
@@ -506,7 +565,8 @@ func (s *Store) Reserve(ctx context.Context, principalID, key, requestHash strin
 
 func (s *Store) Finish(ctx context.Context, principalID, key, responseKey string) error {
 	tag, err := s.pool.Exec(ctx, `
-		UPDATE idempotency_records SET response_key=$3, status=$4 WHERE principal_id=$1 AND key=$2
+		UPDATE idempotency_records SET response_key=$3, status=$4
+		WHERE principal_id=$1 AND key=$2
 	`, principalID, key, responseKey, string(store.IdempotencyCompleted))
 	if err != nil {
 		return err

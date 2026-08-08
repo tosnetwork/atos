@@ -1,44 +1,37 @@
-// Package toscore defines the trust/economy interface contract from
-// ~/atos-spec/docs/ARCHITECTURE.md: identity, registry, reputation,
-// escrow, receipt verification, settlement and proof. Nothing about
-// execution belongs here — see internal/adapters/tosai for that half.
-//
-// Two call directions share this interface per the spec: tos-ai -> tos-core
-// (receipt lifecycle) and ATOS -> tos-core (direct trust reads/writes). A
-// single interface is fine here because both callers live in this same
-// process for Phase 0/1 — split them if/when tos-ai becomes a separate
-// service in Phase 2+.
+// Package toscore defines the ATOS/tos-ai -> tos-protocol trust, economy and
+// proof boundary. Execution itself belongs behind internal/adapters/tosai.
 package toscore
 
 import (
 	"context"
+	"time"
 
 	"github.com/tosnetwork/atos/internal/domain"
 )
 
 type CreateEscrowRequest struct {
-	QuoteID      string
-	CapabilityID string
-	PrincipalID  string
-	ProviderID   string
-	Reserved     domain.Money
+	QuoteID           string
+	JobID             string
+	CapabilityID      string
+	CapabilityVersion string
+	PrincipalID       string
+	ProviderID        string
+	TrustMode         domain.TrustMode
+	ProofProfile      domain.ProofProfile
+	Settlement        domain.SettlementDescriptor
+	Reserved          domain.Money
 }
 
-// VerifyExecutionReceiptResult is intentionally the *only* thing
-// VerifyExecutionReceipt returns beyond an error: a stateless pass/fail
-// judgment. It must never carry a side effect — see docs/SETTLEMENT.md's
-// verify/apply separation.
 type VerifyExecutionReceiptResult struct {
-	Valid  bool
-	Reason string // populated when Valid is false
+	Valid    bool
+	Reason   string
+	ProofRef string
 }
 
 type SettleJobRequest struct {
-	EscrowID string
-	JobID    string
-	// ActualCost is what the job really cost per the verified receipt; it
-	// may be less than the escrow's Reserved amount (metered/per_unit
-	// pricing), never more.
+	EscrowID   string
+	JobID      string
+	ReceiptID  string
 	ActualCost domain.Money
 }
 
@@ -46,19 +39,37 @@ type SettleJobResult struct {
 	Receipt domain.Receipt
 }
 
+type ExecutionSignerAuthorization struct {
+	AuthorizationID   string
+	ProviderID        string
+	CapabilityID      string
+	CapabilityVersion string
+	ExecutionSignerID string
+	ValidFrom         time.Time
+	ValidUntil        time.Time
+	AuthorizationRef  string
+	Revoked           bool
+}
+
 type Core interface {
-	// Identity / registry / reputation (ATOS -> tos-core direct reads).
+	// Identity and capability trust facts.
 	ResolveAgent(ctx context.Context, principalID string) (agentID string, err error)
 	ResolveCapability(ctx context.Context, capabilityID string) (domain.Trust, error)
 	ReadReputation(ctx context.Context, providerID string) (domain.Trust, error)
 	VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID string) (bool, error)
 	UpdateReputationEvidence(ctx context.Context, providerID string, evidence string) error
 
-	// Escrow / settlement (both call directions).
+	// Quote and execution-signer trust.
+	CommitQuote(ctx context.Context, quote domain.Quote) (proofRef string, err error)
+	ResolveExecutionSignerAuthorization(ctx context.Context, providerID, capabilityID, capabilityVersion, signerID string, at time.Time) (ExecutionSignerAuthorization, bool, error)
+
+	// Escrow, receipt and settlement.
 	CreateEscrow(ctx context.Context, req CreateEscrowRequest) (domain.Escrow, error)
 	ReleaseEscrow(ctx context.Context, escrowID string) (domain.Receipt, error)
+	CommitExecutionReceipt(ctx context.Context, receipt domain.ExecutionReceipt) (proofRef string, err error)
 	VerifyExecutionReceipt(ctx context.Context, escrowID string, receipt domain.ExecutionReceipt) (VerifyExecutionReceiptResult, error)
 	SettleJob(ctx context.Context, req SettleJobRequest) (SettleJobResult, error)
+	CommitProofOfServiceEvidence(ctx context.Context, receipt domain.ExecutionReceipt) (evidenceRef string, err error)
 	ReadSettlementStatus(ctx context.Context, escrowID string) (domain.EscrowStatus, error)
 	ReadProof(ctx context.Context, receiptID string) (map[string]any, error)
 }

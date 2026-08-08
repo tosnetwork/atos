@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/tosnetwork/atos/internal/auth"
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/service"
 )
@@ -16,25 +17,39 @@ type createUploadRequest struct {
 
 func (s *Server) handleCreateUpload(w http.ResponseWriter, r *http.Request) {
 	var req createUploadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed JSON body", false)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed upload request: "+err.Error(), false)
+		return
+	}
+	principal := scopesFrom(r)
+	switch req.Purpose {
+	case "job_input":
+		if !principal.HasAny(auth.ScopeInvocationsCreate, auth.ScopeJobsCreate) {
+			writeError(w, http.StatusForbidden, domain.ErrPermissionDenied, "job_input upload requires invocations:create or jobs:create", false)
+			return
+		}
+	case "capability_asset":
+		if !principal.Has(auth.ScopeCapabilitiesWrite) {
+			writeError(w, http.StatusForbidden, domain.ErrPermissionDenied, "capability_asset upload requires capabilities:write", false)
+			return
+		}
+	default:
+		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "purpose must be job_input or capability_asset", false)
 		return
 	}
 	target, err := s.Artifacts.CreateUpload(r.Context(), service.CreateUploadInput{
-		PrincipalID: principalFrom(r),
-		ContentType: req.ContentType,
-		SizeBytes:   req.SizeBytes,
-		Purpose:     req.Purpose,
+		PrincipalID: principal.ID, ContentType: req.ContentType,
+		SizeBytes: req.SizeBytes, Purpose: req.Purpose,
 	})
 	if err != nil {
 		writeDomainErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"upload_id":     target.UploadID,
-		"upload_url":    target.UploadURL,
-		"upload_method": target.UploadMethod,
-		"expires_at":    target.ExpiresAt,
+		"upload_id": target.UploadID, "upload_url": target.UploadURL,
+		"upload_method": target.UploadMethod, "expires_at": target.ExpiresAt,
 	})
 }
 
@@ -63,9 +78,7 @@ func (s *Server) handleGetDownloadURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"download_url": target.DownloadURL,
-		"expires_at":   target.ExpiresAt,
-		"content_type": target.ContentType,
-		"size_bytes":   target.SizeBytes,
+		"download_url": target.DownloadURL, "expires_at": target.ExpiresAt,
+		"content_type": target.ContentType, "size_bytes": target.SizeBytes,
 	})
 }

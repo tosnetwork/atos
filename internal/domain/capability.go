@@ -1,7 +1,4 @@
-// Package domain holds the ATOS business objects defined in atos-spec:
-// Capability, Quote, Escrow, Receipt, Job and Account. Field names follow
-// the JSON examples in ~/atos-spec/docs so REST/MCP payloads can (de)serialize
-// with minimal adapter code.
+// Package domain holds the ATOS business objects defined in atos-spec.
 package domain
 
 import "time"
@@ -32,8 +29,8 @@ const (
 	CapabilityPaused CapabilityStatus = "paused"
 )
 
-// TrustLevel mirrors docs/AGENT_CARD.md's signed-card ladder: a capability's
-// trust starts self-asserted and strengthens as ATOS/tos-core corroborate it.
+// TrustLevel is identity/attestation assurance. It is deliberately distinct
+// from TrustMode, which is selected per Quote.
 type TrustLevel string
 
 const (
@@ -59,14 +56,12 @@ type SLA struct {
 }
 
 type Trust struct {
-	Score float64    `json:"score"`
-	Level TrustLevel `json:"level"`
+	Score               float64    `json:"score"`
+	Level               TrustLevel `json:"identity_assurance"`
+	ProofOfServiceCount uint64     `json:"proof_of_service_count,omitempty"`
+	LastUpdatedAt       *time.Time `json:"last_updated_at,omitempty"`
 }
 
-// EndpointAdapterType is how tos-ai (or a human) actually fulfils the
-// capability. ATOS only needs to know the adapter *category*, never the
-// adapter's internal wiring — see docs/ARCHITECTURE.md's "hide execution
-// internals" rule.
 type EndpointAdapterType string
 
 const (
@@ -77,21 +72,42 @@ const (
 	AdapterTOSNative EndpointAdapterType = "tos-native"
 )
 
+type CapabilityBinding struct {
+	Transport          EndpointAdapterType `json:"transport"`
+	EndpointRef        string              `json:"endpoint_ref"`
+	EligibleTrustModes []TrustMode         `json:"eligible_trust_modes"`
+}
+
 type Capability struct {
-	ID           string              `json:"id"`
-	ProviderID   string              `json:"provider_id"`
-	Name         string              `json:"name"`
-	Description  string              `json:"description"`
-	Version      string              `json:"version"`
-	Tags         []string            `json:"tags,omitempty"`
-	Modalities   []string            `json:"modalities,omitempty"`
-	DeliveryMode DeliveryMode        `json:"delivery_mode"`
-	InputSchema  map[string]any      `json:"input_schema"`
-	OutputSchema map[string]any      `json:"output_schema"`
-	Pricing      Pricing             `json:"pricing"`
-	SLA          SLA                 `json:"sla"`
-	Trust        Trust               `json:"trust"`
-	AdapterType  EndpointAdapterType `json:"-"`
-	Status       CapabilityStatus    `json:"status"`
-	UpdatedAt    time.Time           `json:"updated_at"`
+	ID                       string              `json:"id"`
+	CanonicalURI             string              `json:"canonical_uri,omitempty"`
+	ProviderID               string              `json:"provider_id"`
+	Name                     string              `json:"name"`
+	Description              string              `json:"description"`
+	Version                  string              `json:"version"`
+	ManifestCommitment       string              `json:"manifest_commitment,omitempty"`
+	Tags                     []string            `json:"tags,omitempty"`
+	Modalities               []string            `json:"modalities,omitempty"`
+	DeliveryMode             DeliveryMode        `json:"delivery_mode"`
+	InputSchema              map[string]any      `json:"input_schema"`
+	OutputSchema             map[string]any      `json:"output_schema"`
+	Pricing                  Pricing             `json:"pricing"`
+	SLA                      SLA                 `json:"sla"`
+	Trust                    Trust               `json:"trust_summary"`
+	RequestedTrustModes      []TrustMode         `json:"requested_trust_modes"`
+	SupportedTrustModes      []TrustMode         `json:"supported_trust_modes"`
+	ModeSupport              ModeSupport         `json:"mode_support"`
+	Bindings                 []CapabilityBinding `json:"bindings,omitempty"`
+	RequiresArtifactTransfer bool                `json:"requires_artifact_transfer"`
+	ArtifactInputFields      []string            `json:"artifact_input_fields,omitempty"`
+	ArtifactOutputFields     []string            `json:"artifact_output_fields,omitempty"`
+	// AdapterType remains an internal compatibility shortcut for the current
+	// single-adapter Phase 0 runtime. Bindings are the public v0.2 contract.
+	AdapterType EndpointAdapterType `json:"-"`
+	Status      CapabilityStatus    `json:"status"`
+	UpdatedAt   time.Time           `json:"updated_at"`
+}
+
+func (c Capability) Supports(mode TrustMode) bool {
+	return c.ModeSupport.Active(mode)
 }

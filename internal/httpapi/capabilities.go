@@ -10,14 +10,9 @@ import (
 	"github.com/tosnetwork/atos/internal/service"
 )
 
-// handleSearchCapabilities implements GET /capabilities, including the
-// docs/CAPABILITIES.md filters as query parameters: max_price (+
-// max_price_currency, default USD), min_trust_score, max_latency_ms,
-// delivery_mode (repeatable).
 func (s *Server) handleSearchCapabilities(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	in := service.SearchInput{Query: q.Get("q")}
-
 	if raw := q.Get("max_price"); raw != "" {
 		currency := q.Get("max_price_currency")
 		if currency == "" {
@@ -26,19 +21,40 @@ func (s *Server) handleSearchCapabilities(w http.ResponseWriter, r *http.Request
 		in.Filters.MaxPrice = &domain.Money{Amount: raw, Currency: currency}
 	}
 	if raw := q.Get("min_trust_score"); raw != "" {
-		if v, err := strconv.ParseFloat(raw, 64); err == nil {
-			in.Filters.MinTrustScore = &v
+		value, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "invalid min_trust_score", false)
+			return
 		}
+		in.Filters.MinTrustScore = &value
 	}
 	if raw := q.Get("max_latency_ms"); raw != "" {
-		if v, err := strconv.ParseInt(raw, 10, 64); err == nil {
-			in.Filters.MaxLatencyMS = &v
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "invalid max_latency_ms", false)
+			return
 		}
+		in.Filters.MaxLatencyMS = &value
 	}
-	if modes := q["delivery_mode"]; len(modes) > 0 {
-		for _, m := range modes {
-			in.Filters.DeliveryModes = append(in.Filters.DeliveryModes, domain.DeliveryMode(strings.TrimSpace(m)))
-		}
+	for _, mode := range q["delivery_mode"] {
+		in.Filters.DeliveryModes = append(in.Filters.DeliveryModes, domain.DeliveryMode(strings.TrimSpace(mode)))
+	}
+	in.Filters.RequestedTrustMode = domain.RequestedTrustMode(q.Get("requested_trust_mode"))
+	var err error
+	in.Filters.ProofRequirements.NetworkVerifiableReceipt, err = optionalBool(q.Get("network_verifiable_receipt"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, err.Error(), false)
+		return
+	}
+	in.Filters.ProofRequirements.TOSSettlement, err = optionalBool(q.Get("tos_settlement"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, err.Error(), false)
+		return
+	}
+	in.Filters.ProofRequirements.PortableProofOfService, err = optionalBool(q.Get("portable_proof_of_service"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, err.Error(), false)
+		return
 	}
 
 	caps, err := s.Capabilities.Search(r.Context(), in)
@@ -49,9 +65,19 @@ func (s *Server) handleSearchCapabilities(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{"capabilities": caps})
 }
 
+func optionalBool(raw string) (bool, error) {
+	if raw == "" {
+		return false, nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, domain.NewError(domain.ErrValidationFailed, "invalid boolean query value", false)
+	}
+	return value, nil
+}
+
 func (s *Server) handleGetCapability(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	cap, err := s.Capabilities.Get(r.Context(), id)
+	cap, err := s.Capabilities.Get(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeDomainErr(w, err)
 		return
@@ -60,30 +86,31 @@ func (s *Server) handleGetCapability(w http.ResponseWriter, r *http.Request) {
 }
 
 type registerCapabilityRequest struct {
-	Name         string              `json:"name"`
-	Description  string              `json:"description"`
-	DeliveryMode domain.DeliveryMode `json:"delivery_mode"`
-	InputSchema  map[string]any      `json:"input_schema"`
-	OutputSchema map[string]any      `json:"output_schema"`
-	Pricing      domain.Pricing      `json:"pricing"`
-	Tags         []string            `json:"tags"`
+	Name                string                     `json:"name"`
+	Description         string                     `json:"description"`
+	DeliveryMode        domain.DeliveryMode        `json:"delivery_mode"`
+	InputSchema         map[string]any             `json:"input_schema"`
+	OutputSchema        map[string]any             `json:"output_schema"`
+	Pricing             domain.Pricing             `json:"pricing"`
+	Tags                []string                   `json:"tags"`
+	RequestedTrustModes []domain.TrustMode         `json:"requested_trust_modes"`
+	Bindings            []domain.CapabilityBinding `json:"bindings"`
 }
 
 func (s *Server) handleRegisterCapability(w http.ResponseWriter, r *http.Request) {
 	var req registerCapabilityRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed JSON body", false)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed capability request: "+err.Error(), false)
 		return
 	}
 	cap, err := s.Capabilities.Register(r.Context(), service.RegisterCapabilityInput{
-		ProviderID:   principalFrom(r),
-		Name:         req.Name,
-		Description:  req.Description,
-		DeliveryMode: req.DeliveryMode,
-		InputSchema:  req.InputSchema,
-		OutputSchema: req.OutputSchema,
-		Pricing:      req.Pricing,
-		Tags:         req.Tags,
+		ProviderID: principalFrom(r), Name: req.Name, Description: req.Description,
+		DeliveryMode: req.DeliveryMode, InputSchema: req.InputSchema,
+		OutputSchema: req.OutputSchema, Pricing: req.Pricing, Tags: req.Tags,
+		RequestedTrustModes: req.RequestedTrustModes, Bindings: req.Bindings,
+		IdempotencyKey: idempotencyKeyFrom(r),
 	})
 	if err != nil {
 		writeDomainErr(w, err)
@@ -93,13 +120,16 @@ func (s *Server) handleRegisterCapability(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleUpdateCapability(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
 	var patch map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&patch); err != nil {
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed JSON body", false)
 		return
 	}
-	cap, err := s.Capabilities.Update(r.Context(), id, principalFrom(r), patch)
+	cap, err := s.Capabilities.Update(
+		r.Context(), r.PathValue("id"), principalFrom(r), patch, idempotencyKeyFrom(r),
+	)
 	if err != nil {
 		writeDomainErr(w, err)
 		return
@@ -108,7 +138,9 @@ func (s *Server) handleUpdateCapability(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handlePauseCapability(w http.ResponseWriter, r *http.Request) {
-	cap, err := s.Capabilities.Pause(r.Context(), r.PathValue("id"), principalFrom(r))
+	cap, err := s.Capabilities.Pause(
+		r.Context(), r.PathValue("id"), principalFrom(r), idempotencyKeyFrom(r),
+	)
 	if err != nil {
 		writeDomainErr(w, err)
 		return
@@ -117,10 +149,16 @@ func (s *Server) handlePauseCapability(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleResumeCapability(w http.ResponseWriter, r *http.Request) {
-	cap, err := s.Capabilities.Resume(r.Context(), r.PathValue("id"), principalFrom(r))
+	cap, err := s.Capabilities.Resume(
+		r.Context(), r.PathValue("id"), principalFrom(r), idempotencyKeyFrom(r),
+	)
 	if err != nil {
 		writeDomainErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, cap)
+}
+
+func idempotencyKeyFrom(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 }
