@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"strings"
@@ -11,26 +12,38 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/tosnetwork/atos/internal/adapters/tosai"
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/money"
 	"github.com/tosnetwork/atos/internal/store"
 )
 
 const (
-	quoteTTL       = 10 * time.Minute
-	quoteDecimals  = 2
-	defaultFeeRate = 0.05
+	quoteTTL            = 10 * time.Minute
+	quoteDecimals       = 2
+	defaultFeeRate      = 0.05
+	defaultExecutionTTL = 15 * time.Minute
+	defaultMaxOutput    = 1 << 20
 )
 
 type QuoteService struct {
-	store store.Store
+	store  store.Store
+	quoter tosai.Quoter
 }
 
-func NewQuoteService(s store.Store) *QuoteService {
-	return &QuoteService{store: s}
+// NewQuoteService accepts an optional provider/Edge quoter. Omitting it keeps
+// the explicit Phase 0 static-price path; RPC deployments pass the real
+// tos-protocol client and therefore obtain a two-layer Quote.
+func NewQuoteService(s store.Store, quoters ...tosai.Quoter) *QuoteService {
+	service := &QuoteService{store: s}
+	if len(quoters) > 0 {
+		service.quoter = quoters[0]
+	}
+	return service
 }
 
 type CreateQuoteInput struct {
+	PrincipalID        string
 	CapabilityID       string
 	InputSummary       map[string]any
 	RequestedTrustMode domain.RequestedTrustMode
@@ -39,6 +52,9 @@ type CreateQuoteInput struct {
 }
 
 func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.Quote, error) {
+	if s.quoter != nil && in.PrincipalID == "" {
+		return domain.Quote{}, domain.NewError(domain.ErrAuthenticationRequired, "principal is required for an RPC-backed Quote", false)
+	}
 	cap, err := s.store.Get(ctx, in.CapabilityID)
 	if err != nil {
 		if err == store.ErrNotFound {
@@ -98,12 +114,39 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 
 	settlement, proof := quoteGuarantees(mode, subtotal.Currency)
 	now := time.Now().UTC()
+	executionDeadline := now.Add(defaultExecutionTTL)
+	if cap.SLA.TimeoutMS > 0 {
+		executionDeadline = now.Add(time.Duration(cap.SLA.TimeoutMS) * time.Millisecond)
+	}
+	inputSummaryBytes, err := json.Marshal(in.InputSummary)
+	if err != nil {
+		return domain.Quote{}, domain.NewError(domain.ErrValidationFailed, "input_summary is not serializable", false)
+	}
+	inputSummaryCommitment := hashCommitment(in.InputSummary)
+	var serviceQuote tosai.ServiceExecutionQuote
+	if s.quoter != nil {
+		serviceQuote, err = s.quoter.QuoteExecution(ctx, tosai.QuoteExecutionRequest{
+			Capability: cap, InputSummary: in.InputSummary,
+			InputCommitment: inputSummaryCommitment,
+			InputBytes:      uint64(len(inputSummaryBytes)), MaxOutputBytes: defaultMaxOutput,
+			ExecutionDeadline: executionDeadline,
+			TrustMode:         mode, ProofProfile: profile,
+		})
+		if err != nil {
+			return domain.Quote{}, err
+		}
+		if serviceQuote.ID == "" || serviceQuote.ExpiresAt.IsZero() || serviceQuote.ExecutionDeadline.IsZero() {
+			return domain.Quote{}, domain.NewError(domain.ErrProviderFailed, "tos-protocol returned an incomplete service execution quote", true)
+		}
+		executionDeadline = serviceQuote.ExecutionDeadline
+	}
 	disputePolicyHash := termsHash("atos-dispute-policy", "v0.2", "72h")
 	q := domain.Quote{
 		ID:                 "q_" + uuid.NewString(),
 		CapabilityID:       cap.ID,
 		CapabilityVersion:  cap.Version,
 		ProviderID:         cap.ProviderID,
+		PrincipalID:        in.PrincipalID,
 		RequestedTrustMode: requested,
 		TrustMode:          mode,
 		ProofProfile:       profile,
@@ -113,18 +156,29 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 			TotalMax: totalMax.String(),
 			Currency: subtotal.Currency,
 		},
-		Settlement:        settlement,
-		Proof:             proof,
-		ExpiresAt:         now.Add(quoteTTL),
-		DisputePolicyHash: disputePolicyHash,
-		CreatedAt:         now,
+		Settlement:             settlement,
+		Proof:                  proof,
+		ExpiresAt:              now.Add(quoteTTL),
+		DisputePolicyHash:      disputePolicyHash,
+		InputSummaryCommitment: inputSummaryCommitment,
+		ExecutionDeadline:      executionDeadline,
+		CreatedAt:              now,
+	}
+	if serviceQuote.ID != "" {
+		q.ServiceQuoteID = serviceQuote.ID
+		q.UnderlyingServiceQuoteRef = serviceQuote.Reference
+		if serviceQuote.ExpiresAt.Before(q.ExpiresAt) {
+			q.ExpiresAt = serviceQuote.ExpiresAt
+		}
 	}
 	q.TermsHash = termsHash(
-		q.CapabilityID, q.CapabilityVersion, q.ProviderID,
+		q.CapabilityID, q.CapabilityVersion, q.ProviderID, q.PrincipalID,
 		string(q.TrustMode), string(q.ProofProfile),
 		q.Price.TotalMax, q.Price.Currency,
 		string(q.Settlement.Backend), string(q.Settlement.FundingModel),
-		q.ExpiresAt.Format(time.RFC3339Nano), q.DisputePolicyHash,
+		q.ExpiresAt.Format(time.RFC3339Nano), q.ExecutionDeadline.Format(time.RFC3339Nano),
+		q.DisputePolicyHash, q.ServiceQuoteID, q.UnderlyingServiceQuoteRef,
+		q.InputSummaryCommitment,
 	)
 	if err := s.store.PutQuote(ctx, q); err != nil {
 		return domain.Quote{}, err

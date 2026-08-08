@@ -108,6 +108,9 @@ func (s *JobService) submit(ctx context.Context, in SubmitInput, waitInline bool
 	if quote.CapabilityID != in.CapabilityID {
 		return SubmitResult{}, domain.NewError(domain.ErrQuoteMismatch, "quote does not match capability_id", false)
 	}
+	if quote.PrincipalID != "" && quote.PrincipalID != in.PrincipalID {
+		return SubmitResult{}, domain.NewError(domain.ErrQuoteMismatch, "quote belongs to a different principal", false)
+	}
 	if quote.Expired(time.Now().UTC()) {
 		return SubmitResult{}, domain.NewError(domain.ErrQuoteExpired, "quote has expired", false)
 	}
@@ -146,6 +149,7 @@ func (s *JobService) submit(ctx context.Context, in SubmitInput, waitInline bool
 		CapabilityVersion: cap.Version,
 		ProviderID:        cap.ProviderID,
 		QuoteID:           quote.ID,
+		ServiceQuoteID:    quote.ServiceQuoteID,
 		PrincipalID:       in.PrincipalID,
 		TrustMode:         quote.TrustMode,
 		ProofProfile:      quote.ProofProfile,
@@ -155,6 +159,7 @@ func (s *JobService) submit(ctx context.Context, in SubmitInput, waitInline bool
 		IdempotencyKey:    in.IdempotencyKey,
 		CreatedAt:         now,
 		UpdatedAt:         now,
+		ExecutionDeadline: quote.ExecutionDeadline,
 	}
 	if idPrefix == "inv_" {
 		job.InvocationID = job.ID
@@ -184,7 +189,8 @@ func (s *JobService) executeJob(ctx context.Context, jobID string, waitInline bo
 	lock := s.jobLock(jobID)
 	lock.Lock()
 	quote, err := s.getQuote(ctx, job.QuoteID)
-	if err != nil || quote.Expired(time.Now().UTC()) {
+	now := time.Now().UTC()
+	if err != nil || quote.Expired(now) || (!quote.ExecutionDeadline.IsZero() && !now.Before(quote.ExecutionDeadline)) {
 		failed := s.failUnderLock(ctx, job.ID, domain.ErrQuoteExpired, "quote unavailable or expired before execution")
 		lock.Unlock()
 		return failed, nil
@@ -200,6 +206,9 @@ func (s *JobService) executeJob(ctx context.Context, jobID string, waitInline bo
 		failed := s.failUnderLock(ctx, job.ID, domain.ErrQuoteMismatch, "execution contract no longer matches quote")
 		lock.Unlock()
 		return failed, nil
+	}
+	if quote.PrincipalID == "" {
+		quote.PrincipalID = job.PrincipalID // compatibility for pre-v0.2 persisted Quotes
 	}
 	if _, err := s.core.CommitQuote(ctx, quote); err != nil {
 		failed := s.failUnderLock(ctx, job.ID, errCode(err), "quote commitment failed: "+err.Error())
@@ -269,15 +278,21 @@ func (s *JobService) executeJob(ctx context.Context, jobID string, waitInline bo
 
 func (s *JobService) runToCompletion(ctx context.Context, snapshot domain.Job, cap domain.Capability) domain.Job {
 	result, err := s.provider.SubmitJob(ctx, tosai.SubmitJobRequest{
-		JobID: snapshot.ID, QuoteID: snapshot.QuoteID, EscrowID: snapshot.EscrowID,
-		PrincipalID:  snapshot.PrincipalID,
+		JobID: snapshot.ID, InvocationID: snapshot.InvocationID,
+		QuoteID: snapshot.QuoteID, ServiceQuoteID: snapshot.ServiceQuoteID,
+		EscrowID: snapshot.EscrowID, PrincipalID: snapshot.PrincipalID,
 		CapabilityID: snapshot.CapabilityID, CapabilityVersion: snapshot.CapabilityVersion,
 		ProviderID: snapshot.ProviderID, TrustMode: snapshot.TrustMode,
 		ProofProfile: snapshot.ProofProfile, Input: snapshot.Input,
-		InputCommitment: hashCommitment(snapshot.Input),
+		InputCommitment:   hashCommitment(snapshot.Input),
+		ExecutionDeadline: snapshot.ExecutionDeadline,
+		RetainUntil:       time.Now().UTC().Add(48 * time.Hour),
 	})
-	if err != nil || result.Receipt == nil {
-		return s.fail(ctx, snapshot.ID, domain.ErrProviderFailed, "tos-ai execution failed").Job
+	if err != nil {
+		return s.fail(ctx, snapshot.ID, errCode(err), "execution gateway failed: "+err.Error()).Job
+	}
+	if result.Receipt == nil {
+		return s.fail(ctx, snapshot.ID, domain.ErrProviderFailed, "execution gateway returned no receipt").Job
 	}
 
 	lock := s.jobLock(snapshot.ID)

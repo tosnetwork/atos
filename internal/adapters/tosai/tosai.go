@@ -1,7 +1,7 @@
-// Package tosai defines the execution-only adapter boundary. In the final
-// topology ATOS calls tos-protocol Edge Core and Edge Core calls the private
-// tos-ai Worker RPC; this interface remains the Phase 0 compatibility seam for
-// the in-process execution mock.
+// Package tosai defines ATOS's execution-facing adapter boundary. In RPC
+// mode ATOS calls tos-protocol's public ExecutionGatewayService; tos-protocol
+// alone calls the private tos-ai Worker RPC. The in-process mock remains an
+// explicit Phase 0 development backend and is never a network-failure fallback.
 package tosai
 
 import (
@@ -11,9 +11,45 @@ import (
 	"github.com/tosnetwork/atos/internal/domain"
 )
 
+// QuoteExecutionRequest asks tos-protocol for the provider/Edge execution
+// quote that ATOS will bind into its own client-facing commercial Quote.
+type QuoteExecutionRequest struct {
+	Capability        domain.Capability
+	InputSummary      map[string]any
+	InputCommitment   string
+	InputBytes        uint64
+	MaxOutputBytes    uint64
+	ExecutionDeadline time.Time
+	TrustMode         domain.TrustMode
+	ProofProfile      domain.ProofProfile
+}
+
+// ServiceExecutionQuote is the provider/Edge layer of ATOS's two-layer Quote
+// model. It is not itself the client-facing commercial Quote.
+type ServiceExecutionQuote struct {
+	ID                string
+	Reference         string
+	ProviderPrice     domain.Money
+	ExpiresAt         time.Time
+	ExecutionDeadline time.Time
+	CapacityRevision  string
+	RuntimeRevision   string
+	ModelRevision     string
+	SignedDigest      string
+}
+
+// Quoter is intentionally separate from Provider so the Quote service can be
+// configured independently while legacy/mock deployments keep the static
+// catalog-price path explicitly.
+type Quoter interface {
+	QuoteExecution(ctx context.Context, req QuoteExecutionRequest) (ServiceExecutionQuote, error)
+}
+
 type SubmitJobRequest struct {
 	JobID             string
+	InvocationID      string
 	QuoteID           string
+	ServiceQuoteID    string
 	EscrowID          string
 	PrincipalID       string
 	CapabilityID      string
@@ -23,6 +59,9 @@ type SubmitJobRequest struct {
 	ProofProfile      domain.ProofProfile
 	Input             map[string]any
 	InputCommitment   string
+	MaxOutputBytes    uint64
+	ExecutionDeadline time.Time
+	RetainUntil       time.Time
 	MaxWaitMS         int64
 }
 
