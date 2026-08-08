@@ -1,4 +1,4 @@
-![ATOS](ATOS.png)
+<img src="ATOS.png" alt="ATOS" width="220">
 
 Go implementation of the ATOS Agent Internet gateway defined in
 [`tosnetwork/atos-spec`](https://github.com/tosnetwork/atos-spec).
