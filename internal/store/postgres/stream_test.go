@@ -426,72 +426,114 @@ func TestAppendJobStreamEventRollbackLeavesNoPartialRow(t *testing.T) {
 	}
 }
 
-// TestSetJobStreamUpstreamDigestBeforeAnyEvent proves the upstream identity
-// digest can be recorded before the cursor row exists at all, and that a
-// subsequent AppendJobStreamEvent's ON CONFLICT upsert leaves it intact.
-func TestSetJobStreamUpstreamDigestBeforeAnyEvent(t *testing.T) {
+// TestAppendJobStreamEventRecordsUpstreamDigestFromFirstChunk proves the
+// execution provider's retained-output identity digest is recorded from the
+// first OutputChunk event that carries one, atomically with that same
+// event's append (not via any separate write), and that it is untouched by
+// the STATE event and cursor upserts before and after it.
+func TestAppendJobStreamEventRecordsUpstreamDigestFromFirstChunk(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
 	jobID := "job_stream_digest_first_" + randSuffix()
-	digest := "sha256:" + hex.EncodeToString(make([]byte, 32))
+	identity := "sha256:" + hex.EncodeToString(make([]byte, 32))
 
-	if err := s.SetJobStreamUpstreamDigest(ctx, jobID, digest); err != nil {
+	// STATE carries no identity digest -- see AppendJobStreamEvent's doc.
+	if err := s.AppendJobStreamEvent(ctx, stateEvent(jobID, 0)); err != nil {
 		t.Fatal(err)
 	}
-	cursor, found, err := s.JobStreamCursor(ctx, jobID)
+	cursor, _, err := s.JobStreamCursor(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !found || cursor.UpstreamDigest != digest || cursor.NextSequence != 0 {
-		t.Fatalf("unexpected cursor after setting the digest before any event: %+v found=%v", cursor, found)
+	if cursor.UpstreamDigest != "" {
+		t.Fatalf("STATE must not set an upstream identity digest, got %q", cursor.UpstreamDigest)
 	}
 
-	if err := s.AppendJobStreamEvent(ctx, stateEvent(jobID, 0)); err != nil {
+	digest, _ := streamDigest(nil, []byte("abc"))
+	chunk := chunkEvent(jobID, 1, 0, []byte("abc"), digest)
+	chunk.UpstreamRetainedDigest = identity
+	if err := s.AppendJobStreamEvent(ctx, chunk); err != nil {
 		t.Fatal(err)
 	}
 	cursor, _, err = s.JobStreamCursor(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cursor.UpstreamDigest != digest || cursor.NextSequence != 1 {
-		t.Fatalf("AppendJobStreamEvent's cursor upsert must not clobber upstream_digest, got %+v", cursor)
+	if cursor.UpstreamDigest != identity || cursor.NextSequence != 2 {
+		t.Fatalf("unexpected cursor after the first identity-carrying chunk: %+v", cursor)
+	}
+
+	// A later event without an identity digest must not clear it.
+	if err := s.AppendJobStreamEvent(ctx, terminalEvent(jobID, 2)); err != nil {
+		t.Fatal(err)
+	}
+	cursor, _, err = s.JobStreamCursor(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.UpstreamDigest != identity {
+		t.Fatalf("a later event without an identity digest must not clobber it, got %q", cursor.UpstreamDigest)
 	}
 }
 
-// TestSetJobStreamUpstreamDigestIsIdempotentButRejectsChange proves the
-// digest is a set-once value: repeating the same value is a harmless no-op,
-// but a different value for the same Job -- which should never legitimately
-// happen, since a Job's completed output is immutable -- is rejected as a
-// provider-consistency error rather than silently overwritten.
-func TestSetJobStreamUpstreamDigestIsIdempotentButRejectsChange(t *testing.T) {
+// TestAppendJobStreamEventRejectsChangedUpstreamDigestAtomically proves the
+// identity digest is set-once (a later, different non-empty value is a
+// provider-consistency error, not silently overwritten) and, critically,
+// that a rejected chunk leaves *no* partial state at all: neither the event
+// row nor the cursor's upstream_digest changes. Because both are validated
+// and written in the exact same transaction as the event, there is no
+// window where the identity digest could be committed without the event
+// that justified it.
+func TestAppendJobStreamEventRejectsChangedUpstreamDigestAtomically(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
 	jobID := "job_stream_digest_once_" + randSuffix()
-	digest := "sha256:" + hex.EncodeToString(make([]byte, 32))
+	identity := "sha256:" + hex.EncodeToString(make([]byte, 32))
+	other := "sha256:" + hex.EncodeToString(bytes.Repeat([]byte{1}, 32))
 
-	if err := s.SetJobStreamUpstreamDigest(ctx, jobID, digest); err != nil {
+	if err := s.AppendJobStreamEvent(ctx, stateEvent(jobID, 0)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetJobStreamUpstreamDigest(ctx, jobID, digest); err != nil {
-		t.Fatalf("repeating the same digest should be idempotent, got: %v", err)
+	digest1, cum1 := streamDigest(nil, []byte("abc"))
+	chunk1 := chunkEvent(jobID, 1, 0, []byte("abc"), digest1)
+	chunk1.UpstreamRetainedDigest = identity
+	if err := s.AppendJobStreamEvent(ctx, chunk1); err != nil {
+		t.Fatal(err)
 	}
 
-	other := "sha256:" + hex.EncodeToString(bytes.Repeat([]byte{1}, 32))
-	err := s.SetJobStreamUpstreamDigest(ctx, jobID, other)
+	// Re-appending the identical first chunk (same sequence, same content,
+	// same identity digest) must remain a harmless idempotent no-op.
+	if err := s.AppendJobStreamEvent(ctx, chunk1); err != nil {
+		t.Fatalf("idempotent replay with the same identity digest should not fail, got: %v", err)
+	}
+
+	digest2, _ := streamDigest(cum1, []byte("def"))
+	chunk2 := chunkEvent(jobID, 2, 3, []byte("def"), digest2)
+	chunk2.UpstreamRetainedDigest = other // a different, changed identity digest
+	err := s.AppendJobStreamEvent(ctx, chunk2)
 	if err == nil {
-		t.Fatal("expected an error when the observed digest changes for an existing job stream")
+		t.Fatal("expected an error when the observed identity digest changes for an existing job stream")
 	}
 	de, ok := err.(*domain.Error)
 	if !ok || de.Code != domain.ErrProviderFailed {
 		t.Fatalf("got %v, want provider_failed", err)
 	}
 
+	// Atomicity: the rejected chunk must not have been written, and the
+	// cursor's identity digest must remain exactly what it was before.
 	cursor, _, err := s.JobStreamCursor(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cursor.UpstreamDigest != digest {
-		t.Fatalf("rejected change must not have overwritten the original digest, got %q", cursor.UpstreamDigest)
+	if cursor.UpstreamDigest != identity || cursor.NextSequence != 2 || cursor.NextOffset != 3 {
+		t.Fatalf("a rejected chunk must leave the cursor exactly as it was, got %+v", cursor)
+	}
+	events, err := s.JobStreamEvents(ctx, jobID, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("got %d durable events, want exactly 2 (the rejected chunk must not be present)", len(events))
 	}
 }
 

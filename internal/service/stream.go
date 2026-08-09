@@ -45,9 +45,9 @@ func NewStreamService(s store.Store, provider tosai.Provider) *StreamService {
 // real output exists. A Job observed only in a non-terminal STATE has no
 // output yet, so persisting or replaying that early digest would make the
 // Job's own later, legitimate transition to completed look like content
-// substitution -- which is exactly why UpstreamRetainedDigest is captured
-// (see the onEvent callback below) only from OutputChunk events, never from
-// STATE.
+// substitution -- which is exactly why AppendJobStreamEvent only ever
+// validates/records UpstreamRetainedDigest for OutputChunk events, never
+// for STATE.
 //
 // Either way, AppendJobStreamEvent's idempotent-replay semantics make
 // re-ingesting any already-durable event a safe no-op, which is what lets
@@ -86,11 +86,10 @@ func (s *StreamService) EnsureIngested(ctx context.Context, jobID string) error 
 		if event.JobID != jobID {
 			return domain.NewError(domain.ErrStreamJobBindingMismatch, fmt.Sprintf("execution provider returned an event bound to job %q while streaming job %q", event.JobID, jobID), false)
 		}
-		if event.EventType == domain.JobEventOutputChunk && event.UpstreamRetainedDigest != "" {
-			if err := s.store.SetJobStreamUpstreamDigest(ctx, jobID, event.UpstreamRetainedDigest); err != nil {
-				return err
-			}
-		}
+		// AppendJobStreamEvent itself validates/records
+		// event.UpstreamRetainedDigest (for OutputChunk events) in the same
+		// transaction as the event -- there is no separate write to race
+		// with a rejected or half-committed append.
 		return s.store.AppendJobStreamEvent(ctx, event)
 	})
 	if err != nil {
@@ -135,6 +134,11 @@ func (s *StreamService) Events(
 		if err := s.validateResumeCursor(ctx, jobID, fromSequence, expectedOffset, expectedDigest); err != nil {
 			return nil, domain.JobStreamCursor{}, err
 		}
+	} else if expectedOffset != 0 || expectedDigest != "" {
+		// A fresh read (next_sequence=0) has no cumulative state to resume
+		// from at all; claiming otherwise is itself an invalid cursor, not
+		// a set of parameters silently ignored.
+		return nil, domain.JobStreamCursor{}, domain.NewError(domain.ErrStreamCursorMismatch, "next_offset/expected_stream_digest must not be set when next_sequence is 0", false)
 	}
 	events, err := s.store.JobStreamEvents(ctx, jobID, fromSequence, limit)
 	if err != nil {

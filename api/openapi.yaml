@@ -441,15 +441,15 @@ paths:
       - {$ref: '#/components/parameters/JobID'}
       - name: next_sequence
         in: query
-        description: Resume from this durable journal sequence (0 = from the start).
+        description: Resume from this durable journal sequence (0 = from the start, in which case next_offset and expected_stream_digest must be omitted).
         schema: {type: integer, minimum: 0, default: 0}
       - name: next_offset
         in: query
-        description: Required alongside expected_stream_digest whenever next_sequence > 0; must equal the durable cumulative output byte offset as of next_sequence.
+        description: Required whenever next_sequence > 0 -- must exactly equal the durable cumulative output byte offset as of next_sequence, which is legitimately 0 if no OutputChunk event has occurred yet (e.g. resuming right after an initial STATE event).
         schema: {type: integer, minimum: 0, default: 0}
       - name: expected_stream_digest
         in: query
-        description: Required alongside next_offset whenever next_sequence > 0; must equal the durable cumulative output digest as of next_sequence.
+        description: Required whenever next_sequence > 0 -- must exactly equal the durable cumulative output digest as of next_sequence, which is legitimately empty if no OutputChunk event has occurred yet (e.g. resuming right after an initial STATE event).
         schema: {type: string}
     get:
       tags: [jobs]

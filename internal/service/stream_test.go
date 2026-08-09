@@ -140,6 +140,46 @@ func TestStreamServiceResumeCursorMismatchRejected(t *testing.T) {
 	}
 }
 
+// TestStreamServiceRejectsNonZeroOffsetDigestOnFreshRead proves a fresh
+// read (next_sequence=0) cannot carry a non-zero next_offset or non-empty
+// expected_stream_digest: there is no cumulative state to resume from at
+// all at sequence 0, so claiming otherwise is itself an invalid cursor,
+// not a pair of parameters that get silently ignored.
+func TestStreamServiceRejectsNonZeroOffsetDigestOnFreshRead(t *testing.T) {
+	ctx := context.Background()
+	h, streams := newStreamHarness()
+	cap := registerCapability(t, h, "agt_stream_provider_fresh", "1.00")
+	quote := createQuote(t, h, cap.ID)
+	result, err := h.jobs.Invoke(ctx, service.SubmitInput{
+		PrincipalID: "prn_fresh", CapabilityID: cap.ID, QuoteID: quote.ID,
+		Input: map[string]any{"x": 1}, IdempotencyKey: "stream-fresh-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name   string
+		offset uint64
+		digest string
+	}{
+		{name: "nonzero offset", offset: 1},
+		{name: "nonempty digest", digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := streams.Events(ctx, result.Job.ID, "prn_fresh", 0, tc.offset, tc.digest, 0)
+			if err == nil {
+				t.Fatal("expected a cursor mismatch error")
+			}
+			de, ok := err.(*domain.Error)
+			if !ok || de.Code != domain.ErrStreamCursorMismatch {
+				t.Fatalf("got %v, want stream_cursor_mismatch", err)
+			}
+		})
+	}
+}
+
 // noopProvider implements tosai.Provider with methods StreamService never
 // calls; only the embedded Streamer implementation matters for these tests.
 type noopProvider struct{}

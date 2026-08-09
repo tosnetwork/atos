@@ -46,12 +46,13 @@ func eventContentHash(e domain.JobEvent) string {
 }
 
 type streamCursorRow struct {
-	nextSequence uint64
-	nextOffset   uint64
-	streamDigest string
-	digestState  []byte
-	terminal     bool
-	exists       bool
+	nextSequence   uint64
+	nextOffset     uint64
+	streamDigest   string
+	digestState    []byte
+	terminal       bool
+	upstreamDigest string
+	exists         bool
 }
 
 func (s *Store) AppendJobStreamEvent(ctx context.Context, event domain.JobEvent) error {
@@ -100,6 +101,25 @@ func (s *Store) AppendJobStreamEvent(ctx context.Context, event domain.JobEvent)
 
 	if cursor.terminal {
 		return domain.NewError(domain.ErrStreamTerminal, "job stream already recorded a terminal event", false)
+	}
+
+	// The execution provider's retained-output identity digest is validated
+	// and set in this same transaction as the event it arrived with -- never
+	// as a separate, independently-committed write. A crash or a rejected
+	// event (e.g. a bad offset/digest below) must not be able to leave the
+	// identity digest durably set without the event itself ever landing;
+	// tx.Rollback on any early return above/below undoes both together.
+	// Only OutputChunk events carry a trustworthy identity digest: a Job
+	// observed only via STATE has no output yet, so its provider identity
+	// digest is not yet stable (see docs/TOS_RPC.md's StreamJob section).
+	nextUpstreamDigest := cursor.upstreamDigest
+	if event.EventType == domain.JobEventOutputChunk && event.UpstreamRetainedDigest != "" {
+		switch {
+		case cursor.upstreamDigest == "":
+			nextUpstreamDigest = event.UpstreamRetainedDigest
+		case cursor.upstreamDigest != event.UpstreamRetainedDigest:
+			return domain.NewError(domain.ErrProviderFailed, "execution provider's retained-output identity digest changed for an existing job stream", false)
+		}
 	}
 
 	// rowOffset/rowDigest are the values stored on the event row itself and
@@ -161,11 +181,11 @@ func (s *Store) AppendJobStreamEvent(ctx context.Context, event domain.JobEvent)
 
 	terminal := cursor.terminal || event.Terminal
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO job_stream_cursors (job_id, next_sequence, next_offset, stream_digest, digest_state, terminal, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6, now())
+		INSERT INTO job_stream_cursors (job_id, next_sequence, next_offset, stream_digest, digest_state, terminal, upstream_digest, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7, now())
 		ON CONFLICT (job_id) DO UPDATE SET
-			next_sequence=$2, next_offset=$3, stream_digest=$4, digest_state=$5, terminal=$6, updated_at=now()
-	`, event.JobID, event.Sequence+1, nextOffset, nextDigest, nullableBytes(nextDigestState), terminal); err != nil {
+			next_sequence=$2, next_offset=$3, stream_digest=$4, digest_state=$5, terminal=$6, upstream_digest=$7, updated_at=now()
+	`, event.JobID, event.Sequence+1, nextOffset, nextDigest, nullableBytes(nextDigestState), terminal, nextUpstreamDigest); err != nil {
 		return err
 	}
 
@@ -176,9 +196,9 @@ func loadStreamCursorTx(ctx context.Context, tx pgx.Tx, jobID string) (streamCur
 	var row streamCursorRow
 	var digestState []byte
 	err := tx.QueryRow(ctx, `
-		SELECT next_sequence, next_offset, stream_digest, digest_state, terminal
+		SELECT next_sequence, next_offset, stream_digest, digest_state, terminal, upstream_digest
 		FROM job_stream_cursors WHERE job_id=$1 FOR UPDATE
-	`, jobID).Scan(&row.nextSequence, &row.nextOffset, &row.streamDigest, &digestState, &row.terminal)
+	`, jobID).Scan(&row.nextSequence, &row.nextOffset, &row.streamDigest, &digestState, &row.terminal, &row.upstreamDigest)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return streamCursorRow{}, nil
 	}
@@ -313,45 +333,6 @@ func (s *Store) JobStreamCursor(ctx context.Context, jobID string) (domain.JobSt
 		return domain.JobStreamCursor{}, false, err
 	}
 	return c, true, nil
-}
-
-// SetJobStreamUpstreamDigest records the provider's retained-output identity
-// digest the first time it is observed for a Job, creating the cursor row
-// if necessary. AppendJobStreamEvent's own cursor upsert never lists
-// upstream_digest in its SET clause, so once written here it survives every
-// subsequent event append untouched.
-func (s *Store) SetJobStreamUpstreamDigest(ctx context.Context, jobID, digest string) error {
-	if digest == "" {
-		return nil
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-	if err := lockTransactionKey(ctx, tx, "job-stream", jobID); err != nil {
-		return err
-	}
-
-	var existing string
-	err = tx.QueryRow(ctx, `SELECT upstream_digest FROM job_stream_cursors WHERE job_id=$1`, jobID).Scan(&existing)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO job_stream_cursors (job_id, upstream_digest, updated_at) VALUES ($1,$2, now())
-		`, jobID, digest); err != nil {
-			return err
-		}
-	case err != nil:
-		return err
-	case existing == "":
-		if _, err := tx.Exec(ctx, `UPDATE job_stream_cursors SET upstream_digest=$2 WHERE job_id=$1`, jobID, digest); err != nil {
-			return err
-		}
-	case existing != digest:
-		return domain.NewError(domain.ErrProviderFailed, "execution provider's retained-output identity digest changed for an existing job stream", false)
-	}
-	return tx.Commit(ctx)
 }
 
 var _ store.JobStream = (*Store)(nil)

@@ -115,6 +115,14 @@ type JobStream interface {
 	//     durable chunks;
 	//   - ErrStreamTerminal if a terminal event was already recorded for
 	//     this Job (no events are accepted after terminal).
+	// For a JobEventOutputChunk event carrying a non-empty
+	// UpstreamRetainedDigest, the execution provider's retained-output
+	// identity digest is also validated/recorded (set-once; a later,
+	// different non-empty value is a provider-consistency error) in the
+	// exact same transaction/write as the event itself -- never as a
+	// separate, independently-committed step, so a crash or a rejected
+	// event can never leave the identity digest durably set without the
+	// event that justified it.
 	AppendJobStreamEvent(ctx context.Context, event domain.JobEvent) error
 	// JobStreamEvents returns durable events for jobID with
 	// sequence >= fromSequence, oldest first. limit<=0 means no limit.
@@ -122,16 +130,6 @@ type JobStream interface {
 	// JobStreamCursor returns the current durable resume cursor for jobID.
 	// found is false if no event has ever been appended for this Job.
 	JobStreamCursor(ctx context.Context, jobID string) (cursor domain.JobStreamCursor, found bool, err error)
-	// SetJobStreamUpstreamDigest durably records the execution provider's
-	// retained-output identity digest (JobEvent.UpstreamRetainedDigest) the
-	// first time it is observed for a Job, creating the cursor row if it
-	// does not exist yet. It is safe to call before any event has been
-	// appended, and safe to call repeatedly with the same value. A digest
-	// is a stable property of a Job's immutable completed output, so
-	// observing a *different* non-empty digest for the same Job is a
-	// provider-consistency error, not a benign race. Passing an empty
-	// digest is a no-op.
-	SetJobStreamUpstreamDigest(ctx context.Context, jobID, digest string) error
 	// LastJobStreamChunkBefore returns the most recent JobEventOutputChunk
 	// event with sequence < beforeSequence, if any. Cumulative offset/digest
 	// state only changes on OutputChunk events -- every other event type
