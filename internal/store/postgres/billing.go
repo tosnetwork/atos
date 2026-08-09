@@ -109,7 +109,7 @@ func (s *Store) BillingSnapshotByJob(ctx context.Context, jobID string) (domain.
 
 // --- Earnings ---
 
-const earningColumns = `id, provider_id, job_id, quote_id, receipt_id, settlement_id, capability_id, capability_version, gross_amount, gateway_fee, net_amount, status, created_at, matures_at, available_at, payout_requested_at, payout_reference, paid_at, payout_idempotency_key, payout_attempts, payout_last_attempt_at, payout_failure_reason, content_hash, payload`
+const earningColumns = `id, provider_id, job_id, quote_id, receipt_id, settlement_id, capability_id, capability_version, gross_amount, gateway_fee, net_amount, status, created_at, matures_at, available_at, payout_requested_at, payout_reference, paid_at, payout_idempotency_key, payout_attempts, payout_last_attempt_at, payout_failure_reason, dispute_hold_id, content_hash, payload`
 
 // earningContentHash summarizes the identity+economic fields of a
 // ProviderEarning that must never differ for a given SettlementID --
@@ -134,7 +134,7 @@ func earningWriteArgs(e domain.ProviderEarning) []any {
 		mustMarshal(e.GrossAmount), mustMarshal(e.GatewayFee), mustMarshal(e.NetAmount), string(e.Status),
 		e.CreatedAt, e.MaturesAt, e.AvailableAt, e.PayoutRequestedAt, e.PayoutReference, e.PaidAt,
 		e.PayoutIdempotencyKey, e.PayoutAttempts, nullableTime(e.PayoutLastAttemptAt), e.PayoutFailureReason,
-		earningContentHash(e), mustMarshal(e),
+		e.DisputeHoldID, earningContentHash(e), mustMarshal(e),
 	}
 }
 
@@ -150,12 +150,12 @@ const upsertEarningSQL = `
 		id, provider_id, job_id, quote_id, receipt_id, settlement_id, capability_id, capability_version,
 		gross_amount, gateway_fee, net_amount, status, created_at, matures_at, available_at,
 		payout_requested_at, payout_reference, paid_at, payout_idempotency_key, payout_attempts,
-		payout_last_attempt_at, payout_failure_reason, content_hash, payload
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+		payout_last_attempt_at, payout_failure_reason, dispute_hold_id, content_hash, payload
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
 	ON CONFLICT (id) DO UPDATE SET
 		status=$12, available_at=$15, payout_requested_at=$16, payout_reference=$17, paid_at=$18,
 		payout_idempotency_key=$19, payout_attempts=$20, payout_last_attempt_at=$21,
-		payout_failure_reason=$22, payload=$24
+		payout_failure_reason=$22, dispute_hold_id=$23, payload=$25
 `
 
 func scanEarning(row pgx.Row) (domain.ProviderEarning, error) {
@@ -167,7 +167,7 @@ func scanEarning(row pgx.Row) (domain.ProviderEarning, error) {
 		&e.ID, &e.ProviderID, &e.JobID, &e.QuoteID, &e.ReceiptID, &e.SettlementID, &e.CapabilityID, &e.CapabilityVersion,
 		&grossAmount, &gatewayFee, &netAmount, &status, &e.CreatedAt, &e.MaturesAt, &e.AvailableAt,
 		&e.PayoutRequestedAt, &e.PayoutReference, &e.PaidAt, &e.PayoutIdempotencyKey, &e.PayoutAttempts,
-		&payoutLastAttemptAt, &e.PayoutFailureReason, &contentHash, &payload,
+		&payoutLastAttemptAt, &e.PayoutFailureReason, &e.DisputeHoldID, &contentHash, &payload,
 	); err != nil {
 		return domain.ProviderEarning{}, err
 	}
@@ -182,11 +182,12 @@ func scanEarning(row pgx.Row) (domain.ProviderEarning, error) {
 		return domain.ProviderEarning{}, err
 	}
 	// PayoutIdempotencyKey/PayoutAttempts/PayoutLastAttemptAt/
-	// PayoutFailureReason are tagged json:"-" on domain.ProviderEarning, so
-	// they are never part of payload and applyPayload cannot touch them;
-	// they already hold the values scanned from their dedicated columns
-	// above. Status IS part of the public payload, so re-assert the
-	// dedicated column's value defensively, mirroring scanJob's convention.
+	// PayoutFailureReason/DisputeHoldID are tagged json:"-" on
+	// domain.ProviderEarning, so they are never part of payload and
+	// applyPayload cannot touch them; they already hold the values scanned
+	// from their dedicated columns above. Status IS part of the public
+	// payload, so re-assert the dedicated column's value defensively,
+	// mirroring scanJob's convention.
 	e.Status = domain.EarningStatus(status)
 	return e, nil
 }
@@ -197,8 +198,8 @@ func (s *Store) CreateEarning(ctx context.Context, e domain.ProviderEarning) (do
 			id, provider_id, job_id, quote_id, receipt_id, settlement_id, capability_id, capability_version,
 			gross_amount, gateway_fee, net_amount, status, created_at, matures_at, available_at,
 			payout_requested_at, payout_reference, paid_at, payout_idempotency_key, payout_attempts,
-			payout_last_attempt_at, payout_failure_reason, content_hash, payload
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+			payout_last_attempt_at, payout_failure_reason, dispute_hold_id, content_hash, payload
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
 		ON CONFLICT (settlement_id) DO NOTHING
 	`, earningWriteArgs(e)...)
 	if err != nil {
@@ -231,6 +232,14 @@ func (s *Store) GetEarning(ctx context.Context, id string) (domain.ProviderEarni
 
 func (s *Store) EarningBySettlement(ctx context.Context, settlementID string) (domain.ProviderEarning, error) {
 	e, err := scanEarning(s.pool.QueryRow(ctx, `SELECT `+earningColumns+` FROM provider_earnings WHERE settlement_id=$1`, settlementID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ProviderEarning{}, store.ErrNotFound
+	}
+	return e, err
+}
+
+func (s *Store) EarningByJob(ctx context.Context, jobID string) (domain.ProviderEarning, error) {
+	e, err := scanEarning(s.pool.QueryRow(ctx, `SELECT `+earningColumns+` FROM provider_earnings WHERE job_id=$1`, jobID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.ProviderEarning{}, store.ErrNotFound
 	}
@@ -285,7 +294,7 @@ func (s *Store) EarningsAvailableForPayout(ctx context.Context, limit int) ([]do
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+earningColumns+` FROM provider_earnings
-		WHERE status='available'
+		WHERE status='available' AND dispute_hold_id=''
 		ORDER BY created_at ASC, id ASC
 		LIMIT $1
 	`, limit)

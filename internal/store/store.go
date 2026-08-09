@@ -194,12 +194,20 @@ type Earnings interface {
 	CreateEarning(ctx context.Context, e domain.ProviderEarning) (out domain.ProviderEarning, created bool, err error)
 	GetEarning(ctx context.Context, id string) (domain.ProviderEarning, error)
 	EarningBySettlement(ctx context.Context, settlementID string) (domain.ProviderEarning, error)
+	// EarningByJob returns the ProviderEarning for jobID. Used by the
+	// dispute workflow, which is keyed by Job (the principal-facing
+	// identity) rather than SettlementID.
+	EarningByJob(ctx context.Context, jobID string) (domain.ProviderEarning, error)
 	EarningsByProvider(ctx context.Context, providerID string) ([]domain.ProviderEarning, error)
 	// EarningsMaturing returns EarningMaturing earnings with matures_at <=
 	// before, oldest first, for the maturation sweep.
 	EarningsMaturing(ctx context.Context, before time.Time, limit int) ([]domain.ProviderEarning, error)
 	// EarningsAvailableForPayout returns EarningAvailable earnings ready to
-	// begin the payout state machine.
+	// begin the payout state machine. Earnings with a non-empty
+	// DisputeHoldID are excluded even though their Status is Available --
+	// beginPayoutUnderLock would no-op on them anyway, but excluding them
+	// here keeps a batch of held earnings from head-of-line-blocking
+	// genuinely payable ones behind the reconciler's limit.
 	EarningsAvailableForPayout(ctx context.Context, limit int) ([]domain.ProviderEarning, error)
 	// EarningsPayoutPending returns EarningPayoutPending earnings whose
 	// payout_requested_at <= before, for payout crash recovery: a process
@@ -223,6 +231,78 @@ type Earnings interface {
 	// stored earning -- only lifecycle fields (Status, timestamps, payout
 	// checkpoints) may change through this method.
 	UpdateEarning(ctx context.Context, id string, fn func(e domain.ProviderEarning, exists bool) (domain.ProviderEarning, error)) (domain.ProviderEarning, error)
+}
+
+// Disputes persists the durable Managed-dispute workflow and its economic
+// recovery checkpoints. See domain.Dispute's doc comment for the
+// immutability contract every implementation must uphold.
+type Disputes interface {
+	// OpenDispute atomically resolves the ProviderEarning bound to
+	// settlementID (row-locked, by its real UNIQUE identity -- never by
+	// job_id, which carries no uniqueness guarantee -- in the same
+	// transaction the dispute row is created in) and applies build to
+	// decide the dispute's initial durable state together with the
+	// earning's next state -- see domain.DisputeEconomicState's doc
+	// comments for the three possible branches (frozen /
+	// pending_payout_resolution / paid) build must choose between based on
+	// the earning's current, row-locked status. This is what makes
+	// "opening a dispute atomically freezes provider funds" (or correctly
+	// defers to pending_payout_resolution/paid when it cannot) a single
+	// durable transaction rather than two operations with a crash window
+	// between them.
+	//
+	// If a dispute already exists for jobID, build is never called and the
+	// existing dispute is returned with created=false and a nil error --
+	// enforced by a database UNIQUE(job_id) constraint, not a
+	// service-layer race, so "at most one dispute per Job" holds even
+	// under 8+ concurrent callers or two independent ATOS replicas.
+	OpenDispute(ctx context.Context, jobID, settlementID string, build func(earning domain.ProviderEarning, earningExists bool) (domain.Dispute, domain.ProviderEarning, error)) (dispute domain.Dispute, earning domain.ProviderEarning, created bool, err error)
+	GetDispute(ctx context.Context, id string) (domain.Dispute, error)
+	DisputeByJob(ctx context.Context, jobID string) (domain.Dispute, error)
+	DisputeByIdempotencyKey(ctx context.Context, principalID, key string) (domain.Dispute, error)
+	DisputesByPrincipal(ctx context.Context, principalID string) ([]domain.Dispute, error)
+	DisputesByProvider(ctx context.Context, providerID string) ([]domain.Dispute, error)
+	// DisputesUnderReview returns disputes still awaiting a review
+	// decision (ReviewStatus opened or under_review), oldest first, for
+	// the reviewer queue.
+	DisputesUnderReview(ctx context.Context, limit int) ([]domain.Dispute, error)
+	// DisputesForRecovery returns disputes whose economic recovery is not
+	// yet terminal (see domain.DisputeEconomicState.Terminal) and were
+	// last updated before updatedBefore, for the dispute reconciler.
+	DisputesForRecovery(ctx context.Context, updatedBefore time.Time, limit int) ([]domain.Dispute, error)
+	// UpdateDispute atomically applies fn to the dispute's current stored
+	// state and persists whatever fn returns, mirroring UpdateJob/
+	// UpdateEarning's compare-and-swap pattern. Implementations MUST
+	// reject (domain.ErrIdempotencyConflict) a returned value whose ID or
+	// whose identity/economic fields (see domain.Dispute's doc comment)
+	// differ from the existing stored dispute -- only lifecycle fields
+	// (ReviewStatus, EconomicState, Outcome, ReviewerID, ReasonRejected,
+	// timestamps) may change through this method.
+	UpdateDispute(ctx context.Context, id string, fn func(d domain.Dispute, exists bool) (domain.Dispute, error)) (domain.Dispute, error)
+	// UpdateDisputeAndEarning atomically applies fn to the dispute AND the
+	// ProviderEarning it references -- both row-locked in the same
+	// transaction, the earning by the dispute's own immutable EarningID
+	// (never re-derived from job_id) -- for resolution transitions that
+	// must durably commit both together in one instruction (reversing/
+	// releasing the earning together with the dispute's own checkpoint).
+	// Same immutability contract as UpdateDispute for the dispute side,
+	// and the same as UpdateEarning for the earning side.
+	UpdateDisputeAndEarning(ctx context.Context, disputeID string, fn func(d domain.Dispute, e domain.ProviderEarning, earningExists bool) (domain.Dispute, domain.ProviderEarning, error)) (domain.Dispute, domain.ProviderEarning, error)
+	// ResolveDispute atomically row-locks the dispute, the ProviderEarning
+	// it references (by the dispute's own immutable EarningID, never
+	// re-derived from job_id), and the principal's Account (in
+	// that order: dispute, then earning, then account) and commits fn's
+	// result to all three in one transaction. This is the sole primitive
+	// DisputeService.Resolve uses for every outcome (principal, provider,
+	// rejected), so a principal-win's earning reversal and account credit
+	// can never be split across two transactions with a crash window
+	// between them -- there is no intermediate durable state between
+	// "frozen" and "refunded" to recover from, because that transition can
+	// never be observed partially applied. Same immutability contract as
+	// UpdateDispute/UpdateEarning for the dispute/earning sides; fn MUST
+	// return an Account whose PrincipalID equals principalID even when
+	// leaving the account otherwise unchanged (provider-win/rejected).
+	ResolveDispute(ctx context.Context, disputeID, principalID string, seed domain.Account, fn func(d domain.Dispute, e domain.ProviderEarning, earningExists bool, a domain.Account, accountExists bool) (domain.Dispute, domain.ProviderEarning, domain.Account, error)) (domain.Dispute, domain.ProviderEarning, domain.Account, error)
 }
 
 type Artifacts interface {
@@ -257,6 +337,7 @@ type Store interface {
 	Accounts
 	Billing
 	Earnings
+	Disputes
 	Artifacts
 	Idempotency
 }

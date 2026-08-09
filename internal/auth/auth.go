@@ -36,6 +36,9 @@ const (
 	ScopeSettlementRead      Scope = "settlement:read"
 	ScopeProofsRead          Scope = "proofs:read"
 	ScopeNetworkRead         Scope = "network:read"
+	ScopeDisputesOpen        Scope = "disputes:open"
+	ScopeDisputesRead        Scope = "disputes:read"
+	ScopeDisputesReview      Scope = "disputes:review"
 )
 
 var allowedScopes = map[Scope]struct{}{
@@ -43,6 +46,7 @@ var allowedScopes = map[Scope]struct{}{
 	ScopeInvocationsCreate: {}, ScopeJobsCreate: {}, ScopeJobsRead: {}, ScopeJobsCancel: {},
 	ScopeAccountRead: {}, ScopeProviderJobsRead: {}, ScopeProviderJobsDeliver: {},
 	ScopeEarningsRead: {}, ScopeSettlementRead: {}, ScopeProofsRead: {}, ScopeNetworkRead: {},
+	ScopeDisputesOpen: {}, ScopeDisputesRead: {}, ScopeDisputesReview: {},
 }
 
 var defaultConsumerScopes = []Scope{
@@ -53,6 +57,13 @@ var defaultConsumerScopes = []Scope{
 	ScopeJobsRead,
 	ScopeJobsCancel,
 	ScopeAccountRead,
+	// A principal can dispute and view their own completed Jobs by
+	// default, the same way they can already cancel or read them.
+	// disputes:review is deliberately NOT a default scope -- reviewing is
+	// a distinct, explicitly-granted role, never implied by being a
+	// consumer.
+	ScopeDisputesOpen,
+	ScopeDisputesRead,
 }
 
 type Principal struct {

@@ -348,6 +348,112 @@ func TestEarningsService_PayoutSweep_RejectedFallsBackToAvailable(t *testing.T) 
 	}
 }
 
+// rejectThenPayAdapter rejects its first Payout call, then would pay on any
+// subsequent call. Used to prove a Dispute's hold blocks EarningsService
+// from ever reaching that second call while the hold is set.
+type rejectThenPayAdapter struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (a *rejectThenPayAdapter) Payout(ctx context.Context, req payout.Request) (payout.Result, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.calls++
+	if a.calls == 1 {
+		return payout.Result{Status: payout.StatusRejected, Reason: "first attempt rejected"}, nil
+	}
+	return payout.Result{Status: payout.StatusPaid, Reference: "should_never_be_reached"}, nil
+}
+
+func (a *rejectThenPayAdapter) Query(ctx context.Context, idempotencyKey string) (payout.Result, bool, error) {
+	return payout.Result{}, false, nil
+}
+
+func (a *rejectThenPayAdapter) callCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.calls
+}
+
+// TestEarningsService_DisputeHoldBlocksRetryAfterRejectedPayout proves the
+// exact race the reviewer flagged: a payout attempt is in flight
+// (payout_pending) when a Dispute opens against the same earning and sets
+// its durable hold; the in-flight attempt is then allowed to resolve on its
+// own (here, StatusRejected -> back to Available), but the hold must
+// prevent beginPayoutUnderLock from starting a NEW payout intent for as
+// long as it is set -- even though the earning is Available again -- so the
+// adapter's second call (which would incorrectly pay out a disputed
+// earning) must never happen.
+func TestEarningsService_DisputeHoldBlocksRetryAfterRejectedPayout(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	adapter := &rejectThenPayAdapter{}
+	svc := NewEarningsService(st, adapter)
+	e := availableEarning(ctx, t, svc, st, "job_hold", "prov_1", "settle_hold")
+
+	// Step 1: a payout intent is committed and attempted -- rejected.
+	started, err := svc.beginPayoutUnderLock(ctx, e.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.Status != domain.EarningPayoutPending {
+		t.Fatalf("status = %s, want payout_pending", started.Status)
+	}
+
+	// Step 2: a Dispute opens WHILE the payout is in flight and sets its
+	// durable hold -- exactly what DisputeService.Open's build callback
+	// does for the EarningPayoutPending case (exercised end-to-end in
+	// dispute_test.go). Simulated directly here via the store so this test
+	// can isolate EarningsService's own responsibility: respecting the
+	// hold once set, regardless of who set it.
+	held, err := st.UpdateEarning(ctx, e.ID, func(current domain.ProviderEarning, exists bool) (domain.ProviderEarning, error) {
+		current.DisputeHoldID = "dispute_hold_test"
+		return current, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held.Status != domain.EarningPayoutPending {
+		t.Fatalf("status after hold set = %s, want unchanged payout_pending", held.Status)
+	}
+
+	// Step 3: the in-flight attempt is allowed to resolve on its own.
+	resolved, err := svc.attemptPayout(ctx, held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Status != domain.EarningAvailable {
+		t.Fatalf("status after rejected payout = %s, want available", resolved.Status)
+	}
+	if resolved.DisputeHoldID != "dispute_hold_test" {
+		t.Fatal("hold was cleared by attemptPayout's rejection handling; it must persist until dispute resolution")
+	}
+	if calls := adapter.callCount(); calls != 1 {
+		t.Fatalf("expected exactly 1 Payout() call so far, got %d", calls)
+	}
+
+	// Step 4: the earning is Available again, and a PayoutSweep would
+	// normally pick it right back up -- but the hold must block a new
+	// payout intent from ever starting.
+	if _, err := svc.PayoutSweep(ctx, 100); err != nil {
+		t.Fatal(err)
+	}
+	final, err := st.GetEarning(ctx, e.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Status != domain.EarningAvailable {
+		t.Fatalf("status after PayoutSweep while held = %s, want still available (never re-entered payout_pending)", final.Status)
+	}
+	if final.DisputeHoldID != "dispute_hold_test" {
+		t.Fatal("hold was cleared without a dispute resolution")
+	}
+	if calls := adapter.callCount(); calls != 1 {
+		t.Fatalf("Payout() was called again despite the dispute hold: %d calls, want 1 (the adapter's 2nd call would incorrectly report Paid)", calls)
+	}
+}
+
 // TestEarningsService_PayoutSweep_DuplicateRequestConverges proves running
 // the sweep again after an earning is already paid does not attempt another
 // payout and leaves the earning exactly as it was.

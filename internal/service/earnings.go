@@ -196,6 +196,15 @@ func (s *EarningsService) beginPayoutUnderLock(ctx context.Context, earningID st
 		if current.Status == domain.EarningPayoutPending || current.Status.Terminal() {
 			return current, nil
 		}
+		// A Dispute holds this earning out of the payout pipeline even
+		// while it is transiently Available again (e.g. a prior in-flight
+		// payout attempt was rejected, moving Status back to Available,
+		// but the dispute reconciler has not yet had a chance to freeze it
+		// late) -- see domain.ProviderEarning.DisputeHoldID's doc comment.
+		// No new payout intent may begin for as long as the hold is set.
+		if current.DisputeHoldID != "" {
+			return current, nil
+		}
 		if current.Status != domain.EarningAvailable {
 			return domain.ProviderEarning{}, store.ErrConflict
 		}

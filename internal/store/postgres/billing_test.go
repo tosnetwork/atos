@@ -459,3 +459,54 @@ func TestSettledJobsMissingEarningFindsGapAndExcludesCompleted(t *testing.T) {
 		}
 	}
 }
+
+// TestEarningsAvailableForPayoutExcludesDisputeHeldEarnings proves a held
+// earning (Status=Available, DisputeHoldID set) is never returned as a
+// payout candidate against real Postgres, even though its Status alone
+// would qualify and it satisfies idx_provider_earnings_available's old
+// (status='available')-only predicate -- so a batch full of held earnings
+// cannot head-of-line-block genuinely payable ones behind the
+// reconciler's limit.
+func TestEarningsAvailableForPayoutExcludesDisputeHeldEarnings(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+
+	held := testEarning("prov_hold_"+suffix, "job_hold_"+suffix, "settle_hold_"+suffix)
+	held.Status = domain.EarningAvailable
+	if _, _, err := s.CreateEarning(ctx, held); err != nil {
+		t.Fatalf("CreateEarning (held): %v", err)
+	}
+	if _, err := s.UpdateEarning(ctx, held.ID, func(current domain.ProviderEarning, exists bool) (domain.ProviderEarning, error) {
+		current.DisputeHoldID = "dispute_hold_" + suffix
+		return current, nil
+	}); err != nil {
+		t.Fatalf("UpdateEarning (set hold): %v", err)
+	}
+
+	free := testEarning("prov_free_"+suffix, "job_free_"+suffix, "settle_free_"+suffix)
+	free.Status = domain.EarningAvailable
+	if _, _, err := s.CreateEarning(ctx, free); err != nil {
+		t.Fatalf("CreateEarning (free): %v", err)
+	}
+
+	candidates, err := s.EarningsAvailableForPayout(ctx, 1000)
+	if err != nil {
+		t.Fatalf("EarningsAvailableForPayout: %v", err)
+	}
+	sawFree, sawHeld := false, false
+	for _, e := range candidates {
+		if e.ID == free.ID {
+			sawFree = true
+		}
+		if e.ID == held.ID {
+			sawHeld = true
+		}
+	}
+	if !sawFree {
+		t.Fatalf("un-held earning %s was not returned as a payout candidate", free.ID)
+	}
+	if sawHeld {
+		t.Fatalf("held earning %s was incorrectly returned as a payout candidate", held.ID)
+	}
+}

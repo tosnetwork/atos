@@ -54,6 +54,7 @@ type Server struct {
 	Accounts      *service.AccountService
 	Receipts      *service.ReceiptService
 	Earnings      *service.EarningsService
+	Disputes      *service.DisputeService
 	Artifacts     *service.ArtifactService
 	Logger        *slog.Logger
 	PublicBaseURL string
@@ -106,6 +107,12 @@ func (s *Server) Mux() *http.ServeMux {
 
 	mux.HandleFunc("GET /v1/provider/earnings", s.withScopes(s.handleListEarnings, auth.ScopeEarningsRead))
 	mux.HandleFunc("GET /v1/provider/earnings/{id}", s.withScopes(s.handleGetEarning, auth.ScopeEarningsRead))
+
+	mux.HandleFunc("POST /v1/jobs/{id}/disputes", s.withScopes(s.handleOpenDispute, auth.ScopeDisputesOpen))
+	mux.HandleFunc("GET /v1/disputes/{id}", s.withScopes(s.handleGetDispute, auth.ScopeDisputesRead))
+	mux.HandleFunc("GET /v1/disputes", s.withScopes(s.handleListDisputes, auth.ScopeDisputesRead))
+	mux.HandleFunc("POST /v1/disputes/{id}/review", s.withScopes(s.handleReviewDispute, auth.ScopeDisputesReview))
+	mux.HandleFunc("POST /v1/disputes/{id}/resolve", s.withScopes(s.handleResolveDispute, auth.ScopeDisputesReview))
 
 	mux.HandleFunc("GET /v1/taxonomy", s.withScopes(s.handleTaxonomy, auth.ScopeCapabilitiesRead))
 	mux.HandleFunc("GET /v1/network/status", s.withScopes(s.handleNetworkStatus, auth.ScopeCapabilitiesRead))
@@ -209,7 +216,8 @@ func statusForCode(code domain.ErrorCode) int {
 	case domain.ErrRateLimited:
 		return http.StatusTooManyRequests
 	case domain.ErrValidationFailed, domain.ErrUploadMismatch, domain.ErrStreamOffsetInvalid,
-		domain.ErrStreamDigestInvalid, domain.ErrStreamChunkTooLarge, domain.ErrStreamCursorMismatch:
+		domain.ErrStreamDigestInvalid, domain.ErrStreamChunkTooLarge, domain.ErrStreamCursorMismatch,
+		domain.ErrDisputeNotEligible:
 		return http.StatusBadRequest
 	case domain.ErrNotFound, domain.ErrCapabilityUnavailable, domain.ErrArtifactNotFound:
 		return http.StatusNotFound
@@ -221,7 +229,7 @@ func statusForCode(code domain.ErrorCode) int {
 		domain.ErrIdempotencyConflict, domain.ErrJobNotCancelable,
 		domain.ErrSpendConfirmationRequired, domain.ErrSpendConfirmationDenied,
 		domain.ErrSpendConfirmationExpired, domain.ErrStreamSequenceConflict,
-		domain.ErrStreamTerminal:
+		domain.ErrStreamTerminal, domain.ErrDisputeWindowExpired, domain.ErrDisputeInvalidTransition:
 		return http.StatusConflict
 	case domain.ErrSpendLimitExceeded, domain.ErrInsufficientBalance:
 		return http.StatusPaymentRequired

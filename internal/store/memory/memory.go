@@ -29,6 +29,9 @@ type Store struct {
 	billingSnapshots     map[string]domain.BillingSnapshot // jobID -> snapshot
 	earnings             map[string]domain.ProviderEarning // earningID -> earning
 	earningsBySettlement map[string]string                 // settlementID -> earningID
+	earningsByJob        map[string]string                 // jobID -> earningID
+	disputes             map[string]domain.Dispute         // disputeID -> dispute
+	disputesByJob        map[string]string                 // jobID -> disputeID
 	artifacts            map[string]domain.StoredArtifact
 	idempotency          map[string]store.IdempotencyRecord // principalID+":"+key
 }
@@ -49,6 +52,9 @@ func New() *Store {
 		billingSnapshots:     make(map[string]domain.BillingSnapshot),
 		earnings:             make(map[string]domain.ProviderEarning),
 		earningsBySettlement: make(map[string]string),
+		earningsByJob:        make(map[string]string),
+		disputes:             make(map[string]domain.Dispute),
+		disputesByJob:        make(map[string]string),
 		artifacts:            make(map[string]domain.StoredArtifact),
 		idempotency:          make(map[string]store.IdempotencyRecord),
 	}
