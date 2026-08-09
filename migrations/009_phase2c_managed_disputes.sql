@@ -27,6 +27,18 @@ CREATE INDEX IF NOT EXISTS idx_provider_earnings_job ON provider_earnings (job_i
 -- EarningsService.beginPayoutUnderLock's hold check.
 ALTER TABLE provider_earnings ADD COLUMN IF NOT EXISTS dispute_hold_id TEXT NOT NULL DEFAULT '';
 
+-- Redefine migration 008's idx_provider_earnings_available to also
+-- exclude held earnings, so EarningsAvailableForPayout's
+-- "status='available' AND dispute_hold_id=''" query is served directly by
+-- the index instead of scanning every available row (including held ones)
+-- and filtering afterward -- a batch full of held rows should not be able
+-- to head-of-line-block genuinely payable ones behind the reconciler's
+-- limit.
+DROP INDEX IF EXISTS idx_provider_earnings_available;
+CREATE INDEX IF NOT EXISTS idx_provider_earnings_available
+    ON provider_earnings (status)
+    WHERE status = 'available' AND dispute_hold_id = '';
+
 -- job_id is UNIQUE: at most one dispute may ever exist for a given Job.
 -- This is what makes "at most one dispute per settlement" a database
 -- guarantee under 8+ concurrent openers or two independent ATOS replicas,

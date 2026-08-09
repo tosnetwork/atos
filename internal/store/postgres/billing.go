@@ -294,7 +294,7 @@ func (s *Store) EarningsAvailableForPayout(ctx context.Context, limit int) ([]do
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+earningColumns+` FROM provider_earnings
-		WHERE status='available'
+		WHERE status='available' AND dispute_hold_id=''
 		ORDER BY created_at ASC, id ASC
 		LIMIT $1
 	`, limit)

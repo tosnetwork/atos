@@ -203,7 +203,11 @@ type Earnings interface {
 	// before, oldest first, for the maturation sweep.
 	EarningsMaturing(ctx context.Context, before time.Time, limit int) ([]domain.ProviderEarning, error)
 	// EarningsAvailableForPayout returns EarningAvailable earnings ready to
-	// begin the payout state machine.
+	// begin the payout state machine. Earnings with a non-empty
+	// DisputeHoldID are excluded even though their Status is Available --
+	// beginPayoutUnderLock would no-op on them anyway, but excluding them
+	// here keeps a batch of held earnings from head-of-line-blocking
+	// genuinely payable ones behind the reconciler's limit.
 	EarningsAvailableForPayout(ctx context.Context, limit int) ([]domain.ProviderEarning, error)
 	// EarningsPayoutPending returns EarningPayoutPending earnings whose
 	// payout_requested_at <= before, for payout crash recovery: a process

@@ -245,3 +245,35 @@ func TestUpdateEarningRejectsIDChange(t *testing.T) {
 		t.Fatal("a rejected ID change must not have created an entry under the new id")
 	}
 }
+
+// TestEarningsAvailableForPayoutExcludesDisputeHeldEarnings proves a held
+// earning (Status=Available, DisputeHoldID set) is never returned as a
+// payout candidate, even though its Status alone would qualify -- so a
+// batch full of held earnings cannot head-of-line-block genuinely payable
+// ones behind the reconciler's limit.
+func TestEarningsAvailableForPayoutExcludesDisputeHeldEarnings(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+	held := testMemEarning("prov_1", "job_held", "settle_held")
+	held.Status = domain.EarningAvailable
+	held.DisputeHoldID = "dispute_1"
+	if _, _, err := s.CreateEarning(ctx, held); err != nil {
+		t.Fatal(err)
+	}
+	free := testMemEarning("prov_1", "job_free", "settle_free")
+	free.Status = domain.EarningAvailable
+	if _, _, err := s.CreateEarning(ctx, free); err != nil {
+		t.Fatal(err)
+	}
+
+	candidates, err := s.EarningsAvailableForPayout(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %d, want exactly 1 (held earning excluded)", len(candidates))
+	}
+	if candidates[0].ID != free.ID {
+		t.Fatalf("candidate = %s, want the un-held earning %s", candidates[0].ID, free.ID)
+	}
+}

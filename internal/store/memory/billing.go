@@ -155,7 +155,7 @@ func (s *Store) EarningsAvailableForPayout(ctx context.Context, limit int) ([]do
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return filterEarningsLocked(s.earnings, limit, func(e domain.ProviderEarning) bool {
-		return e.Status == domain.EarningAvailable
+		return e.Status == domain.EarningAvailable && e.DisputeHoldID == ""
 	}), nil
 }
 
