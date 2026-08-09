@@ -552,6 +552,7 @@ func (s *JobService) recoverProviderExecution(ctx context.Context, jobID string,
 			ProviderID: job.ProviderID, TrustMode: job.TrustMode, ProofProfile: job.ProofProfile,
 			Input: job.Input, InputCommitment: hashCommitment(job.Input),
 			ExecutionDeadline: job.ExecutionDeadline, RetainUntil: time.Now().UTC().Add(executionRetention),
+			Bindings: capability.Bindings,
 		})
 		if getErr != nil {
 			pending := s.markEconomicReconciliationUnderLock(ctx, job.ID, job.EconomicState, domain.JobWorking, domain.ErrProviderFailed, "provider submission outcome requires recovery: "+getErr.Error())

@@ -63,6 +63,14 @@ type SubmitJobRequest struct {
 	ExecutionDeadline time.Time
 	RetainUntil       time.Time
 	MaxWaitMS         int64
+	// Bindings is the Job's Capability's transport binding list at
+	// submission time, carried through so a Provider implementation that
+	// dispatches by transport (see internal/adapters/tosai/dispatch) never
+	// needs its own separate Capability lookup -- the same binding the
+	// caller already resolved and validated is the one that gets invoked.
+	// A Provider that only ever executes tos-native capabilities (the mock,
+	// the tos-protocol RPC client) is free to ignore this field entirely.
+	Bindings []domain.CapabilityBinding
 }
 
 type SubmitJobResult struct {
