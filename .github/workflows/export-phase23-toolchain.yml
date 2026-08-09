@@ -1,0 +1,37 @@
+name: export-phase23-toolchain
+
+on:
+  push:
+    branches:
+      - agent/phase2-phase3-completion
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: Populate module cache
+        run: go mod download
+      - name: Package toolchain and module cache
+        run: |
+          mkdir -p /tmp/phase23-go
+          tar -C "$(dirname "$(go env GOROOT)")" -czf /tmp/phase23-go/goroot.tar.gz "$(basename "$(go env GOROOT)")"
+          tar -C "$(go env GOPATH)" -czf /tmp/phase23-go/gomodcache.tar.gz pkg/mod
+          go version > /tmp/phase23-go/version.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atos-phase23-go-${{ github.sha }}
+          path: /tmp/phase23-go
+          retention-days: 1
+          if-no-files-found: error
