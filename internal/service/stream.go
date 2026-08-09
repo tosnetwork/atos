@@ -26,13 +26,23 @@ func NewStreamService(s store.Store, provider tosai.Provider) *StreamService {
 
 // EnsureIngested pulls the provider's canonical event sequence into the
 // durable journal unless it is already fully ingested (cursor.Terminal).
-// It always resumes the provider replay from the Job's own start (sequence
-// 0): providers execute synchronously today, so a Job's canonical event
-// sequence is only ever produced once, in full, and AppendJobStreamEvent's
-// idempotent-replay semantics make re-ingesting already-durable events a
-// safe no-op. This is what lets EnsureIngested be called freely, from any
-// process, on every stream read without an in-process "already ingesting"
-// guard.
+//
+// If nothing has been durably ingested for this Job yet, it pulls from the
+// very start. If a prior ingestion attempt got partway through before
+// failing (e.g. a dropped connection to the provider mid-transfer), it
+// resumes the provider pull itself at the durable cursor's next_offset,
+// asking the provider to skip re-sending bytes ATOS already has, rather
+// than always re-pulling the complete output from scratch. This relies on
+// the provider's own resumable StreamJob contract (real tos-protocol RPC,
+// or the mock backend's equivalent), which requires echoing back the
+// provider's retained-output identity digest (cursor.UpstreamDigest,
+// captured from the first event ever observed for this Job) as
+// expected_stream_digest.
+//
+// Either way, AppendJobStreamEvent's idempotent-replay semantics make
+// re-ingesting any already-durable event a safe no-op, which is what lets
+// EnsureIngested be called freely, from any process, on every stream read
+// without an in-process "already ingesting" guard.
 func (s *StreamService) EnsureIngested(ctx context.Context, jobID string) error {
 	cursor, found, err := s.store.JobStreamCursor(ctx, jobID)
 	if err != nil {
@@ -45,7 +55,18 @@ func (s *StreamService) EnsureIngested(ctx context.Context, jobID string) error 
 	if !ok {
 		return nil
 	}
-	err = streamer.StreamJobEvents(ctx, tosai.StreamJobEventsRequest{JobID: jobID}, func(event domain.JobEvent) error {
+	req := tosai.StreamJobEventsRequest{JobID: jobID}
+	if found && cursor.NextOffset > 0 && cursor.UpstreamDigest != "" {
+		req.NextSequence = cursor.NextSequence
+		req.NextOffset = cursor.NextOffset
+		req.ExpectedStreamDigest = cursor.UpstreamDigest
+	}
+	err = streamer.StreamJobEvents(ctx, req, func(event domain.JobEvent) error {
+		if event.UpstreamRetainedDigest != "" {
+			if err := s.store.SetJobStreamUpstreamDigest(ctx, jobID, event.UpstreamRetainedDigest); err != nil {
+				return err
+			}
+		}
 		return s.store.AppendJobStreamEvent(ctx, event)
 	})
 	if err != nil {

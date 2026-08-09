@@ -23,12 +23,20 @@ CREATE TABLE IF NOT EXISTS job_stream_events (
 -- with every job_stream_events append. digest_state carries the marshaled
 -- incremental sha256 hasher state (encoding.BinaryMarshaler) so resuming a
 -- cumulative stream digest never requires re-reading every prior chunk.
+-- upstream_digest is the execution provider's retained-output identity
+-- digest (tos-protocol's digestMessage(stored.Output)), captured the first
+-- time it is observed. It is a different concept from stream_digest above
+-- (which is ATOS's own independently-computed progressive per-chunk
+-- cumulative digest): it never changes for a given Job and exists only so a
+-- resumed ingestion pull can supply it back to the provider as
+-- expected_stream_digest.
 CREATE TABLE IF NOT EXISTS job_stream_cursors (
-    job_id         TEXT PRIMARY KEY,
-    next_sequence  BIGINT NOT NULL DEFAULT 0,
-    next_offset    BIGINT NOT NULL DEFAULT 0,
-    stream_digest  TEXT NOT NULL DEFAULT '',
-    digest_state   BYTEA,
-    terminal       BOOLEAN NOT NULL DEFAULT false,
-    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    job_id          TEXT PRIMARY KEY,
+    next_sequence   BIGINT NOT NULL DEFAULT 0,
+    next_offset     BIGINT NOT NULL DEFAULT 0,
+    stream_digest   TEXT NOT NULL DEFAULT '',
+    digest_state    BYTEA,
+    terminal        BOOLEAN NOT NULL DEFAULT false,
+    upstream_digest TEXT NOT NULL DEFAULT '',
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

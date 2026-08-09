@@ -122,6 +122,16 @@ type JobStream interface {
 	// JobStreamCursor returns the current durable resume cursor for jobID.
 	// found is false if no event has ever been appended for this Job.
 	JobStreamCursor(ctx context.Context, jobID string) (cursor domain.JobStreamCursor, found bool, err error)
+	// SetJobStreamUpstreamDigest durably records the execution provider's
+	// retained-output identity digest (JobEvent.UpstreamRetainedDigest) the
+	// first time it is observed for a Job, creating the cursor row if it
+	// does not exist yet. It is safe to call before any event has been
+	// appended, and safe to call repeatedly with the same value. A digest
+	// is a stable property of a Job's immutable completed output, so
+	// observing a *different* non-empty digest for the same Job is a
+	// provider-consistency error, not a benign race. Passing an empty
+	// digest is a no-op.
+	SetJobStreamUpstreamDigest(ctx context.Context, jobID, digest string) error
 }
 
 type Accounts interface {

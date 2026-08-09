@@ -260,9 +260,9 @@ func (s *Store) JobStreamCursor(ctx context.Context, jobID string) (domain.JobSt
 	var c domain.JobStreamCursor
 	c.JobID = jobID
 	err := s.pool.QueryRow(ctx, `
-		SELECT next_sequence, next_offset, stream_digest, terminal
+		SELECT next_sequence, next_offset, stream_digest, terminal, upstream_digest
 		FROM job_stream_cursors WHERE job_id=$1
-	`, jobID).Scan(&c.NextSequence, &c.NextOffset, &c.StreamDigest, &c.Terminal)
+	`, jobID).Scan(&c.NextSequence, &c.NextOffset, &c.StreamDigest, &c.Terminal, &c.UpstreamDigest)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.JobStreamCursor{JobID: jobID}, false, nil
 	}
@@ -270,6 +270,45 @@ func (s *Store) JobStreamCursor(ctx context.Context, jobID string) (domain.JobSt
 		return domain.JobStreamCursor{}, false, err
 	}
 	return c, true, nil
+}
+
+// SetJobStreamUpstreamDigest records the provider's retained-output identity
+// digest the first time it is observed for a Job, creating the cursor row
+// if necessary. AppendJobStreamEvent's own cursor upsert never lists
+// upstream_digest in its SET clause, so once written here it survives every
+// subsequent event append untouched.
+func (s *Store) SetJobStreamUpstreamDigest(ctx context.Context, jobID, digest string) error {
+	if digest == "" {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := lockTransactionKey(ctx, tx, "job-stream", jobID); err != nil {
+		return err
+	}
+
+	var existing string
+	err = tx.QueryRow(ctx, `SELECT upstream_digest FROM job_stream_cursors WHERE job_id=$1`, jobID).Scan(&existing)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO job_stream_cursors (job_id, upstream_digest, updated_at) VALUES ($1,$2, now())
+		`, jobID, digest); err != nil {
+			return err
+		}
+	case err != nil:
+		return err
+	case existing == "":
+		if _, err := tx.Exec(ctx, `UPDATE job_stream_cursors SET upstream_digest=$2 WHERE job_id=$1`, jobID, digest); err != nil {
+			return err
+		}
+	case existing != digest:
+		return domain.NewError(domain.ErrProviderFailed, "execution provider's retained-output identity digest changed for an existing job stream", false)
+	}
+	return tx.Commit(ctx)
 }
 
 var _ store.JobStream = (*Store)(nil)

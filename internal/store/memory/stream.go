@@ -115,6 +115,28 @@ func (s *Store) AppendJobStreamEvent(ctx context.Context, event domain.JobEvent)
 	s.streamCursors[event.JobID] = domain.JobStreamCursor{
 		JobID: event.JobID, NextSequence: event.Sequence + 1, NextOffset: nextOffset,
 		StreamDigest: nextDigest, Terminal: cursor.Terminal || event.Terminal,
+		UpstreamDigest: cursor.UpstreamDigest,
+	}
+	return nil
+}
+
+// SetJobStreamUpstreamDigest records the provider's retained-output identity
+// digest the first time it is observed for a Job, mirroring the Postgres
+// store's set-once/reject-on-change semantics.
+func (s *Store) SetJobStreamUpstreamDigest(ctx context.Context, jobID, digest string) error {
+	if digest == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cursor := s.streamCursors[jobID]
+	cursor.JobID = jobID
+	switch {
+	case cursor.UpstreamDigest == "":
+		cursor.UpstreamDigest = digest
+		s.streamCursors[jobID] = cursor
+	case cursor.UpstreamDigest != digest:
+		return domain.NewError(domain.ErrProviderFailed, "execution provider's retained-output identity digest changed for an existing job stream", false)
 	}
 	return nil
 }

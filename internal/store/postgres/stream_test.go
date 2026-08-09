@@ -1,6 +1,7 @@
 package postgres_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -422,5 +423,74 @@ func TestAppendJobStreamEventRollbackLeavesNoPartialRow(t *testing.T) {
 	}
 	if len(events) != 2 {
 		t.Fatalf("got %d events after retry, want 2 (no leftover partial row from the rejected attempt)", len(events))
+	}
+}
+
+// TestSetJobStreamUpstreamDigestBeforeAnyEvent proves the upstream identity
+// digest can be recorded before the cursor row exists at all, and that a
+// subsequent AppendJobStreamEvent's ON CONFLICT upsert leaves it intact.
+func TestSetJobStreamUpstreamDigestBeforeAnyEvent(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	jobID := "job_stream_digest_first_" + randSuffix()
+	digest := "sha256:" + hex.EncodeToString(make([]byte, 32))
+
+	if err := s.SetJobStreamUpstreamDigest(ctx, jobID, digest); err != nil {
+		t.Fatal(err)
+	}
+	cursor, found, err := s.JobStreamCursor(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || cursor.UpstreamDigest != digest || cursor.NextSequence != 0 {
+		t.Fatalf("unexpected cursor after setting the digest before any event: %+v found=%v", cursor, found)
+	}
+
+	if err := s.AppendJobStreamEvent(ctx, stateEvent(jobID, 0)); err != nil {
+		t.Fatal(err)
+	}
+	cursor, _, err = s.JobStreamCursor(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.UpstreamDigest != digest || cursor.NextSequence != 1 {
+		t.Fatalf("AppendJobStreamEvent's cursor upsert must not clobber upstream_digest, got %+v", cursor)
+	}
+}
+
+// TestSetJobStreamUpstreamDigestIsIdempotentButRejectsChange proves the
+// digest is a set-once value: repeating the same value is a harmless no-op,
+// but a different value for the same Job -- which should never legitimately
+// happen, since a Job's completed output is immutable -- is rejected as a
+// provider-consistency error rather than silently overwritten.
+func TestSetJobStreamUpstreamDigestIsIdempotentButRejectsChange(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	jobID := "job_stream_digest_once_" + randSuffix()
+	digest := "sha256:" + hex.EncodeToString(make([]byte, 32))
+
+	if err := s.SetJobStreamUpstreamDigest(ctx, jobID, digest); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetJobStreamUpstreamDigest(ctx, jobID, digest); err != nil {
+		t.Fatalf("repeating the same digest should be idempotent, got: %v", err)
+	}
+
+	other := "sha256:" + hex.EncodeToString(bytes.Repeat([]byte{1}, 32))
+	err := s.SetJobStreamUpstreamDigest(ctx, jobID, other)
+	if err == nil {
+		t.Fatal("expected an error when the observed digest changes for an existing job stream")
+	}
+	de, ok := err.(*domain.Error)
+	if !ok || de.Code != domain.ErrProviderFailed {
+		t.Fatalf("got %v, want provider_failed", err)
+	}
+
+	cursor, _, err := s.JobStreamCursor(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.UpstreamDigest != digest {
+		t.Fatalf("rejected change must not have overwritten the original digest, got %q", cursor.UpstreamDigest)
 	}
 }

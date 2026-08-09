@@ -51,14 +51,17 @@ func (c *Client) StreamJobEvents(ctx context.Context, req tosai.StreamJobEventsR
 			State: domainJobState(event.State), Chunk: append([]byte(nil), event.Chunk...),
 			Offset: event.Offset, TotalOutputBytes: event.TotalOutputBytes,
 			Terminal: event.Terminal, ErrorCode: domain.ErrorCode(event.ErrorCode),
-			// event.StreamDigest is deliberately NOT forwarded here: the
-			// current tos-protocol StreamJob implementation sets it to the
-			// digest of the complete final output on every event rather than
-			// a true progressive cumulative digest per chunk, so it cannot
-			// be trusted as ATOS's per-chunk stream_digest. Leaving this
-			// empty is safe -- the durable store independently (re)computes
-			// the real cumulative digest from the chunk bytes themselves and
-			// only cross-checks a caller-supplied digest when non-empty.
+			// event.StreamDigest is deliberately NOT forwarded as StreamDigest:
+			// tos-protocol sets it to the digest of the complete retained
+			// output on every event (STATE, each chunk, and TERMINAL alike)
+			// rather than a true progressive cumulative digest per chunk, so
+			// it cannot be trusted as ATOS's per-chunk stream_digest -- the
+			// durable store independently (re)computes that instead. It IS,
+			// however, a stable per-Job execution-identity value, so it is
+			// carried separately as UpstreamRetainedDigest: EnsureIngested
+			// persists it once and supplies it back as expected_stream_digest
+			// on a resumed ingestion pull (see internal/service/stream.go).
+			UpstreamRetainedDigest: digestString(event.StreamDigest),
 		}
 		if event.Usage != nil {
 			usage := domainUsage(event.Usage)

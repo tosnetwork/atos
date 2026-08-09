@@ -173,10 +173,14 @@ const mockMaxStreamChunkBytes = 256 << 10
 
 // StreamJobEvents synthesizes the same STATE -> OutputChunk* -> Terminal
 // sequence tos-protocol's real StreamJob RPC replays for a completed Job,
-// deterministically re-derived from the stored completion each call. The
-// mock has no genuine mid-execution partial output (SubmitJob above always
-// completes synchronously), so this is an equivalent local replay rather
-// than a network round trip — not a polling-based fake of a live stream.
+// deterministically re-derived from the stored completion each call and
+// mirroring its exact resume contract: a STATE event is always sent first,
+// labeled at NextSequence; OutputChunk events start at NextOffset (not
+// necessarily zero); NextOffset/ExpectedStreamDigest are validated against
+// the retained output before anything is sent. The mock has no genuine
+// mid-execution partial output (SubmitJob above always completes
+// synchronously), so this is an equivalent local replay rather than a
+// network round trip — not a polling-based fake of a live stream.
 func (p *Provider) StreamJobEvents(ctx context.Context, req tosai.StreamJobEventsRequest, onEvent func(domain.JobEvent) error) error {
 	p.mu.Lock()
 	result, ok := p.jobs[req.JobID]
@@ -188,44 +192,49 @@ func (p *Provider) StreamJobEvents(ctx context.Context, req tosai.StreamJobEvent
 	if err != nil {
 		return err
 	}
+	outputSize := uint64(len(outputBytes))
+	outputSum := sha256.Sum256(outputBytes)
+	identityDigest := "sha256:" + hex.EncodeToString(outputSum[:])
+	if req.NextOffset > outputSize {
+		return domain.NewError(domain.ErrStreamCursorMismatch, "next_offset is beyond the retained output", false)
+	}
+	if req.ExpectedStreamDigest != "" && req.ExpectedStreamDigest != identityDigest {
+		return domain.NewError(domain.ErrStreamCursorMismatch, "expected_stream_digest does not match retained output", false)
+	}
+	if req.NextOffset > 0 && req.ExpectedStreamDigest == "" {
+		return domain.NewError(domain.ErrStreamCursorMismatch, "expected_stream_digest is required when resuming output", false)
+	}
 	chunkSize := req.MaxChunkBytes
 	if chunkSize == 0 || chunkSize > mockMaxStreamChunkBytes {
 		chunkSize = mockMaxStreamChunkBytes
 	}
 	now := time.Now().UTC()
-	emit := func(event domain.JobEvent) error {
-		if event.Sequence < req.NextSequence {
-			return nil
-		}
+	sequence := req.NextSequence
+	send := func(event domain.JobEvent) error {
+		event.Sequence = sequence
+		sequence++
 		event.CreatedAt = now
+		event.UpstreamRetainedDigest = identityDigest
 		return onEvent(event)
 	}
 
-	sequence := uint64(0)
-	if err := emit(domain.JobEvent{JobID: req.JobID, Sequence: sequence, EventType: domain.JobEventState, State: result.State}); err != nil {
+	if err := send(domain.JobEvent{JobID: req.JobID, EventType: domain.JobEventState, State: result.State}); err != nil {
 		return err
 	}
-	sequence++
-
-	hasher := sha256.New()
-	for offset := uint64(0); offset < uint64(len(outputBytes)); offset += chunkSize {
-		end := min(offset+chunkSize, uint64(len(outputBytes)))
-		chunk := outputBytes[offset:end]
-		hasher.Write(chunk)
-		digest := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
-		if err := emit(domain.JobEvent{
-			JobID: req.JobID, Sequence: sequence, EventType: domain.JobEventOutputChunk,
-			State: result.State, Chunk: slices.Clone(chunk), Offset: offset,
-			TotalOutputBytes: uint64(len(outputBytes)), StreamDigest: digest,
+	for offset := req.NextOffset; offset < outputSize; offset += chunkSize {
+		end := min(offset+chunkSize, outputSize)
+		if err := send(domain.JobEvent{
+			JobID: req.JobID, EventType: domain.JobEventOutputChunk,
+			State: result.State, Chunk: slices.Clone(outputBytes[offset:end]), Offset: offset,
+			TotalOutputBytes: outputSize,
 		}); err != nil {
 			return err
 		}
-		sequence++
 	}
 
 	usage := result.Usage
-	return emit(domain.JobEvent{
-		JobID: req.JobID, Sequence: sequence, EventType: domain.JobEventTerminal,
+	return send(domain.JobEvent{
+		JobID: req.JobID, EventType: domain.JobEventTerminal,
 		State: result.State, Terminal: true, Usage: &usage,
 	})
 }

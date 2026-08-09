@@ -33,6 +33,15 @@ type JobEvent struct {
 	ProofStatus      *ProofStatus `json:"proof_status,omitempty"`
 	ErrorCode        ErrorCode    `json:"error_code,omitempty"`
 	CreatedAt        time.Time    `json:"created_at"`
+	// UpstreamRetainedDigest is the execution provider's identity digest for
+	// this Job's complete retained output (tos-protocol's
+	// digestMessage(stored.Output), the same value on every event for a
+	// given Job). It is deliberately a different concept from StreamDigest
+	// above: it is not a progressive per-chunk cumulative digest, only a
+	// stable "am I resuming the same execution" check the provider expects
+	// back as expected_stream_digest on a resumed pull. ATOS-internal only;
+	// never part of the public REST/SSE/MCP/A2A contract.
+	UpstreamRetainedDigest string `json:"-"`
 }
 
 // JobStreamCursor is the durable resume point for a Job's stream journal.
@@ -45,4 +54,10 @@ type JobStreamCursor struct {
 	NextOffset   uint64 `json:"next_offset"`
 	StreamDigest string `json:"stream_digest,omitempty"`
 	Terminal     bool   `json:"terminal"`
+	// UpstreamDigest is the provider's retained-output identity digest
+	// captured the first time it was observed for this Job (see
+	// JobEvent.UpstreamRetainedDigest); it is what a resumed ingestion pull
+	// supplies back to the provider as expected_stream_digest. ATOS-internal
+	// only; never part of the public REST/SSE/MCP/A2A contract.
+	UpstreamDigest string `json:"-"`
 }
