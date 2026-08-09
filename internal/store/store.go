@@ -95,6 +95,53 @@ type Jobs interface {
 	) (domain.Job, domain.Account, error)
 }
 
+// JobStream persists a Job's resumable stream-event journal. Implementations
+// MUST make AppendJobStreamEvent safe across concurrent callers in different
+// ATOS processes (e.g. a PostgreSQL advisory transaction lock scoped to the
+// Job ID, not an in-process mutex), since the same Job can be ingested and
+// streamed from more than one gateway replica.
+type JobStream interface {
+	// AppendJobStreamEvent durably appends one event to the Job's ordered
+	// journal, enforcing:
+	//   - idempotent replay: an event identical to the one already stored at
+	//     that sequence is a silent no-op;
+	//   - ErrStreamSequenceConflict if that sequence already holds different
+	//     content ("sequence substitution");
+	//   - ErrConflict if the sequence is not exactly the next expected one
+	//     (out-of-order/gapped append);
+	//   - ErrStreamOffsetInvalid / ErrStreamDigestInvalid if an
+	//     JobEventOutputChunk event's offset or cumulative stream digest does
+	//     not match what the store independently computes from the prior
+	//     durable chunks;
+	//   - ErrStreamTerminal if a terminal event was already recorded for
+	//     this Job (no events are accepted after terminal).
+	// For a JobEventOutputChunk event carrying a non-empty
+	// UpstreamRetainedDigest, the execution provider's retained-output
+	// identity digest is also validated/recorded (set-once; a later,
+	// different non-empty value is a provider-consistency error) in the
+	// exact same transaction/write as the event itself -- never as a
+	// separate, independently-committed step, so a crash or a rejected
+	// event can never leave the identity digest durably set without the
+	// event that justified it.
+	AppendJobStreamEvent(ctx context.Context, event domain.JobEvent) error
+	// JobStreamEvents returns durable events for jobID with
+	// sequence >= fromSequence, oldest first. limit<=0 means no limit.
+	JobStreamEvents(ctx context.Context, jobID string, fromSequence uint64, limit int) ([]domain.JobEvent, error)
+	// JobStreamCursor returns the current durable resume cursor for jobID.
+	// found is false if no event has ever been appended for this Job.
+	JobStreamCursor(ctx context.Context, jobID string) (cursor domain.JobStreamCursor, found bool, err error)
+	// LastJobStreamChunkBefore returns the most recent JobEventOutputChunk
+	// event with sequence < beforeSequence, if any. Cumulative offset/digest
+	// state only changes on OutputChunk events -- every other event type
+	// (STATE, PROOF_STATUS, TERMINAL, ...) passes the current cumulative
+	// state through unchanged -- so this is the correct way to recover "the
+	// stream's cumulative state as of beforeSequence" regardless of which
+	// event type happens to sit immediately before it. found is false if no
+	// OutputChunk event exists before beforeSequence (the state is still
+	// offset 0 / no digest).
+	LastJobStreamChunkBefore(ctx context.Context, jobID string, beforeSequence uint64) (event domain.JobEvent, found bool, err error)
+}
+
 type Accounts interface {
 	GetAccount(ctx context.Context, principalID string) (domain.Account, error)
 	PutAccount(ctx context.Context, a domain.Account) error
@@ -134,6 +181,7 @@ type Store interface {
 	Escrows
 	Receipts
 	Jobs
+	JobStream
 	Accounts
 	Artifacts
 	Idempotency

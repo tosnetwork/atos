@@ -14,29 +14,37 @@ import (
 )
 
 type Store struct {
-	mu            sync.Mutex
-	capabilities  map[string]domain.Capability
-	quotes        map[string]domain.Quote
-	escrows       map[string]domain.Escrow
-	receipts      map[string]domain.Receipt
-	receiptsByJob map[string]string // jobID -> receiptID
-	jobs          map[string]domain.Job
-	accounts      map[string]domain.Account
-	artifacts     map[string]domain.StoredArtifact
-	idempotency   map[string]store.IdempotencyRecord // principalID+":"+key
+	mu                sync.Mutex
+	capabilities      map[string]domain.Capability
+	quotes            map[string]domain.Quote
+	escrows           map[string]domain.Escrow
+	receipts          map[string]domain.Receipt
+	receiptsByJob     map[string]string // jobID -> receiptID
+	jobs              map[string]domain.Job
+	streamEvents      map[string][]domain.JobEvent      // jobID -> ordered events
+	streamEventHashes map[string][]string               // jobID -> content hash of the pristine incoming event at that index, mirroring Postgres's content_hash column
+	streamCursors     map[string]domain.JobStreamCursor // jobID -> cursor
+	streamDigests     map[string]streamDigestState      // jobID -> resumable hasher state
+	accounts          map[string]domain.Account
+	artifacts         map[string]domain.StoredArtifact
+	idempotency       map[string]store.IdempotencyRecord // principalID+":"+key
 }
 
 func New() *Store {
 	return &Store{
-		capabilities:  make(map[string]domain.Capability),
-		quotes:        make(map[string]domain.Quote),
-		escrows:       make(map[string]domain.Escrow),
-		receipts:      make(map[string]domain.Receipt),
-		receiptsByJob: make(map[string]string),
-		jobs:          make(map[string]domain.Job),
-		accounts:      make(map[string]domain.Account),
-		artifacts:     make(map[string]domain.StoredArtifact),
-		idempotency:   make(map[string]store.IdempotencyRecord),
+		capabilities:      make(map[string]domain.Capability),
+		quotes:            make(map[string]domain.Quote),
+		escrows:           make(map[string]domain.Escrow),
+		receipts:          make(map[string]domain.Receipt),
+		receiptsByJob:     make(map[string]string),
+		jobs:              make(map[string]domain.Job),
+		streamEvents:      make(map[string][]domain.JobEvent),
+		streamEventHashes: make(map[string][]string),
+		streamCursors:     make(map[string]domain.JobStreamCursor),
+		streamDigests:     make(map[string]streamDigestState),
+		accounts:          make(map[string]domain.Account),
+		artifacts:         make(map[string]domain.StoredArtifact),
+		idempotency:       make(map[string]store.IdempotencyRecord),
 	}
 }
 

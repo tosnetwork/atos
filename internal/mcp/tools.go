@@ -176,6 +176,9 @@ func (s *Server) toolCreateJob(ctx context.Context, principal auth.Principal, ar
 	if result.Job.Confirmation != nil {
 		response["confirmation_uri"] = s.confirmationURI(result.Job.Confirmation.UserCode)
 	}
+	if result.Job.ID != "" {
+		response["stream_url"] = s.jobStreamURI(result.Job.ID)
+	}
 	return response, nil
 }
 
@@ -191,6 +194,7 @@ func (s *Server) toolGetJob(ctx context.Context, principal auth.Principal, args 
 	if receipt, receiptErr := s.Receipts.ByJob(ctx, job.ID, principal.ID); receiptErr == nil {
 		response["receipt"] = receipt
 	}
+	response["stream_url"] = s.jobStreamURI(job.ID)
 	return response, nil
 }
 
@@ -320,6 +324,14 @@ func (s *Server) confirmationURI(code string) string {
 		base = "http://localhost:8080"
 	}
 	return base + "/confirm?code=" + url.QueryEscape(code)
+}
+
+func (s *Server) jobStreamURI(jobID string) string {
+	base := strings.TrimRight(s.PublicBaseURL, "/")
+	if base == "" {
+		base = "http://localhost:8080"
+	}
+	return base + "/v1/jobs/" + url.PathEscape(jobID) + "/stream"
 }
 
 func nullableString(value string) any {

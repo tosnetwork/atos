@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/tosnetwork/atos/internal/auth"
@@ -16,10 +17,11 @@ import (
 // MCP. The caller never chooses a new trust mode here: the supplied Quote is
 // authoritative and its concrete mode/profile flow into Task metadata.
 type Server struct {
-	Auth   *auth.Service
-	Quotes *service.QuoteService
-	Jobs   *service.JobService
-	Logger *slog.Logger
+	Auth          *auth.Service
+	Quotes        *service.QuoteService
+	Jobs          *service.JobService
+	Logger        *slog.Logger
+	PublicBaseURL string
 }
 
 type rpcRequest struct {
@@ -143,7 +145,7 @@ func (s *Server) handleMessageSend(ctx context.Context, w http.ResponseWriter, r
 		writeDomainErrorAsRPC(w, req.ID, err)
 		return
 	}
-	writeRPCResult(w, req.ID, TaskFromJob(result.Job))
+	writeRPCResult(w, req.ID, TaskFromJob(result.Job, s.jobStreamURL(result.Job.ID)))
 }
 
 type taskIDParams struct {
@@ -166,7 +168,7 @@ func (s *Server) handleTasksGet(ctx context.Context, w http.ResponseWriter, req 
 		writeRPCError(w, req.ID, codeForbidden, "not the task's owning principal", map[string]any{"code": domain.ErrPermissionDenied})
 		return
 	}
-	writeRPCResult(w, req.ID, TaskFromJob(job))
+	writeRPCResult(w, req.ID, TaskFromJob(job, s.jobStreamURL(job.ID)))
 }
 
 func (s *Server) handleTasksCancel(ctx context.Context, w http.ResponseWriter, req rpcRequest, principalID string) {
@@ -185,7 +187,18 @@ func (s *Server) handleTasksCancel(ctx context.Context, w http.ResponseWriter, r
 		writeDomainErrorAsRPC(w, req.ID, err)
 		return
 	}
-	writeRPCResult(w, req.ID, TaskFromJob(job))
+	writeRPCResult(w, req.ID, TaskFromJob(job, s.jobStreamURL(job.ID)))
+}
+
+func (s *Server) jobStreamURL(jobID string) string {
+	if jobID == "" {
+		return ""
+	}
+	base := strings.TrimRight(s.PublicBaseURL, "/")
+	if base == "" {
+		base = "http://localhost:8080"
+	}
+	return base + "/v1/jobs/" + url.PathEscape(jobID) + "/stream"
 }
 
 func writeRPCResult(w http.ResponseWriter, id json.RawMessage, result any) {
