@@ -1,0 +1,29 @@
+name: export-phase23-source
+
+on:
+  push:
+    branches:
+      - agent/phase2-phase3-completion
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Package exact source revision
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ github.sha }}"
+          tar --exclude=.git -czf /tmp/atos-phase23-source.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atos-phase23-source-${{ github.sha }}
+          path: /tmp/atos-phase23-source.tar.gz
+          retention-days: 1
+          if-no-files-found: error
