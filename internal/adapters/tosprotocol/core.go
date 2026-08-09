@@ -130,10 +130,12 @@ func (c *Client) CommitQuote(ctx context.Context, quote domain.Quote) (string, e
 			return "", err
 		}
 	}
-	underlying := quote.UnderlyingServiceQuoteRef
-	if underlying == "" {
-		underlying = quote.ServiceQuoteID
-	}
+	// tos-protocol's SubmitJob binds a Job to its Quote by requiring
+	// underlying_service_quote_ref to equal the service_quote_id presented
+	// later, so this must carry the raw service quote ID rather than
+	// quote.UnderlyingServiceQuoteRef (the distinct commitment reference
+	// tos-protocol returns from QuoteExecution).
+	underlying := quote.ServiceQuoteID
 	settlementAsset := quote.Settlement.ProviderAsset
 	if settlementAsset == "" {
 		settlementAsset = quote.Settlement.ClientAsset
@@ -209,6 +211,17 @@ func (c *Client) ResolveExecutionSignerAuthorization(
 }
 
 func (c *Client) CreateEscrow(ctx context.Context, req toscore.CreateEscrowRequest) (domain.Escrow, error) {
+	if existing, err := c.store.EscrowByJob(ctx, req.JobID); err == nil {
+		if existing.QuoteID != req.QuoteID || existing.PrincipalID != req.PrincipalID ||
+			existing.ProviderID != req.ProviderID || existing.CapabilityID != req.CapabilityID ||
+			existing.CapabilityVersion != req.CapabilityVersion || existing.TrustMode != req.TrustMode ||
+			existing.ProofProfile != req.ProofProfile || existing.Reserved != req.Reserved {
+			return domain.Escrow{}, domain.NewError(domain.ErrIdempotencyConflict, "stored escrow does not match replayed request", false)
+		}
+		return existing, nil
+	} else if err != store.ErrNotFound {
+		return domain.Escrow{}, err
+	}
 	reserve, err := networkAmount(req.Reserved)
 	if err != nil {
 		return domain.Escrow{}, err
@@ -252,6 +265,11 @@ func (c *Client) ReleaseEscrow(ctx context.Context, escrowID string) (domain.Rec
 	local, err := c.store.GetEscrow(ctx, escrowID)
 	if err != nil {
 		return domain.Receipt{}, err
+	}
+	if local.Status == domain.EscrowReleased {
+		if receipt, replayErr := c.store.ReceiptByJob(ctx, local.JobID); replayErr == nil && receipt.EscrowID == local.ID && receipt.Status == domain.ReceiptReleased {
+			return receipt, nil
+		}
 	}
 	callCtx, cancel := c.callContext(ctx, time.Time{})
 	defer cancel()
@@ -369,6 +387,11 @@ func (c *Client) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (t
 	local, err := c.store.GetEscrow(ctx, req.EscrowID)
 	if err != nil {
 		return toscore.SettleJobResult{}, err
+	}
+	if local.Status == domain.EscrowSettled {
+		if receipt, replayErr := c.store.ReceiptByJob(ctx, req.JobID); replayErr == nil && receipt.EscrowID == local.ID && receipt.Status == domain.ReceiptSettled {
+			return toscore.SettleJobResult{Receipt: receipt}, nil
+		}
 	}
 	charge, err := networkAmount(req.ActualCost)
 	if err != nil {

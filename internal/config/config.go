@@ -4,10 +4,19 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+)
+
+type Environment string
+
+const (
+	EnvironmentDevelopment Environment = "development"
+	EnvironmentProduction  Environment = "production"
 )
 
 type TOSBackend string
@@ -29,32 +38,54 @@ type TOSRPCConfig struct {
 	ClientKeyFile   string
 }
 
-type Config struct {
-	Addr string
-	// DatabaseURL selects the storage backend: empty uses the Phase 0
-	// in-memory store (zero setup, non-durable); set it to use the
-	// Phase 1 Postgres store (internal/store/postgres) instead. Run
-	// cmd/migrate against the same URL first.
-	DatabaseURL string
-	// BlobDir is where internal/adapters/storage/local writes uploaded
-	// file bytes. See ~/atos-spec/docs/ARTIFACTS.md.
-	BlobDir string
-	// PublicBaseURL is prefixed onto signed upload/download URLs so a
-	// client can actually reach this server from outside the process —
-	// it cannot be inferred from Addr alone (":8080" isn't a fetchable
-	// host).
-	PublicBaseURL string
+type AuthConfig struct {
+	AutoApprove   bool
+	StatePath     string
+	ApprovalToken string
+	TokenTTL      time.Duration
+	DeviceTTL     time.Duration
+	PollInterval  time.Duration
+}
 
-	// TOSBackend is explicit. RPC failures never fall back to mock.
-	TOSBackend TOSBackend
-	TOSRPC     TOSRPCConfig
+type ManagedAccountConfig struct {
+	Currency       string
+	InitialBalance string
+	PerCallLimit   string
+	DailyLimit     string
+}
+
+type Config struct {
+	Environment    Environment
+	Addr           string
+	DatabaseURL    string
+	BlobDir        string
+	PublicBaseURL  string
+	Auth           AuthConfig
+	ManagedAccount ManagedAccountConfig
+	TOSBackend     TOSBackend
+	TOSRPC         TOSRPCConfig
 }
 
 func Load() (Config, error) {
-	addr := envOr("ATOS_ADDR", ":8080")
-	blobDir := envOr("ATOS_BLOB_DIR", "./data/blobs")
-	publicBaseURL := envOr("ATOS_PUBLIC_BASE_URL", "http://localhost:8080")
-	backend := TOSBackend(strings.ToLower(envOr("ATOS_TOS_BACKEND", string(TOSBackendMock))))
+	environment := Environment(strings.ToLower(envOr("ATOS_ENV", string(EnvironmentDevelopment))))
+	production := environment == EnvironmentProduction
+	autoApproveDefault := !production
+	autoApprove, err := boolEnv("ATOS_AUTH_AUTO_APPROVE", autoApproveDefault)
+	if err != nil {
+		return Config{}, err
+	}
+	tokenTTL, err := durationEnv("ATOS_AUTH_TOKEN_TTL", time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+	deviceTTL, err := durationEnv("ATOS_AUTH_DEVICE_TTL", 15*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	pollInterval, err := durationEnv("ATOS_AUTH_POLL_INTERVAL", 5*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
 	timeout, err := durationEnv("ATOS_TOS_RPC_TIMEOUT", 30*time.Second)
 	if err != nil {
 		return Config{}, err
@@ -67,10 +98,26 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+
 	cfg := Config{
-		Addr: addr, DatabaseURL: strings.TrimSpace(os.Getenv("ATOS_DATABASE_URL")),
-		BlobDir: blobDir, PublicBaseURL: publicBaseURL,
-		TOSBackend: backend,
+		Environment:   environment,
+		Addr:          envOr("ATOS_ADDR", ":8080"),
+		DatabaseURL:   strings.TrimSpace(os.Getenv("ATOS_DATABASE_URL")),
+		BlobDir:       envOr("ATOS_BLOB_DIR", "./data/blobs"),
+		PublicBaseURL: envOr("ATOS_PUBLIC_BASE_URL", "http://localhost:8080"),
+		Auth: AuthConfig{
+			AutoApprove:   autoApprove,
+			StatePath:     strings.TrimSpace(os.Getenv("ATOS_AUTH_STATE_PATH")),
+			ApprovalToken: strings.TrimSpace(os.Getenv("ATOS_APPROVAL_TOKEN")),
+			TokenTTL:      tokenTTL, DeviceTTL: deviceTTL, PollInterval: pollInterval,
+		},
+		ManagedAccount: ManagedAccountConfig{
+			Currency:       strings.ToUpper(envOr("ATOS_MANAGED_CURRENCY", "USD")),
+			InitialBalance: envOr("ATOS_MANAGED_INITIAL_BALANCE", "25.00"),
+			PerCallLimit:   envOr("ATOS_MANAGED_PER_CALL_LIMIT", "2.00"),
+			DailyLimit:     envOr("ATOS_MANAGED_DAILY_LIMIT", "20.00"),
+		},
+		TOSBackend: TOSBackend(strings.ToLower(envOr("ATOS_TOS_BACKEND", string(TOSBackendMock)))),
 		TOSRPC: TOSRPCConfig{
 			URL:      strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_URL")),
 			Token:    strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_TOKEN")),
@@ -88,9 +135,35 @@ func Load() (Config, error) {
 }
 
 func (c Config) Validate() error {
+	switch c.Environment {
+	case EnvironmentDevelopment, EnvironmentProduction:
+	default:
+		return fmt.Errorf("invalid ATOS_ENV %q", c.Environment)
+	}
+	parsedBase, err := url.Parse(c.PublicBaseURL)
+	if err != nil || parsedBase.Scheme == "" || parsedBase.Host == "" || parsedBase.RawQuery != "" || parsedBase.Fragment != "" {
+		return errors.New("ATOS_PUBLIC_BASE_URL must be an absolute URL without query or fragment")
+	}
+	if parsedBase.Path != "" && parsedBase.Path != "/" {
+		return errors.New("ATOS_PUBLIC_BASE_URL must not contain a path prefix")
+	}
+	if c.Auth.TokenTTL <= 0 || c.Auth.TokenTTL > 30*24*time.Hour ||
+		c.Auth.DeviceTTL <= 0 || c.Auth.DeviceTTL > time.Hour ||
+		c.Auth.PollInterval < time.Second || c.Auth.PollInterval > time.Minute {
+		return errors.New("ATOS authorization durations are outside the allowed range")
+	}
+	if c.Auth.StatePath != "" && (!filepath.IsAbs(c.Auth.StatePath) || filepath.Clean(c.Auth.StatePath) != c.Auth.StatePath) {
+		return errors.New("ATOS_AUTH_STATE_PATH must be an absolute clean path")
+	}
+	if !c.Auth.AutoApprove && len(c.Auth.ApprovalToken) < 32 {
+		return errors.New("ATOS_APPROVAL_TOKEN must contain at least 32 characters when automatic approval is disabled")
+	}
+	if strings.TrimSpace(c.ManagedAccount.Currency) == "" || len(c.ManagedAccount.Currency) > 12 {
+		return errors.New("ATOS_MANAGED_CURRENCY is invalid")
+	}
+
 	switch c.TOSBackend {
 	case TOSBackendMock:
-		return nil
 	case TOSBackendRPC:
 		if c.TOSRPC.URL == "" || c.TOSRPC.Token == "" {
 			return errors.New("ATOS_TOS_RPC_URL and ATOS_TOS_RPC_TOKEN are required when ATOS_TOS_BACKEND=rpc")
@@ -104,10 +177,28 @@ func (c Config) Validate() error {
 		if (c.TOSRPC.ClientCertFile == "") != (c.TOSRPC.ClientKeyFile == "") {
 			return errors.New("ATOS_TOS_RPC_CLIENT_CERT_FILE and ATOS_TOS_RPC_CLIENT_KEY_FILE must be configured together")
 		}
-		return nil
 	default:
 		return fmt.Errorf("invalid ATOS_TOS_BACKEND %q (expected mock or rpc)", c.TOSBackend)
 	}
+
+	if c.Environment == EnvironmentProduction {
+		if c.DatabaseURL == "" {
+			return errors.New("ATOS_DATABASE_URL is required in production")
+		}
+		if parsedBase.Scheme != "https" {
+			return errors.New("ATOS_PUBLIC_BASE_URL must use HTTPS in production")
+		}
+		if c.Auth.AutoApprove {
+			return errors.New("ATOS_AUTH_AUTO_APPROVE must be false in production")
+		}
+		if c.Auth.StatePath == "" {
+			return errors.New("ATOS_AUTH_STATE_PATH is required in production")
+		}
+		if c.TOSBackend != TOSBackendRPC {
+			return errors.New("ATOS_TOS_BACKEND=rpc is required in production")
+		}
+	}
+	return nil
 }
 
 func envOr(name, fallback string) string {

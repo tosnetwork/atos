@@ -66,3 +66,32 @@ func TestActiveModesNeverContainsAutoAndIsStable(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateCommittedTrustAcceptsOnlyNormativePairs(t *testing.T) {
+	tests := []struct {
+		name    string
+		mode    TrustMode
+		profile ProofProfile
+		valid   bool
+	}{
+		{name: "managed", mode: TrustModeManaged, profile: ProofProfileNone, valid: true},
+		{name: "verified", mode: TrustModeVerified, profile: ProofProfileTOSVerifiedV1, valid: true},
+		{name: "native", mode: TrustModeNative, profile: ProofProfileTOSNativeV1, valid: true},
+		{name: "empty mode", mode: TrustMode(""), profile: ProofProfileNone},
+		{name: "auto cannot be committed", mode: TrustMode(RequestedTrustAuto), profile: ProofProfileNone},
+		{name: "managed with verified profile", mode: TrustModeManaged, profile: ProofProfileTOSVerifiedV1},
+		{name: "verified without profile", mode: TrustModeVerified, profile: ProofProfileNone},
+		{name: "native with verified profile", mode: TrustModeNative, profile: ProofProfileTOSVerifiedV1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateCommittedTrust(tc.mode, tc.profile)
+			if tc.valid && err != nil {
+				t.Fatalf("valid pair rejected: %v", err)
+			}
+			if !tc.valid && err == nil {
+				t.Fatalf("invalid pair accepted: mode=%q profile=%q", tc.mode, tc.profile)
+			}
+		})
+	}
+}

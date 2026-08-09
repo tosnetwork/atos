@@ -53,7 +53,26 @@ func main() {
 		logger.Info("using in-memory store (set ATOS_DATABASE_URL for postgres)")
 	}
 
-	authorization := auth.NewService()
+	var authPersistence auth.Persistence
+	if cfg.Auth.StatePath != "" {
+		authPersistence, err = auth.OpenBoltPersistence(cfg.Auth.StatePath)
+		if err != nil {
+			logger.Error("authorization state init failed", "error", err)
+			os.Exit(1)
+		}
+	}
+	authorization, err := auth.Open(auth.Config{
+		AutoApprove:  cfg.Auth.AutoApprove,
+		TokenTTL:     cfg.Auth.TokenTTL,
+		DeviceTTL:    cfg.Auth.DeviceTTL,
+		PollInterval: cfg.Auth.PollInterval,
+		Persistence:  authPersistence,
+	})
+	if err != nil {
+		logger.Error("authorization service init failed", "error", err)
+		os.Exit(1)
+	}
+	defer func() { _ = authorization.Close() }()
 	var execution tosai.Provider
 	var core toscore.Core
 	var quoter tosai.Quoter
@@ -96,9 +115,24 @@ func main() {
 	} else {
 		quotes = service.NewQuoteService(st, quoter)
 	}
-	accounts := service.NewAccountService(st)
+	accountDefaults := service.AccountDefaults{
+		InitialBalance: domain.Money{Amount: cfg.ManagedAccount.InitialBalance, Currency: cfg.ManagedAccount.Currency},
+		PerCallLimit:   domain.Money{Amount: cfg.ManagedAccount.PerCallLimit, Currency: cfg.ManagedAccount.Currency},
+		DailyLimit:     domain.Money{Amount: cfg.ManagedAccount.DailyLimit, Currency: cfg.ManagedAccount.Currency},
+	}
+	if err := service.ValidateAccountDefaults(accountDefaults); err != nil {
+		logger.Error("invalid managed account configuration", "error", err)
+		os.Exit(2)
+	}
+	accounts := service.NewAccountService(st, accountDefaults)
+	quotes.WithAccountService(accounts)
 	jobs := service.NewJobService(st, execution, core, accounts)
 	receipts := service.NewReceiptService(st, core)
+	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
+	defer reconcileCancel()
+	go jobs.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
+		logger.Error("managed economic reconciliation pending", "error", reconcileErr)
+	})
 
 	blobStorage, err := local.New(cfg.BlobDir, cfg.PublicBaseURL, st)
 	if err != nil {
@@ -114,12 +148,13 @@ func main() {
 	restServer := &httpapi.Server{
 		Auth: authorization, Capabilities: capabilities, Quotes: quotes,
 		Jobs: jobs, Accounts: accounts, Receipts: receipts,
-		Artifacts: artifacts, Logger: logger,
+		Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
+		ApprovalToken: cfg.Auth.ApprovalToken,
 	}
 	mcpServer := &mcp.Server{
 		Auth: authorization, Capabilities: capabilities, Quotes: quotes,
 		Jobs: jobs, Accounts: accounts, Receipts: receipts,
-		Artifacts: artifacts, Logger: logger,
+		Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}
 	a2aServer := &a2a.Server{Auth: authorization, Quotes: quotes, Jobs: jobs, Logger: logger}
 

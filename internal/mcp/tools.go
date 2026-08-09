@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"net/url"
+	"strings"
 
 	"github.com/tosnetwork/atos/internal/auth"
 	"github.com/tosnetwork/atos/internal/domain"
@@ -50,11 +52,6 @@ func argInt64(args map[string]any, key string) int64 {
 
 func argObject(args map[string]any, key string) map[string]any {
 	value, _ := args[key].(map[string]any)
-	return value
-}
-
-func argBool(args map[string]any, key string) bool {
-	value, _ := args[key].(bool)
 	return value
 }
 
@@ -137,7 +134,6 @@ func (s *Server) toolInvoke(ctx context.Context, principal auth.Principal, args 
 		PrincipalID: principal.ID, CapabilityID: argString(args, "capability_id"),
 		QuoteID: argString(args, "quote_id"), Input: argObject(args, "input"),
 		IdempotencyKey: argString(args, "idempotency_key"), MaxWaitMS: argInt64(args, "max_wait_ms"),
-		Confirmed: argBool(args, "confirmed"),
 	})
 	if err != nil {
 		return nil, err
@@ -148,7 +144,7 @@ func (s *Server) toolInvoke(ctx context.Context, principal auth.Principal, args 
 			receipt = found
 		}
 	}
-	return map[string]any{
+	response := map[string]any{
 		"result_type":   result.Type,
 		"invocation_id": nullableString(result.Job.InvocationID),
 		"job_id":        nullableString(result.Job.ID),
@@ -158,19 +154,29 @@ func (s *Server) toolInvoke(ctx context.Context, principal auth.Principal, args 
 		"output":        result.Job.Output,
 		"artifacts":     result.Job.Artifacts,
 		"receipt":       receipt,
-	}, nil
+	}
+	if result.Job.Confirmation != nil {
+		response["confirmation"] = result.Job.Confirmation
+		response["confirmation_uri"] = s.confirmationURI(result.Job.Confirmation.UserCode)
+	}
+	return response, nil
 }
 
 func (s *Server) toolCreateJob(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
 	result, err := s.Jobs.CreateJob(ctx, service.SubmitInput{
 		PrincipalID: principal.ID, CapabilityID: argString(args, "capability_id"),
 		QuoteID: argString(args, "quote_id"), Input: argObject(args, "input"),
-		IdempotencyKey: argString(args, "idempotency_key"), Confirmed: argBool(args, "confirmed"),
+		IdempotencyKey: argString(args, "idempotency_key"),
 	})
 	if err != nil {
 		return nil, err
 	}
-	return result.Job, nil
+	response := mapFrom(result.Job)
+	response["result_type"] = result.Type
+	if result.Job.Confirmation != nil {
+		response["confirmation_uri"] = s.confirmationURI(result.Job.Confirmation.UserCode)
+	}
+	return response, nil
 }
 
 func (s *Server) toolGetJob(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
@@ -306,6 +312,14 @@ func mapFrom(value any) map[string]any {
 	var out map[string]any
 	_ = json.Unmarshal(encoded, &out)
 	return out
+}
+
+func (s *Server) confirmationURI(code string) string {
+	base := strings.TrimRight(s.PublicBaseURL, "/")
+	if base == "" {
+		base = "http://localhost:8080"
+	}
+	return base + "/confirm?code=" + url.QueryEscape(code)
 }
 
 func nullableString(value string) any {

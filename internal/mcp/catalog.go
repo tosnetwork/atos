@@ -145,7 +145,6 @@ func invocationInputSchema() map[string]any {
 		"input":           map[string]any{},
 		"idempotency_key": map[string]any{"type": "string", "minLength": 1},
 		"max_wait_ms":     map[string]any{"type": "integer", "minimum": 1000, "maximum": 120000},
-		"confirmed":       map[string]any{"type": "boolean", "description": "Phase 0 continuation flag after input_required; production MCP elicitation binds signed request state."},
 	})
 }
 
@@ -159,6 +158,7 @@ func invokeTool() map[string]any {
 			"quote_id": map[string]any{"type": "string"}, "trust_mode": concreteModeSchema(),
 			"proof_profile": map[string]any{"type": []string{"string", "null"}}, "output": map[string]any{},
 			"artifacts": map[string]any{"type": "array"}, "receipt": map[string]any{"type": []string{"object", "null"}},
+			"confirmation": map[string]any{"type": []string{"object", "null"}}, "confirmation_uri": map[string]any{"type": []string{"string", "null"}},
 		}),
 	}
 }

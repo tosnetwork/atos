@@ -8,6 +8,7 @@ package store
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/tosnetwork/atos/internal/domain"
 )
@@ -34,9 +35,11 @@ const (
 // retried request with the same key returns the original outcome instead
 // of re-executing (docs/MCP.md "Idempotency").
 type IdempotencyRecord struct {
-	RequestHash string
-	ResponseKey string // opaque pointer the caller resolves (e.g. a job/invocation ID); only meaningful once Status is Completed
-	Status      IdempotencyStatus
+	RequestHash  string
+	ResponseKey  string // opaque pointer the caller resolves (e.g. a job/invocation ID); only meaningful once Status is Completed
+	Status       IdempotencyStatus
+	ReservedAt   time.Time
+	LeaseExpires time.Time
 }
 
 // Method names are qualified per collection (PutQuote, not Put) because
@@ -58,6 +61,7 @@ type Quotes interface {
 type Escrows interface {
 	PutEscrow(ctx context.Context, e domain.Escrow) error
 	GetEscrow(ctx context.Context, id string) (domain.Escrow, error)
+	EscrowByJob(ctx context.Context, jobID string) (domain.Escrow, error)
 }
 
 type Receipts interface {
@@ -71,6 +75,9 @@ type Jobs interface {
 	PutJob(ctx context.Context, j domain.Job) error
 	GetJob(ctx context.Context, id string) (domain.Job, error)
 	JobsByPrincipal(ctx context.Context, principalID string) ([]domain.Job, error)
+	JobsForRecovery(ctx context.Context, updatedBefore time.Time, limit int) ([]domain.Job, error)
+	JobByConfirmationCode(ctx context.Context, userCode string) (domain.Job, error)
+	JobByIdempotencyKey(ctx context.Context, principalID, key string) (domain.Job, error)
 	// UpdateJob atomically applies fn to the job's current stored state (or
 	// domain.Job{} with exists=false if it isn't stored yet) and persists
 	// whatever fn returns. fn returning an error aborts without persisting
@@ -78,6 +85,14 @@ type Jobs interface {
 	// move to failed if not already terminal") without a read/write race
 	// between the execution pipeline and cancellation.
 	UpdateJob(ctx context.Context, id string, fn func(j domain.Job, exists bool) (domain.Job, error)) (domain.Job, error)
+	// UpdateJobAndAccount commits one Job checkpoint and one Managed Account
+	// mutation in the same storage transaction. This is the Phase 1 economic
+	// atomicity boundary: a crash cannot persist a debit/credit without the
+	// corresponding durable Job checkpoint, or vice versa.
+	UpdateJobAndAccount(
+		ctx context.Context, jobID, principalID string, seed domain.Account,
+		fn func(job domain.Job, jobExists bool, account domain.Account, accountExists bool) (domain.Job, domain.Account, error),
+	) (domain.Job, domain.Account, error)
 }
 
 type Accounts interface {
@@ -101,7 +116,7 @@ type Idempotency interface {
 	// If the key was already used it returns the prior record and ok=false
 	// so the caller can return the cached result (Completed) or a
 	// retry-later conflict (still InProgress).
-	Reserve(ctx context.Context, principalID, key, requestHash string) (rec IdempotencyRecord, ok bool, err error)
+	Reserve(ctx context.Context, principalID, key, requestHash string, leaseUntil time.Time) (rec IdempotencyRecord, ok bool, err error)
 	// Finish marks a reservation Completed with its response_key, so a
 	// later replay resolves to the real result.
 	Finish(ctx context.Context, principalID, key, responseKey string) error

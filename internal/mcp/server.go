@@ -15,14 +15,15 @@ import (
 )
 
 type Server struct {
-	Auth         *auth.Service
-	Capabilities *service.CapabilityService
-	Quotes       *service.QuoteService
-	Jobs         *service.JobService
-	Accounts     *service.AccountService
-	Receipts     *service.ReceiptService
-	Artifacts    *service.ArtifactService
-	Logger       *slog.Logger
+	Auth          *auth.Service
+	Capabilities  *service.CapabilityService
+	Quotes        *service.QuoteService
+	Jobs          *service.JobService
+	Accounts      *service.AccountService
+	Receipts      *service.ReceiptService
+	Artifacts     *service.ArtifactService
+	Logger        *slog.Logger
+	PublicBaseURL string
 }
 
 type rpcRequest struct {

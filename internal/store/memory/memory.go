@@ -7,6 +7,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/store"
@@ -140,6 +141,17 @@ func (s *Store) GetEscrow(ctx context.Context, id string) (domain.Escrow, error)
 	return e, nil
 }
 
+func (s *Store) EscrowByJob(ctx context.Context, jobID string) (domain.Escrow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range s.escrows {
+		if e.JobID == jobID {
+			return e, nil
+		}
+	}
+	return domain.Escrow{}, store.ErrNotFound
+}
+
 func (s *Store) PutReceipt(ctx context.Context, r domain.Receipt) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -209,6 +221,50 @@ func (s *Store) JobsByPrincipal(ctx context.Context, principalID string) ([]doma
 	return out, nil
 }
 
+func (s *Store) JobsForRecovery(ctx context.Context, updatedBefore time.Time, limit int) ([]domain.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 {
+		limit = 100
+	}
+	out := make([]domain.Job, 0, limit)
+	for _, j := range s.jobs {
+		if j.State.Terminal() || j.State == domain.JobInputRequired {
+			continue
+		}
+		if !j.UpdatedAt.IsZero() && j.UpdatedAt.After(updatedBefore) {
+			continue
+		}
+		out = append(out, j)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) JobByConfirmationCode(ctx context.Context, userCode string) (domain.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, j := range s.jobs {
+		if j.Confirmation != nil && j.Confirmation.UserCode == userCode {
+			return j, nil
+		}
+	}
+	return domain.Job{}, store.ErrNotFound
+}
+
+func (s *Store) JobByIdempotencyKey(ctx context.Context, principalID, key string) (domain.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, j := range s.jobs {
+		if j.PrincipalID == principalID && j.IdempotencyKey == key {
+			return j, nil
+		}
+	}
+	return domain.Job{}, store.ErrNotFound
+}
+
 // UpdateJob holds the store lock for the whole read-modify-write so two
 // callers (e.g. the execution pipeline and Cancel) can never both act on
 // the same stale job state.
@@ -261,6 +317,29 @@ func (s *Store) UpdateAccount(ctx context.Context, principalID string, seed doma
 	return next, nil
 }
 
+func (s *Store) UpdateJobAndAccount(
+	ctx context.Context, jobID, principalID string, seed domain.Account,
+	fn func(domain.Job, bool, domain.Account, bool) (domain.Job, domain.Account, error),
+) (domain.Job, domain.Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, jobExists := s.jobs[jobID]
+	account, accountExists := s.accounts[principalID]
+	if !accountExists {
+		account = seed
+	}
+	nextJob, nextAccount, err := fn(job, jobExists, account, accountExists)
+	if err != nil {
+		return domain.Job{}, domain.Account{}, err
+	}
+	if nextJob.ID != jobID || nextAccount.PrincipalID != principalID {
+		return domain.Job{}, domain.Account{}, store.ErrConflict
+	}
+	s.jobs[jobID] = nextJob
+	s.accounts[principalID] = nextAccount
+	return nextJob, nextAccount, nil
+}
+
 func (s *Store) PutArtifact(ctx context.Context, a domain.StoredArtifact) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -278,14 +357,28 @@ func (s *Store) GetArtifact(ctx context.Context, id string) (domain.StoredArtifa
 	return a, nil
 }
 
-func (s *Store) Reserve(ctx context.Context, principalID, key, requestHash string) (store.IdempotencyRecord, bool, error) {
+func (s *Store) Reserve(ctx context.Context, principalID, key, requestHash string, leaseUntil time.Time) (store.IdempotencyRecord, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	compositeKey := principalID + ":" + key
+	now := time.Now().UTC()
 	if existing, ok := s.idempotency[compositeKey]; ok {
+		if existing.Status == store.IdempotencyInProgress &&
+			existing.RequestHash == requestHash &&
+			!existing.LeaseExpires.IsZero() && !now.Before(existing.LeaseExpires) {
+			existing.ReservedAt = now
+			existing.LeaseExpires = leaseUntil.UTC()
+			s.idempotency[compositeKey] = existing
+			return existing, true, nil
+		}
 		return existing, false, nil
 	}
-	rec := store.IdempotencyRecord{RequestHash: requestHash, Status: store.IdempotencyInProgress}
+	rec := store.IdempotencyRecord{
+		RequestHash:  requestHash,
+		Status:       store.IdempotencyInProgress,
+		ReservedAt:   now,
+		LeaseExpires: leaseUntil.UTC(),
+	}
 	s.idempotency[compositeKey] = rec
 	return rec, true, nil
 }

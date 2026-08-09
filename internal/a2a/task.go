@@ -78,21 +78,23 @@ func TaskFromJob(j domain.Job) Task {
 	if j.Output != nil {
 		artifacts = append(artifacts, Artifact{ID: j.ID + "-output", Name: "result", Content: j.Output})
 	}
+	commerce := map[string]any{
+		"quote_id":           j.QuoteID,
+		"capability_id":      j.CapabilityID,
+		"capability_version": j.CapabilityVersion,
+		"provider_id":        j.ProviderID,
+		"trust_mode":         j.TrustMode,
+		"proof_profile":      nullableProfile(j.ProofProfile),
+		"proof_status":       j.ProofStatus,
+	}
+	if j.Confirmation != nil {
+		commerce["confirmation"] = j.Confirmation
+	}
 	return Task{
 		ID:        j.ID,
 		Status:    TaskStatus{State: StateFromJob(j.State), Timestamp: j.UpdatedAt},
 		Artifacts: artifacts,
-		Metadata: map[string]any{
-			CommerceExtensionURI: map[string]any{
-				"quote_id":           j.QuoteID,
-				"capability_id":      j.CapabilityID,
-				"capability_version": j.CapabilityVersion,
-				"provider_id":        j.ProviderID,
-				"trust_mode":         j.TrustMode,
-				"proof_profile":      nullableProfile(j.ProofProfile),
-				"proof_status":       j.ProofStatus,
-			},
-		},
+		Metadata:  map[string]any{CommerceExtensionURI: commerce},
 	}
 }
 
@@ -121,7 +123,6 @@ type CommerceExtension struct {
 	CapabilityID   string `json:"capability_id"`
 	QuoteID        string `json:"quote_id"`
 	IdempotencyKey string `json:"idempotency_key"`
-	Confirmed      bool   `json:"confirmed"`
 	Reason         string `json:"reason,omitempty"`
 }
 
@@ -135,10 +136,9 @@ func (m Message) Commerce() CommerceExtension {
 		v, _ := ext[k].(string)
 		return v
 	}
-	confirmed, _ := ext["confirmed"].(bool)
 	return CommerceExtension{
 		CapabilityID: get("capability_id"), QuoteID: get("quote_id"),
-		IdempotencyKey: get("idempotency_key"), Confirmed: confirmed,
-		Reason: get("reason"),
+		IdempotencyKey: get("idempotency_key"),
+		Reason:         get("reason"),
 	}
 }

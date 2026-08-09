@@ -27,8 +27,9 @@ const (
 )
 
 type QuoteService struct {
-	store  store.Store
-	quoter tosai.Quoter
+	store    store.Store
+	quoter   tosai.Quoter
+	accounts *AccountService
 }
 
 // NewQuoteService accepts an optional provider/Edge quoter. Omitting it keeps
@@ -40,6 +41,14 @@ func NewQuoteService(s store.Store, quoters ...tosai.Quoter) *QuoteService {
 		service.quoter = quoters[0]
 	}
 	return service
+}
+
+// WithAccountService adds gateway spending-policy evaluation to Quote output.
+// The execution path still rechecks policy before reserving funds, so this
+// presentation hint can never bypass authorization or accounting.
+func (s *QuoteService) WithAccountService(accounts *AccountService) *QuoteService {
+	s.accounts = accounts
+	return s
 }
 
 type CreateQuoteInput struct {
@@ -81,6 +90,9 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 	if mode != domain.TrustModeManaged && profile == domain.ProofProfileNone {
 		return domain.Quote{}, domain.NewError(domain.ErrProofProfileUnavailable, "selected mode has no active proof profile", true)
 	}
+	if err := domain.ValidateCommittedTrust(mode, profile); err != nil {
+		return domain.Quote{}, domain.NewError(domain.ErrProofProfileUnavailable, err.Error(), false)
+	}
 
 	subtotal, err := money.Parse(cap.Pricing.PriceHint.Amount, cap.Pricing.PriceHint.Currency, quoteDecimals)
 	if err != nil {
@@ -93,6 +105,14 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 	totalMax, err := subtotal.Add(fees)
 	if err != nil {
 		return domain.Quote{}, err
+	}
+
+	requiresConfirmation := false
+	if s.accounts != nil && strings.TrimSpace(in.PrincipalID) != "" {
+		requiresConfirmation, err = s.accounts.RequiresConfirmation(ctx, in.PrincipalID, totalMax.String(), totalMax.Currency)
+		if err != nil {
+			return domain.Quote{}, err
+		}
 	}
 
 	if in.MaxTotal != nil {
@@ -163,6 +183,7 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 		InputSummaryCommitment: inputSummaryCommitment,
 		ExecutionDeadline:      executionDeadline,
 		CreatedAt:              now,
+		RequiresConfirmation:   requiresConfirmation,
 	}
 	if serviceQuote.ID != "" {
 		q.ServiceQuoteID = serviceQuote.ID

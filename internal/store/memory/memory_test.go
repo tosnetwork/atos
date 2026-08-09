@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/store"
@@ -144,7 +145,7 @@ func TestIdempotencyLifecycle(t *testing.T) {
 	ctx := context.Background()
 	s := New()
 
-	rec, ok, err := s.Reserve(ctx, "prn_a", "key1", "hash1")
+	rec, ok, err := s.Reserve(ctx, "prn_a", "key1", "hash1", time.Now().UTC().Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +156,7 @@ func TestIdempotencyLifecycle(t *testing.T) {
 		t.Errorf("status = %q, want in_progress", rec.Status)
 	}
 
-	rec2, ok2, err := s.Reserve(ctx, "prn_a", "key1", "hash1")
+	rec2, ok2, err := s.Reserve(ctx, "prn_a", "key1", "hash1", time.Now().UTC().Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +171,7 @@ func TestIdempotencyLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rec3, ok3, err := s.Reserve(ctx, "prn_a", "key1", "hash1")
+	rec3, ok3, err := s.Reserve(ctx, "prn_a", "key1", "hash1", time.Now().UTC().Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,11 +185,26 @@ func TestIdempotencyLifecycle(t *testing.T) {
 	if err := s.Release(ctx, "prn_a", "key1"); err != nil {
 		t.Fatal(err)
 	}
-	_, ok4, err := s.Reserve(ctx, "prn_a", "key1", "hash1")
+	_, ok4, err := s.Reserve(ctx, "prn_a", "key1", "hash1", time.Now().UTC().Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !ok4 {
 		t.Fatal("Reserve after Release should succeed again")
+	}
+}
+
+func TestExpiredIdempotencyLeaseCanBeReclaimedOnlyBySameRequest(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+	past := time.Now().UTC().Add(-time.Minute)
+	if _, ok, err := s.Reserve(ctx, "prn", "stale", "hash-a", past); err != nil || !ok {
+		t.Fatalf("initial reserve = ok:%v err:%v", ok, err)
+	}
+	if rec, ok, err := s.Reserve(ctx, "prn", "stale", "hash-a", time.Now().UTC().Add(time.Minute)); err != nil || !ok || rec.RequestHash != "hash-a" {
+		t.Fatalf("same request did not reclaim expired lease: rec=%+v ok=%v err=%v", rec, ok, err)
+	}
+	if rec, ok, err := s.Reserve(ctx, "prn", "stale", "hash-b", time.Now().UTC().Add(time.Minute)); err != nil || ok || rec.RequestHash != "hash-a" {
+		t.Fatalf("different request reclaimed key: rec=%+v ok=%v err=%v", rec, ok, err)
 	}
 }

@@ -1,52 +1,120 @@
 # ATOS v0.2 Implementation Status
 
-This document tracks the implementation boundary of the Go gateway against
-`tosnetwork/atos-spec` v0.2.
+This document tracks the Go gateway against `tosnetwork/atos-spec` v0.2.
 
-## Implemented in this branch
+## Phase 0 — Contract First
 
-- one REST + MCP + A2A business model;
+**Code status: complete.**
+
+Implemented and tested:
+
+- one Capability/Quote/Invocation/Job/Escrow/Receipt/Settlement model shared by REST, MCP and A2A;
 - `requested_trust_mode` separated from concrete `trust_mode`;
-- standard `tos_verified_v1` and `tos_native_v1` profile types;
-- provider-requested modes separated from active/quotable modes;
-- immutable Quote mode/profile propagation through Job, Escrow and Receipt;
-- Managed Quote -> reserve -> execute -> verify -> settle lifecycle;
-- authorized execution-signer receipt fields and content commitments;
-- fail-closed Verified/Native selection while TOS-backed infrastructure is unavailable;
-- scoped Device Authorization, access-token refresh and revocation;
-- authorization-derived deterministic MCP `tools/list` with private caching;
-- 9-tool ordinary consumer surface and scoped provider management tools;
-- operation-discriminated `atos_artifact` with signed HTTP PUT/GET URLs;
-- artifact ownership, declared-size and expiry enforcement;
-- PostgreSQL v0.2 payload persistence through embedded migrations;
-- v0.2 Agent Card, provider cards, REST OpenAPI and A2A commerce extension;
-- a real `atos -> tos-protocol` ConnectRPC client covering all six ATOS/TOS v0.2 services;
-- an explicit `ATOS_TOS_BACKEND=mock|rpc` switch with no failure fallback;
-- TLS/custom CA/mTLS, bearer authentication, bounded messages, deadlines and readiness checks;
-- two-layer Service Execution Quote -> ATOS Commercial Quote binding;
-- real Managed execution through `tos-protocol` -> private Unix-socket `tos-ai` Worker RPC;
-- cross-service integration coverage for Quote -> Escrow -> Worker -> Receipt -> Verify -> Settle and idempotent replay;
-- formatting, OpenAPI parsing, vet and race-test CI.
+- `auto` accepted only as pre-Quote policy and rejected as committed state;
+- normative `managed`/no-profile, `verified`/`tos_verified_v1` and `native`/`tos_native_v1` pairs;
+- provider `requested_trust_modes` separated from derived active `supported_trust_modes`;
+- immutable Quote mode/profile propagation through Job, Escrow, Receipt and Settlement;
+- no execution-time mode override and no silent downgrade;
+- explicit delegated execution-signer fields and proof references;
+- federation-safe identity and commitment fields modeled without moving bulk or private payloads on-chain;
+- schema, OpenAPI and conformance tests, including one common Quote API shape across all three concrete resolved modes.
 
-## Current runtime boundary
+Remaining Phase 0 work is maintenance rather than missing behavior: future schema changes must keep generated artifacts and conformance vectors synchronized.
 
-The cross-repository Managed path now exists:
+## Phase 1 — Codex-First Managed MVP
+
+**Code status: complete.**
+
+Implemented and tested:
+
+- embedded installable Skill served from `/skills/atos/SKILL.md`;
+- OAuth-style Device Authorization with pending approval, browser consent, polling intervals, `slow_down`, denial, expiry and bounded codes;
+- scoped access tokens, rotating refresh tokens, revocation and durable owner-private bbolt auth state;
+- trusted consent decisions derive the principal from the authenticated `X-ATOS-Principal-ID` boundary rather than a caller-supplied JSON field;
+- stateless Streamable HTTP MCP with nine deterministic ordinary consumer tools;
+- Capability search/retrieval, Commercial Quote, invocation, jobs and account;
+- PostgreSQL capability/search/business storage with complete v0.2 JSON payloads;
+- configurable Managed internal-credit balance, per-call limit and daily limit;
+- server-issued, exact-request-bound spending confirmations for calls above automatic policy limits;
+- rejection of caller-supplied confirmation booleans;
+- Managed reservation, execution, signed receipt, verification and settlement;
+- explicit `ATOS_TOS_BACKEND=mock|rpc` selection with no failure fallback;
+- real `atos -> tos-protocol -> private tos-ai Worker` Managed RPC path;
+- signed-URL Artifact transport with ownership, size and expiry enforcement;
+- idempotency leases, stale-reservation recovery and a unique `(principal_id, idempotency_key)` Job constraint;
+- production configuration gates requiring PostgreSQL, HTTPS public URL, explicit user approval, durable auth state and the RPC backend;
+- a full HTTP acceptance test from Skill retrieval and authorization through search, Quote, payment-policy handling, invocation, Receipt/settlement and exact balance mutation.
+
+### Crash-safe Managed economic state machine
+
+Managed economic mutations now use explicit durable private checkpoints:
 
 ```text
-ATOS -> ConnectRPC -> tos-protocol ExecutionGatewayService
-     -> private Unix-socket tos-ai Worker
-     -> signed Execution Receipt -> verification -> settlement
+none
+  -> debited
+  -> escrow_pending
+  -> escrow_reserved
+  -> settlement_pending
+  -> settled
+
+failure/cancellation path:
+  escrow_pending / escrow_reserved
+  -> release_pending
+  -> released
 ```
 
-The current `tos-protocol` binary still supplies `NewLocalAuthority("tos-local")`,
-which supports Managed mode only. Therefore the gateway does not claim Verified
-or Native availability merely because their RPC types and verification logic
-exist. Remaining activation requirements are:
+The checkpoints are intentionally internal implementation state rather than new public ATOS protocol states.
 
-1. a configurable TOS Network-backed Authority rather than the local Authority;
-2. TOS-backed identity and Capability ownership/finality;
-3. enforceable network escrow/release/settlement and portable proof references;
-4. Native global resolution, independent index reconstruction and federation tests.
+Crash-safety guarantees implemented by the gateway include:
 
-Until those guarantees exist, explicit `verified` or `native` requests fail
-instead of falling back to Managed.
+- Account debit and its Job `debited` checkpoint commit in one storage transaction;
+- Account refund/credit and the corresponding terminal Job checkpoint commit in one storage transaction;
+- PostgreSQL transaction-scoped advisory locks serialize Account, Job and idempotency mutation identities even before a logical row exists;
+- `working` is not persisted until the exact escrow has been created/recovered and its reference is durable;
+- `escrow_pending` means an external CreateEscrow result may be ambiguous and therefore MUST be recovered by idempotent replay rather than guessed or immediately refunded;
+- Job-to-Escrow is uniquely recoverable through the durable `job_id` relation;
+- escrow create, release and settlement adapters support stable replay semantics;
+- the exact verified Execution Receipt is privately persisted before the `settlement_pending` external effect;
+- a lost settlement response can be recovered after process restart without re-executing provider work;
+- a lost release response can be replayed without applying the Account refund twice;
+- settlement/refund finalization and Account mutation are atomic locally;
+- an immediate startup sweep plus a periodic reconciler resumes stale `submitted`, `working`, `canceling` and `reconciling` Jobs;
+- ambiguous external outcomes remain visibly `reconciling` and fail closed instead of being converted into a false terminal success/failure;
+- permanent CI runs the crash-recovery service tests against PostgreSQL 16 in addition to the in-memory failure-injection suite.
+
+Failure-injection coverage includes:
+
+```text
+lost CreateEscrow response after the escrow side effect committed
+lost SettleJob response after settlement committed
+lost ReleaseEscrow response after release committed
+process restart with settlement_pending + persisted Execution Receipt
+provider unavailable after that restart
+debited Job recovered before escrow creation
+stale Job discovery by the periodic reconciliation scan
+repeated recovery proving no double debit or double credit
+```
+
+## Runtime boundary
+
+```text
+Agent client
+    -> REST / MCP / A2A
+    -> ATOS Commercial Quote and Managed account policy
+    -> durable economic checkpoint
+    -> tos-protocol ExecutionGatewayService
+    -> private Unix-socket tos-ai Worker
+    -> signed Execution Receipt
+    -> verification
+    -> durable settlement checkpoint
+    -> Managed settlement
+    -> atomic Account/Job finalization
+```
+
+The deterministic mock backend remains available only as an explicit local-development/test deployment. Production configuration rejects it.
+
+## Completion boundary
+
+“Phase 0/1 code complete” means the roadmap contracts, services, persistence, authorization, Managed economy, crash recovery and executable acceptance criteria are implemented and permanently regression-tested. It does not mean a public production environment has automatically been provisioned. A hosted launch still requires operator-controlled domains, certificates, PostgreSQL, secrets, backups, monitoring, billing policy, support and incident response.
+
+Verified and Native work continues in later roadmap phases. Stronger-mode requests remain fail-closed unless the configured TOS backends provide the required guarantees.

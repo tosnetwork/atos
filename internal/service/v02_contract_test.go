@@ -2,10 +2,13 @@ package service_test
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/service"
+	"github.com/tosnetwork/atos/internal/store/memory"
 )
 
 func TestCapabilityModeActivationSeparatesRequestedFromSupported(t *testing.T) {
@@ -125,5 +128,65 @@ func TestCapabilityArtifactMetadataDerivedFromSchema(t *testing.T) {
 	}
 	if !cap.RequiresArtifactTransfer || len(cap.ArtifactInputFields) != 1 || cap.ArtifactInputFields[0] != "document" {
 		t.Fatalf("artifact metadata = required:%v inputs:%v", cap.RequiresArtifactTransfer, cap.ArtifactInputFields)
+	}
+}
+
+func TestPhase0ConcreteModesKeepOneQuoteAPIShape(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capability := domain.Capability{
+		ID: "cap_phase0_modes", CanonicalURI: "atos://capability/phase0-modes",
+		ProviderID: "agt_phase0", Name: "Phase 0 Modes", Description: "contract fixture",
+		Version: "1.0.0", Status: domain.CapabilityActive, DeliveryMode: domain.DeliveryInstant,
+		Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
+		ModeSupport: domain.ModeSupport{
+			domain.TrustModeManaged:  {Status: domain.ModeSupportActive},
+			domain.TrustModeVerified: {Status: domain.ModeSupportActive, ProofProfile: domain.ProofProfileTOSVerifiedV1},
+			domain.TrustModeNative:   {Status: domain.ModeSupportActive, ProofProfile: domain.ProofProfileTOSNativeV1},
+		},
+		SupportedTrustModes: []domain.TrustMode{domain.TrustModeManaged, domain.TrustModeVerified, domain.TrustModeNative},
+	}
+	if err := st.Put(ctx, capability); err != nil {
+		t.Fatal(err)
+	}
+	quotes := service.NewQuoteService(st)
+	tests := []struct {
+		requested domain.RequestedTrustMode
+		mode      domain.TrustMode
+		profile   domain.ProofProfile
+	}{
+		{domain.RequestedTrustManaged, domain.TrustModeManaged, domain.ProofProfileNone},
+		{domain.RequestedTrustVerified, domain.TrustModeVerified, domain.ProofProfileTOSVerifiedV1},
+		{domain.RequestedTrustNative, domain.TrustModeNative, domain.ProofProfileTOSNativeV1},
+	}
+	for _, tc := range tests {
+		t.Run(string(tc.requested), func(t *testing.T) {
+			quote, err := quotes.Create(ctx, service.CreateQuoteInput{
+				PrincipalID: "prn_phase0", CapabilityID: capability.ID,
+				RequestedTrustMode: tc.requested,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if quote.TrustMode != tc.mode || quote.ProofProfile != tc.profile {
+				t.Fatalf("mode/profile = %q/%q, want %q/%q", quote.TrustMode, quote.ProofProfile, tc.mode, tc.profile)
+			}
+			if err := domain.ValidateCommittedTrust(quote.TrustMode, quote.ProofProfile); err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := json.Marshal(quote)
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := string(encoded)
+			for _, field := range []string{`"quote_id"`, `"requested_trust_mode"`, `"trust_mode"`, `"price"`, `"settlement"`, `"proof"`, `"terms_hash"`} {
+				if !strings.Contains(text, field) {
+					t.Fatalf("quote JSON for %s is missing %s: %s", tc.requested, field, text)
+				}
+			}
+			if strings.Contains(text, `"trust_mode":"auto"`) {
+				t.Fatalf("auto survived into committed Quote: %s", text)
+			}
+		})
 	}
 }

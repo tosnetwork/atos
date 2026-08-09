@@ -2,8 +2,12 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -13,15 +17,45 @@ import (
 	"github.com/tosnetwork/atos/internal/service"
 )
 
+const maxRequestJSONBytes = 1 << 20
+
+// decodeRequestJSON enforces one bounded JSON value with no unknown struct
+// fields or trailing data. Keeping this rule shared prevents REST adapters from
+// accepting a wider contract than MCP/A2A or the published OpenAPI model.
+func decodeRequestJSON(r *http.Request, dst any) error {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestJSONBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(body) > maxRequestJSONBytes {
+		return fmt.Errorf("JSON body exceeds %d bytes", maxRequestJSONBytes)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("JSON body contains trailing data")
+		}
+		return err
+	}
+	return nil
+}
+
 type Server struct {
-	Auth         *auth.Service
-	Capabilities *service.CapabilityService
-	Quotes       *service.QuoteService
-	Jobs         *service.JobService
-	Accounts     *service.AccountService
-	Receipts     *service.ReceiptService
-	Artifacts    *service.ArtifactService
-	Logger       *slog.Logger
+	Auth          *auth.Service
+	Capabilities  *service.CapabilityService
+	Quotes        *service.QuoteService
+	Jobs          *service.JobService
+	Accounts      *service.AccountService
+	Receipts      *service.ReceiptService
+	Artifacts     *service.ArtifactService
+	Logger        *slog.Logger
+	PublicBaseURL string
+	ApprovalToken string
 }
 
 func (s *Server) Mux() *http.ServeMux {
@@ -29,11 +63,18 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("GET /livez", s.handleLivez)
 	mux.HandleFunc("GET /.well-known/agent-card.json", s.handleAgentCard)
 	mux.HandleFunc("GET /.well-known/agent.json", s.handleAgentCard)
+	mux.HandleFunc("GET /skills/atos/SKILL.md", s.handleSkill)
+	mux.HandleFunc("GET /activate", s.handleActivationPage)
+	mux.HandleFunc("POST /activate", s.handleActivationDecisionPage)
+	mux.HandleFunc("GET /confirm", s.handleConfirmationPage)
 
 	mux.HandleFunc("POST /v1/auth/device", s.handleAuthDeviceStart)
 	mux.HandleFunc("POST /v1/auth/device/token", s.handleAuthDeviceToken)
+	mux.HandleFunc("POST /v1/auth/device/decision", s.handleAuthDeviceDecision)
 	mux.HandleFunc("POST /v1/auth/token/refresh", s.handleAuthTokenRefresh)
 	mux.HandleFunc("POST /v1/auth/revoke", s.withScopes(s.handleAuthRevoke))
+	mux.HandleFunc("GET /v1/auth/devices", s.withScopes(s.handleListDevices))
+	mux.HandleFunc("DELETE /v1/auth/devices/{id}", s.withScopes(s.handleRevokeDevice))
 
 	mux.HandleFunc("GET /v1/capabilities", s.withScopes(s.handleSearchCapabilities, auth.ScopeCapabilitiesRead))
 	mux.HandleFunc("GET /v1/capabilities/{id}", s.withScopes(s.handleGetCapability, auth.ScopeCapabilitiesRead))
@@ -50,6 +91,8 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("POST /v1/jobs", s.withScopes(s.handleCreateJob, auth.ScopeJobsCreate))
 	mux.HandleFunc("GET /v1/jobs/{id}", s.withScopes(s.handleGetJob, auth.ScopeJobsRead))
 	mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.withScopes(s.handleCancelJob, auth.ScopeJobsCancel))
+	mux.HandleFunc("GET /v1/confirmations/{code}", s.withScopes(s.handleGetConfirmation, auth.ScopeAccountRead))
+	mux.HandleFunc("POST /v1/confirmations/{code}/decision", s.withScopes(s.handleConfirmationDecision, auth.ScopeAccountRead))
 
 	mux.HandleFunc("GET /v1/account", s.withScopes(s.handleGetAccount, auth.ScopeAccountRead))
 	mux.HandleFunc("GET /v1/account/usage", s.withScopes(s.handleGetAccountUsage, auth.ScopeAccountRead))
@@ -167,7 +210,9 @@ func statusForCode(code domain.ErrorCode) int {
 	case domain.ErrQuoteExpired, domain.ErrQuoteMismatch, domain.ErrQuoteModeMismatch,
 		domain.ErrTrustModeUnavailable, domain.ErrProofRequirementsUnsatisfied,
 		domain.ErrProofProfileUnavailable, domain.ErrRequoteRequired,
-		domain.ErrIdempotencyConflict, domain.ErrJobNotCancelable:
+		domain.ErrIdempotencyConflict, domain.ErrJobNotCancelable,
+		domain.ErrSpendConfirmationRequired, domain.ErrSpendConfirmationDenied,
+		domain.ErrSpendConfirmationExpired:
 		return http.StatusConflict
 	case domain.ErrSpendLimitExceeded, domain.ErrInsufficientBalance:
 		return http.StatusPaymentRequired

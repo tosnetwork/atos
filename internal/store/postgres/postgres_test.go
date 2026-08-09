@@ -10,6 +10,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	tosaimock "github.com/tosnetwork/atos/internal/adapters/tosai/mock"
 	toscoremock "github.com/tosnetwork/atos/internal/adapters/toscore/mock"
@@ -160,9 +161,11 @@ func TestFullJobLifecycleAgainstPostgres(t *testing.T) {
 	capabilities := service.NewCapabilityService(s)
 	quotes := service.NewQuoteService(s)
 	accounts := service.NewAccountService(s)
+	quotes.WithAccountService(accounts)
 	jobs := service.NewJobService(s, provider, core, accounts)
 
-	principalID := "prn_pg_lifecycle_" + randSuffix()
+	suffix := randSuffix()
+	principalID := "prn_pg_lifecycle_" + suffix
 	cap, err := capabilities.Register(ctx, service.RegisterCapabilityInput{
 		ProviderID:   "agt_pg_lifecycle",
 		Name:         "PG Lifecycle Cap",
@@ -174,12 +177,13 @@ func TestFullJobLifecycleAgainstPostgres(t *testing.T) {
 			Model:     domain.PricingFixed,
 			PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"},
 		},
+		IdempotencyKey: "register-pg-lifecycle-" + suffix,
 	})
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
-	quote, err := quotes.Create(ctx, service.CreateQuoteInput{CapabilityID: cap.ID})
+	quote, err := quotes.Create(ctx, service.CreateQuoteInput{PrincipalID: principalID, CapabilityID: cap.ID})
 	if err != nil {
 		t.Fatalf("Create quote: %v", err)
 	}
@@ -189,7 +193,7 @@ func TestFullJobLifecycleAgainstPostgres(t *testing.T) {
 		CapabilityID:   cap.ID,
 		QuoteID:        quote.ID,
 		Input:          map[string]any{"x": 1},
-		IdempotencyKey: "pg-lifecycle-1",
+		IdempotencyKey: "pg-lifecycle-1-" + suffix,
 	})
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
@@ -213,7 +217,7 @@ func TestFullJobLifecycleAgainstPostgres(t *testing.T) {
 		CapabilityID:   cap.ID,
 		QuoteID:        quote.ID,
 		Input:          map[string]any{"x": 1},
-		IdempotencyKey: "pg-lifecycle-1",
+		IdempotencyKey: "pg-lifecycle-1-" + suffix,
 	})
 	if err != nil {
 		t.Fatalf("replay Invoke: %v", err)
@@ -265,4 +269,108 @@ func randSuffix() string {
 	defer suffixMu.Unlock()
 	suffixCounter++
 	return formatWholeDollars(os.Getpid()) + "_" + formatWholeDollars(suffixCounter)
+}
+
+// TestUpdateJobConcurrentCreateHasSingleWinner proves the atomic mutation
+// boundary also serializes the first writer, when no row exists yet.
+func TestUpdateJobConcurrentCreateHasSingleWinner(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	jobID := "job_pg_create_" + suffix
+
+	const attempts = 24
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	winners := 0
+	unexpected := ""
+
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := s.UpdateJob(ctx, jobID, func(_ domain.Job, exists bool) (domain.Job, error) {
+				if exists {
+					return domain.Job{}, store.ErrConflict
+				}
+				now := time.Now().UTC()
+				return domain.Job{
+					ID: jobID, CapabilityID: "cap_pg_create_" + suffix,
+					QuoteID:     "quote_pg_create_" + suffix,
+					PrincipalID: "prn_pg_create_" + suffix,
+					State:       domain.JobSubmitted, Input: map[string]any{},
+					Artifacts: []domain.Artifact{}, IdempotencyKey: "idem_pg_create_" + suffix,
+					CreatedAt: now, UpdatedAt: now,
+				}, nil
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if err == nil {
+				winners++
+			} else if err != store.ErrConflict && unexpected == "" {
+				unexpected = err.Error()
+			}
+		}()
+	}
+	wg.Wait()
+	if unexpected != "" {
+		t.Fatalf("unexpected concurrent UpdateJob error: %s", unexpected)
+	}
+	if winners != 1 {
+		t.Fatalf("concurrent first-writer winners = %d, want exactly 1", winners)
+	}
+	if _, err := s.GetJob(ctx, jobID); err != nil {
+		t.Fatalf("GetJob after concurrent create: %v", err)
+	}
+}
+
+// TestReserveConcurrentClaimHasSingleWinner proves missing idempotency
+// rows are serialized instead of surfacing unique-key races or allowing
+// more than one caller to believe it owns the economic mutation.
+func TestReserveConcurrentClaimHasSingleWinner(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	principalID := "prn_pg_reserve_" + suffix
+	key := "reserve-" + suffix
+	requestHash := "sha256:reserve-" + suffix
+	leaseUntil := time.Now().UTC().Add(time.Minute)
+
+	const attempts = 24
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	winners := 0
+	unexpected := ""
+
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec, ok, err := s.Reserve(ctx, principalID, key, requestHash, leaseUntil)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if unexpected == "" {
+					unexpected = err.Error()
+				}
+				return
+			}
+			if rec.RequestHash != requestHash {
+				if unexpected == "" {
+					unexpected = "idempotency reservation returned the wrong request hash"
+				}
+				return
+			}
+			if ok {
+				winners++
+			}
+		}()
+	}
+	wg.Wait()
+	if unexpected != "" {
+		t.Fatalf("unexpected concurrent Reserve result: %s", unexpected)
+	}
+	if winners != 1 {
+		t.Fatalf("concurrent idempotency winners = %d, want exactly 1", winners)
+	}
 }

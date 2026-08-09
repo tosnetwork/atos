@@ -20,17 +20,42 @@ import (
 const settlementDecimals = 2
 
 type Core struct {
-	mu       sync.Mutex
-	store    store.Store
-	verified map[string]domain.ExecutionReceipt
-	quotes   map[string]domain.Quote
+	mu        sync.Mutex
+	store     store.Store
+	verified  map[string]domain.ExecutionReceipt
+	quotes    map[string]domain.Quote
+	modes     map[domain.TrustMode]bool
+	simulated bool
 }
 
 func New(s store.Store) *Core {
+	return newCore(s, false, domain.TrustModeManaged)
+}
+
+// NewContractFixture creates a deliberately simulated Core for Phase 0
+// contract/conformance tests. It never becomes part of runtime composition and
+// its simulated references are not TOS proofs.
+func NewContractFixture(s store.Store) *Core {
+	return newCore(s, true, domain.TrustModeManaged, domain.TrustModeVerified, domain.TrustModeNative)
+}
+
+func newCore(s store.Store, simulated bool, modes ...domain.TrustMode) *Core {
+	allowed := make(map[domain.TrustMode]bool, len(modes))
+	for _, mode := range modes {
+		allowed[mode] = true
+	}
 	return &Core{
 		store: s, verified: make(map[string]domain.ExecutionReceipt),
-		quotes: make(map[string]domain.Quote),
+		quotes: make(map[string]domain.Quote), modes: allowed, simulated: simulated,
 	}
+}
+
+func (c *Core) supports(mode domain.TrustMode) bool {
+	return c != nil && c.modes[mode]
+}
+
+func simulatedRef(kind string, mode domain.TrustMode, id string) string {
+	return "simulated:atos-v0.2:" + string(mode) + ":" + kind + ":" + id
 }
 
 func (c *Core) ResolveAgent(ctx context.Context, principalID string) (string, error) {
@@ -62,12 +87,18 @@ func (c *Core) UpdateReputationEvidence(ctx context.Context, providerID string, 
 }
 
 func (c *Core) CommitQuote(ctx context.Context, quote domain.Quote) (string, error) {
-	if quote.TrustMode != domain.TrustModeManaged {
-		return "", domain.NewError(domain.ErrNetworkUnavailable, "mock tos-core cannot create a TOS quote commitment", true)
+	if !c.supports(quote.TrustMode) {
+		return "", domain.NewError(domain.ErrNetworkUnavailable, "mock tos-core is not configured for this trust mode", true)
+	}
+	if err := domain.ValidateCommittedTrust(quote.TrustMode, quote.ProofProfile); err != nil {
+		return "", err
 	}
 	c.mu.Lock()
 	c.quotes[quote.ID] = quote
 	c.mu.Unlock()
+	if c.simulated && quote.TrustMode != domain.TrustModeManaged {
+		return simulatedRef("quote", quote.TrustMode, quote.ID), nil
+	}
 	return "", nil
 }
 
@@ -79,8 +110,13 @@ func (c *Core) ResolveExecutionSignerAuthorization(
 	if signerID == "" {
 		return toscore.ExecutionSignerAuthorization{}, false, nil
 	}
-	// The Phase 0 mock signer is local Managed evidence. It is not a TOS
-	// attestation and therefore cannot activate Verified/Native mode.
+	if !c.supports(domain.TrustModeManaged) && !c.simulated {
+		return toscore.ExecutionSignerAuthorization{}, false, nil
+	}
+	authorizationRef := "atos:managed:signer:" + signerID
+	if c.simulated {
+		authorizationRef = simulatedRef("signer", domain.TrustModeVerified, "auth_mock_"+capabilityID)
+	}
 	auth := toscore.ExecutionSignerAuthorization{
 		AuthorizationID:   "auth_mock_" + capabilityID,
 		ProviderID:        providerID,
@@ -89,7 +125,7 @@ func (c *Core) ResolveExecutionSignerAuthorization(
 		ExecutionSignerID: signerID,
 		ValidFrom:         at.Add(-24 * time.Hour),
 		ValidUntil:        at.Add(24 * time.Hour),
-		AuthorizationRef:  "atos:managed:signer:" + signerID,
+		AuthorizationRef:  authorizationRef,
 	}
 	return auth, true, nil
 }
@@ -101,9 +137,24 @@ func (c *Core) CreateEscrow(ctx context.Context, req toscore.CreateEscrowRequest
 	if !req.TrustMode.Valid() {
 		return domain.Escrow{}, domain.NewError(domain.ErrQuoteModeMismatch, "escrow requires a concrete trust mode", false)
 	}
-	if req.TrustMode != domain.TrustModeManaged {
-		return domain.Escrow{}, domain.NewError(domain.ErrNetworkUnavailable, "mock tos-core cannot create enforceable TOS escrow", true)
+	if !c.supports(req.TrustMode) {
+		return domain.Escrow{}, domain.NewError(domain.ErrNetworkUnavailable, "mock tos-core is not configured for this trust mode", true)
 	}
+	if err := domain.ValidateCommittedTrust(req.TrustMode, req.ProofProfile); err != nil {
+		return domain.Escrow{}, err
+	}
+	if existing, err := c.store.EscrowByJob(ctx, req.JobID); err == nil {
+		if existing.QuoteID != req.QuoteID || existing.PrincipalID != req.PrincipalID ||
+			existing.ProviderID != req.ProviderID || existing.CapabilityID != req.CapabilityID ||
+			existing.CapabilityVersion != req.CapabilityVersion || existing.TrustMode != req.TrustMode ||
+			existing.ProofProfile != req.ProofProfile || existing.Reserved != req.Reserved {
+			return domain.Escrow{}, domain.NewError(domain.ErrIdempotencyConflict, "existing escrow does not match replayed request", false)
+		}
+		return existing, nil
+	} else if err != store.ErrNotFound {
+		return domain.Escrow{}, err
+	}
+
 	now := time.Now().UTC()
 	e := domain.Escrow{
 		ID:                "esc_" + uuid.NewString(),
@@ -121,6 +172,9 @@ func (c *Core) CreateEscrow(ctx context.Context, req toscore.CreateEscrowRequest
 		CreatedAt:         now,
 		ExpiresAt:         now.Add(24 * time.Hour),
 	}
+	if c.simulated && req.TrustMode != domain.TrustModeManaged {
+		e.NetworkProofRef = simulatedRef("escrow", req.TrustMode, e.ID)
+	}
 	if err := c.store.PutEscrow(ctx, e); err != nil {
 		return domain.Escrow{}, err
 	}
@@ -134,6 +188,11 @@ func (c *Core) ReleaseEscrow(ctx context.Context, escrowID string) (domain.Recei
 	e, err := c.store.GetEscrow(ctx, escrowID)
 	if err != nil {
 		return domain.Receipt{}, err
+	}
+	if e.Status == domain.EscrowReleased {
+		if receipt, replayErr := c.store.ReceiptByJob(ctx, e.JobID); replayErr == nil && receipt.EscrowID == e.ID && receipt.Status == domain.ReceiptReleased {
+			return receipt, nil
+		}
 	}
 	if e.Status.Terminal() {
 		return domain.Receipt{}, domain.NewError(domain.ErrSettlementFailed, "escrow already in a terminal state", false)
@@ -150,7 +209,7 @@ func (c *Core) ReleaseEscrow(ctx context.Context, escrowID string) (domain.Recei
 	delete(c.verified, escrowID)
 
 	receipt := domain.Receipt{
-		ID:           "rcpt_" + uuid.NewString(),
+		ID:           "rcpt_release_" + e.ID,
 		QuoteID:      e.QuoteID,
 		EscrowID:     e.ID,
 		JobID:        e.JobID,
@@ -170,8 +229,11 @@ func (c *Core) ReleaseEscrow(ctx context.Context, escrowID string) (domain.Recei
 }
 
 func (c *Core) CommitExecutionReceipt(ctx context.Context, receipt domain.ExecutionReceipt) (string, error) {
-	if receipt.TrustMode != domain.TrustModeManaged {
-		return "", domain.NewError(domain.ErrNetworkUnavailable, "mock tos-core cannot commit receipt evidence to TOS", true)
+	if !c.supports(receipt.TrustMode) {
+		return "", domain.NewError(domain.ErrNetworkUnavailable, "mock tos-core is not configured for this trust mode", true)
+	}
+	if c.simulated && receipt.TrustMode != domain.TrustModeManaged {
+		return simulatedRef("receipt", receipt.TrustMode, receipt.ID), nil
 	}
 	return "", nil
 }
@@ -225,10 +287,20 @@ func (c *Core) VerifyExecutionReceipt(ctx context.Context, escrowID string, rece
 	c.mu.Lock()
 	c.verified[escrowID] = receipt
 	c.mu.Unlock()
-	return toscore.VerifyExecutionReceiptResult{Valid: true}, nil
+	proofRef := ""
+	if c.simulated && receipt.TrustMode != domain.TrustModeManaged {
+		proofRef = simulatedRef("receipt-verified", receipt.TrustMode, receipt.ID)
+	}
+	return toscore.VerifyExecutionReceiptResult{Valid: true, ProofRef: proofRef}, nil
 }
 
+// SettleJob is replayable: a lost response after a committed settlement
+// returns the original terminal receipt instead of requiring the caller to
+// guess whether the economic side effect happened.
 func (c *Core) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (toscore.SettleJobResult, error) {
+	if receipt, err := c.store.ReceiptByJob(ctx, req.JobID); err == nil && receipt.EscrowID == req.EscrowID && receipt.Status == domain.ReceiptSettled {
+		return toscore.SettleJobResult{Receipt: receipt}, nil
+	}
 	c.mu.Lock()
 	verifiedReceipt, ok := c.verified[req.EscrowID]
 	c.mu.Unlock()
@@ -282,8 +354,9 @@ func (c *Core) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (tos
 	if e.TrustMode != domain.TrustModeManaged {
 		proofStatus = domain.ProofVerified
 	}
+	settlementReceiptID := "rcpt_settle_" + e.ID
 	receipt := domain.Receipt{
-		ID:                     "rcpt_" + uuid.NewString(),
+		ID:                     settlementReceiptID,
 		QuoteID:                e.QuoteID,
 		EscrowID:               e.ID,
 		JobID:                  req.JobID,
@@ -302,6 +375,9 @@ func (c *Core) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (tos
 		UsageCommitment:        verifiedReceipt.UsageCommitment,
 		CreatedAt:              now,
 	}
+	if c.simulated && e.TrustMode != domain.TrustModeManaged {
+		receipt.NetworkProofRef = simulatedRef("settlement", e.TrustMode, settlementReceiptID)
+	}
 	if err := c.store.PutReceipt(ctx, receipt); err != nil {
 		return toscore.SettleJobResult{}, err
 	}
@@ -315,6 +391,9 @@ func (c *Core) CommitProofOfServiceEvidence(ctx context.Context, receipt domain.
 	}
 	if receipt.TrustMode == domain.TrustModeManaged {
 		return "atos:managed:pos:" + receipt.ID, nil
+	}
+	if c.simulated && c.supports(receipt.TrustMode) {
+		return simulatedRef("proof-of-service", receipt.TrustMode, receipt.ID), nil
 	}
 	return "", domain.NewError(domain.ErrNetworkUnavailable, "mock tos-core cannot commit portable Proof-of-Service evidence", true)
 }
@@ -340,6 +419,6 @@ func (c *Core) ReadProof(ctx context.Context, receiptID string) (map[string]any,
 		"proof_status":      r.ProofStatus,
 		"network_proof_ref": r.NetworkProofRef,
 		"attested":          false,
-		"note":              fmt.Sprintf("Phase 0/1 mock evidence; %s is not a TOS network proof", r.TrustMode),
+		"note":              fmt.Sprintf("Phase 0 contract simulation; %s evidence is not a TOS network proof", r.TrustMode),
 	}, nil
 }
