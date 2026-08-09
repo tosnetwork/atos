@@ -20,10 +20,14 @@ type InvokeRequest struct {
 	CapabilityID      string
 	CapabilityVersion string
 	ProviderID        string
-	EndpointRef       string
-	Input             map[string]any
-	InputCommitment   string
-	Deadline          time.Time
+	// QuoteID is carried through for transports (A2A) whose own commerce
+	// extension wire contract requires it; transports that don't need it
+	// (HTTP, MCP) simply ignore the field.
+	QuoteID         string
+	EndpointRef     string
+	Input           map[string]any
+	InputCommitment string
+	Deadline        time.Time
 	// IdempotencyKey is the stable, durable execution identity for this
 	// exact semantic operation. It MUST be derived only from the Job's own
 	// durable identity (see dispatch.InvocationIdentity) and MUST NOT be
