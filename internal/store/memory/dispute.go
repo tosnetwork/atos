@@ -151,7 +151,7 @@ func (s *Store) DisputesForRecovery(ctx context.Context, updatedBefore time.Time
 		if d.EconomicState.Terminal() {
 			continue
 		}
-		if d.EconomicState != domain.DisputeEconomicPendingPayoutResolution && d.EconomicState != domain.DisputeEconomicRefundPending {
+		if d.EconomicState != domain.DisputeEconomicPendingPayoutResolution {
 			continue
 		}
 		if d.UpdatedAt.After(updatedBefore) {
@@ -226,33 +226,53 @@ func (s *Store) UpdateDisputeAndEarning(ctx context.Context, disputeID string, f
 	return nextDispute, nextEarning, nil
 }
 
-func (s *Store) UpdateDisputeAndAccount(ctx context.Context, disputeID, principalID string, seed domain.Account, fn func(domain.Dispute, bool, domain.Account, bool) (domain.Dispute, domain.Account, error)) (domain.Dispute, domain.Account, error) {
+// ResolveDispute locks dispute, earning and account together (all under
+// the store's single coarse mutex, mirroring how the Postgres
+// implementation locks all three rows in one transaction) so a
+// principal-win's earning reversal and account credit can never be
+// observed partially applied.
+func (s *Store) ResolveDispute(ctx context.Context, disputeID, principalID string, seed domain.Account, fn func(domain.Dispute, domain.ProviderEarning, bool, domain.Account, bool) (domain.Dispute, domain.ProviderEarning, domain.Account, error)) (domain.Dispute, domain.ProviderEarning, domain.Account, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	currentDispute, disputeExists := s.disputes[disputeID]
 	if !disputeExists {
-		return domain.Dispute{}, domain.Account{}, store.ErrNotFound
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, store.ErrNotFound
 	}
+	earningID, earningExists := s.earningsByJob[currentDispute.JobID]
+	currentEarning := s.earnings[earningID]
 	account, accountExists := s.accounts[principalID]
 	if !accountExists {
 		account = seed
 	}
-	nextDispute, nextAccount, err := fn(currentDispute, disputeExists, account, accountExists)
+
+	nextDispute, nextEarning, nextAccount, err := fn(currentDispute, currentEarning, earningExists, account, accountExists)
 	if err != nil {
-		return domain.Dispute{}, domain.Account{}, err
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
 	}
 	if nextDispute.ID != currentDispute.ID {
-		return domain.Dispute{}, domain.Account{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change the dispute id", false)
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change the dispute id", false)
 	}
 	if disputeContentHash(currentDispute) != disputeContentHash(nextDispute) {
-		return domain.Dispute{}, domain.Account{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change identity/economic fields", false)
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change identity/economic fields", false)
+	}
+	if earningExists {
+		if nextEarning.ID != currentEarning.ID {
+			return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change the earning id", false)
+		}
+		if earningContentHash(currentEarning) != earningContentHash(nextEarning) {
+			return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change identity/economic earning fields", false)
+		}
 	}
 	if nextAccount.PrincipalID != principalID {
-		return domain.Dispute{}, domain.Account{}, store.ErrConflict
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, store.ErrConflict
 	}
+
 	s.disputes[disputeID] = nextDispute
+	if earningExists {
+		s.earnings[nextEarning.ID] = nextEarning
+	}
 	s.accounts[principalID] = nextAccount
-	return nextDispute, nextAccount, nil
+	return nextDispute, nextEarning, nextAccount, nil
 }
 
 func sortDisputesNewestFirst(out []domain.Dispute) {

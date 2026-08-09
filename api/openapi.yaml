@@ -1268,7 +1268,7 @@ components:
         description: {type: string}
         evidence: {type: array, items: {$ref: '#/components/schemas/DisputeEvidence'}}
         status: {type: string, enum: [opened, under_review, resolved_for_principal, resolved_for_provider, rejected]}
-        economic_recovery_state: {type: string, enum: [pending_payout_resolution, frozen, paid, refund_pending, refunded, released, clawback_required]}
+        economic_recovery_state: {type: string, enum: [pending_payout_resolution, frozen, paid, refunded, released, clawback_required]}
         outcome: {type: string, enum: [principal, provider, rejected]}
         reason_rejected: {type: string}
         opened_at: {type: string, format: date-time}

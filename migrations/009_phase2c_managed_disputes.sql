@@ -82,11 +82,12 @@ CREATE INDEX IF NOT EXISTS idx_disputes_under_review
     WHERE review_status IN ('opened', 'under_review');
 
 -- Supports DisputesForRecovery's reconciliation scan: disputes whose
--- economic recovery is not yet terminal (see
--- domain.DisputeEconomicState.Terminal) -- either because the disputed
--- earning was payout_pending/ambiguous at open time and its outcome must
--- still be resolved, or because a principal-win resolution reversed the
--- earning but has not yet completed the principal's account credit.
+-- disputed earning was payout_pending/ambiguous at open time and whose
+-- outcome must still be resolved (see domain.DisputeEconomicState's doc
+-- comments). Resolution's principal-win path (earning reversal + account
+-- credit + dispute terminal checkpoint) is a single atomic transaction
+-- (store.Disputes.ResolveDispute), so it has no intermediate durable
+-- state to reconcile here.
 CREATE INDEX IF NOT EXISTS idx_disputes_recovery
     ON disputes (updated_at ASC, id ASC)
-    WHERE economic_state IN ('pending_payout_resolution', 'refund_pending');
+    WHERE economic_state = 'pending_payout_resolution';

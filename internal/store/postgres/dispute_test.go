@@ -323,7 +323,13 @@ func TestUpdateDisputeRejectsIdentityFieldChange(t *testing.T) {
 	}
 }
 
-func TestUpdateDisputeAndAccountCreditsExactlyOnceConcurrently(t *testing.T) {
+// TestResolveDisputeCreditsExactlyOnceConcurrently proves ResolveDispute's
+// atomic three-way transaction (dispute + earning + account, row-locked
+// together) converges to exactly one credit under real concurrent
+// Postgres connections attempting the same principal-win resolution --
+// the earning reversal and the account credit are never observable as two
+// separate operations with a crash/race window between them.
+func TestResolveDisputeCreditsExactlyOnceConcurrently(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
 	suffix := randSuffix()
@@ -336,9 +342,8 @@ func TestUpdateDisputeAndAccountCreditsExactlyOnceConcurrently(t *testing.T) {
 	dispute, _, _, err := s.OpenDispute(ctx, jobID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
 		d := testDisputeFor(jobID, e)
 		d.PrincipalID = principalID
-		d.EconomicState = domain.DisputeEconomicRefundPending
 		next := e
-		next.Status = domain.EarningReversed
+		next.Status = domain.EarningFrozen
 		return d, next, nil
 	})
 	if err != nil {
@@ -352,21 +357,23 @@ func TestUpdateDisputeAndAccountCreditsExactlyOnceConcurrently(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _, err := s.UpdateDisputeAndAccount(ctx, dispute.ID, principalID, domain.Account{PrincipalID: principalID}, func(d domain.Dispute, exists bool, a domain.Account, aExists bool) (domain.Dispute, domain.Account, error) {
-				if d.EconomicState == domain.DisputeEconomicRefunded {
-					return d, a, nil
-				}
-				if !aExists {
-					a.Balance = domain.Money{Amount: "0.00", Currency: "USD"}
-				}
-				a.Balance = domain.Money{Amount: "1.05", Currency: "USD"}
-				d.EconomicState = domain.DisputeEconomicRefunded
-				d.ReviewStatus = domain.DisputeResolvedForPrincipal
-				atomic.AddInt64(&credits, 1)
-				return d, a, nil
-			})
+			_, _, _, err := s.ResolveDispute(ctx, dispute.ID, principalID, domain.Account{PrincipalID: principalID},
+				func(d domain.Dispute, e domain.ProviderEarning, eExists bool, a domain.Account, aExists bool) (domain.Dispute, domain.ProviderEarning, domain.Account, error) {
+					if d.EconomicState == domain.DisputeEconomicRefunded {
+						return d, e, a, nil
+					}
+					if !eExists || e.Status != domain.EarningFrozen {
+						return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrSettlementFailed, "earning not frozen", false)
+					}
+					a.Balance = domain.Money{Amount: "1.05", Currency: "USD"}
+					e.Status = domain.EarningReversed
+					d.EconomicState = domain.DisputeEconomicRefunded
+					d.ReviewStatus = domain.DisputeResolvedForPrincipal
+					atomic.AddInt64(&credits, 1)
+					return d, e, a, nil
+				})
 			if err != nil {
-				t.Errorf("UpdateDisputeAndAccount: %v", err)
+				t.Errorf("ResolveDispute: %v", err)
 			}
 		}()
 	}
@@ -380,5 +387,12 @@ func TestUpdateDisputeAndAccountCreditsExactlyOnceConcurrently(t *testing.T) {
 	}
 	if final.Balance.Amount != "1.05" {
 		t.Fatalf("final balance = %s, want 1.05 (no double credit)", final.Balance.Amount)
+	}
+	finalEarning, err := s.EarningByJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalEarning.Status != domain.EarningReversed {
+		t.Fatalf("final earning status = %s, want reversed", finalEarning.Status)
 	}
 }

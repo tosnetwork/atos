@@ -57,10 +57,17 @@ type OpenDisputeInput struct {
 // Open validates and, if eligible, durably opens a dispute against JobID on
 // behalf of PrincipalID. Every economic fact recorded on the resulting
 // Dispute (ProviderID, amounts, IDs, ...) is resolved internally from the
-// Job/Quote/BillingSnapshot/ProviderEarning -- never accepted as caller
-// input -- and opening atomically freezes (or correctly defers/records the
-// inability to freeze) the disputed ProviderEarning in the same
-// transaction; see store.Disputes.OpenDispute.
+// Job/Quote/ExecutionReceipt/BillingSnapshot/ProviderEarning -- never
+// accepted as caller input -- and opening atomically freezes (or
+// correctly defers/records the inability to freeze) the disputed
+// ProviderEarning in the same transaction; see store.Disputes.OpenDispute.
+//
+// Idempotency is reserved BEFORE any dynamic eligibility check (dispute
+// window, billing snapshot lookup, evidence accessibility) runs: a
+// successful replay of the same (principal, idempotency_key) always
+// returns the original result, even if evaluated "now" the dispute window
+// would have expired or an evidence Artifact has since expired. Only a
+// genuinely new request (unreserved key) performs those checks.
 func (s *DisputeService) Open(ctx context.Context, in OpenDisputeInput) (domain.Dispute, error) {
 	if in.PrincipalID == "" {
 		return domain.Dispute{}, domain.NewError(domain.ErrAuthenticationRequired, "principal is required", false)
@@ -72,62 +79,8 @@ func (s *DisputeService) Open(ctx context.Context, in OpenDisputeInput) (domain.
 		return domain.Dispute{}, domain.NewError(domain.ErrValidationFailed, "idempotency_key is required", false)
 	}
 
-	job, err := s.jobs.Get(ctx, in.JobID)
-	if err != nil {
-		return domain.Dispute{}, err
-	}
-	if job.PrincipalID != in.PrincipalID {
-		return domain.Dispute{}, domain.NewError(domain.ErrPermissionDenied, "not the owning principal of this job", false)
-	}
-	if job.TrustMode != domain.TrustModeManaged {
-		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "only Managed-mode jobs may be disputed", false)
-	}
-	if job.State != domain.JobCompleted || job.EconomicState != domain.EconomicSettled {
-		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "job is not a completed, settled Managed job", false)
-	}
-	if job.CompletedAt == nil {
-		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "job has no completion timestamp", false)
-	}
-
-	quote, err := s.store.GetQuote(ctx, job.QuoteID)
-	if err != nil {
-		if err == store.ErrNotFound {
-			return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "quote not found for this job", false)
-		}
-		return domain.Dispute{}, err
-	}
-	if quote.ID != job.QuoteID || quote.ProviderID != job.ProviderID || quote.CapabilityID != job.CapabilityID {
-		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "quote binding does not match job", false)
-	}
-	window, ok := disputePolicyWindows[quote.DisputePolicyHash]
-	if !ok {
-		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "job's quote committed to an unrecognized dispute policy", false)
-	}
 	now := time.Now().UTC()
-	if !now.Before(job.CompletedAt.Add(window)) {
-		return domain.Dispute{}, domain.NewError(domain.ErrDisputeWindowExpired, "the dispute window for this job has expired", false)
-	}
-
-	snap, err := s.earnings.BillingSnapshotForJob(ctx, job.ID)
-	if err != nil {
-		return domain.Dispute{}, err
-	}
-	if snap.JobID != job.ID || snap.ProviderID != job.ProviderID || snap.QuoteID != job.QuoteID {
-		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "billing snapshot binding does not match job", false)
-	}
-
-	evidence := make([]domain.DisputeEvidence, 0, len(in.Evidence))
-	for _, e := range in.Evidence {
-		if e.ArtifactID == "" {
-			continue
-		}
-		if _, err := s.artifacts.Get(ctx, in.PrincipalID, e.ArtifactID); err != nil {
-			return domain.Dispute{}, domain.NewError(domain.ErrValidationFailed, fmt.Sprintf("evidence artifact %s is not accessible: %s", e.ArtifactID, err.Error()), false)
-		}
-		evidence = append(evidence, domain.DisputeEvidence{ArtifactID: e.ArtifactID, Description: e.Description})
-	}
-
-	requestHash := hashRequest("open-dispute", job.ID, in.Reason, in.Description, evidence)
+	requestHash := hashRequest("open-dispute", in.JobID, in.Reason, in.Description, in.Evidence)
 	rec, reserved, err := s.store.Reserve(ctx, in.PrincipalID, in.IdempotencyKey, requestHash, now.Add(idempotencyLease))
 	if err != nil {
 		return domain.Dispute{}, err
@@ -162,9 +115,100 @@ func (s *DisputeService) Open(ctx context.Context, in OpenDisputeInput) (domain.
 		return domain.Dispute{}, lookupErr
 	}
 
+	// Everything from here on is a genuinely new request: dynamic
+	// eligibility checks run now, never before the idempotency reservation
+	// above, so a replay of an already-successful request can never be
+	// re-evaluated against (and rejected by) state that has since changed.
+	job, err := s.jobs.Get(ctx, in.JobID)
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	if job.PrincipalID != in.PrincipalID {
+		return domain.Dispute{}, domain.NewError(domain.ErrPermissionDenied, "not the owning principal of this job", false)
+	}
+	if job.TrustMode != domain.TrustModeManaged {
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "only Managed-mode jobs may be disputed", false)
+	}
+	if job.State != domain.JobCompleted || job.EconomicState != domain.EconomicSettled {
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "job is not a completed, settled Managed job", false)
+	}
+	if job.CompletedAt == nil {
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "job has no completion timestamp", false)
+	}
+	if job.ExecutionReceipt == nil {
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "job has no execution receipt", false)
+	}
+
+	quote, err := s.store.GetQuote(ctx, job.QuoteID)
+	if err != nil {
+		if err == store.ErrNotFound {
+			return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "quote not found for this job", false)
+		}
+		return domain.Dispute{}, err
+	}
+	if quote.ID != job.QuoteID || quote.ProviderID != job.ProviderID || quote.CapabilityID != job.CapabilityID {
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "quote binding does not match job", false)
+	}
+	window, ok := disputePolicyWindows[quote.DisputePolicyHash]
+	if !ok {
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "job's quote committed to an unrecognized dispute policy", false)
+	}
+	if !now.Before(job.CompletedAt.Add(window)) {
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeWindowExpired, "the dispute window for this job has expired", false)
+	}
+
+	snap, err := s.earnings.BillingSnapshotForJob(ctx, job.ID)
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	if snap.JobID != job.ID || snap.ProviderID != job.ProviderID || snap.QuoteID != job.QuoteID {
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "billing snapshot binding does not match job", false)
+	}
+	if snap.ReceiptID != job.ExecutionReceipt.ID {
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "billing snapshot execution receipt binding does not match job", false)
+	}
+
+	// The durable settlement Receipt (distinct from the ExecutionReceipt
+	// above) is what the disputed ProviderEarning's SettlementID must
+	// equal -- see internal/service/economic_recovery.go's
+	// RecordSettlement(ctx, billingSnapshot, settled.Receipt.ID) call.
+	settlementReceipt, err := s.store.ReceiptByJob(ctx, job.ID)
+	if err != nil {
+		if err == store.ErrNotFound {
+			return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "settlement receipt not found for this job", false)
+		}
+		return domain.Dispute{}, err
+	}
+
+	evidence := make([]domain.DisputeEvidence, 0, len(in.Evidence))
+	for _, e := range in.Evidence {
+		if e.ArtifactID == "" {
+			continue
+		}
+		if _, err := s.artifacts.Get(ctx, in.PrincipalID, e.ArtifactID); err != nil {
+			return domain.Dispute{}, domain.NewError(domain.ErrValidationFailed, fmt.Sprintf("evidence artifact %s is not accessible: %s", e.ArtifactID, err.Error()), false)
+		}
+		evidence = append(evidence, domain.DisputeEvidence{ArtifactID: e.ArtifactID, Description: e.Description})
+	}
+
 	build := func(earning domain.ProviderEarning, earningExists bool) (domain.Dispute, domain.ProviderEarning, error) {
-		if !earningExists || earning.JobID != job.ID {
-			return domain.Dispute{}, domain.ProviderEarning{}, domain.NewError(domain.ErrDisputeNotEligible, "no matching provider earning found for this job's settlement", false)
+		// Full "all IDs bind consistently" validation against the
+		// row-locked live earning: identity fields must trace back to
+		// exactly this Job's Quote/Capability/ExecutionReceipt/settlement
+		// Receipt, and the earning's amounts must still equal what the
+		// BillingSnapshot actually computed -- never merely job_id.
+		if !earningExists ||
+			earning.JobID != job.ID ||
+			earning.ProviderID != job.ProviderID ||
+			earning.QuoteID != job.QuoteID ||
+			earning.CapabilityID != job.CapabilityID ||
+			earning.CapabilityVersion != job.CapabilityVersion ||
+			earning.ReceiptID != snap.ReceiptID ||
+			earning.SettlementID != settlementReceipt.ID ||
+			earning.GrossAmount != snap.GrossCharge ||
+			earning.GatewayFee != snap.GatewayFee ||
+			earning.NetAmount != snap.ProviderGross {
+			return domain.Dispute{}, domain.ProviderEarning{}, domain.NewError(domain.ErrDisputeNotEligible, "earning binding does not match job/billing snapshot/settlement receipt", false)
 		}
 		dispute := domain.Dispute{
 			ID: "dispute_" + uuid.NewString(), PrincipalID: job.PrincipalID, ProviderID: job.ProviderID,
@@ -244,20 +288,22 @@ type ResolveDisputeInput struct {
 	ReasonRejected string
 }
 
-// Resolve durably decides a dispute and carries out (or begins carrying
-// out) its economic consequence:
+// Resolve durably decides a dispute and carries out its economic
+// consequence, all within a single store.Disputes.ResolveDispute
+// transaction (dispute + earning + account row-locked together) -- there
+// is no intermediate durable state between "frozen" and "refunded" for a
+// principal-win, because that transition can never be observed partially
+// applied:
+//   - DisputeOutcomePrincipal against a Frozen earning: earning reversed,
+//     principal credited exactly once, dispute reaches its terminal
+//     checkpoint -- all three in the same transaction.
 //   - DisputeOutcomeProvider / DisputeOutcomeRejected against a Frozen
 //     earning: released back to Available in the same transaction as the
-//     terminal checkpoint -- fully complete when this call returns.
-//   - DisputeOutcomePrincipal against a Frozen earning: the earning is
-//     reversed and the dispute checkpointed to RefundPending in this same
-//     transaction, then the principal's account credit is completed
-//     before returning (or left for the reconciler to complete if this
-//     process dies in between -- see completePrincipalRefund).
-//   - Any outcome against an earning already known Paid: no earning
-//     mutation is possible (the money already left ATOS). A principal-win
-//     records ClawbackRequired; provider-win/rejected require no further
-//     action.
+//     terminal checkpoint, account left untouched.
+//   - Any outcome against an earning already known Paid: no earning or
+//     account mutation is possible (the money already left ATOS). A
+//     principal-win records ClawbackRequired; provider-win/rejected
+//     require no further action.
 //   - Against a still-PendingPayoutResolution earning: rejected as not yet
 //     eligible -- the payout ambiguity must resolve first.
 func (s *DisputeService) Resolve(ctx context.Context, in ResolveDisputeInput) (domain.Dispute, error) {
@@ -270,117 +316,91 @@ func (s *DisputeService) Resolve(ctx context.Context, in ResolveDisputeInput) (d
 		return domain.Dispute{}, domain.NewError(domain.ErrValidationFailed, "outcome must be principal, provider, or rejected", false)
 	}
 
-	dispute, _, err := s.store.UpdateDisputeAndEarning(ctx, in.DisputeID, func(d domain.Dispute, e domain.ProviderEarning, earningExists bool) (domain.Dispute, domain.ProviderEarning, error) {
-		if d.PrincipalID == in.ReviewerID || d.ProviderID == in.ReviewerID {
-			return domain.Dispute{}, domain.ProviderEarning{}, domain.NewError(domain.ErrPermissionDenied, "a party to the dispute cannot resolve it", false)
-		}
-		if d.ReviewStatus.Terminal() {
-			if d.Outcome == in.Outcome {
-				return d, e, nil
-			}
-			return domain.Dispute{}, domain.ProviderEarning{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute already resolved with a different outcome", false)
-		}
-		if d.EconomicState == domain.DisputeEconomicRefundPending {
-			// Reversal already committed; the account credit is a
-			// separate, safe-to-retry step -- see completePrincipalRefund.
-			return d, e, nil
-		}
-		if d.ReviewStatus != domain.DisputeUnderReview && d.ReviewStatus != domain.DisputeOpened {
-			return domain.Dispute{}, domain.ProviderEarning{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute is not in a resolvable state", false)
-		}
-		if in.Outcome != domain.DisputeOutcomeRejected && d.ReviewStatus != domain.DisputeUnderReview {
-			return domain.Dispute{}, domain.ProviderEarning{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute must be under review before it can be decided for a party", false)
-		}
+	// principalID is needed up front to key the account lock; a plain read
+	// is safe here since Dispute.PrincipalID is immutable after creation
+	// (see domain.Dispute's doc comment) -- the row-locked read inside
+	// ResolveDispute is what makes every subsequent decision authoritative.
+	seed, err := s.store.GetDispute(ctx, in.DisputeID)
+	if err != nil {
+		return domain.Dispute{}, err
+	}
 
-		now := time.Now().UTC()
-		d.Outcome = in.Outcome
-		if in.Outcome == domain.DisputeOutcomeRejected {
-			d.ReasonRejected = in.ReasonRejected
-		}
+	dispute, _, _, err := s.store.ResolveDispute(ctx, in.DisputeID, seed.PrincipalID, s.accounts.defaultAccount(seed.PrincipalID),
+		func(d domain.Dispute, e domain.ProviderEarning, earningExists bool, a domain.Account, accountExists bool) (domain.Dispute, domain.ProviderEarning, domain.Account, error) {
+			if d.PrincipalID == in.ReviewerID || d.ProviderID == in.ReviewerID {
+				return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrPermissionDenied, "a party to the dispute cannot resolve it", false)
+			}
+			if d.ReviewStatus.Terminal() {
+				if d.Outcome == in.Outcome {
+					return d, e, a, nil
+				}
+				return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute already resolved with a different outcome", false)
+			}
+			if d.ReviewStatus != domain.DisputeUnderReview && d.ReviewStatus != domain.DisputeOpened {
+				return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute is not in a resolvable state", false)
+			}
+			if in.Outcome != domain.DisputeOutcomeRejected && d.ReviewStatus != domain.DisputeUnderReview {
+				return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute must be under review before it can be decided for a party", false)
+			}
 
-		switch d.EconomicState {
-		case domain.DisputeEconomicPaid:
-			// The money already left ATOS; no automated reversal is
-			// possible -- see domain.DisputeEconomicClawbackRequired.
-			switch in.Outcome {
-			case domain.DisputeOutcomePrincipal:
-				d.EconomicState = domain.DisputeEconomicClawbackRequired
-				d.ReviewStatus = domain.DisputeResolvedForPrincipal
-			case domain.DisputeOutcomeProvider:
-				d.ReviewStatus = domain.DisputeResolvedForProvider
-			case domain.DisputeOutcomeRejected:
-				d.ReviewStatus = domain.DisputeRejected
+			now := time.Now().UTC()
+			d.Outcome = in.Outcome
+			if in.Outcome == domain.DisputeOutcomeRejected {
+				d.ReasonRejected = in.ReasonRejected
 			}
-			d.ResolvedAt = &now
-			d.UpdatedAt = now
-			return d, e, nil
-		case domain.DisputeEconomicFrozen:
-			if !earningExists || e.Status != domain.EarningFrozen {
-				return domain.Dispute{}, domain.ProviderEarning{}, domain.NewError(domain.ErrSettlementFailed, "disputed earning is not in the expected frozen state", false)
-			}
-			switch in.Outcome {
-			case domain.DisputeOutcomePrincipal:
-				e.Status = domain.EarningReversed
-				d.EconomicState = domain.DisputeEconomicRefundPending
-				d.UpdatedAt = now
-				return d, e, nil
-			case domain.DisputeOutcomeProvider, domain.DisputeOutcomeRejected:
-				e.Status = domain.EarningAvailable
-				d.EconomicState = domain.DisputeEconomicReleased
-				if in.Outcome == domain.DisputeOutcomeProvider {
+
+			switch d.EconomicState {
+			case domain.DisputeEconomicPaid:
+				// The money already left ATOS; no automated reversal or
+				// credit is possible -- see
+				// domain.DisputeEconomicClawbackRequired.
+				switch in.Outcome {
+				case domain.DisputeOutcomePrincipal:
+					d.EconomicState = domain.DisputeEconomicClawbackRequired
+					d.ReviewStatus = domain.DisputeResolvedForPrincipal
+				case domain.DisputeOutcomeProvider:
 					d.ReviewStatus = domain.DisputeResolvedForProvider
-				} else {
+				case domain.DisputeOutcomeRejected:
 					d.ReviewStatus = domain.DisputeRejected
 				}
 				d.ResolvedAt = &now
 				d.UpdatedAt = now
-				return d, e, nil
+				return d, e, a, nil
+			case domain.DisputeEconomicFrozen:
+				if !earningExists || e.Status != domain.EarningFrozen {
+					return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrSettlementFailed, "disputed earning is not in the expected frozen state", false)
+				}
+				switch in.Outcome {
+				case domain.DisputeOutcomePrincipal:
+					nextAccount, err := s.accounts.creditAccountValue(a, d.ChargedAmount.Amount, d.ChargedAmount.Currency)
+					if err != nil {
+						return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
+					}
+					e.Status = domain.EarningReversed
+					d.EconomicState = domain.DisputeEconomicRefunded
+					d.ReviewStatus = domain.DisputeResolvedForPrincipal
+					d.ResolvedAt = &now
+					d.UpdatedAt = now
+					return d, e, nextAccount, nil
+				case domain.DisputeOutcomeProvider, domain.DisputeOutcomeRejected:
+					e.Status = domain.EarningAvailable
+					d.EconomicState = domain.DisputeEconomicReleased
+					if in.Outcome == domain.DisputeOutcomeProvider {
+						d.ReviewStatus = domain.DisputeResolvedForProvider
+					} else {
+						d.ReviewStatus = domain.DisputeRejected
+					}
+					d.ResolvedAt = &now
+					d.UpdatedAt = now
+					return d, e, a, nil
+				}
 			}
-		}
-		return domain.Dispute{}, domain.ProviderEarning{}, domain.NewError(domain.ErrDisputeNotEligible, "dispute economic recovery is still pending payout resolution", true)
-	})
+			return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrDisputeNotEligible, "dispute economic recovery is still pending payout resolution", true)
+		})
 	if err != nil {
 		return domain.Dispute{}, err
-	}
-	if dispute.EconomicState == domain.DisputeEconomicRefundPending {
-		return s.completePrincipalRefund(ctx, dispute.ID)
 	}
 	return dispute, nil
-}
-
-// completePrincipalRefund credits the principal's account for a dispute
-// whose earning has already been durably reversed (EconomicState ==
-// RefundPending), completing the account credit and the dispute's
-// terminal RefundStatus/ReviewStatus checkpoint in one transaction. Safe
-// to call repeatedly: idempotent no-op once already Refunded.
-func (s *DisputeService) completePrincipalRefund(ctx context.Context, disputeID string) (domain.Dispute, error) {
-	dispute, err := s.store.GetDispute(ctx, disputeID)
-	if err != nil {
-		return domain.Dispute{}, err
-	}
-	updated, _, err := s.store.UpdateDisputeAndAccount(ctx, disputeID, dispute.PrincipalID, s.accounts.defaultAccount(dispute.PrincipalID),
-		func(d domain.Dispute, exists bool, a domain.Account, _ bool) (domain.Dispute, domain.Account, error) {
-			if !exists {
-				return domain.Dispute{}, domain.Account{}, domain.NewError(domain.ErrNotFound, "dispute not found", false)
-			}
-			if d.EconomicState == domain.DisputeEconomicRefunded && d.ReviewStatus == domain.DisputeResolvedForPrincipal {
-				return d, a, nil
-			}
-			if d.EconomicState != domain.DisputeEconomicRefundPending {
-				return domain.Dispute{}, domain.Account{}, store.ErrConflict
-			}
-			nextAccount, err := s.accounts.creditAccountValue(a, d.ChargedAmount.Amount, d.ChargedAmount.Currency)
-			if err != nil {
-				return domain.Dispute{}, domain.Account{}, err
-			}
-			now := time.Now().UTC()
-			d.EconomicState = domain.DisputeEconomicRefunded
-			d.ReviewStatus = domain.DisputeResolvedForPrincipal
-			d.ResolvedAt = &now
-			d.UpdatedAt = now
-			return d, nextAccount, nil
-		})
-	return updated, err
 }
 
 func (s *DisputeService) Get(ctx context.Context, id string) (domain.Dispute, error) {
@@ -408,19 +428,18 @@ func (s *DisputeService) ListUnderReview(ctx context.Context, limit int) ([]doma
 
 // ReconcileDispute drives one dispute's economic recovery forward from
 // whatever checkpoint it is durably parked at. Safe to call repeatedly.
+// PendingPayoutResolution is the only non-terminal EconomicState that can
+// persist between calls -- Resolve's principal-win path has no
+// intermediate checkpoint to recover (see ResolveDispute).
 func (s *DisputeService) ReconcileDispute(ctx context.Context, disputeID string) (domain.Dispute, error) {
 	dispute, err := s.store.GetDispute(ctx, disputeID)
 	if err != nil {
 		return domain.Dispute{}, err
 	}
-	switch dispute.EconomicState {
-	case domain.DisputeEconomicPendingPayoutResolution:
+	if dispute.EconomicState == domain.DisputeEconomicPendingPayoutResolution {
 		return s.reconcilePendingPayout(ctx, dispute)
-	case domain.DisputeEconomicRefundPending:
-		return s.completePrincipalRefund(ctx, dispute.ID)
-	default:
-		return dispute, nil
 	}
+	return dispute, nil
 }
 
 // reconcilePendingPayout re-checks the disputed earning's own status,

@@ -341,3 +341,69 @@ func TestDisputeOpen_QuoteBindingSubstitutionRejected(t *testing.T) {
 		t.Fatalf("got %v, want domain.ErrDisputeNotEligible", err)
 	}
 }
+
+// TestDisputeOpen_CapabilityVersionSubstitutionRejected proves the
+// earning/job binding check catches a mismatch that quote-binding
+// validation alone would not: a Job whose capability_version was tampered
+// after settlement so it no longer matches the ProviderEarning's own
+// capability_version (frozen from the BillingSnapshot at settlement time).
+func TestDisputeOpen_CapabilityVersionSubstitutionRejected(t *testing.T) {
+	ctx := context.Background()
+	h, _, disputes := disputeHarness(t)
+	job := completedJob(t, h, "agt_dispute_capver", "prn_dispute_capver", "1.00")
+
+	if _, err := h.store().UpdateJob(ctx, job.ID, func(j domain.Job, exists bool) (domain.Job, error) {
+		j.CapabilityVersion = "9.9.9-tampered"
+		return j, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := disputes.Open(ctx, service.OpenDisputeInput{
+		PrincipalID: "prn_dispute_capver", JobID: job.ID, Reason: "not delivered",
+		IdempotencyKey: "dispute-open-capver",
+	})
+	var domainErr *domain.Error
+	if !errors.As(err, &domainErr) || domainErr.Code != domain.ErrDisputeNotEligible {
+		t.Fatalf("got %v, want domain.ErrDisputeNotEligible", err)
+	}
+}
+
+// TestDisputeOpen_IdempotentReplayBypassesWindowExpiry proves a replay of
+// an already-successful Open call returns the original dispute even if
+// dynamic eligibility state (here, the dispute window) would now reject a
+// fresh request -- idempotency is reserved before any dynamic check runs,
+// so a genuinely successful prior result is never re-litigated against
+// state that has since changed.
+func TestDisputeOpen_IdempotentReplayBypassesWindowExpiry(t *testing.T) {
+	ctx := context.Background()
+	h, _, disputes := disputeHarness(t)
+	job := completedJob(t, h, "agt_dispute_replaywindow", "prn_dispute_replaywindow", "1.00")
+
+	in := service.OpenDisputeInput{
+		PrincipalID: "prn_dispute_replaywindow", JobID: job.ID, Reason: "not delivered",
+		IdempotencyKey: "dispute-open-replaywindow",
+	}
+	first, err := disputes.Open(ctx, in)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+
+	// Simulate the dispute window having since expired -- a fresh request
+	// against this Job would now be rejected.
+	longAgo := time.Now().UTC().Add(-73 * time.Hour)
+	if _, err := h.store().UpdateJob(ctx, job.ID, func(j domain.Job, exists bool) (domain.Job, error) {
+		j.CompletedAt = &longAgo
+		return j, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	replay, err := disputes.Open(ctx, in)
+	if err != nil {
+		t.Fatalf("replay Open (should bypass the now-expired window and return the cached result): %v", err)
+	}
+	if replay.ID != first.ID {
+		t.Fatalf("replay returned a different dispute: %s vs %s", replay.ID, first.ID)
+	}
+}

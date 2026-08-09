@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -189,64 +190,64 @@ func TestDisputeResolve_PrincipalWinConcurrentResolveConvergesToOneCredit(t *tes
 // driven directly to refund_pending without going through Resolve's
 // second half, then ReconcileDispute must complete the credit -- exactly
 // once, even if invoked twice (a duplicate reconciler sweep).
-func TestDisputeReconcile_CompletesInterruptedRefund(t *testing.T) {
+// TestDisputeResolve_PrincipalWinHasNoObservableIntermediateState proves
+// ResolveDispute's atomicity claim directly: a principal-win resolution
+// against a Frozen earning can never be observed with the earning already
+// Reversed but the principal not yet credited (or vice versa) -- by
+// construction there is no store call between those two effects for a
+// concurrent reader to observe mid-flight. This replaces the older crash-
+// injection test for that window, which is no longer reachable now that
+// resolution is a single atomic transaction (dispute + earning +
+// account) rather than two.
+func TestDisputeResolve_PrincipalWinHasNoObservableIntermediateState(t *testing.T) {
 	ctx := context.Background()
 	h, earnings, disputes := disputeHarness(t)
-	_, d := openedDispute(t, h, disputes, "agt_reconcile_refund", "prn_reconcile_refund", "1.00")
+	job, d := openedDispute(t, h, disputes, "agt_atomic_resolve", "prn_atomic_resolve", "1.00")
+	if _, err := disputes.Review(ctx, d.ID, "rev_1"); err != nil {
+		t.Fatal(err)
+	}
 
-	// Simulate the durable state left behind by a crash immediately after
-	// UpdateDisputeAndEarning committed but before completePrincipalRefund
-	// ran: earning reversed, dispute checkpointed to refund_pending, but
-	// no credit applied and ReviewStatus still under_review (not terminal).
-	_, _, err := h.store().UpdateDisputeAndEarning(ctx, d.ID, func(dd domain.Dispute, e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
-		if !exists {
-			t.Fatal("expected earning to exist")
+	// A concurrent reader polling mid-resolution must only ever observe
+	// either the pre-resolution state (Frozen, no credit) or the fully
+	// resolved state (Reversed, credited, terminal) -- never anything in
+	// between.
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var badObservation error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			earning, err := earnings.Get(ctx, d.EarningID, job.ProviderID)
+			if err != nil {
+				continue
+			}
+			dispute, err := disputes.Get(ctx, d.ID)
+			if err != nil {
+				continue
+			}
+			reversedButNotTerminal := earning.Status == domain.EarningReversed && dispute.ReviewStatus != domain.DisputeResolvedForPrincipal
+			terminalButNotReversed := dispute.ReviewStatus == domain.DisputeResolvedForPrincipal && earning.Status != domain.EarningReversed
+			if reversedButNotTerminal || terminalButNotReversed {
+				badObservation = fmt.Errorf("observed inconsistent intermediate state: earning.Status=%s dispute.ReviewStatus=%s", earning.Status, dispute.ReviewStatus)
+				return
+			}
 		}
-		e.Status = domain.EarningReversed
-		dd.Outcome = domain.DisputeOutcomePrincipal
-		dd.EconomicState = domain.DisputeEconomicRefundPending
-		return dd, e, nil
-	})
-	if err != nil {
-		t.Fatalf("simulate interrupted resolution: %v", err)
-	}
+	}()
 
-	before, err := h.accounts.Get(ctx, "prn_reconcile_refund")
-	if err != nil {
-		t.Fatal(err)
+	if _, err := disputes.Resolve(ctx, service.ResolveDisputeInput{DisputeID: d.ID, ReviewerID: "rev_1", Outcome: domain.DisputeOutcomePrincipal}); err != nil {
+		t.Fatalf("Resolve: %v", err)
 	}
-
-	recovered, err := disputes.ReconcileDispute(ctx, d.ID)
-	if err != nil {
-		t.Fatalf("ReconcileDispute: %v", err)
+	close(stop)
+	wg.Wait()
+	if badObservation != nil {
+		t.Fatal(badObservation)
 	}
-	if recovered.EconomicState != domain.DisputeEconomicRefunded || recovered.ReviewStatus != domain.DisputeResolvedForPrincipal {
-		t.Fatalf("reconciled dispute = %+v, want refunded/resolved_for_principal", recovered)
-	}
-
-	after, err := h.accounts.Get(ctx, "prn_reconcile_refund")
-	if err != nil {
-		t.Fatal(err)
-	}
-	beforeCents, _ := parseCents(t, before.Balance.Amount)
-	afterCents, _ := parseCents(t, after.Balance.Amount)
-	chargedCents, _ := parseCents(t, d.ChargedAmount.Amount)
-	if afterCents-beforeCents != chargedCents {
-		t.Fatalf("balance increased by %d cents, want exactly %d", afterCents-beforeCents, chargedCents)
-	}
-
-	// A duplicate reconciler sweep must not credit again.
-	if _, err := disputes.ReconcileDispute(ctx, d.ID); err != nil {
-		t.Fatalf("duplicate ReconcileDispute: %v", err)
-	}
-	final, err := h.accounts.Get(ctx, "prn_reconcile_refund")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if final.Balance != after.Balance {
-		t.Fatalf("balance changed on duplicate reconcile: %s -> %s", after.Balance.Amount, final.Balance.Amount)
-	}
-	_ = earnings
 }
 
 func TestDisputeResolve_ProviderWinHappyPath(t *testing.T) {

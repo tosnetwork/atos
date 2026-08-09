@@ -281,13 +281,20 @@ type Disputes interface {
 	// contract as UpdateDispute for the dispute side, and the same as
 	// UpdateEarning for the earning side.
 	UpdateDisputeAndEarning(ctx context.Context, disputeID string, fn func(d domain.Dispute, e domain.ProviderEarning, earningExists bool) (domain.Dispute, domain.ProviderEarning, error)) (domain.Dispute, domain.ProviderEarning, error)
-	// UpdateDisputeAndAccount atomically applies fn to the dispute AND the
-	// principal's Account (both row-locked in the same transaction), for
-	// the principal-win refund step: the account credit and the dispute's
-	// terminal refunded checkpoint commit together, so a crash between
-	// them is impossible -- eliminating the double-credit risk a separate
-	// "credit, then mark done" pair of operations would have.
-	UpdateDisputeAndAccount(ctx context.Context, disputeID, principalID string, seed domain.Account, fn func(d domain.Dispute, dExists bool, a domain.Account, aExists bool) (domain.Dispute, domain.Account, error)) (domain.Dispute, domain.Account, error)
+	// ResolveDispute atomically row-locks the dispute, the ProviderEarning
+	// it references (found by job_id), and the principal's Account (in
+	// that order: dispute, then earning, then account) and commits fn's
+	// result to all three in one transaction. This is the sole primitive
+	// DisputeService.Resolve uses for every outcome (principal, provider,
+	// rejected), so a principal-win's earning reversal and account credit
+	// can never be split across two transactions with a crash window
+	// between them -- there is no intermediate durable state between
+	// "frozen" and "refunded" to recover from, because that transition can
+	// never be observed partially applied. Same immutability contract as
+	// UpdateDispute/UpdateEarning for the dispute/earning sides; fn MUST
+	// return an Account whose PrincipalID equals principalID even when
+	// leaving the account otherwise unchanged (provider-win/rejected).
+	ResolveDispute(ctx context.Context, disputeID, principalID string, seed domain.Account, fn func(d domain.Dispute, e domain.ProviderEarning, earningExists bool, a domain.Account, accountExists bool) (domain.Dispute, domain.ProviderEarning, domain.Account, error)) (domain.Dispute, domain.ProviderEarning, domain.Account, error)
 }
 
 type Artifacts interface {

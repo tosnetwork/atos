@@ -232,20 +232,40 @@ func TestUpdateDisputeAllowsLifecycleFieldChanges(t *testing.T) {
 	}
 }
 
-func TestUpdateDisputeAndEarningCommitsBothTogether(t *testing.T) {
+// TestUpdateDisputeAndEarningFreezesLate exercises UpdateDisputeAndEarning's
+// real remaining use -- DisputeService.reconcilePendingPayout's "freeze
+// late" branch: a dispute opened while the earning's payout was ambiguous
+// (PendingPayoutResolution) later observes the earning settled back to
+// Available (the payout attempt never moved funds), and freezes it then,
+// committing both the earning transition and the dispute's updated
+// checkpoint in one transaction.
+func TestUpdateDisputeAndEarningFreezesLate(t *testing.T) {
 	ctx := context.Background()
 	s := New()
 	earning := testDisputeEarning("job_5")
+	earning.Status = domain.EarningPayoutPending
 	if _, _, err := s.CreateEarning(ctx, earning); err != nil {
 		t.Fatal(err)
 	}
 	dispute, _, _, err := s.OpenDispute(ctx, "job_5", func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
 		d := testDisputeFor("job_5", e)
-		next := e
-		next.Status = domain.EarningFrozen
-		return d, next, nil
+		d.EconomicState = domain.DisputeEconomicPendingPayoutResolution
+		return d, e, nil
 	})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if dispute.EconomicState != domain.DisputeEconomicPendingPayoutResolution {
+		t.Fatalf("economic state = %s, want pending_payout_resolution", dispute.EconomicState)
+	}
+
+	// The payout attempt resolves to "no funds moved" -- the earning is
+	// back to Available. Simulate that directly (UpdateEarning is the
+	// earnings reconciler's own primitive, exercised elsewhere).
+	if _, err := s.UpdateEarning(ctx, earning.ID, func(e domain.ProviderEarning, exists bool) (domain.ProviderEarning, error) {
+		e.Status = domain.EarningAvailable
+		return e, nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -253,32 +273,37 @@ func TestUpdateDisputeAndEarningCommitsBothTogether(t *testing.T) {
 		if !exists {
 			t.Fatal("expected earning to exist")
 		}
-		if e.Status != domain.EarningFrozen {
-			t.Fatalf("earning status = %s, want frozen", e.Status)
+		if e.Status != domain.EarningAvailable {
+			t.Fatalf("earning status = %s, want available", e.Status)
 		}
-		e.Status = domain.EarningReversed
-		d.EconomicState = domain.DisputeEconomicRefundPending
+		e.Status = domain.EarningFrozen
+		d.EconomicState = domain.DisputeEconomicFrozen
 		return d, e, nil
 	})
 	if err != nil {
 		t.Fatalf("UpdateDisputeAndEarning: %v", err)
 	}
-	if updatedDispute.EconomicState != domain.DisputeEconomicRefundPending {
-		t.Fatalf("economic state = %s, want refund_pending", updatedDispute.EconomicState)
+	if updatedDispute.EconomicState != domain.DisputeEconomicFrozen {
+		t.Fatalf("economic state = %s, want frozen", updatedDispute.EconomicState)
 	}
-	if updatedEarning.Status != domain.EarningReversed {
-		t.Fatalf("earning status = %s, want reversed", updatedEarning.Status)
+	if updatedEarning.Status != domain.EarningFrozen {
+		t.Fatalf("earning status = %s, want frozen", updatedEarning.Status)
 	}
 	storedEarning, err := s.EarningByJob(ctx, "job_5")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if storedEarning.Status != domain.EarningReversed {
-		t.Fatalf("stored earning status = %s, want reversed", storedEarning.Status)
+	if storedEarning.Status != domain.EarningFrozen {
+		t.Fatalf("stored earning status = %s, want frozen", storedEarning.Status)
 	}
 }
 
-func TestUpdateDisputeAndAccountCreditsExactlyOnce(t *testing.T) {
+// TestResolveDisputeCreditsExactlyOnce proves ResolveDispute's atomic
+// three-way transaction (dispute + earning + account) commits a
+// principal-win's earning reversal and account credit together, and that
+// a retry (e.g. a duplicate client resolve call, or reconciler-style
+// replay) does not credit a second time.
+func TestResolveDisputeCreditsExactlyOnce(t *testing.T) {
 	ctx := context.Background()
 	s := New()
 	earning := testDisputeEarning("job_6")
@@ -287,47 +312,54 @@ func TestUpdateDisputeAndAccountCreditsExactlyOnce(t *testing.T) {
 	}
 	dispute, _, _, err := s.OpenDispute(ctx, "job_6", func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
 		d := testDisputeFor("job_6", e)
-		d.EconomicState = domain.DisputeEconomicRefundPending
 		next := e
-		next.Status = domain.EarningReversed
+		next.Status = domain.EarningFrozen
 		return d, next, nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	credit := func() (domain.Dispute, domain.Account, error) {
-		return s.UpdateDisputeAndAccount(ctx, dispute.ID, "prn_1", domain.Account{PrincipalID: "prn_1"}, func(d domain.Dispute, exists bool, a domain.Account, aExists bool) (domain.Dispute, domain.Account, error) {
-			if d.EconomicState == domain.DisputeEconomicRefunded {
-				return d, a, nil
-			}
-			a.Balance = domain.Money{Amount: "1.05", Currency: "USD"}
-			d.EconomicState = domain.DisputeEconomicRefunded
-			d.ReviewStatus = domain.DisputeResolvedForPrincipal
-			return d, a, nil
-		})
+	resolve := func() (domain.Dispute, domain.ProviderEarning, domain.Account, error) {
+		return s.ResolveDispute(ctx, dispute.ID, "prn_1", domain.Account{PrincipalID: "prn_1"},
+			func(d domain.Dispute, e domain.ProviderEarning, eExists bool, a domain.Account, aExists bool) (domain.Dispute, domain.ProviderEarning, domain.Account, error) {
+				if d.EconomicState == domain.DisputeEconomicRefunded {
+					return d, e, a, nil
+				}
+				if !eExists || e.Status != domain.EarningFrozen {
+					t.Fatalf("earning not frozen: exists=%v status=%s", eExists, e.Status)
+				}
+				a.Balance = domain.Money{Amount: "1.05", Currency: "USD"}
+				e.Status = domain.EarningReversed
+				d.EconomicState = domain.DisputeEconomicRefunded
+				d.ReviewStatus = domain.DisputeResolvedForPrincipal
+				return d, e, a, nil
+			})
 	}
 
-	first, account, err := credit()
+	firstDispute, firstEarning, firstAccount, err := resolve()
 	if err != nil {
-		t.Fatalf("first credit: %v", err)
+		t.Fatalf("first resolve: %v", err)
 	}
-	if first.EconomicState != domain.DisputeEconomicRefunded {
-		t.Fatalf("economic state = %s, want refunded", first.EconomicState)
+	if firstDispute.EconomicState != domain.DisputeEconomicRefunded {
+		t.Fatalf("economic state = %s, want refunded", firstDispute.EconomicState)
 	}
-	if account.Balance.Amount != "1.05" {
-		t.Fatalf("balance = %s, want 1.05", account.Balance.Amount)
+	if firstEarning.Status != domain.EarningReversed {
+		t.Fatalf("earning status = %s, want reversed", firstEarning.Status)
+	}
+	if firstAccount.Balance.Amount != "1.05" {
+		t.Fatalf("balance = %s, want 1.05", firstAccount.Balance.Amount)
 	}
 
-	// A retry (e.g. reconciler replay after a crash) must not credit again.
-	second, account2, err := credit()
+	// A retry must not credit again.
+	secondDispute, _, secondAccount, err := resolve()
 	if err != nil {
-		t.Fatalf("second (idempotent) credit: %v", err)
+		t.Fatalf("second (idempotent) resolve: %v", err)
 	}
-	if second.EconomicState != domain.DisputeEconomicRefunded {
-		t.Fatalf("economic state after replay = %s, want refunded", second.EconomicState)
+	if secondDispute.EconomicState != domain.DisputeEconomicRefunded {
+		t.Fatalf("economic state after replay = %s, want refunded", secondDispute.EconomicState)
 	}
-	if account2.Balance.Amount != "1.05" {
-		t.Fatalf("balance after replay credit = %s, want unchanged 1.05 (no double credit)", account2.Balance.Amount)
+	if secondAccount.Balance.Amount != "1.05" {
+		t.Fatalf("balance after replay resolve = %s, want unchanged 1.05 (no double credit)", secondAccount.Balance.Amount)
 	}
 }

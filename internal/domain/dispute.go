@@ -60,16 +60,12 @@ const (
 	// earning moves to DisputeEconomicClawbackRequired rather than
 	// attempting any reversal.
 	DisputeEconomicPaid DisputeEconomicState = "paid"
-	// DisputeEconomicRefundPending means the disputed earning has already
-	// been durably transitioned to EarningReversed (in the same
-	// transaction that committed this checkpoint), but the principal's
-	// account has not yet been credited. Reconciliation completes this by
-	// crediting the account and moving to DisputeEconomicRefunded in one
-	// atomic step — see UpdateDisputeAndAccount.
-	DisputeEconomicRefundPending DisputeEconomicState = "refund_pending"
 	// DisputeEconomicRefunded is terminal for a principal-win resolution:
-	// the earning is EarningReversed and the principal's account has been
-	// credited exactly once.
+	// the earning reversal and the principal's account credit are
+	// committed together in one transaction (store.Disputes.ResolveDispute)
+	// -- there is no intermediate durable checkpoint between "reversed" and
+	// "credited" to model, because that transition can never be observed
+	// partially applied.
 	DisputeEconomicRefunded DisputeEconomicState = "refunded"
 	// DisputeEconomicReleased is terminal for a provider-win or rejected
 	// resolution: the earning has been returned to EarningAvailable (or

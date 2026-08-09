@@ -272,7 +272,7 @@ func (s *Store) DisputesForRecovery(ctx context.Context, updatedBefore time.Time
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+disputeColumns+` FROM disputes
-		WHERE economic_state IN ('pending_payout_resolution','refund_pending') AND updated_at <= $1
+		WHERE economic_state = 'pending_payout_resolution' AND updated_at <= $1
 		ORDER BY updated_at ASC, id ASC
 		LIMIT $2
 	`, updatedBefore.UTC(), limit)
@@ -414,29 +414,56 @@ func (s *Store) UpdateDisputeAndEarning(ctx context.Context, disputeID string, f
 // ever locks both earning and account in the same transaction, so there is
 // no additional ordering to reconcile against UpdateJobAndAccount's
 // (account, then job) order.
-func (s *Store) UpdateDisputeAndAccount(ctx context.Context, disputeID, principalID string, seed domain.Account, fn func(domain.Dispute, bool, domain.Account, bool) (domain.Dispute, domain.Account, error)) (domain.Dispute, domain.Account, error) {
+// ResolveDispute row-locks the dispute (by id), the ProviderEarning it
+// references (found by job_id, locked by earning id), and the principal's
+// Account -- in that order (dispute, earning, account), consistent with
+// UpdateDisputeAndEarning's (dispute, earning) order and never conflicting
+// with UpdateJobAndAccount's (account, job) order since no code path locks
+// both earning and job together -- then commits fn's result to all three
+// in one transaction. A principal-win's earning reversal and account
+// credit therefore can never be observed partially applied.
+func (s *Store) ResolveDispute(ctx context.Context, disputeID, principalID string, seed domain.Account, fn func(domain.Dispute, domain.ProviderEarning, bool, domain.Account, bool) (domain.Dispute, domain.ProviderEarning, domain.Account, error)) (domain.Dispute, domain.ProviderEarning, domain.Account, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return domain.Dispute{}, domain.Account{}, err
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	if err := lockTransactionKey(ctx, tx, "dispute", disputeID); err != nil {
-		return domain.Dispute{}, domain.Account{}, err
-	}
-	if err := lockTransactionKey(ctx, tx, "account", principalID); err != nil {
-		return domain.Dispute{}, domain.Account{}, err
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
 	}
 
 	currentDispute, err := scanDispute(tx.QueryRow(ctx, `SELECT `+disputeColumns+` FROM disputes WHERE id=$1 FOR UPDATE`, disputeID))
-	disputeExists := true
 	if errors.Is(err, pgx.ErrNoRows) {
-		disputeExists = false
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
+	}
+
+	var earningID string
+	err = tx.QueryRow(ctx, `SELECT id FROM provider_earnings WHERE job_id=$1`, currentDispute.JobID).Scan(&earningID)
+	earningExists := true
+	if errors.Is(err, pgx.ErrNoRows) {
+		earningExists = false
 		err = nil
 	}
 	if err != nil {
-		return domain.Dispute{}, domain.Account{}, err
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
+	}
+	var currentEarning domain.ProviderEarning
+	if earningExists {
+		if err := lockTransactionKey(ctx, tx, "earning", earningID); err != nil {
+			return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
+		}
+		currentEarning, err = scanEarning(tx.QueryRow(ctx, `SELECT `+earningColumns+` FROM provider_earnings WHERE id=$1 FOR UPDATE`, earningID))
+		if err != nil {
+			return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
+		}
 	}
 
+	if err := lockTransactionKey(ctx, tx, "account", principalID); err != nil {
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
+	}
 	var account domain.Account
 	account.PrincipalID = principalID
 	var balance, spendPolicy, payload []byte
@@ -448,33 +475,42 @@ func (s *Store) UpdateDisputeAndAccount(ctx context.Context, disputeID, principa
 		accountExists = false
 		account = seed
 	case err != nil:
-		return domain.Dispute{}, domain.Account{}, err
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
 	default:
 		_ = json.Unmarshal(balance, &account.Balance)
 		_ = json.Unmarshal(spendPolicy, &account.SpendPolicy)
 		if err := applyPayload(payload, &account); err != nil {
-			return domain.Dispute{}, domain.Account{}, err
+			return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
 		}
 	}
 	account.PrincipalID = principalID
 
-	nextDispute, nextAccount, err := fn(currentDispute, disputeExists, account, accountExists)
+	nextDispute, nextEarning, nextAccount, err := fn(currentDispute, currentEarning, earningExists, account, accountExists)
 	if err != nil {
-		return domain.Dispute{}, domain.Account{}, err
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
 	}
-	if disputeExists {
-		if nextDispute.ID != currentDispute.ID {
-			return domain.Dispute{}, domain.Account{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change the dispute id", false)
-		}
-		if disputeContentHash(currentDispute) != disputeContentHash(nextDispute) {
-			return domain.Dispute{}, domain.Account{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change identity/economic fields", false)
-		}
+	if nextDispute.ID != currentDispute.ID {
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change the dispute id", false)
+	}
+	if disputeContentHash(currentDispute) != disputeContentHash(nextDispute) {
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change identity/economic fields", false)
 	}
 	if nextAccount.PrincipalID != principalID {
-		return domain.Dispute{}, domain.Account{}, store.ErrConflict
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, store.ErrConflict
 	}
 	if _, err := tx.Exec(ctx, upsertDisputeSQL, disputeWriteArgs(nextDispute)...); err != nil {
-		return domain.Dispute{}, domain.Account{}, err
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
+	}
+	if earningExists {
+		if nextEarning.ID != currentEarning.ID {
+			return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change the earning id", false)
+		}
+		if earningContentHash(currentEarning) != earningContentHash(nextEarning) {
+			return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change identity/economic earning fields", false)
+		}
+		if _, err := tx.Exec(ctx, upsertEarningSQL, earningWriteArgs(nextEarning)...); err != nil {
+			return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
+		}
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO accounts (principal_id, balance, spend_policy, payload)
@@ -482,10 +518,10 @@ func (s *Store) UpdateDisputeAndAccount(ctx context.Context, disputeID, principa
 		ON CONFLICT (principal_id) DO UPDATE SET
 			balance=$2, spend_policy=$3, payload=$4
 	`, principalID, mustMarshal(nextAccount.Balance), mustMarshal(nextAccount.SpendPolicy), mustMarshal(nextAccount)); err != nil {
-		return domain.Dispute{}, domain.Account{}, err
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return domain.Dispute{}, domain.Account{}, err
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
 	}
-	return nextDispute, nextAccount, nil
+	return nextDispute, nextEarning, nextAccount, nil
 }
