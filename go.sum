@@ -24,10 +24,12 @@ github.com/stretchr/testify v1.3.0/go.mod h1:M5WIy9Dh21IEIfnGCwXGc5bZfKNJtfHm1UV
 github.com/stretchr/testify v1.7.0/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
-github.com/tosnetwork/tos-protocol v0.0.0-20260808003356-b3ecb27bb1e2 h1:d8/Iaru+VvC78w5GS+Pp3p6QfaK2AZzaBaDPPOEKyQw=
-github.com/tosnetwork/tos-protocol v0.0.0-20260808003356-b3ecb27bb1e2/go.mod h1:9XcMRGbK87BU0HVazLv/cuZ5SvVAcKsyTMtAfcgaqYQ=
+github.com/tosnetwork/tos-protocol v0.0.0-20260809005605-1585abf88ec0 h1:OtnAyN0LEU4ZTs1nOKxmoP/muyNZpZk4tv1KbA34a0g=
+github.com/tosnetwork/tos-protocol v0.0.0-20260809005605-1585abf88ec0/go.mod h1:9XcMRGbK87BU0HVazLv/cuZ5SvVAcKsyTMtAfcgaqYQ=
 github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
 github.com/x448/float16 v0.8.4/go.mod h1:14CWIYCyZA/cWjXOioeEpHeN/83MdbZDRQHoFcYsOfg=
+github.com/xssnick/tonutils-go v1.16.0 h1:MLYVZiiMB0Q+XudLo7WyjOli4gMuenNmJpBqETqa5DE=
+github.com/xssnick/tonutils-go v1.16.0/go.mod h1:CNSM+L0FYufOFhprg8otc9Y/ecFfLrWqFMq00Gh9yk4=
 go.etcd.io/bbolt v1.4.3 h1:dEadXpI6G79deX5prL3QRNP6JB8UxVkqo4UPnHaNXJo=
 go.etcd.io/bbolt v1.4.3/go.mod h1:tKQlpPaYCVFctUIgFKFnAlvbmB3tpy1vkTnDWohtc0E=
 golang.org/x/sync v0.17.0 h1:l60nONMj9l5drqw6jlhIELNv9I0A4OFgRsG9k2oT9Ug=
