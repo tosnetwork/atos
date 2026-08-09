@@ -132,15 +132,24 @@ func main() {
 	streams := service.NewStreamService(st, execution)
 	receipts := service.NewReceiptService(st, core)
 
-	// No production payout rail is configured yet -- this deployment has no
-	// real bank/stablecoin transfer integration. payoutmock is an explicit,
-	// deterministic test/development adapter (see
-	// internal/adapters/payout/mock) that never moves real funds; it is
-	// wired here only so the earnings ledger and payout state machine are
-	// exercised end to end. Swap in a real payout.Adapter implementation
-	// before this deployment pays anyone for real.
-	var payoutAdapter payout.Adapter = payoutmock.New()
-	logger.Warn("no production payout adapter configured; using the mock payout adapter, which never moves real funds")
+	// No production payout rail exists yet. ATOS_PAYOUT_BACKEND defaults to
+	// "disabled": earnings still mature to Available and stop there --
+	// nothing ever attempts an external payout, so the ledger can never
+	// mark a real provider liability "paid" when no funds actually moved.
+	// "mock" is an explicit, deterministic test/development opt-in (see
+	// internal/adapters/payout/mock) that never moves real funds either,
+	// but DOES drive earnings through to Paid, purely to exercise the
+	// ledger and payout state machine end to end; config.Validate rejects
+	// it in production. Swap in a real payout.Adapter implementation and a
+	// new backend case here before any deployment pays anyone for real.
+	var payoutAdapter payout.Adapter
+	switch cfg.PayoutBackend {
+	case config.PayoutBackendMock:
+		payoutAdapter = payoutmock.New()
+		logger.Warn("ATOS_PAYOUT_BACKEND=mock: using the mock payout adapter, which never moves real funds (development/test only)")
+	default:
+		logger.Info("ATOS_PAYOUT_BACKEND=disabled: provider earnings will mature to available and stop there; no payout will be attempted")
+	}
 	earnings := service.NewEarningsService(st, payoutAdapter)
 	jobs.WithEarnings(earnings)
 

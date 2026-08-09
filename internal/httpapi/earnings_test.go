@@ -138,7 +138,7 @@ func TestGetJobBilling_RejectsNonPartyPrincipal(t *testing.T) {
 		CapabilityID: job.CapabilityID, CapabilityVersion: "1.0.0", TrustMode: domain.TrustModeManaged,
 		GrossCharge: domain.Money{Amount: "1.05", Currency: "USD"},
 	}
-	if err := st.PutBillingSnapshot(t.Context(), snap); err != nil {
+	if _, _, err := st.PutBillingSnapshot(t.Context(), snap); err != nil {
 		t.Fatal(err)
 	}
 

@@ -1,6 +1,9 @@
 package money
 
-import "testing"
+import (
+	"math/big"
+	"testing"
+)
 
 func TestParse(t *testing.T) {
 	tests := []struct {
@@ -181,5 +184,34 @@ func TestMin(t *testing.T) {
 func TestParseRejectsTooManyDecimals(t *testing.T) {
 	if _, err := Parse("1.999", "USD", 2); err == nil {
 		t.Error("expected error for excess decimal precision")
+	}
+}
+
+func TestRescaleWidening(t *testing.T) {
+	a, _ := Parse("1.05", "USD", 2)
+	widened := a.Rescale(9)
+	if widened.Decimals != 9 || widened.String() != "1.050000000" {
+		t.Fatalf("Rescale(9) = %+v, want 1.050000000 at 9 decimals", widened)
+	}
+	// Widening then narrowing back must be exact (no precision lost).
+	narrowed := widened.Rescale(2)
+	if narrowed.String() != a.String() {
+		t.Fatalf("round trip = %q, want %q", narrowed.String(), a.String())
+	}
+}
+
+func TestRescaleNarrowingTruncatesTowardZero(t *testing.T) {
+	// 1.999999999 narrowed to 2 decimals truncates to 1.99, not 2.00.
+	a := Amount{Minor: big.NewInt(1999999999), Currency: "USD", Decimals: 9}
+	got := a.Rescale(2)
+	if got.String() != "1.99" {
+		t.Fatalf("Rescale(2) = %q, want 1.99 (truncated, not rounded)", got.String())
+	}
+}
+
+func TestRescaleNoOpAtSamePrecision(t *testing.T) {
+	a, _ := Parse("1.05", "USD", 2)
+	if got := a.Rescale(2); got.String() != "1.05" {
+		t.Fatalf("Rescale(2) on a 2-decimal amount = %q, want 1.05", got.String())
 	}
 }

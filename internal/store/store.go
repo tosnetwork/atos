@@ -160,10 +160,16 @@ type Accounts interface {
 // identical snapshot for the same JobID is always a safe no-op -- exactly
 // what makes it safe to call from crash recovery.
 type Billing interface {
-	// PutBillingSnapshot idempotently persists snap. Implementations MUST
-	// key storage by JobID (one snapshot per Job) so a retried settlement
-	// path can safely call this more than once.
-	PutBillingSnapshot(ctx context.Context, snap domain.BillingSnapshot) error
+	// PutBillingSnapshot idempotently persists snap, keyed by JobID (one
+	// snapshot per Job). If a snapshot already exists for this JobID with
+	// identical economic content (every field except CalculatedAt),
+	// implementations MUST return that stored snapshot with created=false
+	// and a nil error -- a safe no-op recomputation. If a snapshot already
+	// exists with DIFFERENT economic content, implementations MUST return
+	// domain.ErrIdempotencyConflict rather than silently keeping the old
+	// value or silently accepting the new one: a Job's billing may never be
+	// recomputed to a different result once persisted.
+	PutBillingSnapshot(ctx context.Context, snap domain.BillingSnapshot) (stored domain.BillingSnapshot, created bool, err error)
 	BillingSnapshotByJob(ctx context.Context, jobID string) (domain.BillingSnapshot, error)
 }
 
@@ -172,11 +178,19 @@ type Billing interface {
 type Earnings interface {
 	// CreateEarning atomically creates a ProviderEarning uniquely bound to
 	// e.SettlementID. If an earning already exists for that settlement
-	// (enforced by a database uniqueness constraint, not a Get+Put race),
-	// the existing record is returned with created=false and a nil error --
-	// this is what makes earning creation from crash recovery or a
-	// duplicate reconciler sweep safe to retry without ever creating a
-	// second earning for the same settlement.
+	// (enforced by a database uniqueness constraint, not a Get+Put race)
+	// with IDENTICAL identity+economic fields (ProviderID, JobID, QuoteID,
+	// ReceiptID, SettlementID, CapabilityID, CapabilityVersion,
+	// GrossAmount, GatewayFee, NetAmount -- not lifecycle fields like
+	// Status/CreatedAt/MaturesAt, which legitimately differ between the
+	// original create and a later retry), the existing record is returned
+	// with created=false and a nil error -- this is what makes earning
+	// creation from crash recovery or a duplicate reconciler sweep safe to
+	// retry without ever creating a second earning for the same
+	// settlement. If an earning already exists for that settlement with
+	// DIFFERENT identity+economic fields, implementations MUST return
+	// domain.ErrIdempotencyConflict rather than silently returning the
+	// stale row.
 	CreateEarning(ctx context.Context, e domain.ProviderEarning) (out domain.ProviderEarning, created bool, err error)
 	GetEarning(ctx context.Context, id string) (domain.ProviderEarning, error)
 	EarningBySettlement(ctx context.Context, settlementID string) (domain.ProviderEarning, error)

@@ -2,6 +2,9 @@ package memory
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"sort"
 	"time"
 
@@ -9,11 +12,58 @@ import (
 	"github.com/tosnetwork/atos/internal/store"
 )
 
-func (s *Store) PutBillingSnapshot(ctx context.Context, snap domain.BillingSnapshot) error {
+// billingSnapshotContentHash summarizes the semantically meaningful
+// economic fields of a BillingSnapshot -- everything except CalculatedAt,
+// which legitimately differs between the original computation and a later
+// idempotent recomputation -- so a replayed PutBillingSnapshot for the same
+// JobID can be recognized as identical (safe no-op) versus a computation
+// that produced different economic content for the same Job (rejected).
+func billingSnapshotContentHash(snap domain.BillingSnapshot) string {
+	encoded, _ := json.Marshal(struct {
+		JobID, QuoteID, ReceiptID, ProviderID, CapabilityID, CapabilityVersion string
+		TrustMode                                                              domain.TrustMode
+		Usage                                                                  domain.Usage
+		UsageCommitment                                                        string
+		PricingModel                                                           domain.PricingModel
+		PricingTermsHash                                                       string
+		GrossCharge, ProviderGross, GatewayFee, PrincipalRefund                domain.Money
+	}{
+		snap.JobID, snap.QuoteID, snap.ReceiptID, snap.ProviderID, snap.CapabilityID, snap.CapabilityVersion,
+		snap.TrustMode, snap.Usage, snap.UsageCommitment, snap.PricingModel, snap.PricingTermsHash,
+		snap.GrossCharge, snap.ProviderGross, snap.GatewayFee, snap.PrincipalRefund,
+	})
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+// earningContentHash summarizes the identity+economic fields of a
+// ProviderEarning that must never differ for a given SettlementID --
+// deliberately excluding lifecycle fields (Status, CreatedAt, MaturesAt,
+// payout checkpoints, ...) which legitimately change over the earning's
+// life and differ between the original create and a later retry.
+func earningContentHash(e domain.ProviderEarning) string {
+	encoded, _ := json.Marshal(struct {
+		ProviderID, JobID, QuoteID, ReceiptID, SettlementID, CapabilityID, CapabilityVersion string
+		GrossAmount, GatewayFee, NetAmount                                                   domain.Money
+	}{
+		e.ProviderID, e.JobID, e.QuoteID, e.ReceiptID, e.SettlementID, e.CapabilityID, e.CapabilityVersion,
+		e.GrossAmount, e.GatewayFee, e.NetAmount,
+	})
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *Store) PutBillingSnapshot(ctx context.Context, snap domain.BillingSnapshot) (domain.BillingSnapshot, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if existing, ok := s.billingSnapshots[snap.JobID]; ok {
+		if billingSnapshotContentHash(existing) != billingSnapshotContentHash(snap) {
+			return domain.BillingSnapshot{}, false, domain.NewError(domain.ErrIdempotencyConflict, "billing snapshot already exists for this job with different economic content", false)
+		}
+		return existing, false, nil
+	}
 	s.billingSnapshots[snap.JobID] = snap
-	return nil
+	return snap, true, nil
 }
 
 func (s *Store) BillingSnapshotByJob(ctx context.Context, jobID string) (domain.BillingSnapshot, error) {
@@ -33,7 +83,11 @@ func (s *Store) CreateEarning(ctx context.Context, e domain.ProviderEarning) (do
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existingID, ok := s.earningsBySettlement[e.SettlementID]; ok {
-		return s.earnings[existingID], false, nil
+		existing := s.earnings[existingID]
+		if earningContentHash(existing) != earningContentHash(e) {
+			return domain.ProviderEarning{}, false, domain.NewError(domain.ErrIdempotencyConflict, "an earning already exists for this settlement with different identity/economic fields", false)
+		}
+		return existing, false, nil
 	}
 	s.earnings[e.ID] = e
 	s.earningsBySettlement[e.SettlementID] = e.ID

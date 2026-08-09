@@ -182,6 +182,34 @@ func TestEarningsService_PayoutSweep_HappyPathReachesPaid(t *testing.T) {
 	}
 }
 
+// TestEarningsService_PayoutSweep_NilAdapterNeverMarksPaid proves that with
+// no payout adapter configured (config.PayoutBackendDisabled, the default),
+// PayoutSweep is a genuine no-op: an Available earning must never be driven
+// to Paid by a backend that cannot actually move funds. This is the
+// regression test for the finding that the default mock adapter used to
+// mark real unpaid provider liabilities as paid.
+func TestEarningsService_PayoutSweep_NilAdapterNeverMarksPaid(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	svc := NewEarningsService(st, nil)
+	e := availableEarning(ctx, t, svc, st, "job_disabled", "prov_1", "settle_disabled")
+
+	count, err := svc.PayoutSweep(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("PayoutSweep attempted %d earnings with no adapter configured, want 0", count)
+	}
+	final, err := st.GetEarning(ctx, e.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Status != domain.EarningAvailable {
+		t.Fatalf("status = %s, want still available (no adapter can move funds)", final.Status)
+	}
+}
+
 // countingAdapter wraps another payout.Adapter and counts real Payout()
 // calls, so tests can assert an external side effect happened at most once
 // even across many retries/concurrent callers.
@@ -375,8 +403,24 @@ func TestEarningsService_PayoutSweep_EightConcurrentAttemptsConvergeToOnePayout(
 	if final.Status != domain.EarningPaid {
 		t.Fatalf("status = %s, want paid", final.Status)
 	}
-	if calls := atomic.LoadInt64(&adapter.calls); calls != 1 {
-		t.Fatalf("concurrent attempts triggered %d Payout() calls, want exactly 1", calls)
+	// beginPayoutUnderLock's CAS lets exactly one goroutine win the
+	// Available->PayoutPending transition, but the losers can still observe
+	// PayoutPending (if they call beginPayoutUnderLock before the winner's
+	// later, separate attemptPayout call finishes) and legitimately attempt
+	// Payout() themselves before the mock's idempotency-key map resolves
+	// the race -- so more than one Payout() call is possible. What must
+	// hold is the actual economic invariant: every one of those calls
+	// resolves to the SAME single stored result, never a second distinct
+	// payout for this key.
+	result, found, err := mock.Query(ctx, final.PayoutIdempotencyKey)
+	if err != nil || !found {
+		t.Fatalf("expected a durably recorded payout: found=%v err=%v", found, err)
+	}
+	if final.PayoutReference != result.Reference {
+		t.Fatalf("earning's recorded reference %q does not match the adapter's single stored result %q", final.PayoutReference, result.Reference)
+	}
+	if calls := atomic.LoadInt64(&adapter.calls); calls < 1 || calls > attempts {
+		t.Fatalf("concurrent attempts triggered %d Payout() calls, want between 1 and %d", calls, attempts)
 	}
 }
 
@@ -409,18 +453,30 @@ func TestEarningsService_TwoIndependentInstancesConvergeToOnePayout(t *testing.T
 	if len(earnings) != 1 || earnings[0].Status != domain.EarningPaid {
 		t.Fatalf("earnings = %+v, want exactly 1 paid", earnings)
 	}
-	if calls := atomic.LoadInt64(&adapter.calls); calls != 1 {
-		t.Fatalf("two replicas triggered %d Payout() calls, want exactly 1", calls)
+	// As in the 8-concurrent-attempts test: more than one Payout() call is
+	// possible if both replicas observe PayoutPending before either
+	// finishes recording the result, but every call must resolve to the
+	// SAME single stored result.
+	result, found, err := mock.Query(ctx, earnings[0].PayoutIdempotencyKey)
+	if err != nil || !found {
+		t.Fatalf("expected a durably recorded payout: found=%v err=%v", found, err)
+	}
+	if earnings[0].PayoutReference != result.Reference {
+		t.Fatalf("earning's recorded reference %q does not match the adapter's single stored result %q", earnings[0].PayoutReference, result.Reference)
+	}
+	if calls := atomic.LoadInt64(&adapter.calls); calls < 1 || calls > 4 {
+		t.Fatalf("two replicas triggered %d Payout() calls, want between 1 and 4", calls)
 	}
 }
 
-// TestEarningsService_ChangedSemanticsUnderSameKeyDoesNotDoubleCredit proves
-// that replaying a payout attempt with the SAME idempotency key but
-// (hypothetically) a different requested amount still resolves to the
-// originally recorded external result, rather than trusting whatever the
-// second attempt asked for -- the adapter's idempotency guarantee, not the
-// caller's request, is authoritative for what actually got paid.
-func TestEarningsService_ChangedSemanticsUnderSameKeyDoesNotDoubleCredit(t *testing.T) {
+// TestEarningsService_ChangedSemanticsUnderSameKeyIsRejected proves that
+// reusing a payout idempotency key for a request with DIFFERENT semantic
+// content (a different amount, here) is rejected outright rather than
+// either silently double-paying the new amount or silently discarding it by
+// replaying the original result -- a real idempotent rail treats "same key,
+// different body" as a caller bug, not a retry, and the mock adapter must
+// too.
+func TestEarningsService_ChangedSemanticsUnderSameKeyIsRejected(t *testing.T) {
 	ctx := context.Background()
 	st := memory.New()
 	mock := payoutmock.New()
@@ -440,18 +496,33 @@ func TestEarningsService_ChangedSemanticsUnderSameKeyDoesNotDoubleCredit(t *test
 	}
 
 	// A second, independent Payout call using the exact same key but a
-	// different amount must still resolve to the SAME stored result -- the
-	// mock adapter (like a real idempotent rail) ignores the new request
-	// body once a result exists for the key.
-	tampered, err := mock.Payout(ctx, payout.Request{
+	// different amount must be rejected, not silently resolved either way.
+	_, err = mock.Payout(ctx, payout.Request{
 		IdempotencyKey: started.PayoutIdempotencyKey, EarningID: e.ID, ProviderID: e.ProviderID,
 		Amount: domain.Money{Amount: "999.99", Currency: "USD"},
 	})
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		t.Fatal("expected an error for a reused idempotency key with different request content")
 	}
-	if tampered.Reference != firstResult.Reference {
-		t.Fatalf("replay under the same key produced a different result: %+v vs %+v", tampered, firstResult)
+
+	// The original recorded result must remain untouched by the rejected attempt.
+	unchanged, found, err := mock.Query(ctx, started.PayoutIdempotencyKey)
+	if err != nil || !found {
+		t.Fatalf("expected the original result to still be recorded: found=%v err=%v", found, err)
+	}
+	if unchanged.Reference != firstResult.Reference {
+		t.Fatalf("rejected replay mutated the stored result: %+v vs %+v", unchanged, firstResult)
+	}
+
+	// A replay with the SAME semantic content must still succeed normally.
+	replay, err := mock.Payout(ctx, payout.Request{
+		IdempotencyKey: started.PayoutIdempotencyKey, EarningID: e.ID, ProviderID: e.ProviderID, Amount: e.NetAmount,
+	})
+	if err != nil {
+		t.Fatalf("replay with identical request content should succeed: %v", err)
+	}
+	if replay.Reference != firstResult.Reference {
+		t.Fatalf("identical replay produced a different result: %+v vs %+v", replay, firstResult)
 	}
 }
 

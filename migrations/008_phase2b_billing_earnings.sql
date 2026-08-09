@@ -22,6 +22,14 @@ CREATE TABLE IF NOT EXISTS billing_snapshots (
     gateway_fee         JSONB NOT NULL,
     principal_refund    JSONB NOT NULL,
     calculated_at       TIMESTAMPTZ NOT NULL,
+    -- content_hash summarizes the semantically meaningful economic fields
+    -- (everything above except calculated_at) so a replayed
+    -- PutBillingSnapshot for the same job_id can be recognized as an
+    -- identical recomputation (idempotent no-op) versus a computation that
+    -- produced different economic content for the same Job, which is
+    -- rejected rather than silently ignored. Mirrors
+    -- job_stream_events.content_hash's role for stream events.
+    content_hash        TEXT NOT NULL,
     payload             JSONB NOT NULL
 );
 
@@ -67,6 +75,13 @@ CREATE TABLE IF NOT EXISTS provider_earnings (
     payout_attempts         INT NOT NULL DEFAULT 0,
     payout_last_attempt_at  TIMESTAMPTZ,
     payout_failure_reason   TEXT NOT NULL DEFAULT '',
+    -- content_hash summarizes the identity+economic fields that must never
+    -- differ for a given settlement_id (provider/job/quote/receipt id and
+    -- the gross/fee/net split) -- not lifecycle fields like status or
+    -- timestamps, which legitimately change over the earning's life. A
+    -- CreateEarning conflict on settlement_id with a DIFFERENT content_hash
+    -- is rejected rather than silently returning the stale row.
+    content_hash            TEXT NOT NULL,
     payload                 JSONB NOT NULL,
     UNIQUE (settlement_id)
 );

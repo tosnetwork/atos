@@ -26,6 +26,21 @@ const (
 	TOSBackendRPC  TOSBackend = "rpc"
 )
 
+// PayoutBackend selects the external side effect provider earnings actually
+// pay out through. PayoutBackendDisabled is the default and the only safe
+// choice absent a real payout rail: earnings still mature to Available, but
+// nothing ever attempts an external payout, so the ledger can never mark a
+// provider "paid" when no funds actually moved. PayoutBackendMock is an
+// explicit opt-in for development/test only -- it never moves real funds
+// either, but it does drive earnings through to Paid, so it must never be
+// the default in a real deployment.
+type PayoutBackend string
+
+const (
+	PayoutBackendDisabled PayoutBackend = "disabled"
+	PayoutBackendMock     PayoutBackend = "mock"
+)
+
 type TOSRPCConfig struct {
 	URL             string
 	Token           string
@@ -64,6 +79,7 @@ type Config struct {
 	ManagedAccount ManagedAccountConfig
 	TOSBackend     TOSBackend
 	TOSRPC         TOSRPCConfig
+	PayoutBackend  PayoutBackend
 }
 
 func Load() (Config, error) {
@@ -127,6 +143,7 @@ func Load() (Config, error) {
 			ClientCertFile: strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_CLIENT_CERT_FILE")),
 			ClientKeyFile:  strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_CLIENT_KEY_FILE")),
 		},
+		PayoutBackend: PayoutBackend(strings.ToLower(envOr("ATOS_PAYOUT_BACKEND", string(PayoutBackendDisabled)))),
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -181,6 +198,12 @@ func (c Config) Validate() error {
 		return fmt.Errorf("invalid ATOS_TOS_BACKEND %q (expected mock or rpc)", c.TOSBackend)
 	}
 
+	switch c.PayoutBackend {
+	case PayoutBackendDisabled, PayoutBackendMock:
+	default:
+		return fmt.Errorf("invalid ATOS_PAYOUT_BACKEND %q (expected disabled or mock)", c.PayoutBackend)
+	}
+
 	if c.Environment == EnvironmentProduction {
 		if c.DatabaseURL == "" {
 			return errors.New("ATOS_DATABASE_URL is required in production")
@@ -196,6 +219,9 @@ func (c Config) Validate() error {
 		}
 		if c.TOSBackend != TOSBackendRPC {
 			return errors.New("ATOS_TOS_BACKEND=rpc is required in production")
+		}
+		if c.PayoutBackend == PayoutBackendMock {
+			return errors.New("ATOS_PAYOUT_BACKEND=mock never moves real funds and must not be used in production")
 		}
 	}
 	return nil

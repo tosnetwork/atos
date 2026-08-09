@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -44,12 +45,23 @@ func TestBillingSnapshotRoundTripIsIdempotent(t *testing.T) {
 		PrincipalRefund:  domain.Money{Amount: "0.53", Currency: "USD"},
 		CalculatedAt:     time.Now().UTC().Truncate(time.Microsecond),
 	}
-	if err := s.PutBillingSnapshot(ctx, snap); err != nil {
+	first, created, err := s.PutBillingSnapshot(ctx, snap)
+	if err != nil {
 		t.Fatalf("PutBillingSnapshot: %v", err)
 	}
+	if !created {
+		t.Fatal("first PutBillingSnapshot should report created=true")
+	}
 	// Calling it again with identical content must be a safe no-op.
-	if err := s.PutBillingSnapshot(ctx, snap); err != nil {
+	second, created, err := s.PutBillingSnapshot(ctx, snap)
+	if err != nil {
 		t.Fatalf("PutBillingSnapshot (retry): %v", err)
+	}
+	if created {
+		t.Fatal("retried PutBillingSnapshot with identical content should report created=false")
+	}
+	if second.GrossCharge != first.GrossCharge {
+		t.Fatalf("retry returned different content: %+v vs %+v", second, first)
 	}
 	got, err := s.BillingSnapshotByJob(ctx, jobID)
 	if err != nil {
@@ -72,6 +84,77 @@ func TestBillingSnapshotByJobNotFound(t *testing.T) {
 	s := openTestStore(t)
 	if _, err := s.BillingSnapshotByJob(ctx, "job_pg_missing_"+randSuffix()); err != store.ErrNotFound {
 		t.Fatalf("got %v, want store.ErrNotFound", err)
+	}
+}
+
+// TestPutBillingSnapshotConflictingRecomputeIsRejected proves that if a
+// billing snapshot already exists for a JobID and a second call presents
+// DIFFERENT economic content for the same job (e.g. a crash-recovery replay
+// that recomputed a different charge), the store rejects it with
+// ErrIdempotencyConflict instead of silently keeping the stale value.
+func TestPutBillingSnapshotConflictingRecomputeIsRejected(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	jobID := "job_pg_conflict_" + randSuffix()
+
+	original := domain.BillingSnapshot{
+		JobID: jobID, QuoteID: "q_1", ReceiptID: "rcpt_1", ProviderID: "prov_1",
+		CapabilityID: "cap_1", CapabilityVersion: "1.0.0", TrustMode: domain.TrustModeManaged,
+		GrossCharge: domain.Money{Amount: "0.52", Currency: "USD"}, ProviderGross: domain.Money{Amount: "0.50", Currency: "USD"},
+		GatewayFee: domain.Money{Amount: "0.02", Currency: "USD"}, PrincipalRefund: domain.Money{Amount: "0.53", Currency: "USD"},
+		CalculatedAt: time.Now().UTC().Truncate(time.Microsecond),
+	}
+	if _, _, err := s.PutBillingSnapshot(ctx, original); err != nil {
+		t.Fatalf("PutBillingSnapshot (original): %v", err)
+	}
+
+	conflicting := original
+	conflicting.GrossCharge = domain.Money{Amount: "0.73", Currency: "USD"}
+	conflicting.CalculatedAt = time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
+	_, _, err := s.PutBillingSnapshot(ctx, conflicting)
+	var domainErr *domain.Error
+	if !errors.As(err, &domainErr) || domainErr.Code != domain.ErrIdempotencyConflict {
+		t.Fatalf("got %v, want domain.ErrIdempotencyConflict", err)
+	}
+
+	// The original snapshot must remain untouched by the rejected conflict.
+	got, err := s.BillingSnapshotByJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GrossCharge.Amount != "0.52" {
+		t.Fatalf("stored snapshot was mutated by a rejected conflict: gross_charge = %s, want 0.52", got.GrossCharge.Amount)
+	}
+}
+
+// TestCreateEarningConflictingContentIsRejected proves that if an earning
+// already exists for a settlement_id and a second call presents DIFFERENT
+// identity/economic fields for the same settlement, the store rejects it
+// with ErrIdempotencyConflict instead of silently returning the stale row.
+func TestCreateEarningConflictingContentIsRejected(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	settlementID := "settle_conflict_" + suffix
+	original := testEarning("prov_"+suffix, "job_"+suffix, settlementID)
+	if _, _, err := s.CreateEarning(ctx, original); err != nil {
+		t.Fatalf("CreateEarning (original): %v", err)
+	}
+
+	conflicting := original
+	conflicting.NetAmount = domain.Money{Amount: "999.99", Currency: "USD"}
+	_, _, err := s.CreateEarning(ctx, conflicting)
+	var domainErr *domain.Error
+	if !errors.As(err, &domainErr) || domainErr.Code != domain.ErrIdempotencyConflict {
+		t.Fatalf("got %v, want domain.ErrIdempotencyConflict", err)
+	}
+
+	got, err := s.EarningBySettlement(ctx, settlementID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NetAmount.Amount != "1.00" {
+		t.Fatalf("stored earning was mutated by a rejected conflict: net_amount = %s, want 1.00", got.NetAmount.Amount)
 	}
 }
 

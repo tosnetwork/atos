@@ -85,11 +85,20 @@ func computeBillingSnapshot(quote domain.Quote, receipt domain.ExecutionReceipt)
 	}, nil
 }
 
+// meteredRateDecimals is the internal precision unit rates are parsed and
+// summed at -- deliberately much finer than quoteDecimals, since realistic
+// per-token/per-byte/per-millisecond prices are routinely sub-cent (e.g.
+// $0.000001/token). Rounding to the settlement currency's actual precision
+// (quoteDecimals) happens exactly once, at the very end of meterUsage, via
+// Rescale -- never per-dimension, which would compound truncation error
+// across dimensions before the final clamp against the frozen subtotal.
+const meteredRateDecimals = 9
+
 // meterUsage sums each configured per-dimension rate times its
 // corresponding verified usage count. A dimension with no configured rate
 // (empty string) does not contribute.
 func meterUsage(rates domain.MeteredRates, usage domain.Usage, currency string) (money.Amount, error) {
-	total := money.Zero(currency, quoteDecimals)
+	total := money.Zero(currency, meteredRateDecimals)
 	dimensions := []struct {
 		rate  string
 		count uint64
@@ -104,7 +113,7 @@ func meterUsage(rates domain.MeteredRates, usage domain.Usage, currency string) 
 		if d.rate == "" {
 			continue
 		}
-		rate, err := money.Parse(d.rate, currency, quoteDecimals)
+		rate, err := money.Parse(d.rate, currency, meteredRateDecimals)
 		if err != nil {
 			return money.Amount{}, domain.NewError(domain.ErrSettlementFailed, "quote has an invalid metered rate: "+err.Error(), false)
 		}
@@ -114,5 +123,5 @@ func meterUsage(rates domain.MeteredRates, usage domain.Usage, currency string) 
 		}
 		total = sum
 	}
-	return total, nil
+	return total.Rescale(quoteDecimals), nil
 }

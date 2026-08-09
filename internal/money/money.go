@@ -178,3 +178,22 @@ func (a Amount) Min(b Amount) Amount {
 	}
 	return b
 }
+
+// Rescale converts a to a different decimal precision, exact when widening
+// (newDecimals > a.Decimals) and truncating toward zero when narrowing --
+// consistent with every other truncation in this package (Div, MulDiv).
+// Used to price metered unit rates at a higher internal precision than a
+// quote's settlement currency (so realistic sub-cent per-token/per-byte
+// rates parse correctly) and then round down exactly once, at the end, to
+// the currency's actual precision.
+func (a Amount) Rescale(newDecimals int) Amount {
+	if newDecimals == a.Decimals {
+		return a
+	}
+	if newDecimals > a.Decimals {
+		factor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(newDecimals-a.Decimals)), nil)
+		return Amount{Minor: new(big.Int).Mul(a.Minor, factor), Currency: a.Currency, Decimals: newDecimals}
+	}
+	factor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(a.Decimals-newDecimals)), nil)
+	return Amount{Minor: new(big.Int).Div(a.Minor, factor), Currency: a.Currency, Decimals: newDecimals}
+}

@@ -39,7 +39,11 @@ type Quote struct {
 	// Capability's current live pricing -- see domain.MeteredRates.
 	MeteredRates *MeteredRates `json:"metered_rates,omitempty"`
 	// PricingModel is likewise frozen from the Capability's pricing at
-	// Quote-creation time, recorded here purely for billing audit trail.
+	// Quote-creation time. Along with MeteredRates and Price, it is part of
+	// the frozen pricing contract committed into TermsHash (see
+	// internal/service/quote.go's Create) -- not merely recorded for audit
+	// trail -- so two Quotes cannot share a TermsHash while differing in
+	// how a Job would actually be charged.
 	PricingModel PricingModel `json:"pricing_model,omitempty"`
 }
 

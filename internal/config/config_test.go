@@ -17,6 +17,37 @@ func TestLoadDefaultsToDevelopmentMockBackend(t *testing.T) {
 	if !cfg.Auth.AutoApprove {
 		t.Fatal("development default should explicitly auto-approve for zero-setup local use")
 	}
+	// The default payout backend must be "disabled", never "mock" -- an
+	// operator who never set ATOS_PAYOUT_BACKEND must not silently get a
+	// backend that marks unpaid earnings as paid.
+	if cfg.PayoutBackend != PayoutBackendDisabled {
+		t.Fatalf("default PayoutBackend = %q, want %q", cfg.PayoutBackend, PayoutBackendDisabled)
+	}
+}
+
+func TestLoadRejectsUnknownPayoutBackend(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ATOS_PAYOUT_BACKEND", "stripe")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "ATOS_PAYOUT_BACKEND") {
+		t.Fatalf("Load() error = %v, want invalid payout backend error", err)
+	}
+}
+
+func TestProductionRejectsMockPayoutBackend(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ATOS_ENV", "production")
+	t.Setenv("ATOS_DATABASE_URL", "postgres://atos@example/atos")
+	t.Setenv("ATOS_PUBLIC_BASE_URL", "https://api.atos.example")
+	t.Setenv("ATOS_AUTH_AUTO_APPROVE", "false")
+	t.Setenv("ATOS_APPROVAL_TOKEN", strings.Repeat("a", 32))
+	t.Setenv("ATOS_AUTH_STATE_PATH", "/var/lib/atos/auth.db")
+	t.Setenv("ATOS_TOS_BACKEND", "rpc")
+	t.Setenv("ATOS_TOS_RPC_URL", "https://tos-protocol.internal")
+	t.Setenv("ATOS_TOS_RPC_TOKEN", "integration-token")
+	t.Setenv("ATOS_PAYOUT_BACKEND", "mock")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "never moves real funds") {
+		t.Fatalf("Load() error = %v, want mock-payout-in-production rejection", err)
+	}
 }
 
 func TestManualDeviceAuthorizationRequiresApprovalToken(t *testing.T) {

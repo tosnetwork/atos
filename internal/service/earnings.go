@@ -58,30 +58,41 @@ func (s *EarningsService) WithMaturationPeriod(d time.Duration) *EarningsService
 // keyed by JobID, and CreateEarning is a database-uniqueness-enforced
 // exactly-once create keyed by settlementID -- which is what makes it safe
 // to call RecordSettlement again from crash recovery.
+//
+// If a billing snapshot or earning already exists for this Job/settlement
+// with DIFFERENT economic content than what's being recorded now (e.g. a
+// crash-recovery replay that recomputed a different amount), the store
+// layer returns domain.ErrIdempotencyConflict rather than silently keeping
+// the old value or accepting the new one -- that conflict is returned to
+// the caller unchanged rather than papered over here. When no conflict
+// occurs, the earning is built from the store's canonical stored snapshot
+// (not the possibly-different snap argument), so the earning's amounts can
+// never drift from the durable billing record.
 func (s *EarningsService) RecordSettlement(ctx context.Context, snap domain.BillingSnapshot, settlementID string) (domain.ProviderEarning, error) {
 	if settlementID == "" {
 		return domain.ProviderEarning{}, domain.NewError(domain.ErrSettlementFailed, "settlement id is required to record an earning", false)
 	}
-	if err := s.store.PutBillingSnapshot(ctx, snap); err != nil {
+	stored, _, err := s.store.PutBillingSnapshot(ctx, snap)
+	if err != nil {
 		return domain.ProviderEarning{}, err
 	}
 	now := time.Now().UTC()
 	earning := domain.ProviderEarning{
 		ID:                "earn_" + settlementID,
-		ProviderID:        snap.ProviderID,
-		JobID:             snap.JobID,
-		QuoteID:           snap.QuoteID,
-		ReceiptID:         snap.ReceiptID,
+		ProviderID:        stored.ProviderID,
+		JobID:             stored.JobID,
+		QuoteID:           stored.QuoteID,
+		ReceiptID:         stored.ReceiptID,
 		SettlementID:      settlementID,
-		CapabilityID:      snap.CapabilityID,
-		CapabilityVersion: snap.CapabilityVersion,
+		CapabilityID:      stored.CapabilityID,
+		CapabilityVersion: stored.CapabilityVersion,
 		// GrossAmount is the full amount charged to the principal for this
 		// job; GatewayFee is ATOS's cut of it; NetAmount (= GrossAmount -
-		// GatewayFee = snap.ProviderGross) is what the provider is actually
-		// owed and what gets paid out.
-		GrossAmount: snap.GrossCharge,
-		GatewayFee:  snap.GatewayFee,
-		NetAmount:   snap.ProviderGross,
+		// GatewayFee = stored.ProviderGross) is what the provider is
+		// actually owed and what gets paid out.
+		GrossAmount: stored.GrossCharge,
+		GatewayFee:  stored.GatewayFee,
+		NetAmount:   stored.ProviderGross,
 		Status:      domain.EarningMaturing,
 		CreatedAt:   now,
 		MaturesAt:   now.Add(s.maturationPeriod),
@@ -293,7 +304,16 @@ func (s *EarningsService) recordPayoutAttempt(ctx context.Context, e domain.Prov
 // observing the external result, or an ambiguous/pending adapter response
 // on a prior sweep). Both paths funnel through attemptPayout so the primary
 // path and crash recovery share identical logic and can never diverge.
+//
+// With no payoutAdapter configured (the default -- see
+// config.PayoutBackendDisabled), this is a deliberate no-op: earnings
+// mature to Available and stop there rather than being driven to Paid by
+// an adapter that cannot actually move funds. This is what prevents a real
+// provider liability from ever being marked paid when nothing was paid.
 func (s *EarningsService) PayoutSweep(ctx context.Context, limit int) (int, error) {
+	if s.payoutAdapter == nil {
+		return 0, nil
+	}
 	var joined error
 	count := 0
 	available, err := s.store.EarningsAvailableForPayout(ctx, limit)

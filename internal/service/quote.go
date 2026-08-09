@@ -200,7 +200,17 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 	q.TermsHash = termsHash(
 		q.CapabilityID, q.CapabilityVersion, q.ProviderID, q.PrincipalID,
 		string(q.TrustMode), string(q.ProofProfile),
-		q.Price.TotalMax, q.Price.Currency,
+		// The full frozen pricing contract must be committed here, not just
+		// TotalMax: two Quotes can share the same TotalMax while splitting
+		// it differently between Subtotal/Fees, or while metering usage at
+		// entirely different per-dimension rates, and both differences
+		// change what a Job ultimately gets charged and what the provider
+		// ultimately earns (internal/service/billing.go). PricingModel and
+		// MeteredRates are therefore part of this commitment, not just
+		// recorded for audit trail (see domain.Quote.PricingModel /
+		// MeteredRates doc comments).
+		string(q.PricingModel), q.Price.Subtotal, q.Price.Fees, q.Price.TotalMax, q.Price.Currency,
+		hashCommitment(q.MeteredRates),
 		string(q.Settlement.Backend), string(q.Settlement.FundingModel),
 		q.ExpiresAt.Format(time.RFC3339Nano), q.ExecutionDeadline.Format(time.RFC3339Nano),
 		q.DisputePolicyHash, q.ServiceQuoteID, q.UnderlyingServiceQuoteRef,

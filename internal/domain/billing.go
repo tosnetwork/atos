@@ -4,8 +4,13 @@ import "time"
 
 // MeteredRates defines optional per-dimension unit prices for a Capability
 // priced with PricingMetered or PricingPerUnit. Amounts are decimal strings
-// in the capability's pricing currency; a zero/absent rate means that
-// dimension does not contribute to metered billing. Capabilities without
+// in the capability's pricing currency, parsed at a much finer internal
+// precision than the currency's own settlement precision (see
+// internal/service/billing.go's meteredRateDecimals) so realistic sub-cent
+// per-token/per-byte rates (e.g. "0.000001") are accepted; only the final
+// summed charge is truncated to the currency's actual precision. A
+// zero/absent rate means that dimension does not contribute to metered
+// billing. Capabilities without
 // MeteredRates (PricingFixed/PricingFree/PricingPerUse/PricingNegotiated,
 // or a metered capability that simply has none configured) are billed the
 // full frozen Quote subtotal, exactly matching Phase 0/1 behavior.

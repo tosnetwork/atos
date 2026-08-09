@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"time"
@@ -16,19 +18,61 @@ import (
 
 const billingSnapshotColumns = `job_id, quote_id, receipt_id, provider_id, capability_id, capability_version, trust_mode, usage, usage_commitment, pricing_model, pricing_terms_hash, gross_charge, provider_gross, gateway_fee, principal_refund, calculated_at, payload`
 
-func (s *Store) PutBillingSnapshot(ctx context.Context, snap domain.BillingSnapshot) error {
-	_, err := s.pool.Exec(ctx, `
+// billingSnapshotContentHash summarizes the semantically meaningful
+// economic fields of a BillingSnapshot -- everything except CalculatedAt,
+// which legitimately differs between the original computation and a later
+// idempotent recomputation -- so a replayed PutBillingSnapshot for the same
+// JobID can be recognized as identical (safe no-op) versus a computation
+// that produced different economic content for the same Job (rejected).
+func billingSnapshotContentHash(snap domain.BillingSnapshot) string {
+	encoded, _ := json.Marshal(struct {
+		JobID, QuoteID, ReceiptID, ProviderID, CapabilityID, CapabilityVersion string
+		TrustMode                                                              domain.TrustMode
+		Usage                                                                  domain.Usage
+		UsageCommitment                                                        string
+		PricingModel                                                           domain.PricingModel
+		PricingTermsHash                                                       string
+		GrossCharge, ProviderGross, GatewayFee, PrincipalRefund                domain.Money
+	}{
+		snap.JobID, snap.QuoteID, snap.ReceiptID, snap.ProviderID, snap.CapabilityID, snap.CapabilityVersion,
+		snap.TrustMode, snap.Usage, snap.UsageCommitment, snap.PricingModel, snap.PricingTermsHash,
+		snap.GrossCharge, snap.ProviderGross, snap.GatewayFee, snap.PrincipalRefund,
+	})
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *Store) PutBillingSnapshot(ctx context.Context, snap domain.BillingSnapshot) (domain.BillingSnapshot, bool, error) {
+	contentHash := billingSnapshotContentHash(snap)
+	tag, err := s.pool.Exec(ctx, `
 		INSERT INTO billing_snapshots (
 			job_id, quote_id, receipt_id, provider_id, capability_id, capability_version,
 			trust_mode, usage, usage_commitment, pricing_model, pricing_terms_hash,
-			gross_charge, provider_gross, gateway_fee, principal_refund, calculated_at, payload
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+			gross_charge, provider_gross, gateway_fee, principal_refund, calculated_at, content_hash, payload
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
 		ON CONFLICT (job_id) DO NOTHING
 	`, snap.JobID, snap.QuoteID, snap.ReceiptID, snap.ProviderID, snap.CapabilityID, snap.CapabilityVersion,
 		string(snap.TrustMode), mustMarshal(snap.Usage), snap.UsageCommitment, string(snap.PricingModel), snap.PricingTermsHash,
 		mustMarshal(snap.GrossCharge), mustMarshal(snap.ProviderGross), mustMarshal(snap.GatewayFee), mustMarshal(snap.PrincipalRefund),
-		snap.CalculatedAt, mustMarshal(snap))
-	return err
+		snap.CalculatedAt, contentHash, mustMarshal(snap))
+	if err != nil {
+		return domain.BillingSnapshot{}, false, err
+	}
+	if tag.RowsAffected() > 0 {
+		return snap, true, nil
+	}
+	var storedHash string
+	if err := s.pool.QueryRow(ctx, `SELECT content_hash FROM billing_snapshots WHERE job_id=$1`, snap.JobID).Scan(&storedHash); err != nil {
+		return domain.BillingSnapshot{}, false, err
+	}
+	if storedHash != contentHash {
+		return domain.BillingSnapshot{}, false, domain.NewError(domain.ErrIdempotencyConflict, "billing snapshot already exists for this job with different economic content", false)
+	}
+	existing, err := s.BillingSnapshotByJob(ctx, snap.JobID)
+	if err != nil {
+		return domain.BillingSnapshot{}, false, err
+	}
+	return existing, false, nil
 }
 
 func scanBillingSnapshot(row pgx.Row) (domain.BillingSnapshot, error) {
@@ -65,7 +109,24 @@ func (s *Store) BillingSnapshotByJob(ctx context.Context, jobID string) (domain.
 
 // --- Earnings ---
 
-const earningColumns = `id, provider_id, job_id, quote_id, receipt_id, settlement_id, capability_id, capability_version, gross_amount, gateway_fee, net_amount, status, created_at, matures_at, available_at, payout_requested_at, payout_reference, paid_at, payout_idempotency_key, payout_attempts, payout_last_attempt_at, payout_failure_reason, payload`
+const earningColumns = `id, provider_id, job_id, quote_id, receipt_id, settlement_id, capability_id, capability_version, gross_amount, gateway_fee, net_amount, status, created_at, matures_at, available_at, payout_requested_at, payout_reference, paid_at, payout_idempotency_key, payout_attempts, payout_last_attempt_at, payout_failure_reason, content_hash, payload`
+
+// earningContentHash summarizes the identity+economic fields of a
+// ProviderEarning that must never differ for a given SettlementID --
+// deliberately excluding lifecycle fields (Status, CreatedAt, MaturesAt,
+// payout checkpoints, ...) which legitimately change over the earning's
+// life and differ between the original create and a later retry.
+func earningContentHash(e domain.ProviderEarning) string {
+	encoded, _ := json.Marshal(struct {
+		ProviderID, JobID, QuoteID, ReceiptID, SettlementID, CapabilityID, CapabilityVersion string
+		GrossAmount, GatewayFee, NetAmount                                                   domain.Money
+	}{
+		e.ProviderID, e.JobID, e.QuoteID, e.ReceiptID, e.SettlementID, e.CapabilityID, e.CapabilityVersion,
+		e.GrossAmount, e.GatewayFee, e.NetAmount,
+	})
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
 
 func earningWriteArgs(e domain.ProviderEarning) []any {
 	return []any{
@@ -73,7 +134,7 @@ func earningWriteArgs(e domain.ProviderEarning) []any {
 		mustMarshal(e.GrossAmount), mustMarshal(e.GatewayFee), mustMarshal(e.NetAmount), string(e.Status),
 		e.CreatedAt, e.MaturesAt, e.AvailableAt, e.PayoutRequestedAt, e.PayoutReference, e.PaidAt,
 		e.PayoutIdempotencyKey, e.PayoutAttempts, nullableTime(e.PayoutLastAttemptAt), e.PayoutFailureReason,
-		mustMarshal(e),
+		earningContentHash(e), mustMarshal(e),
 	}
 }
 
@@ -89,24 +150,24 @@ const upsertEarningSQL = `
 		id, provider_id, job_id, quote_id, receipt_id, settlement_id, capability_id, capability_version,
 		gross_amount, gateway_fee, net_amount, status, created_at, matures_at, available_at,
 		payout_requested_at, payout_reference, paid_at, payout_idempotency_key, payout_attempts,
-		payout_last_attempt_at, payout_failure_reason, payload
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+		payout_last_attempt_at, payout_failure_reason, content_hash, payload
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
 	ON CONFLICT (id) DO UPDATE SET
 		status=$12, available_at=$15, payout_requested_at=$16, payout_reference=$17, paid_at=$18,
 		payout_idempotency_key=$19, payout_attempts=$20, payout_last_attempt_at=$21,
-		payout_failure_reason=$22, payload=$23
+		payout_failure_reason=$22, payload=$24
 `
 
 func scanEarning(row pgx.Row) (domain.ProviderEarning, error) {
 	var e domain.ProviderEarning
 	var grossAmount, gatewayFee, netAmount, payload []byte
-	var status string
+	var status, contentHash string
 	var payoutLastAttemptAt *time.Time
 	if err := row.Scan(
 		&e.ID, &e.ProviderID, &e.JobID, &e.QuoteID, &e.ReceiptID, &e.SettlementID, &e.CapabilityID, &e.CapabilityVersion,
 		&grossAmount, &gatewayFee, &netAmount, &status, &e.CreatedAt, &e.MaturesAt, &e.AvailableAt,
 		&e.PayoutRequestedAt, &e.PayoutReference, &e.PaidAt, &e.PayoutIdempotencyKey, &e.PayoutAttempts,
-		&payoutLastAttemptAt, &e.PayoutFailureReason, &payload,
+		&payoutLastAttemptAt, &e.PayoutFailureReason, &contentHash, &payload,
 	); err != nil {
 		return domain.ProviderEarning{}, err
 	}
@@ -136,8 +197,8 @@ func (s *Store) CreateEarning(ctx context.Context, e domain.ProviderEarning) (do
 			id, provider_id, job_id, quote_id, receipt_id, settlement_id, capability_id, capability_version,
 			gross_amount, gateway_fee, net_amount, status, created_at, matures_at, available_at,
 			payout_requested_at, payout_reference, paid_at, payout_idempotency_key, payout_attempts,
-			payout_last_attempt_at, payout_failure_reason, payload
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+			payout_last_attempt_at, payout_failure_reason, content_hash, payload
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
 		ON CONFLICT (settlement_id) DO NOTHING
 	`, earningWriteArgs(e)...)
 	if err != nil {
@@ -145,6 +206,13 @@ func (s *Store) CreateEarning(ctx context.Context, e domain.ProviderEarning) (do
 	}
 	if tag.RowsAffected() > 0 {
 		return e, true, nil
+	}
+	var storedHash string
+	if err := s.pool.QueryRow(ctx, `SELECT content_hash FROM provider_earnings WHERE settlement_id=$1`, e.SettlementID).Scan(&storedHash); err != nil {
+		return domain.ProviderEarning{}, false, err
+	}
+	if storedHash != earningContentHash(e) {
+		return domain.ProviderEarning{}, false, domain.NewError(domain.ErrIdempotencyConflict, "an earning already exists for this settlement with different identity/economic fields", false)
 	}
 	existing, err := s.EarningBySettlement(ctx, e.SettlementID)
 	if err != nil {

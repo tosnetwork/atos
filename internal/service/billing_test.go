@@ -138,12 +138,62 @@ func TestComputeBillingSnapshot_NeverReadsLivePricing(t *testing.T) {
 // silently truncated or accepted, since that could misprice a job.
 func TestComputeBillingSnapshot_InvalidRateRejected(t *testing.T) {
 	price := domain.Price{Subtotal: "1.00", Fees: "0.05", TotalMax: "1.05", Currency: "USD"}
-	rates := &domain.MeteredRates{PerOutputToken: "0.001"} // 3 decimals, quoteDecimals=2
+	// meteredRateDecimals=9, so a rate needs more than 9 decimal places to
+	// be rejected -- this is no longer just quoteDecimals=2.
+	rates := &domain.MeteredRates{PerOutputToken: "0.0000000001"} // 10 decimals
 	q := testQuote(price, rates)
 	r := testReceipt(domain.Usage{OutputTokens: 50})
 
 	if _, err := computeBillingSnapshot(q, r); err == nil {
 		t.Fatal("expected an error for a rate with excess decimal precision")
+	}
+}
+
+// TestComputeBillingSnapshot_SubCentRatePrecisionIsRespected proves realistic
+// sub-cent per-dimension unit rates (well finer than the settlement
+// currency's own 2-decimal precision) are parsed and priced correctly, and
+// only truncated to currency precision once at the very end -- not
+// rejected outright, and not truncated to zero per-dimension before
+// summing.
+func TestComputeBillingSnapshot_SubCentRatePrecisionIsRespected(t *testing.T) {
+	price := domain.Price{Subtotal: "10.00", Fees: "0.50", TotalMax: "10.50", Currency: "USD"}
+	// $0.000001 per token (a realistic LLM token price) would have been
+	// rejected outright before this fix (quoteDecimals=2 could not parse
+	// more than 2 decimal places).
+	rates := &domain.MeteredRates{PerOutputToken: "0.000001"}
+	q := testQuote(price, rates)
+	// 300,000 tokens * $0.000001 = $0.30 -- large enough to matter after
+	// rounding to cents, small enough to stay comfortably under the 10.00
+	// quoted subtotal.
+	r := testReceipt(domain.Usage{OutputTokens: 300000})
+
+	snap, err := computeBillingSnapshot(q, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.ProviderGross.Amount != "0.30" {
+		t.Fatalf("provider gross = %s, want 0.30", snap.ProviderGross.Amount)
+	}
+}
+
+// TestComputeBillingSnapshot_SubCentUsageTruncatesNotZero proves usage
+// small enough that the metered charge is sub-cent overall still resolves
+// deterministically via truncation at the final settlement precision (not
+// an error, not silently rounded up).
+func TestComputeBillingSnapshot_SubCentUsageTruncatesNotZero(t *testing.T) {
+	price := domain.Price{Subtotal: "10.00", Fees: "0.50", TotalMax: "10.50", Currency: "USD"}
+	rates := &domain.MeteredRates{PerOutputToken: "0.000001"}
+	q := testQuote(price, rates)
+	// 1 token * $0.000001 = $0.000001, which truncates to $0.00 at the
+	// settlement currency's 2-decimal precision.
+	r := testReceipt(domain.Usage{OutputTokens: 1})
+
+	snap, err := computeBillingSnapshot(q, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.ProviderGross.Amount != "0.00" {
+		t.Fatalf("provider gross = %s, want 0.00 (truncated, not rejected)", snap.ProviderGross.Amount)
 	}
 }
 
