@@ -130,10 +130,12 @@ func (c *Client) CommitQuote(ctx context.Context, quote domain.Quote) (string, e
 			return "", err
 		}
 	}
-	underlying := quote.UnderlyingServiceQuoteRef
-	if underlying == "" {
-		underlying = quote.ServiceQuoteID
-	}
+	// tos-protocol's SubmitJob binds a Job to its Quote by requiring
+	// underlying_service_quote_ref to equal the service_quote_id presented
+	// later, so this must carry the raw service quote ID rather than
+	// quote.UnderlyingServiceQuoteRef (the distinct commitment reference
+	// tos-protocol returns from QuoteExecution).
+	underlying := quote.ServiceQuoteID
 	settlementAsset := quote.Settlement.ProviderAsset
 	if settlementAsset == "" {
 		settlementAsset = quote.Settlement.ClientAsset
