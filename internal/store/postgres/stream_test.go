@@ -494,3 +494,47 @@ func TestSetJobStreamUpstreamDigestIsIdempotentButRejectsChange(t *testing.T) {
 		t.Fatalf("rejected change must not have overwritten the original digest, got %q", cursor.UpstreamDigest)
 	}
 }
+
+// TestLastJobStreamChunkBeforeSkipsIntermediateNonChunkEvents proves the
+// cumulative offset/digest lookup finds the most recent OutputChunk event
+// before a given sequence even when a non-chunk event (e.g. PROOF_STATUS)
+// sits immediately before that sequence -- cumulative state is a property
+// of the whole stream, not of whichever event type happens to be adjacent.
+func TestLastJobStreamChunkBeforeSkipsIntermediateNonChunkEvents(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	jobID := "job_stream_lastchunk_" + randSuffix()
+
+	if err := s.AppendJobStreamEvent(ctx, stateEvent(jobID, 0)); err != nil {
+		t.Fatal(err)
+	}
+	digest, _ := streamDigest(nil, []byte("abc"))
+	if err := s.AppendJobStreamEvent(ctx, chunkEvent(jobID, 1, 0, []byte("abc"), digest)); err != nil {
+		t.Fatal(err)
+	}
+	// A PROOF_STATUS event between the chunk and the resume point: it must
+	// not reset or hide the cumulative chunk state.
+	if err := s.AppendJobStreamEvent(ctx, domain.JobEvent{JobID: jobID, Sequence: 2, EventType: domain.JobEventProofStatus, State: domain.JobWorking}); err != nil {
+		t.Fatal(err)
+	}
+
+	event, found, err := s.LastJobStreamChunkBefore(ctx, jobID, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected to find the chunk event before sequence 3")
+	}
+	if event.Sequence != 1 || event.Offset != 0 || string(event.Chunk) != "abc" || event.StreamDigest != digest {
+		t.Fatalf("unexpected chunk event: %+v", event)
+	}
+
+	// Before any chunk exists at all (sequence 1), nothing is found.
+	_, found, err = s.LastJobStreamChunkBefore(ctx, jobID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("expected no chunk event before sequence 1")
+	}
+}

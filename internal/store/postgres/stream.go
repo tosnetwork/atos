@@ -256,6 +256,49 @@ func (s *Store) JobStreamEvents(ctx context.Context, jobID string, fromSequence 
 	return out, rows.Err()
 }
 
+func (s *Store) LastJobStreamChunkBefore(ctx context.Context, jobID string, beforeSequence uint64) (domain.JobEvent, bool, error) {
+	var e domain.JobEvent
+	var eventType, state, errorCode string
+	var chunk, usage, proofStatus []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT job_id, sequence, event_type, state, chunk, byte_offset,
+		       total_output_bytes, stream_digest, terminal, usage, proof_status,
+		       error_code, created_at
+		FROM job_stream_events
+		WHERE job_id=$1 AND sequence < $2 AND event_type=$3
+		ORDER BY sequence DESC
+		LIMIT 1
+	`, jobID, beforeSequence, string(domain.JobEventOutputChunk)).Scan(
+		&e.JobID, &e.Sequence, &eventType, &state, &chunk, &e.Offset,
+		&e.TotalOutputBytes, &e.StreamDigest, &e.Terminal, &usage, &proofStatus,
+		&errorCode, &e.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.JobEvent{}, false, nil
+	}
+	if err != nil {
+		return domain.JobEvent{}, false, err
+	}
+	e.EventType = domain.JobEventType(eventType)
+	e.State = domain.JobState(state)
+	e.ErrorCode = domain.ErrorCode(errorCode)
+	e.Chunk = chunk
+	if len(usage) > 0 {
+		var u domain.Usage
+		if err := json.Unmarshal(usage, &u); err != nil {
+			return domain.JobEvent{}, false, fmt.Errorf("postgres: decode stream event usage: %w", err)
+		}
+		e.Usage = &u
+	}
+	if len(proofStatus) > 0 {
+		var p domain.ProofStatus
+		if err := json.Unmarshal(proofStatus, &p); err != nil {
+			return domain.JobEvent{}, false, fmt.Errorf("postgres: decode stream event proof status: %w", err)
+		}
+		e.ProofStatus = &p
+	}
+	return e, true, nil
+}
+
 func (s *Store) JobStreamCursor(ctx context.Context, jobID string) (domain.JobStreamCursor, bool, error) {
 	var c domain.JobStreamCursor
 	c.JobID = jobID

@@ -132,6 +132,16 @@ type JobStream interface {
 	// provider-consistency error, not a benign race. Passing an empty
 	// digest is a no-op.
 	SetJobStreamUpstreamDigest(ctx context.Context, jobID, digest string) error
+	// LastJobStreamChunkBefore returns the most recent JobEventOutputChunk
+	// event with sequence < beforeSequence, if any. Cumulative offset/digest
+	// state only changes on OutputChunk events -- every other event type
+	// (STATE, PROOF_STATUS, TERMINAL, ...) passes the current cumulative
+	// state through unchanged -- so this is the correct way to recover "the
+	// stream's cumulative state as of beforeSequence" regardless of which
+	// event type happens to sit immediately before it. found is false if no
+	// OutputChunk event exists before beforeSequence (the state is still
+	// offset 0 / no digest).
+	LastJobStreamChunkBefore(ctx context.Context, jobID string, beforeSequence uint64) (event domain.JobEvent, found bool, err error)
 }
 
 type Accounts interface {

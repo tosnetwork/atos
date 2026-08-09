@@ -50,6 +50,15 @@ func (s *Store) AppendJobStreamEvent(ctx context.Context, event domain.JobEvent)
 	if len(event.Chunk) > maxJobStreamChunkBytes {
 		return domain.NewError(domain.ErrStreamChunkTooLarge, fmt.Sprintf("chunk exceeds %d bytes", maxJobStreamChunkBytes), false)
 	}
+	// Captured on the pristine incoming event, before any field is
+	// recomputed below, and used as the sole basis for the replay-identity
+	// comparison -- mirroring the Postgres store's content_hash column,
+	// which is likewise computed once on the incoming event rather than on
+	// whatever gets derived from it. Comparing against a hash of the
+	// *stored* (post-recompute) copy instead would make a legitimate
+	// identical replay look like a substitution, since the stored copy's
+	// StreamDigest differs from what the caller originally sent.
+	incomingHash := eventContentHash(event)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -57,12 +66,12 @@ func (s *Store) AppendJobStreamEvent(ctx context.Context, event domain.JobEvent)
 	cursor := s.streamCursors[event.JobID]
 
 	if event.Sequence < cursor.NextSequence {
-		events := s.streamEvents[event.JobID]
+		hashes := s.streamEventHashes[event.JobID]
 		idx := int(event.Sequence)
-		if idx < 0 || idx >= len(events) {
+		if idx < 0 || idx >= len(hashes) {
 			return domain.NewError(domain.ErrStreamSequenceConflict, "stream sequence is behind the durable cursor but has no matching row", false)
 		}
-		if eventContentHash(events[idx]) != eventContentHash(event) {
+		if hashes[idx] != incomingHash {
 			return domain.NewError(domain.ErrStreamSequenceConflict, "stream sequence already holds different content", false)
 		}
 		return nil
@@ -112,6 +121,7 @@ func (s *Store) AppendJobStreamEvent(ctx context.Context, event domain.JobEvent)
 	}
 	stored.Chunk = slices.Clone(stored.Chunk)
 	s.streamEvents[event.JobID] = append(s.streamEvents[event.JobID], stored)
+	s.streamEventHashes[event.JobID] = append(s.streamEventHashes[event.JobID], incomingHash)
 	s.streamCursors[event.JobID] = domain.JobStreamCursor{
 		JobID: event.JobID, NextSequence: event.Sequence + 1, NextOffset: nextOffset,
 		StreamDigest: nextDigest, Terminal: cursor.Terminal || event.Terminal,
@@ -156,6 +166,22 @@ func (s *Store) JobStreamEvents(ctx context.Context, jobID string, fromSequence 
 		}
 	}
 	return out, nil
+}
+
+func (s *Store) LastJobStreamChunkBefore(ctx context.Context, jobID string, beforeSequence uint64) (domain.JobEvent, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	events := s.streamEvents[jobID]
+	for i := len(events) - 1; i >= 0; i-- {
+		e := events[i]
+		if e.Sequence >= beforeSequence {
+			continue
+		}
+		if e.EventType == domain.JobEventOutputChunk {
+			return e, true, nil
+		}
+	}
+	return domain.JobEvent{}, false, nil
 }
 
 func (s *Store) JobStreamCursor(ctx context.Context, jobID string) (domain.JobStreamCursor, bool, error) {

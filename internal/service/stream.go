@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/tosnetwork/atos/internal/adapters/tosai"
 	"github.com/tosnetwork/atos/internal/domain"
@@ -27,22 +28,31 @@ func NewStreamService(s store.Store, provider tosai.Provider) *StreamService {
 // EnsureIngested pulls the provider's canonical event sequence into the
 // durable journal unless it is already fully ingested (cursor.Terminal).
 //
-// If nothing has been durably ingested for this Job yet, it pulls from the
-// very start. If a prior ingestion attempt got partway through before
-// failing (e.g. a dropped connection to the provider mid-transfer), it
-// resumes the provider pull itself at the durable cursor's next_offset,
-// asking the provider to skip re-sending bytes ATOS already has, rather
-// than always re-pulling the complete output from scratch. This relies on
-// the provider's own resumable StreamJob contract (real tos-protocol RPC,
-// or the mock backend's equivalent), which requires echoing back the
-// provider's retained-output identity digest (cursor.UpstreamDigest,
-// captured from the first event ever observed for this Job) as
-// expected_stream_digest.
+// If nothing has been durably ingested for this Job yet, it always pulls at
+// least the first snapshot, regardless of the Job's current state. After
+// that first snapshot, while the Job's own ATOS-level record has not yet
+// reached a terminal state, EnsureIngested is a no-op: re-pulling from a
+// still-running provider would only ever re-observe the same non-terminal
+// STATE snapshot, and every SSE poll calling EnsureIngested would otherwise
+// append a redundant STATE event to the journal for no benefit. Once the
+// Job becomes terminal, the next call resumes the provider pull at the
+// durable cursor rather than restarting.
+//
+// The resume request only carries next_offset/expected_stream_digest once
+// the durable cursor has actually advanced past at least one OutputChunk
+// event (cursor.NextOffset > 0). This is deliberate, not an optimization
+// detail: a provider's retained-output identity digest is only stable once
+// real output exists. A Job observed only in a non-terminal STATE has no
+// output yet, so persisting or replaying that early digest would make the
+// Job's own later, legitimate transition to completed look like content
+// substitution -- which is exactly why UpstreamRetainedDigest is captured
+// (see the onEvent callback below) only from OutputChunk events, never from
+// STATE.
 //
 // Either way, AppendJobStreamEvent's idempotent-replay semantics make
 // re-ingesting any already-durable event a safe no-op, which is what lets
-// EnsureIngested be called freely, from any process, on every stream read
-// without an in-process "already ingesting" guard.
+// EnsureIngested be called freely, from any process, without an in-process
+// "already ingesting" guard.
 func (s *StreamService) EnsureIngested(ctx context.Context, jobID string) error {
 	cursor, found, err := s.store.JobStreamCursor(ctx, jobID)
 	if err != nil {
@@ -51,18 +61,32 @@ func (s *StreamService) EnsureIngested(ctx context.Context, jobID string) error 
 	if found && cursor.Terminal {
 		return nil
 	}
+	if found {
+		job, err := s.store.GetJob(ctx, jobID)
+		if err != nil {
+			return err
+		}
+		if !job.State.Terminal() {
+			return nil
+		}
+	}
 	streamer, ok := s.provider.(tosai.Streamer)
 	if !ok {
 		return nil
 	}
 	req := tosai.StreamJobEventsRequest{JobID: jobID}
-	if found && cursor.NextOffset > 0 && cursor.UpstreamDigest != "" {
+	if found {
 		req.NextSequence = cursor.NextSequence
-		req.NextOffset = cursor.NextOffset
-		req.ExpectedStreamDigest = cursor.UpstreamDigest
+		if cursor.NextOffset > 0 {
+			req.NextOffset = cursor.NextOffset
+			req.ExpectedStreamDigest = cursor.UpstreamDigest
+		}
 	}
 	err = streamer.StreamJobEvents(ctx, req, func(event domain.JobEvent) error {
-		if event.UpstreamRetainedDigest != "" {
+		if event.JobID != jobID {
+			return domain.NewError(domain.ErrStreamJobBindingMismatch, fmt.Sprintf("execution provider returned an event bound to job %q while streaming job %q", event.JobID, jobID), false)
+		}
+		if event.EventType == domain.JobEventOutputChunk && event.UpstreamRetainedDigest != "" {
 			if err := s.store.SetJobStreamUpstreamDigest(ctx, jobID, event.UpstreamRetainedDigest); err != nil {
 				return err
 			}
@@ -101,7 +125,13 @@ func (s *StreamService) Events(
 	if err := s.EnsureIngested(ctx, jobID); err != nil {
 		return nil, domain.JobStreamCursor{}, err
 	}
-	if fromSequence > 0 && (expectedOffset != 0 || expectedDigest != "") {
+	// Any resume past sequence 0 MUST prove it knows the exact durable
+	// cumulative state it claims to be resuming from -- including the
+	// (common) case where that state is legitimately offset 0 / no digest
+	// yet. There is no "only validate if a non-zero value was supplied"
+	// escape hatch: omitting next_offset/expected_stream_digest is not a
+	// way to skip the check, it is simply a claim of offset=0/digest="".
+	if fromSequence > 0 {
 		if err := s.validateResumeCursor(ctx, jobID, fromSequence, expectedOffset, expectedDigest); err != nil {
 			return nil, domain.JobStreamCursor{}, err
 		}
@@ -118,29 +148,37 @@ func (s *StreamService) Events(
 }
 
 // validateResumeCursor rejects a resume request whose claimed offset/digest
-// does not match the durable event immediately before fromSequence. Without
-// this, a caller could splice a fabricated cursor onto a real job_id and
-// receive events without the server ever detecting the substitution.
+// does not match the journal's actual cumulative state as of fromSequence.
+// Cumulative offset/digest state only changes on OutputChunk events, so the
+// "actual" state is derived from the most recent OutputChunk event before
+// fromSequence (LastJobStreamChunkBefore), not from whichever event type
+// happens to sit immediately before it -- a PROOF_STATUS or STATE event in
+// between does not reset or invalidate the cumulative output progress
+// already durably recorded. fromSequence is also bounded by the durable
+// cursor: a caller cannot claim to resume from a point the journal has
+// never reached.
 func (s *StreamService) validateResumeCursor(ctx context.Context, jobID string, fromSequence, expectedOffset uint64, expectedDigest string) error {
-	prior, err := s.store.JobStreamEvents(ctx, jobID, fromSequence-1, 1)
+	cursor, found, err := s.store.JobStreamCursor(ctx, jobID)
 	if err != nil {
 		return err
 	}
-	if len(prior) == 0 || prior[0].Sequence != fromSequence-1 {
-		return domain.NewError(domain.ErrStreamCursorMismatch, "resume cursor does not match a durable event", false)
+	if !found || fromSequence > cursor.NextSequence {
+		return domain.NewError(domain.ErrStreamCursorMismatch, "resume cursor is ahead of the durable stream", false)
 	}
-	event := prior[0]
-	if event.EventType != domain.JobEventOutputChunk {
-		if expectedOffset != 0 || expectedDigest != "" {
-			return domain.NewError(domain.ErrStreamCursorMismatch, "resume cursor claims output progress the durable stream does not have", false)
-		}
-		return nil
+	last, chunkFound, err := s.store.LastJobStreamChunkBefore(ctx, jobID, fromSequence)
+	if err != nil {
+		return err
 	}
-	actualOffset := event.Offset + uint64(len(event.Chunk))
-	if expectedOffset != 0 && expectedOffset != actualOffset {
+	var actualOffset uint64
+	var actualDigest string
+	if chunkFound {
+		actualOffset = last.Offset + uint64(len(last.Chunk))
+		actualDigest = last.StreamDigest
+	}
+	if expectedOffset != actualOffset {
 		return domain.NewError(domain.ErrStreamCursorMismatch, "resume offset does not match durable stream state", false)
 	}
-	if expectedDigest != "" && expectedDigest != event.StreamDigest {
+	if expectedDigest != actualDigest {
 		return domain.NewError(domain.ErrStreamCursorMismatch, "resume digest does not match durable stream state", false)
 	}
 	return nil

@@ -2,6 +2,7 @@ package toprotocol
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"connectrpc.com/connect"
@@ -46,8 +47,15 @@ func (c *Client) StreamJobEvents(ctx context.Context, req tosai.StreamJobEventsR
 		if event == nil {
 			continue
 		}
+		if event.JobId != req.JobID {
+			return domain.NewError(domain.ErrStreamJobBindingMismatch, fmt.Sprintf("tos-protocol StreamJob response for job %q contained an event bound to job %q", req.JobID, event.JobId), false)
+		}
+		eventType, err := domainJobEventType(event.EventType)
+		if err != nil {
+			return err
+		}
 		mapped := domain.JobEvent{
-			JobID: event.JobId, Sequence: event.Sequence, EventType: domainJobEventType(event.EventType),
+			JobID: event.JobId, Sequence: event.Sequence, EventType: eventType,
 			State: domainJobState(event.State), Chunk: append([]byte(nil), event.Chunk...),
 			Offset: event.Offset, TotalOutputBytes: event.TotalOutputBytes,
 			Terminal: event.Terminal, ErrorCode: domain.ErrorCode(event.ErrorCode),
@@ -81,20 +89,24 @@ func (c *Client) StreamJobEvents(ctx context.Context, req tosai.StreamJobEventsR
 	return nil
 }
 
-func domainJobEventType(value atostosv1.JobEventType) domain.JobEventType {
+// domainJobEventType fails closed on any value it does not recognize
+// (including JOB_EVENT_TYPE_UNSPECIFIED and any future enum addition this
+// adapter has not been updated for yet) rather than silently guessing it
+// means STATE.
+func domainJobEventType(value atostosv1.JobEventType) (domain.JobEventType, error) {
 	switch value {
 	case atostosv1.JobEventType_JOB_EVENT_TYPE_STATE:
-		return domain.JobEventState
+		return domain.JobEventState, nil
 	case atostosv1.JobEventType_JOB_EVENT_TYPE_OUTPUT_CHUNK:
-		return domain.JobEventOutputChunk
+		return domain.JobEventOutputChunk, nil
 	case atostosv1.JobEventType_JOB_EVENT_TYPE_INPUT_REQUIRED:
-		return domain.JobEventInputRequired
+		return domain.JobEventInputRequired, nil
 	case atostosv1.JobEventType_JOB_EVENT_TYPE_PROOF_STATUS:
-		return domain.JobEventProofStatus
+		return domain.JobEventProofStatus, nil
 	case atostosv1.JobEventType_JOB_EVENT_TYPE_TERMINAL:
-		return domain.JobEventTerminal
+		return domain.JobEventTerminal, nil
 	default:
-		return domain.JobEventState
+		return "", domain.NewError(domain.ErrStreamEventTypeUnsupported, fmt.Sprintf("tos-protocol StreamJob returned an unrecognized event type %v", value), false)
 	}
 }
 

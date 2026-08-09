@@ -260,3 +260,51 @@ func TestStreamServiceEnsureIngestedResumesAfterInterruptionInsteadOfRestarting(
 		t.Fatalf("reassembled output = %q, want %q (no missing/duplicated bytes across the resume boundary)", reassembled, "hello world!")
 	}
 }
+
+// wrongJobIDStreamer simulates a buggy or compromised execution provider
+// that returns an event bound to a different Job than the one requested.
+type wrongJobIDStreamer struct {
+	noopProvider
+	returnedJobID string
+}
+
+func (s wrongJobIDStreamer) StreamJobEvents(ctx context.Context, req tosai.StreamJobEventsRequest, onEvent func(domain.JobEvent) error) error {
+	return onEvent(domain.JobEvent{JobID: s.returnedJobID, Sequence: 0, EventType: domain.JobEventState, State: domain.JobWorking, CreatedAt: time.Now().UTC()})
+}
+
+// TestStreamServiceRejectsJobIDBindingMismatch proves ATOS never trusts an
+// execution provider's event.job_id at face value: an event bound to a
+// different Job than the one actually requested is rejected, and neither
+// the requested Job's journal nor the mismatched Job's journal is written
+// to. Without this, a buggy or compromised provider could cross-contaminate
+// one principal's Job stream with another's data.
+func TestStreamServiceRejectsJobIDBindingMismatch(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	now := time.Now().UTC()
+	jobID := "job_binding_mismatch"
+	otherJobID := "job_other_tenant"
+	if err := st.PutJob(ctx, domain.Job{
+		ID: jobID, PrincipalID: "prn_binding_mismatch", State: domain.JobCompleted,
+		Input: map[string]any{}, Artifacts: []domain.Artifact{}, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	streams := service.NewStreamService(st, wrongJobIDStreamer{returnedJobID: otherJobID})
+
+	_, _, err := streams.Events(ctx, jobID, "prn_binding_mismatch", 0, 0, "", 0)
+	if err == nil {
+		t.Fatal("expected a binding-mismatch error")
+	}
+	de, ok := err.(*domain.Error)
+	if !ok || de.Code != domain.ErrStreamJobBindingMismatch {
+		t.Fatalf("got %v, want stream_job_binding_mismatch", err)
+	}
+
+	if _, found, err := st.JobStreamCursor(ctx, jobID); err != nil || found {
+		t.Fatalf("requested job's journal must remain empty, found=%v err=%v", found, err)
+	}
+	if _, found, err := st.JobStreamCursor(ctx, otherJobID); err != nil || found {
+		t.Fatalf("the mismatched job's journal must not be written either, found=%v err=%v", found, err)
+	}
+}

@@ -36,6 +36,8 @@ const (
 	ErrStreamTerminal               ErrorCode = "stream_terminal"
 	ErrStreamChunkTooLarge          ErrorCode = "stream_chunk_too_large"
 	ErrStreamCursorMismatch         ErrorCode = "stream_cursor_mismatch"
+	ErrStreamJobBindingMismatch     ErrorCode = "stream_job_binding_mismatch"
+	ErrStreamEventTypeUnsupported   ErrorCode = "stream_event_type_unsupported"
 )
 
 type Error struct {

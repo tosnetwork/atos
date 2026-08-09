@@ -436,6 +436,32 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Job'}
         default: {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}/stream:
+    parameters:
+      - {$ref: '#/components/parameters/JobID'}
+      - name: next_sequence
+        in: query
+        description: Resume from this durable journal sequence (0 = from the start).
+        schema: {type: integer, minimum: 0, default: 0}
+      - name: next_offset
+        in: query
+        description: Required alongside expected_stream_digest whenever next_sequence > 0; must equal the durable cumulative output byte offset as of next_sequence.
+        schema: {type: integer, minimum: 0, default: 0}
+      - name: expected_stream_digest
+        in: query
+        description: Required alongside next_offset whenever next_sequence > 0; must equal the durable cumulative output digest as of next_sequence.
+        schema: {type: string}
+    get:
+      tags: [jobs]
+      summary: Stream a Job's durable, resumable event journal
+      description: Requires `jobs:read` and ownership. Server-Sent Events; each `data:` line is a JobStreamEvent. Delivery is bounded -- reads are paginated server-side rather than loading the full journal at once.
+      responses:
+        '200':
+          description: text/event-stream of JobStreamEvent objects, one per SSE `data:` line
+          content:
+            text/event-stream:
+              schema: {$ref: '#/components/schemas/JobStreamEvent'}
+        default: {$ref: '#/components/responses/Error'}
   /v1/jobs/{id}/cancel:
     parameters:
       - {$ref: '#/components/parameters/JobID'}
@@ -922,6 +948,24 @@ components:
         result_type: {type: string, enum: [completed, accepted, input_required, failed]}
         job: {$ref: '#/components/schemas/Job'}
         confirmation_uri: {type: string, format: uri}
+        stream_url: {type: string, format: uri, description: 'GET this URL to stream the Job event journal (see /v1/jobs/{id}/stream).'}
+    JobStreamEvent:
+      type: object
+      required: [job_id, sequence, event_type, created_at]
+      properties:
+        job_id: {type: string}
+        sequence: {type: integer, minimum: 0}
+        event_type: {type: string, enum: [state, output_chunk, input_required, proof_status, terminal]}
+        state: {type: string}
+        chunk: {type: string, format: byte, description: Base64-encoded output bytes; only present on output_chunk events.}
+        offset: {type: integer, minimum: 0, description: Start byte offset of chunk within the total output; only meaningful on output_chunk events.}
+        total_output_bytes: {type: integer, minimum: 0}
+        stream_digest: {type: string, description: 'ATOS''s own cumulative sha256 digest of output bytes 0..offset+len(chunk), inclusive; only present on output_chunk events.'}
+        terminal: {type: boolean, default: false}
+        usage: {type: object}
+        proof_status: {type: object}
+        error_code: {type: string}
+        created_at: {type: string, format: date-time}
     Receipt:
       type: object
       required: [receipt_id, quote_id, escrow_id, job_id, trust_mode, charged, refunded, status, proof_status, created_at]
