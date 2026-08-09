@@ -50,6 +50,7 @@ type Server struct {
 	Capabilities  *service.CapabilityService
 	Quotes        *service.QuoteService
 	Jobs          *service.JobService
+	Streams       *service.StreamService
 	Accounts      *service.AccountService
 	Receipts      *service.ReceiptService
 	Artifacts     *service.ArtifactService
@@ -90,6 +91,7 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("GET /v1/invocations/{id}", s.withScopes(s.handleGetJob, auth.ScopeJobsRead))
 	mux.HandleFunc("POST /v1/jobs", s.withScopes(s.handleCreateJob, auth.ScopeJobsCreate))
 	mux.HandleFunc("GET /v1/jobs/{id}", s.withScopes(s.handleGetJob, auth.ScopeJobsRead))
+	mux.HandleFunc("GET /v1/jobs/{id}/stream", s.withScopes(s.handleStreamJob, auth.ScopeJobsRead))
 	mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.withScopes(s.handleCancelJob, auth.ScopeJobsCancel))
 	mux.HandleFunc("GET /v1/confirmations/{code}", s.withScopes(s.handleGetConfirmation, auth.ScopeAccountRead))
 	mux.HandleFunc("POST /v1/confirmations/{code}/decision", s.withScopes(s.handleConfirmationDecision, auth.ScopeAccountRead))
@@ -201,7 +203,8 @@ func statusForCode(code domain.ErrorCode) int {
 		return http.StatusForbidden
 	case domain.ErrRateLimited:
 		return http.StatusTooManyRequests
-	case domain.ErrValidationFailed, domain.ErrUploadMismatch:
+	case domain.ErrValidationFailed, domain.ErrUploadMismatch, domain.ErrStreamOffsetInvalid,
+		domain.ErrStreamDigestInvalid, domain.ErrStreamChunkTooLarge, domain.ErrStreamCursorMismatch:
 		return http.StatusBadRequest
 	case domain.ErrNotFound, domain.ErrCapabilityUnavailable, domain.ErrArtifactNotFound:
 		return http.StatusNotFound
@@ -212,7 +215,8 @@ func statusForCode(code domain.ErrorCode) int {
 		domain.ErrProofProfileUnavailable, domain.ErrRequoteRequired,
 		domain.ErrIdempotencyConflict, domain.ErrJobNotCancelable,
 		domain.ErrSpendConfirmationRequired, domain.ErrSpendConfirmationDenied,
-		domain.ErrSpendConfirmationExpired:
+		domain.ErrSpendConfirmationExpired, domain.ErrStreamSequenceConflict,
+		domain.ErrStreamTerminal:
 		return http.StatusConflict
 	case domain.ErrSpendLimitExceeded, domain.ErrInsufficientBalance:
 		return http.StatusPaymentRequired

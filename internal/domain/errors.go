@@ -30,6 +30,12 @@ const (
 	ErrProviderFailed               ErrorCode = "provider_failed"
 	ErrSettlementFailed             ErrorCode = "settlement_failed"
 	ErrNotFound                     ErrorCode = "not_found"
+	ErrStreamSequenceConflict       ErrorCode = "stream_sequence_conflict"
+	ErrStreamOffsetInvalid          ErrorCode = "stream_offset_invalid"
+	ErrStreamDigestInvalid          ErrorCode = "stream_digest_invalid"
+	ErrStreamTerminal               ErrorCode = "stream_terminal"
+	ErrStreamChunkTooLarge          ErrorCode = "stream_chunk_too_large"
+	ErrStreamCursorMismatch         ErrorCode = "stream_cursor_mismatch"
 )
 
 type Error struct {

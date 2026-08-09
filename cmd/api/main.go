@@ -127,6 +127,7 @@ func main() {
 	accounts := service.NewAccountService(st, accountDefaults)
 	quotes.WithAccountService(accounts)
 	jobs := service.NewJobService(st, execution, core, accounts)
+	streams := service.NewStreamService(st, execution)
 	receipts := service.NewReceiptService(st, core)
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
 	defer reconcileCancel()
@@ -147,7 +148,7 @@ func main() {
 
 	restServer := &httpapi.Server{
 		Auth: authorization, Capabilities: capabilities, Quotes: quotes,
-		Jobs: jobs, Accounts: accounts, Receipts: receipts,
+		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts,
 		Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 		ApprovalToken: cfg.Auth.ApprovalToken,
 	}
@@ -156,7 +157,10 @@ func main() {
 		Jobs: jobs, Accounts: accounts, Receipts: receipts,
 		Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}
-	a2aServer := &a2a.Server{Auth: authorization, Quotes: quotes, Jobs: jobs, Logger: logger}
+	a2aServer := &a2a.Server{
+		Auth: authorization, Quotes: quotes, Jobs: jobs,
+		Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
+	}
 
 	mux := restServer.Mux()
 	mux.HandleFunc("POST /mcp", mcpServer.Handler())

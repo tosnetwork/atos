@@ -70,7 +70,7 @@ type Task struct {
 	Metadata  map[string]any `json:"metadata,omitempty"`
 }
 
-func TaskFromJob(j domain.Job) Task {
+func TaskFromJob(j domain.Job, streamURL string) Task {
 	artifacts := make([]Artifact, 0, len(j.Artifacts)+boolToInt(j.Output != nil))
 	for _, a := range j.Artifacts {
 		artifacts = append(artifacts, Artifact{ID: a.ID, Name: a.Name, Content: a.Content})
@@ -89,6 +89,9 @@ func TaskFromJob(j domain.Job) Task {
 	}
 	if j.Confirmation != nil {
 		commerce["confirmation"] = j.Confirmation
+	}
+	if streamURL != "" {
+		commerce["stream_url"] = streamURL
 	}
 	return Task{
 		ID:        j.ID,

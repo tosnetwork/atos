@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -164,6 +165,69 @@ func (p *Provider) FetchReceipt(ctx context.Context, jobID string) (*domain.Exec
 		return nil, err
 	}
 	return result.Receipt, nil
+}
+
+// mockMaxStreamChunkBytes mirrors the bound enforced by the durable stream
+// store (internal/store/postgres, internal/store/memory).
+const mockMaxStreamChunkBytes = 256 << 10
+
+// StreamJobEvents synthesizes the same STATE -> OutputChunk* -> Terminal
+// sequence tos-protocol's real StreamJob RPC replays for a completed Job,
+// deterministically re-derived from the stored completion each call. The
+// mock has no genuine mid-execution partial output (SubmitJob above always
+// completes synchronously), so this is an equivalent local replay rather
+// than a network round trip — not a polling-based fake of a live stream.
+func (p *Provider) StreamJobEvents(ctx context.Context, req tosai.StreamJobEventsRequest, onEvent func(domain.JobEvent) error) error {
+	p.mu.Lock()
+	result, ok := p.jobs[req.JobID]
+	p.mu.Unlock()
+	if !ok {
+		return domain.NewError(domain.ErrNotFound, fmt.Sprintf("mock tosai: unknown job %q", req.JobID), false)
+	}
+	outputBytes, err := json.Marshal(result.Output)
+	if err != nil {
+		return err
+	}
+	chunkSize := req.MaxChunkBytes
+	if chunkSize == 0 || chunkSize > mockMaxStreamChunkBytes {
+		chunkSize = mockMaxStreamChunkBytes
+	}
+	now := time.Now().UTC()
+	emit := func(event domain.JobEvent) error {
+		if event.Sequence < req.NextSequence {
+			return nil
+		}
+		event.CreatedAt = now
+		return onEvent(event)
+	}
+
+	sequence := uint64(0)
+	if err := emit(domain.JobEvent{JobID: req.JobID, Sequence: sequence, EventType: domain.JobEventState, State: result.State}); err != nil {
+		return err
+	}
+	sequence++
+
+	hasher := sha256.New()
+	for offset := uint64(0); offset < uint64(len(outputBytes)); offset += chunkSize {
+		end := min(offset+chunkSize, uint64(len(outputBytes)))
+		chunk := outputBytes[offset:end]
+		hasher.Write(chunk)
+		digest := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
+		if err := emit(domain.JobEvent{
+			JobID: req.JobID, Sequence: sequence, EventType: domain.JobEventOutputChunk,
+			State: result.State, Chunk: slices.Clone(chunk), Offset: offset,
+			TotalOutputBytes: uint64(len(outputBytes)), StreamDigest: digest,
+		}); err != nil {
+			return err
+		}
+		sequence++
+	}
+
+	usage := result.Usage
+	return emit(domain.JobEvent{
+		JobID: req.JobID, Sequence: sequence, EventType: domain.JobEventTerminal,
+		State: result.State, Terminal: true, Usage: &usage,
+	})
 }
 
 func hashJSON(v map[string]any) string { return hashAny(v) }

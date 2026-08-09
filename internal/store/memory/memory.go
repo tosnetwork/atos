@@ -21,6 +21,9 @@ type Store struct {
 	receipts      map[string]domain.Receipt
 	receiptsByJob map[string]string // jobID -> receiptID
 	jobs          map[string]domain.Job
+	streamEvents  map[string][]domain.JobEvent      // jobID -> ordered events
+	streamCursors map[string]domain.JobStreamCursor // jobID -> cursor
+	streamDigests map[string]streamDigestState      // jobID -> resumable hasher state
 	accounts      map[string]domain.Account
 	artifacts     map[string]domain.StoredArtifact
 	idempotency   map[string]store.IdempotencyRecord // principalID+":"+key
@@ -34,6 +37,9 @@ func New() *Store {
 		receipts:      make(map[string]domain.Receipt),
 		receiptsByJob: make(map[string]string),
 		jobs:          make(map[string]domain.Job),
+		streamEvents:  make(map[string][]domain.JobEvent),
+		streamCursors: make(map[string]domain.JobStreamCursor),
+		streamDigests: make(map[string]streamDigestState),
 		accounts:      make(map[string]domain.Account),
 		artifacts:     make(map[string]domain.StoredArtifact),
 		idempotency:   make(map[string]store.IdempotencyRecord),

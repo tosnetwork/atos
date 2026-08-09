@@ -28,6 +28,7 @@ type submitResponse struct {
 	ResultType      string     `json:"result_type"`
 	Job             domain.Job `json:"job"`
 	ConfirmationURI string     `json:"confirmation_uri,omitempty"`
+	StreamURL       string     `json:"stream_url,omitempty"`
 }
 
 func (s *Server) writeSubmitResult(w http.ResponseWriter, result service.SubmitResult) {
@@ -39,7 +40,14 @@ func (s *Server) writeSubmitResult(w http.ResponseWriter, result service.SubmitR
 	if result.Job.Confirmation != nil {
 		response.ConfirmationURI = strings.TrimRight(s.PublicBaseURL, "/") + "/confirm?code=" + url.QueryEscape(result.Job.Confirmation.UserCode)
 	}
+	if result.Job.ID != "" {
+		response.StreamURL = s.jobStreamURL(result.Job.ID)
+	}
 	writeJSON(w, status, response)
+}
+
+func (s *Server) jobStreamURL(jobID string) string {
+	return strings.TrimRight(s.PublicBaseURL, "/") + "/v1/jobs/" + url.PathEscape(jobID) + "/stream"
 }
 
 func (s *Server) handleInvoke(w http.ResponseWriter, r *http.Request) {
