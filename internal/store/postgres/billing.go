@@ -393,6 +393,15 @@ func (s *Store) UpdateEarning(ctx context.Context, id string, fn func(domain.Pro
 	if exists && earningContentHash(current) != earningContentHash(next) {
 		return domain.ProviderEarning{}, domain.NewError(domain.ErrIdempotencyConflict, "earning update must not change identity/economic fields", false)
 	}
+	// ID is deliberately excluded from earningContentHash (CreateEarning
+	// must recognize a replay with a different candidate ID as the same
+	// settlement), so it needs its own explicit immutability check here:
+	// upsertEarningSQL's ON CONFLICT target is id itself, so persisting a
+	// changed ID would insert/target an entirely different row than the one
+	// just locked by id=$1 above, rather than updating it.
+	if exists && next.ID != current.ID {
+		return domain.ProviderEarning{}, domain.NewError(domain.ErrIdempotencyConflict, "earning update must not change the earning id", false)
+	}
 	if _, err := tx.Exec(ctx, upsertEarningSQL, earningWriteArgs(next)...); err != nil {
 		return domain.ProviderEarning{}, err
 	}

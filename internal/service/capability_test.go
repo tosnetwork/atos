@@ -89,6 +89,52 @@ func TestCapabilityService_UpdateRejectsInvalidMeteredRate(t *testing.T) {
 	}
 }
 
+// Register must reject a Fixed-priced capability that also configures
+// MeteredRates: a non-metered pricing_model carrying a stray rate would
+// otherwise be silently billed by usage instead of the declared price.
+func TestCapabilityService_RegisterRejectsMeteredRatesOnFixedModel(t *testing.T) {
+	svc := NewCapabilityService(memory.New())
+	pricing := domain.Pricing{
+		Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "10.00", Currency: "USD"},
+		MeteredRates: &domain.MeteredRates{PerOutputToken: "0.001"},
+	}
+	if _, err := svc.Register(context.Background(), testRegisterInput("agt_provider_fixed_rates", pricing)); err == nil {
+		t.Fatal("expected Register to reject a Fixed pricing_model with configured MeteredRates")
+	}
+}
+
+// Register must reject an unrecognized pricing_model outright.
+func TestCapabilityService_RegisterRejectsUnknownPricingModel(t *testing.T) {
+	svc := NewCapabilityService(memory.New())
+	pricing := domain.Pricing{Model: "not_a_real_model", PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}}
+	if _, err := svc.Register(context.Background(), testRegisterInput("agt_provider_unknown_model", pricing)); err == nil {
+		t.Fatal("expected Register to reject an unrecognized pricing_model")
+	}
+}
+
+// Update must reject a patch that sets a Fixed model with MeteredRates
+// still configured, the same way Register does.
+func TestCapabilityService_UpdateRejectsMeteredRatesOnFixedModel(t *testing.T) {
+	svc := NewCapabilityService(memory.New())
+	pricing := domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "10.00", Currency: "USD"}}
+	cap, err := svc.Register(context.Background(), testRegisterInput("agt_provider_upd_fixed_rates", pricing))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	patch := map[string]any{
+		"pricing": map[string]any{
+			"model":      "fixed",
+			"price_hint": map[string]any{"amount": "10.00", "currency": "USD"},
+			"metered_rates": map[string]any{
+				"per_output_token": "0.001",
+			},
+		},
+	}
+	if _, err := svc.Update(context.Background(), cap.ID, "agt_provider_upd_fixed_rates", patch, "update-fixed-rates"); err == nil {
+		t.Fatal("expected Update to reject a Fixed pricing_model with configured MeteredRates")
+	}
+}
+
 // A provider PATCH that only changes MeteredRates (model/unit/price_hint
 // unchanged) must not be silently dropped: it must bump the Capability's
 // version, change its manifest commitment, and be visible to a Quote
@@ -192,5 +238,41 @@ func TestSamePricing_ComparesMeteredRates(t *testing.T) {
 	}
 	if !samePricing(nilRates, nilRates) {
 		t.Error("nil MeteredRates should compare equal to itself")
+	}
+}
+
+// TestQuoteCreate_RejectsLegacyCapabilityWithIncompatiblePricing proves
+// QuoteService.Create's defense-in-depth validatePricing call catches a
+// Capability whose stored Pricing is Fixed but still carries a configured
+// MeteredRate -- necessarily data that predates Register's own validation
+// (written directly here to simulate that), not something reachable
+// through Register/Update anymore. Freezing such a Capability into a new
+// Quote must fail closed rather than propagate the incompatible pricing
+// forward into a Quote that would eventually hit the same wall at
+// settlement, after funds are already committed.
+func TestQuoteCreate_RejectsLegacyCapabilityWithIncompatiblePricing(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := NewCapabilityService(st)
+	quotes := NewQuoteService(st)
+
+	cap, err := capabilities.Register(ctx, testRegisterInput("agt_legacy_fixed_rates", domain.Pricing{
+		Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "10.00", Currency: "USD"},
+	}))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Simulate a Capability whose Pricing predates validatePricing (or was
+	// otherwise corrupted in storage): write the incompatible Fixed+rates
+	// combination directly into the store, bypassing
+	// CapabilityService.Update's validation entirely.
+	cap.Pricing.MeteredRates = &domain.MeteredRates{PerOutputToken: "0.001"}
+	if err := st.Put(ctx, cap); err != nil {
+		t.Fatalf("Put (corrupting stored pricing): %v", err)
+	}
+
+	if _, err := quotes.Create(ctx, CreateQuoteInput{CapabilityID: cap.ID}); err == nil {
+		t.Fatal("expected QuoteService.Create to reject a capability with an incompatible frozen pricing_model/metered_rates combination")
 	}
 }

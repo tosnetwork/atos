@@ -197,3 +197,51 @@ func TestUpdateEarningRejectsEconomicFieldChange(t *testing.T) {
 		t.Fatalf("stored earning mutated by rejected economic-field update: %s", got.NetAmount.Amount)
 	}
 }
+
+// TestUpdateEarningRejectsIDChange proves a callback that changes the
+// earning's ID is rejected: ID is deliberately excluded from
+// earningContentHash (so CreateEarning can recognize a replay under a
+// different candidate ID as the same settlement), so it needs this
+// separate check. Without it, persisting a changed ID would move the entry
+// to a different map key while s.earnings[originalID] and
+// s.earningsBySettlement both go stale/inconsistent.
+func TestUpdateEarningRejectsIDChange(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+	e := testMemEarning("prov_1", "job_idchange", "settle_idchange")
+	if _, _, err := s.CreateEarning(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.UpdateEarning(ctx, e.ID, func(current domain.ProviderEarning, exists bool) (domain.ProviderEarning, error) {
+		if !exists {
+			t.Fatal("expected earning to exist")
+		}
+		current.ID = "earn_different_id"
+		return current, nil
+	})
+	var domainErr *domain.Error
+	if !errors.As(err, &domainErr) || domainErr.Code != domain.ErrIdempotencyConflict {
+		t.Fatalf("got %v, want domain.ErrIdempotencyConflict", err)
+	}
+
+	// The original entry, and the store's internal indexes, must be
+	// untouched by the rejected update.
+	got, err := s.GetEarning(ctx, e.ID)
+	if err != nil {
+		t.Fatalf("original earning must still be retrievable by its original id: %v", err)
+	}
+	if got.ID != e.ID {
+		t.Fatalf("stored earning id mutated by a rejected update: %s", got.ID)
+	}
+	bySettlement, err := s.EarningBySettlement(ctx, e.SettlementID)
+	if err != nil {
+		t.Fatalf("EarningBySettlement: %v", err)
+	}
+	if bySettlement.ID != e.ID {
+		t.Fatalf("earningsBySettlement index corrupted: points at %s, want %s", bySettlement.ID, e.ID)
+	}
+	if _, err := s.GetEarning(ctx, "earn_different_id"); err == nil {
+		t.Fatal("a rejected ID change must not have created an entry under the new id")
+	}
+}

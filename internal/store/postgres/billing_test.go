@@ -368,6 +368,48 @@ func TestUpdateEarningRejectsEconomicFieldChange(t *testing.T) {
 	}
 }
 
+// TestUpdateEarningRejectsIDChange proves a callback that changes the
+// earning's ID is rejected: ID is deliberately excluded from
+// earningContentHash (so CreateEarning can recognize a replay under a
+// different candidate ID as the same settlement), so it needs this
+// separate check. upsertEarningSQL's ON CONFLICT target is id itself, so
+// without this check persisting a changed ID would insert/target an
+// entirely different row than the one the transaction just locked with
+// `SELECT ... WHERE id=$1 FOR UPDATE`.
+func TestUpdateEarningRejectsIDChange(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	settlementID := "settle_idchange_" + suffix
+	e := testEarning("prov_idchange_"+suffix, "job_idchange_"+suffix, settlementID)
+	if _, _, err := s.CreateEarning(ctx, e); err != nil {
+		t.Fatalf("CreateEarning: %v", err)
+	}
+
+	_, err := s.UpdateEarning(ctx, e.ID, func(current domain.ProviderEarning, exists bool) (domain.ProviderEarning, error) {
+		if !exists {
+			t.Fatal("expected earning to exist")
+		}
+		current.ID = "earn_different_id_" + suffix
+		return current, nil
+	})
+	var domainErr *domain.Error
+	if !errors.As(err, &domainErr) || domainErr.Code != domain.ErrIdempotencyConflict {
+		t.Fatalf("got %v, want domain.ErrIdempotencyConflict", err)
+	}
+
+	got, err := s.GetEarning(ctx, e.ID)
+	if err != nil {
+		t.Fatalf("original earning must still be retrievable by its original id: %v", err)
+	}
+	if got.ID != e.ID {
+		t.Fatalf("stored earning id mutated by a rejected update: %s", got.ID)
+	}
+	if _, err := s.GetEarning(ctx, "earn_different_id_"+suffix); err == nil {
+		t.Fatal("a rejected ID change must not have created a row under the new id")
+	}
+}
+
 // TestSettledJobsMissingEarningFindsGapAndExcludesCompleted proves the
 // backfill scan finds a settled Job with no earning row, and stops finding
 // it once an earning exists.

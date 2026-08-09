@@ -302,6 +302,66 @@ func TestJobSettlement_LegacyBadFrozenPricingReleasesAndRefunds(t *testing.T) {
 	}
 }
 
+// TestJobSettlement_CorruptFixedModelWithFrozenRatesReleasesAndRefunds
+// proves the PricingModel/MeteredRates compatibility check
+// computeBillingSnapshot now enforces also fails closed end to end through
+// real settlement: a Quote whose PricingModel is Fixed but which somehow
+// still carries a frozen MeteredRates (corrupted, or predating that
+// validation) must never be silently billed by usage -- it must fail the
+// Job, release the escrow, and refund the principal in full, exactly like
+// an outright malformed rate does.
+func TestJobSettlement_CorruptFixedModelWithFrozenRatesReleasesAndRefunds(t *testing.T) {
+	ctx := context.Background()
+	h, earnings := earningsHarness(t)
+
+	cap := registerCapability(t, h, "agt_modelmismatch_provider", "1.00")
+	quote := createQuote(t, h, cap.ID)
+	if quote.PricingModel != domain.PricingFixed || quote.MeteredRates != nil {
+		t.Fatalf("sanity check failed: quote = %+v", quote)
+	}
+
+	// Simulate a Quote that somehow froze a MeteredRates despite a Fixed
+	// pricing_model (corrupted, or predating the Model/MeteredRates
+	// compatibility check): overwrite the already-created Quote directly in
+	// the store, bypassing QuoteService.Create's defense-in-depth entirely.
+	quote.MeteredRates = &domain.MeteredRates{PerOutputToken: "0.01"}
+	if err := h.store().PutQuote(ctx, quote); err != nil {
+		t.Fatalf("PutQuote (corrupting frozen pricing_model/rates combination): %v", err)
+	}
+
+	before, err := h.accounts.Get(ctx, "prn_modelmismatch_client")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, invokeErr := h.jobs.Invoke(ctx, service.SubmitInput{
+		PrincipalID: "prn_modelmismatch_client", CapabilityID: cap.ID, QuoteID: quote.ID,
+		Input: map[string]any{"x": 1}, IdempotencyKey: "modelmismatch-1",
+	})
+	if result.Job.State != domain.JobFailed {
+		t.Fatalf("job state = %s (err=%v), want failed", result.Job.State, invokeErr)
+	}
+	if result.Job.EconomicState != domain.EconomicReleased {
+		t.Fatalf("economic state = %s, want released", result.Job.EconomicState)
+	}
+
+	after, err := h.accounts.Get(ctx, "prn_modelmismatch_client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Balance != before.Balance {
+		t.Fatalf("balance after pricing_model/metered_rates mismatch = %s, want unchanged from %s (full refund)", after.Balance.Amount, before.Balance.Amount)
+	}
+
+	list, err := earnings.ListByProvider(ctx, "agt_modelmismatch_provider")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("earnings for a pricing_model/metered_rates mismatch = %+v, want none", list)
+	}
+}
+
 func parseCents(t *testing.T, amount string) (int, error) {
 	t.Helper()
 	parts := strings.SplitN(amount, ".", 2)

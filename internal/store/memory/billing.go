@@ -217,6 +217,15 @@ func (s *Store) UpdateEarning(ctx context.Context, id string, fn func(domain.Pro
 	if exists && earningContentHash(current) != earningContentHash(next) {
 		return domain.ProviderEarning{}, domain.NewError(domain.ErrIdempotencyConflict, "earning update must not change identity/economic fields", false)
 	}
+	// ID is deliberately excluded from earningContentHash (CreateEarning
+	// must recognize a replay with a different candidate ID as the same
+	// settlement), so it needs its own explicit immutability check here:
+	// changing it would move the earning to a different map key while
+	// leaving the old key's entry stale and s.earningsBySettlement pointing
+	// at the new key, corrupting this store's internal indexes.
+	if exists && next.ID != current.ID {
+		return domain.ProviderEarning{}, domain.NewError(domain.ErrIdempotencyConflict, "earning update must not change the earning id", false)
+	}
 	s.earnings[id] = next
 	if next.SettlementID != "" {
 		s.earningsBySettlement[next.SettlementID] = next.ID

@@ -149,6 +149,59 @@ func TestComputeBillingSnapshot_InvalidRateRejected(t *testing.T) {
 	}
 }
 
+// TestComputeBillingSnapshot_NonMeteredModelWithStrayRatesFailsClosed proves
+// a Quote whose PricingModel does not permit metered billing (Fixed here)
+// but which somehow still carries non-empty MeteredRates -- necessarily a
+// Quote frozen before validatePricing existed, or otherwise corrupted --
+// is rejected rather than silently billed by usage, which would violate
+// the pricing contract the Quote committed to and short the provider
+// relative to what was actually quoted.
+func TestComputeBillingSnapshot_NonMeteredModelWithStrayRatesFailsClosed(t *testing.T) {
+	price := domain.Price{Subtotal: "10.00", Fees: "0.50", TotalMax: "10.50", Currency: "USD"}
+	q := testQuote(price, &domain.MeteredRates{PerOutputToken: "0.01"})
+	q.PricingModel = domain.PricingFixed // incompatible with non-empty MeteredRates
+	r := testReceipt(domain.Usage{OutputTokens: 1})
+
+	if _, err := computeBillingSnapshot(q, r); err == nil {
+		t.Fatal("expected an error for a Fixed-pricing_model quote carrying stray MeteredRates")
+	}
+}
+
+// TestComputeBillingSnapshot_UnknownPricingModelFailsClosed proves an
+// unrecognized PricingModel (never valid on any real Quote, but possible on
+// corrupted/legacy data) is rejected rather than silently defaulting to
+// either billing mode.
+func TestComputeBillingSnapshot_UnknownPricingModelFailsClosed(t *testing.T) {
+	price := domain.Price{Subtotal: "10.00", Fees: "0.50", TotalMax: "10.50", Currency: "USD"}
+	q := testQuote(price, nil)
+	q.PricingModel = "not_a_real_model"
+	r := testReceipt(domain.Usage{})
+
+	if _, err := computeBillingSnapshot(q, r); err == nil {
+		t.Fatal("expected an error for an unknown pricing_model")
+	}
+}
+
+// TestComputeBillingSnapshot_EmptyPricingModelTreatedAsNonMetered proves
+// backward compatibility with a Quote frozen before PricingModel was
+// recorded (pre-Phase-2B): an empty PricingModel with no MeteredRates
+// bills the full subtotal exactly like a known non-metered model, rather
+// than being rejected as "unknown".
+func TestComputeBillingSnapshot_EmptyPricingModelTreatedAsNonMetered(t *testing.T) {
+	price := domain.Price{Subtotal: "1.00", Fees: "0.05", TotalMax: "1.05", Currency: "USD"}
+	q := testQuote(price, nil)
+	q.PricingModel = ""
+	r := testReceipt(domain.Usage{OutputTokens: 999999})
+
+	snap, err := computeBillingSnapshot(q, r)
+	if err != nil {
+		t.Fatalf("empty pricing_model with no metered rates should bill the full subtotal, got error: %v", err)
+	}
+	if snap.GrossCharge.Amount != "1.05" {
+		t.Errorf("gross charge = %s, want 1.05", snap.GrossCharge.Amount)
+	}
+}
+
 // TestComputeBillingSnapshot_SubCentRatePrecisionIsRespected proves realistic
 // sub-cent per-dimension unit rates (well finer than the settlement
 // currency's own 2-decimal precision) are parsed and priced correctly, and
@@ -243,6 +296,52 @@ func TestValidatePricing_NoRatesConfigured(t *testing.T) {
 	if err := validatePricing(pricing); err != nil {
 		t.Fatalf("empty MeteredRates should be valid, got %v", err)
 	}
+}
+
+// validatePricing must reject any of the non-metered pricing models
+// (Free/Fixed/PerUse/Negotiated) that still carry a non-empty MeteredRates:
+// billing would otherwise silently charge by usage instead of the price the
+// capability actually declared.
+func TestValidatePricing_RejectsMeteredRatesOnNonMeteredModel(t *testing.T) {
+	for _, model := range []domain.PricingModel{domain.PricingFree, domain.PricingFixed, domain.PricingPerUse, domain.PricingNegotiated} {
+		t.Run(string(model), func(t *testing.T) {
+			pricing := domain.Pricing{
+				Model: model, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"},
+				MeteredRates: &domain.MeteredRates{PerOutputToken: "0.01"},
+			}
+			if err := validatePricing(pricing); err == nil {
+				t.Fatalf("expected pricing_model %q with a configured MeteredRate to be rejected", model)
+			}
+		})
+	}
+}
+
+// validatePricing must accept PricingMetered/PricingPerUnit with valid
+// rates, and reject an unrecognized pricing_model outright.
+func TestValidatePricing_ModelValidation(t *testing.T) {
+	for _, model := range []domain.PricingModel{domain.PricingMetered, domain.PricingPerUnit} {
+		t.Run("valid_"+string(model), func(t *testing.T) {
+			pricing := domain.Pricing{
+				Model: model, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"},
+				MeteredRates: &domain.MeteredRates{PerOutputToken: "0.01"},
+			}
+			if err := validatePricing(pricing); err != nil {
+				t.Fatalf("%s with a valid rate should be accepted, got %v", model, err)
+			}
+		})
+	}
+	t.Run("unknown_model", func(t *testing.T) {
+		pricing := domain.Pricing{Model: "not_a_real_model", PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}}
+		if err := validatePricing(pricing); err == nil {
+			t.Fatal("expected an unrecognized pricing_model to be rejected")
+		}
+	})
+	t.Run("empty_model", func(t *testing.T) {
+		pricing := domain.Pricing{PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}}
+		if err := validatePricing(pricing); err == nil {
+			t.Fatal("expected an empty pricing_model to be rejected for new/updated pricing")
+		}
+	})
 }
 
 // validatePricing must reject exactly the malformed rates that would

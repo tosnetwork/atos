@@ -21,6 +21,18 @@ import (
 // Quote subtotal, exactly matching Phase 0/1 behavior. Metered billing only
 // ever narrows the provider's charge toward the verified usage; it can
 // never exceed what the frozen Quote already committed to.
+//
+// Which of those two billing modes applies is gated on quote.PricingModel,
+// not merely on whether quote.MeteredRates happens to be set: a Quote whose
+// PricingModel does not itself permit metered billing (Free/Fixed/PerUse/
+// Negotiated) but which somehow still carries non-empty MeteredRates is
+// necessarily a Quote frozen before validatePricing existed, or otherwise
+// corrupted -- charging it by usage anyway would silently violate the
+// pricing contract the Quote committed to and short the provider relative
+// to what was actually quoted, so that case fails closed instead. An empty
+// PricingModel (a Quote frozen before that field was recorded, i.e. before
+// Phase 2B) is treated the same as a non-metered model for backward
+// compatibility with Jobs already in flight when this check shipped.
 func computeBillingSnapshot(quote domain.Quote, receipt domain.ExecutionReceipt) (domain.BillingSnapshot, error) {
 	currency := quote.Price.Currency
 	subtotal, err := money.Parse(quote.Price.Subtotal, currency, quoteDecimals)
@@ -37,15 +49,25 @@ func computeBillingSnapshot(quote domain.Quote, receipt domain.ExecutionReceipt)
 	}
 
 	providerGross := subtotal
-	if quote.MeteredRates != nil {
-		metered, err := meterUsage(*quote.MeteredRates, receipt.Usage, currency)
-		if err != nil {
-			return domain.BillingSnapshot{}, err
+	switch quote.PricingModel {
+	case domain.PricingMetered, domain.PricingPerUnit:
+		if quote.MeteredRates != nil {
+			metered, err := meterUsage(*quote.MeteredRates, receipt.Usage, currency)
+			if err != nil {
+				return domain.BillingSnapshot{}, err
+			}
+			// Metered usage can never charge more than the frozen subtotal
+			// it was quoted against, no matter how usage compares to
+			// whatever the provider originally estimated when pricing the
+			// capability.
+			providerGross = metered.Min(subtotal)
 		}
-		// Metered usage can never charge more than the frozen subtotal it
-		// was quoted against, no matter how usage compares to whatever the
-		// provider originally estimated when pricing the capability.
-		providerGross = metered.Min(subtotal)
+	case domain.PricingFree, domain.PricingFixed, domain.PricingPerUse, domain.PricingNegotiated, "":
+		if hasNonEmptyMeteredRates(quote.MeteredRates) {
+			return domain.BillingSnapshot{}, domain.NewError(domain.ErrSettlementFailed, "quote pricing_model does not permit metered_rates", false)
+		}
+	default:
+		return domain.BillingSnapshot{}, domain.NewError(domain.ErrSettlementFailed, "quote has an unknown pricing_model", false)
 	}
 
 	gatewayFee := fees
@@ -95,30 +117,65 @@ func computeBillingSnapshot(quote domain.Quote, receipt domain.ExecutionReceipt)
 // across dimensions before the final clamp against the frozen subtotal.
 const meteredRateDecimals = 9
 
-// validatePricing eagerly parses every configured MeteredRate at
-// meteredRateDecimals precision so a malformed rate (negative, non-numeric,
-// or more precise than meteredRateDecimals allows) is rejected as soon as a
-// provider submits it -- at Capability registration/update, and again as
-// defense in depth when a Quote freezes it -- rather than being discovered
-// for the first time inside computeBillingSnapshot at settlement, by which
-// point the Job has already been debited and escrowed and a permanently
-// invalid frozen rate would fail identically on every reconciliation retry
-// forever. Free/Fixed/PerUse/Negotiated capabilities and metered
-// capabilities with no rates configured have nothing to validate.
+// validatePricing enforces the full pricing contract for a Capability's
+// Pricing, called at registration/update -- and again, on the Capability's
+// currently stored Pricing, as defense in depth right before it gets frozen
+// into a new Quote -- rather than only being discovered for the first time
+// inside computeBillingSnapshot at settlement, by which point a Job has
+// already been debited and escrowed:
+//
+//  1. Model must be one of the known PricingModel values.
+//  2. Only PricingMetered/PricingPerUnit may carry non-empty MeteredRates;
+//     a Free/Fixed/PerUse/Negotiated capability with a stray configured
+//     rate would otherwise be silently billed by usage instead of the
+//     price it actually declared (see computeBillingSnapshot).
+//  3. Every configured MeteredRate must parse at meteredRateDecimals
+//     precision (rejects negative, non-numeric, or over-precise rates).
 func validatePricing(pricing domain.Pricing) error {
-	if pricing.MeteredRates == nil {
+	switch pricing.Model {
+	case domain.PricingFree, domain.PricingFixed, domain.PricingPerUse, domain.PricingNegotiated:
+		if hasNonEmptyMeteredRates(pricing.MeteredRates) {
+			return fmt.Errorf("pricing_model %q does not support metered_rates", pricing.Model)
+		}
+		return nil
+	case domain.PricingMetered, domain.PricingPerUnit:
+		return validateMeteredRateValues(pricing.MeteredRates, pricing.PriceHint.Currency)
+	default:
+		return fmt.Errorf("invalid pricing_model %q", pricing.Model)
+	}
+}
+
+// hasNonEmptyMeteredRates reports whether rates configures at least one
+// dimension, treating a nil pointer and an all-empty-string struct the
+// same way (neither contributes to metered billing -- see
+// domain.MeteredRates's doc comment).
+func hasNonEmptyMeteredRates(rates *domain.MeteredRates) bool {
+	if rates == nil {
+		return false
+	}
+	return rates.PerInputByte != "" || rates.PerOutputByte != "" || rates.PerInputToken != "" ||
+		rates.PerOutputToken != "" || rates.PerExecutionMillisecond != ""
+}
+
+// validateMeteredRateValues eagerly parses every configured MeteredRate at
+// meteredRateDecimals precision so a malformed rate (negative, non-numeric,
+// or more precise than meteredRateDecimals allows) is rejected up front
+// rather than only being discovered inside meterUsage at settlement, where
+// a permanently invalid frozen rate would fail identically on every
+// reconciliation retry forever.
+func validateMeteredRateValues(rates *domain.MeteredRates, currency string) error {
+	if rates == nil {
 		return nil
 	}
-	currency := pricing.PriceHint.Currency
 	dimensions := []struct {
 		field string
 		rate  string
 	}{
-		{"per_input_byte", pricing.MeteredRates.PerInputByte},
-		{"per_output_byte", pricing.MeteredRates.PerOutputByte},
-		{"per_input_token", pricing.MeteredRates.PerInputToken},
-		{"per_output_token", pricing.MeteredRates.PerOutputToken},
-		{"per_execution_millisecond", pricing.MeteredRates.PerExecutionMillisecond},
+		{"per_input_byte", rates.PerInputByte},
+		{"per_output_byte", rates.PerOutputByte},
+		{"per_input_token", rates.PerInputToken},
+		{"per_output_token", rates.PerOutputToken},
+		{"per_execution_millisecond", rates.PerExecutionMillisecond},
 	}
 	for _, d := range dimensions {
 		if d.rate == "" {
