@@ -379,7 +379,36 @@ func (s *JobService) settleProviderResultUnderLock(ctx context.Context, current 
 		return s.markEconomicReconciliationUnderLock(ctx, current.ID, current.EconomicState, domain.JobCompleted, domain.ErrSettlementFailed, "quote unavailable during settlement recovery")
 	}
 	receipt := *result.Receipt
-	receipt.Cost = domain.Money{Amount: quote.Price.TotalMax, Currency: quote.Price.Currency}
+	// Metered billing is a deterministic function of the frozen Quote terms
+	// and this receipt's verified usage -- never the capability's current
+	// live pricing. It never charges more than quote.Price.TotalMax (see
+	// computeBillingSnapshot). The result is computed once here, before the
+	// receipt is committed/verified below, so the same value that gets
+	// verified is the value that gets charged and later recorded as the
+	// provider's earning.
+	billingSnapshot, billErr := computeBillingSnapshot(quote, receipt)
+	if billErr != nil {
+		// computeBillingSnapshot is a pure function of the already-durable,
+		// frozen Quote and verified Receipt: any error it returns (e.g. an
+		// invalid/legacy frozen MeteredRate) is deterministic and fails
+		// identically on every future reconciliation retry, so it can never
+		// be treated as a transient outcome to reconcile away. Before the
+		// receipt has been durably committed and verified (EconomicState is
+		// still EconomicEscrowReserved), it is safe -- and required -- to
+		// fail the Job now and release the escrow back to the principal
+		// rather than leaving both the Job and its reserved funds stuck in
+		// JobReconciling/EconomicEscrowReserved forever. Once a receipt has
+		// already been verified (EconomicSettlementPending or later), the
+		// provider's delivered work has already been proven and settlement
+		// must still be recovered rather than unwound, so that case is left
+		// to the existing reconciliation handling below.
+		if current.EconomicState != domain.EconomicSettlementPending {
+			failed, _ := s.releaseForTerminalUnderLock(ctx, current, domain.JobFailed, domain.ErrSettlementFailed, "billing calculation failed: "+billErr.Error())
+			return failed
+		}
+		return s.markEconomicReconciliationUnderLock(ctx, current.ID, current.EconomicState, domain.JobCompleted, domain.ErrSettlementFailed, "billing calculation failed: "+billErr.Error())
+	}
+	receipt.Cost = billingSnapshot.GrossCharge
 	if current.EconomicState != domain.EconomicSettlementPending {
 		current.ProofStatus.Receipt = domain.ProofSigned
 		proofRef, commitErr := s.core.CommitExecutionReceipt(ctx, receipt)
@@ -466,6 +495,17 @@ func (s *JobService) settleProviderResultUnderLock(ctx context.Context, current 
 	})
 	if finalErr != nil {
 		return s.markEconomicReconciliationUnderLock(ctx, current.ID, domain.EconomicSettlementPending, domain.JobCompleted, domain.ErrSettlementFailed, "settlement finalized remotely but local atomic finalization must be retried: "+finalErr.Error())
+	}
+	// The customer-facing settlement (charge/refund, job completion) is now
+	// durably finalized regardless of what happens next. Recording the
+	// provider's earning is a best-effort attempt here: RecordSettlement is
+	// idempotent (PutBillingSnapshot upserts by JobID, CreateEarning is
+	// unique-by-settlement_id), so if this call fails or the process dies
+	// before it runs, EarningsService.BackfillSweep finds this Job via
+	// EconomicSettled and replays it later -- the Job's own State never
+	// reverts away from Completed to wait for it.
+	if s.earnings != nil {
+		_, _ = s.earnings.RecordSettlement(ctx, billingSnapshot, settled.Receipt.ID)
 	}
 	_, _ = s.core.CommitProofOfServiceEvidence(ctx, receipt)
 	return final

@@ -35,11 +35,21 @@ type JobService struct {
 	provider tosai.Provider
 	core     toscore.Core
 	accounts *AccountService
+	earnings *EarningsService
 	jobLocks sync.Map // job_id -> *sync.Mutex; process-local lifecycle serialization
 }
 
 func NewJobService(s store.Store, provider tosai.Provider, core toscore.Core, accounts *AccountService) *JobService {
 	return &JobService{store: s, provider: provider, core: core, accounts: accounts}
+}
+
+// WithEarnings wires provider earnings recording into settlement. Without
+// it, settlement still computes and charges the correct metered amount
+// (billing is independent of earnings), but no ProviderEarning is created
+// -- used by tests and any deployment that doesn't need the earnings ledger.
+func (s *JobService) WithEarnings(e *EarningsService) *JobService {
+	s.earnings = e
+	return s
 }
 
 type SubmitInput struct {

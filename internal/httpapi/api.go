@@ -53,6 +53,7 @@ type Server struct {
 	Streams       *service.StreamService
 	Accounts      *service.AccountService
 	Receipts      *service.ReceiptService
+	Earnings      *service.EarningsService
 	Artifacts     *service.ArtifactService
 	Logger        *slog.Logger
 	PublicBaseURL string
@@ -101,6 +102,10 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("GET /v1/account/receipts", s.withScopes(s.handleListReceipts, auth.ScopeAccountRead))
 	mux.HandleFunc("GET /v1/receipts/{id}", s.withScopes(s.handleGetReceipt, auth.ScopeAccountRead))
 	mux.HandleFunc("GET /v1/receipts/{id}/settlement-proof", s.withScopes(s.handleSettlementProof, auth.ScopeProofsRead))
+	mux.HandleFunc("GET /v1/jobs/{id}/billing", s.withScopes(s.handleGetJobBilling, auth.ScopeJobsRead))
+
+	mux.HandleFunc("GET /v1/provider/earnings", s.withScopes(s.handleListEarnings, auth.ScopeEarningsRead))
+	mux.HandleFunc("GET /v1/provider/earnings/{id}", s.withScopes(s.handleGetEarning, auth.ScopeEarningsRead))
 
 	mux.HandleFunc("GET /v1/taxonomy", s.withScopes(s.handleTaxonomy, auth.ScopeCapabilitiesRead))
 	mux.HandleFunc("GET /v1/network/status", s.withScopes(s.handleNetworkStatus, auth.ScopeCapabilitiesRead))

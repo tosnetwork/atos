@@ -153,6 +153,78 @@ type Accounts interface {
 	UpdateAccount(ctx context.Context, principalID string, seed domain.Account, fn func(a domain.Account, exists bool) (domain.Account, error)) (domain.Account, error)
 }
 
+// Billing persists the durable, auditable metered billing calculation for
+// each Job. computeBillingSnapshot (internal/service/billing.go) is a pure
+// function of already-durable, immutable inputs (the frozen Quote and the
+// verified Execution Receipt), so recomputing and re-persisting an
+// identical snapshot for the same JobID is always a safe no-op -- exactly
+// what makes it safe to call from crash recovery.
+type Billing interface {
+	// PutBillingSnapshot idempotently persists snap, keyed by JobID (one
+	// snapshot per Job). If a snapshot already exists for this JobID with
+	// identical economic content (every field except CalculatedAt),
+	// implementations MUST return that stored snapshot with created=false
+	// and a nil error -- a safe no-op recomputation. If a snapshot already
+	// exists with DIFFERENT economic content, implementations MUST return
+	// domain.ErrIdempotencyConflict rather than silently keeping the old
+	// value or silently accepting the new one: a Job's billing may never be
+	// recomputed to a different result once persisted.
+	PutBillingSnapshot(ctx context.Context, snap domain.BillingSnapshot) (stored domain.BillingSnapshot, created bool, err error)
+	BillingSnapshotByJob(ctx context.Context, jobID string) (domain.BillingSnapshot, error)
+}
+
+// Earnings persists the durable provider earnings ledger and the idempotent
+// external-payout state machine folded into each ProviderEarning record.
+type Earnings interface {
+	// CreateEarning atomically creates a ProviderEarning uniquely bound to
+	// e.SettlementID. If an earning already exists for that settlement
+	// (enforced by a database uniqueness constraint, not a Get+Put race)
+	// with IDENTICAL identity+economic fields (ProviderID, JobID, QuoteID,
+	// ReceiptID, SettlementID, CapabilityID, CapabilityVersion,
+	// GrossAmount, GatewayFee, NetAmount -- not lifecycle fields like
+	// Status/CreatedAt/MaturesAt, which legitimately differ between the
+	// original create and a later retry), the existing record is returned
+	// with created=false and a nil error -- this is what makes earning
+	// creation from crash recovery or a duplicate reconciler sweep safe to
+	// retry without ever creating a second earning for the same
+	// settlement. If an earning already exists for that settlement with
+	// DIFFERENT identity+economic fields, implementations MUST return
+	// domain.ErrIdempotencyConflict rather than silently returning the
+	// stale row.
+	CreateEarning(ctx context.Context, e domain.ProviderEarning) (out domain.ProviderEarning, created bool, err error)
+	GetEarning(ctx context.Context, id string) (domain.ProviderEarning, error)
+	EarningBySettlement(ctx context.Context, settlementID string) (domain.ProviderEarning, error)
+	EarningsByProvider(ctx context.Context, providerID string) ([]domain.ProviderEarning, error)
+	// EarningsMaturing returns EarningMaturing earnings with matures_at <=
+	// before, oldest first, for the maturation sweep.
+	EarningsMaturing(ctx context.Context, before time.Time, limit int) ([]domain.ProviderEarning, error)
+	// EarningsAvailableForPayout returns EarningAvailable earnings ready to
+	// begin the payout state machine.
+	EarningsAvailableForPayout(ctx context.Context, limit int) ([]domain.ProviderEarning, error)
+	// EarningsPayoutPending returns EarningPayoutPending earnings whose
+	// payout_requested_at <= before, for payout crash recovery: a process
+	// that died between committing the payout_pending intent and recording
+	// its outcome leaves the earning here until reconciliation replays it.
+	EarningsPayoutPending(ctx context.Context, before time.Time, limit int) ([]domain.ProviderEarning, error)
+	// SettledJobsMissingEarning returns Jobs whose economic settlement is
+	// already durably finalized (EconomicState == EconomicSettled) but
+	// which have no ProviderEarning yet -- the crash window between
+	// committing a settlement and creating its earning. Used by
+	// EarningsService's backfill sweep; safe to call repeatedly since
+	// RecordSettlement is idempotent.
+	SettledJobsMissingEarning(ctx context.Context, limit int) ([]domain.Job, error)
+	// UpdateEarning atomically applies fn to the earning's current stored
+	// state (or domain.ProviderEarning{} with exists=false if it isn't
+	// stored yet) and persists whatever fn returns, mirroring
+	// store.Jobs.UpdateJob's compare-and-swap pattern. Implementations MUST
+	// reject (domain.ErrIdempotencyConflict) a returned value whose ID, or
+	// whose identity/economic fields (ProviderID, SettlementID,
+	// GrossAmount, GatewayFee, NetAmount, ...), differ from the existing
+	// stored earning -- only lifecycle fields (Status, timestamps, payout
+	// checkpoints) may change through this method.
+	UpdateEarning(ctx context.Context, id string, fn func(e domain.ProviderEarning, exists bool) (domain.ProviderEarning, error)) (domain.ProviderEarning, error)
+}
+
 type Artifacts interface {
 	PutArtifact(ctx context.Context, a domain.StoredArtifact) error
 	GetArtifact(ctx context.Context, id string) (domain.StoredArtifact, error)
@@ -183,6 +255,8 @@ type Store interface {
 	Jobs
 	JobStream
 	Accounts
+	Billing
+	Earnings
 	Artifacts
 	Idempotency
 }

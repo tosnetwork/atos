@@ -98,6 +98,14 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 	if err != nil {
 		return domain.Quote{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability has an invalid price_hint", false)
 	}
+	// Defense in depth: Register/Update already reject invalid MeteredRates,
+	// but this catches a capability that was written before that validation
+	// existed (or reached storage by some other path) before it gets frozen
+	// into a new Quote and eventually causes an unrecoverable settlement
+	// failure long after funds are committed.
+	if err := validatePricing(cap.Pricing); err != nil {
+		return domain.Quote{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability has invalid metered pricing: "+err.Error(), false)
+	}
 	fees, err := applyFeeRate(subtotal, defaultFeeRate)
 	if err != nil {
 		return domain.Quote{}, err
@@ -184,6 +192,11 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 		ExecutionDeadline:      executionDeadline,
 		CreatedAt:              now,
 		RequiresConfirmation:   requiresConfirmation,
+		// Frozen here, not re-read at settlement time: metered billing must
+		// never reinterpret an old Job using the Capability's current live
+		// pricing configuration.
+		MeteredRates: cap.Pricing.MeteredRates,
+		PricingModel: cap.Pricing.Model,
 	}
 	if serviceQuote.ID != "" {
 		q.ServiceQuoteID = serviceQuote.ID
@@ -195,7 +208,17 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 	q.TermsHash = termsHash(
 		q.CapabilityID, q.CapabilityVersion, q.ProviderID, q.PrincipalID,
 		string(q.TrustMode), string(q.ProofProfile),
-		q.Price.TotalMax, q.Price.Currency,
+		// The full frozen pricing contract must be committed here, not just
+		// TotalMax: two Quotes can share the same TotalMax while splitting
+		// it differently between Subtotal/Fees, or while metering usage at
+		// entirely different per-dimension rates, and both differences
+		// change what a Job ultimately gets charged and what the provider
+		// ultimately earns (internal/service/billing.go). PricingModel and
+		// MeteredRates are therefore part of this commitment, not just
+		// recorded for audit trail (see domain.Quote.PricingModel /
+		// MeteredRates doc comments).
+		string(q.PricingModel), q.Price.Subtotal, q.Price.Fees, q.Price.TotalMax, q.Price.Currency,
+		hashCommitment(q.MeteredRates),
 		string(q.Settlement.Backend), string(q.Settlement.FundingModel),
 		q.ExpiresAt.Format(time.RFC3339Nano), q.ExecutionDeadline.Format(time.RFC3339Nano),
 		q.DisputePolicyHash, q.ServiceQuoteID, q.UnderlyingServiceQuoteRef,

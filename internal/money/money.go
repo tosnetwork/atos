@@ -140,3 +140,60 @@ func (a Amount) IsZero() bool {
 func (a Amount) IsPositive() bool {
 	return a.Minor.Sign() > 0
 }
+
+// MulUint64 returns a*n. big.Int has no fixed-width overflow, so this is
+// exact regardless of magnitude. Used to price a metered usage count
+// (e.g. output tokens) against a per-unit rate.
+func (a Amount) MulUint64(n uint64) Amount {
+	return Amount{Minor: new(big.Int).Mul(a.Minor, new(big.Int).SetUint64(n)), Currency: a.Currency, Decimals: a.Decimals}
+}
+
+// MulDiv returns a*numerator/denominator, truncating toward zero (Go's
+// big.Int.Div semantics), checked for currency/decimals agreement between
+// a, numerator and denominator. Used to scale one amount in proportion to
+// the ratio of two others -- e.g. splitting a quoted gateway fee in
+// proportion to how much of the quoted provider subtotal was actually
+// metered, so the split amounts are always guaranteed to sum to at most
+// the original quoted total. denominator must not be zero.
+func (a Amount) MulDiv(numerator, denominator Amount) (Amount, error) {
+	if err := a.sameUnit(numerator); err != nil {
+		return Amount{}, err
+	}
+	if err := a.sameUnit(denominator); err != nil {
+		return Amount{}, err
+	}
+	if denominator.Minor.Sign() == 0 {
+		return Amount{}, errors.New("money: division by zero")
+	}
+	product := new(big.Int).Mul(a.Minor, numerator.Minor)
+	result := new(big.Int).Div(product, denominator.Minor)
+	return Amount{Minor: result, Currency: a.Currency, Decimals: a.Decimals}, nil
+}
+
+// Min returns the smaller of a and b, checked for currency/decimals
+// agreement.
+func (a Amount) Min(b Amount) Amount {
+	if a.Cmp(b) <= 0 {
+		return a
+	}
+	return b
+}
+
+// Rescale converts a to a different decimal precision, exact when widening
+// (newDecimals > a.Decimals) and truncating toward zero when narrowing --
+// consistent with every other truncation in this package (Div, MulDiv).
+// Used to price metered unit rates at a higher internal precision than a
+// quote's settlement currency (so realistic sub-cent per-token/per-byte
+// rates parse correctly) and then round down exactly once, at the end, to
+// the currency's actual precision.
+func (a Amount) Rescale(newDecimals int) Amount {
+	if newDecimals == a.Decimals {
+		return a
+	}
+	if newDecimals > a.Decimals {
+		factor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(newDecimals-a.Decimals)), nil)
+		return Amount{Minor: new(big.Int).Mul(a.Minor, factor), Currency: a.Currency, Decimals: newDecimals}
+	}
+	factor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(a.Decimals-newDecimals)), nil)
+	return Amount{Minor: new(big.Int).Div(a.Minor, factor), Currency: a.Currency, Decimals: newDecimals}
+}

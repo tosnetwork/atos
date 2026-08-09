@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/tosnetwork/atos/internal/a2a"
+	"github.com/tosnetwork/atos/internal/adapters/payout"
+	payoutmock "github.com/tosnetwork/atos/internal/adapters/payout/mock"
 	"github.com/tosnetwork/atos/internal/adapters/storage/local"
 	"github.com/tosnetwork/atos/internal/adapters/tosai"
 	tosaimock "github.com/tosnetwork/atos/internal/adapters/tosai/mock"
@@ -129,10 +131,35 @@ func main() {
 	jobs := service.NewJobService(st, execution, core, accounts)
 	streams := service.NewStreamService(st, execution)
 	receipts := service.NewReceiptService(st, core)
+
+	// No production payout rail exists yet. ATOS_PAYOUT_BACKEND defaults to
+	// "disabled": earnings still mature to Available and stop there --
+	// nothing ever attempts an external payout, so the ledger can never
+	// mark a real provider liability "paid" when no funds actually moved.
+	// "mock" is an explicit, deterministic test/development opt-in (see
+	// internal/adapters/payout/mock) that never moves real funds either,
+	// but DOES drive earnings through to Paid, purely to exercise the
+	// ledger and payout state machine end to end; config.Validate rejects
+	// it in production. Swap in a real payout.Adapter implementation and a
+	// new backend case here before any deployment pays anyone for real.
+	var payoutAdapter payout.Adapter
+	switch cfg.PayoutBackend {
+	case config.PayoutBackendMock:
+		payoutAdapter = payoutmock.New()
+		logger.Warn("ATOS_PAYOUT_BACKEND=mock: using the mock payout adapter, which never moves real funds (development/test only)")
+	default:
+		logger.Info("ATOS_PAYOUT_BACKEND=disabled: provider earnings will mature to available and stop there; no payout will be attempted")
+	}
+	earnings := service.NewEarningsService(st, payoutAdapter)
+	jobs.WithEarnings(earnings)
+
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
 	defer reconcileCancel()
 	go jobs.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("managed economic reconciliation pending", "error", reconcileErr)
+	})
+	go earnings.RunReconciler(reconcileCtx, 30*time.Second, 100, func(reconcileErr error) {
+		logger.Error("provider earnings reconciliation pending", "error", reconcileErr)
 	})
 
 	blobStorage, err := local.New(cfg.BlobDir, cfg.PublicBaseURL, st)
@@ -149,12 +176,12 @@ func main() {
 	restServer := &httpapi.Server{
 		Auth: authorization, Capabilities: capabilities, Quotes: quotes,
 		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts,
-		Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
+		Earnings: earnings, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 		ApprovalToken: cfg.Auth.ApprovalToken,
 	}
 	mcpServer := &mcp.Server{
 		Auth: authorization, Capabilities: capabilities, Quotes: quotes,
-		Jobs: jobs, Accounts: accounts, Receipts: receipts,
+		Jobs: jobs, Accounts: accounts, Receipts: receipts, Earnings: earnings,
 		Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}
 	a2aServer := &a2a.Server{

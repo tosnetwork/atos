@@ -48,6 +48,11 @@ type Pricing struct {
 	Model     PricingModel `json:"model"`
 	Unit      string       `json:"unit,omitempty"`
 	PriceHint PriceHint    `json:"price_hint"`
+	// MeteredRates optionally defines per-dimension unit prices for
+	// PricingMetered/PricingPerUnit capabilities. See domain.MeteredRates.
+	// Billing never reads this field directly at settlement time -- it is
+	// frozen into the Quote at Quote-creation time (Quote.MeteredRates).
+	MeteredRates *MeteredRates `json:"metered_rates,omitempty"`
 }
 
 type SLA struct {

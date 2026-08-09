@@ -26,6 +26,7 @@ tags:
   - name: jobs
   - name: account
   - name: receipts
+  - name: earnings
   - name: artifacts
   - name: metadata
   - name: confirmations
@@ -580,6 +581,54 @@ paths:
             application/json:
               schema: {type: object, additionalProperties: true}
         default: {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}/billing:
+    parameters:
+      - {$ref: '#/components/parameters/JobID'}
+    get:
+      tags: [earnings]
+      summary: Read the durable metered billing snapshot for one Job
+      description: >-
+        Requires `jobs:read`. Visible to the Job's owning principal (the
+        payer) or its owning provider only. Deterministic function of the
+        frozen Quote terms and the verified Execution Receipt usage --
+        `0 <= gross_charge <= quote.price.total_max` always.
+      responses:
+        '200':
+          description: Billing snapshot
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingSnapshot'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/provider/earnings:
+    get:
+      tags: [earnings]
+      summary: List the authenticated provider's earnings
+      description: Requires `earnings:read`. Always scoped to the caller's own provider identity.
+      responses:
+        '200':
+          description: Earnings
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [earnings]
+                properties:
+                  earnings: {type: array, items: {$ref: '#/components/schemas/ProviderEarning'}}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/provider/earnings/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/EarningID'}
+    get:
+      tags: [earnings]
+      summary: Read one owned earning
+      description: Requires `earnings:read`. 403 if the earning belongs to a different provider.
+      responses:
+        '200':
+          description: Provider earning
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProviderEarning'}
+        default: {$ref: '#/components/responses/Error'}
   /v1/uploads:
     post:
       tags: [artifacts]
@@ -710,6 +759,11 @@ components:
       in: path
       required: true
       schema: {type: string, pattern: '^art_'}
+    EarningID:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, pattern: '^earn_'}
   responses:
     Error:
       description: ATOS error envelope
@@ -987,6 +1041,68 @@ components:
         output_commitment: {type: string}
         usage_commitment: {type: string}
         created_at: {type: string, format: date-time}
+    Usage:
+      type: object
+      properties:
+        input_bytes: {type: integer, minimum: 0}
+        output_bytes: {type: integer, minimum: 0}
+        input_tokens: {type: integer, minimum: 0}
+        output_tokens: {type: integer, minimum: 0}
+        execution_millis: {type: integer, minimum: 0}
+    PricingModel:
+      type: string
+      enum: [free, fixed, per_use, per_unit, metered, negotiated]
+    BillingSnapshot:
+      type: object
+      description: >-
+        Deterministic function of the frozen Quote terms and the verified
+        Execution Receipt usage. 0 <= gross_charge <= the originating
+        Quote's price.total_max always.
+      required: [job_id, quote_id, receipt_id, provider_id, capability_id, capability_version, trust_mode, usage, gross_charge, provider_gross, gateway_fee, principal_refund, calculated_at]
+      properties:
+        job_id: {type: string}
+        quote_id: {type: string}
+        receipt_id: {type: string}
+        provider_id: {type: string}
+        capability_id: {type: string}
+        capability_version: {type: string}
+        trust_mode: {$ref: '#/components/schemas/TrustMode'}
+        usage: {$ref: '#/components/schemas/Usage'}
+        usage_commitment: {type: string}
+        pricing_model: {$ref: '#/components/schemas/PricingModel'}
+        pricing_terms_hash: {type: string}
+        gross_charge: {$ref: '#/components/schemas/Money'}
+        provider_gross: {$ref: '#/components/schemas/Money'}
+        gateway_fee: {$ref: '#/components/schemas/Money'}
+        principal_refund: {$ref: '#/components/schemas/Money'}
+        calculated_at: {type: string, format: date-time}
+    ProviderEarning:
+      type: object
+      description: >-
+        One provider's durable claim on a single finalized settlement,
+        uniquely bound to it. Internal payout recovery/checkpoint fields
+        (idempotency key, attempt counters) are deliberately not part of
+        this public contract.
+      required: [earning_id, provider_id, job_id, quote_id, receipt_id, settlement_id, capability_id, capability_version, gross_amount, gateway_fee, net_amount, status, created_at, matures_at]
+      properties:
+        earning_id: {type: string}
+        provider_id: {type: string}
+        job_id: {type: string}
+        quote_id: {type: string}
+        receipt_id: {type: string}
+        settlement_id: {type: string}
+        capability_id: {type: string}
+        capability_version: {type: string}
+        gross_amount: {$ref: '#/components/schemas/Money'}
+        gateway_fee: {$ref: '#/components/schemas/Money'}
+        net_amount: {$ref: '#/components/schemas/Money'}
+        status: {type: string, enum: [maturing, available, payout_pending, paid, frozen, released, reversed]}
+        created_at: {type: string, format: date-time}
+        matures_at: {type: string, format: date-time}
+        available_at: {type: string, format: date-time}
+        payout_requested_at: {type: string, format: date-time}
+        payout_reference: {type: string}
+        paid_at: {type: string, format: date-time}
     Account:
       type: object
       required: [balance, spend_policy, trust_policy]
