@@ -98,7 +98,12 @@ func computeBillingSnapshot(quote domain.Quote, receipt domain.ExecutionReceipt)
 	return domain.BillingSnapshot{
 		JobID: receipt.JobID, QuoteID: quote.ID, ReceiptID: receipt.ID,
 		ProviderID: quote.ProviderID, CapabilityID: quote.CapabilityID, CapabilityVersion: quote.CapabilityVersion,
-		TrustMode: quote.TrustMode, Usage: receipt.Usage, UsageCommitment: hashCommitment(receipt.Usage),
+		// UsageCommitment records the verified Execution Receipt's own proof
+		// -chain usage commitment (set by the tos-protocol adapter from the
+		// signed receipt, or by the mock provider in tests) -- not a fresh
+		// local rehash of Usage -- so it audits what was actually verified,
+		// not a value ATOS recomputed for itself after the fact.
+		TrustMode: quote.TrustMode, Usage: receipt.Usage, UsageCommitment: receipt.UsageCommitment,
 		PricingModel: quote.PricingModel, PricingTermsHash: quote.TermsHash,
 		GrossCharge:     domain.Money{Amount: grossCharge.String(), Currency: currency},
 		ProviderGross:   domain.Money{Amount: providerGross.String(), Currency: currency},
