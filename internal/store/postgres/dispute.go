@@ -96,12 +96,16 @@ func scanDispute(row pgx.Row) (domain.Dispute, error) {
 
 // OpenDispute serializes concurrent first-writers for the same job_id via
 // an advisory transaction lock (a row cannot be SELECT...FOR UPDATE locked
-// before it exists), then row-locks the disputed ProviderEarning (found by
-// job_id) before calling build, so the earning's status observed by build
-// can never change concurrently underneath the freeze/defer decision. Both
-// the new dispute row and the earning's next state commit in the same
-// transaction.
-func (s *Store) OpenDispute(ctx context.Context, jobID string, build func(domain.ProviderEarning, bool) (domain.Dispute, domain.ProviderEarning, error)) (domain.Dispute, domain.ProviderEarning, bool, error) {
+// before it exists), then row-locks the disputed ProviderEarning -- found
+// by settlementID, its real UNIQUE identity, never by job_id (a plain
+// index with no uniqueness guarantee) -- before calling build, so the
+// earning's status observed by build can never change concurrently
+// underneath the freeze/defer decision. A plain SELECT...FOR UPDATE
+// suffices here (no separate advisory lock, mirroring UpdateEarning's own
+// convention) because the earning row is guaranteed to already exist by
+// the time a Job can be disputed. Both the new dispute row and the
+// earning's next state commit in the same transaction.
+func (s *Store) OpenDispute(ctx context.Context, jobID, settlementID string, build func(domain.ProviderEarning, bool) (domain.Dispute, domain.ProviderEarning, error)) (domain.Dispute, domain.ProviderEarning, bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return domain.Dispute{}, domain.ProviderEarning{}, false, err
@@ -120,26 +124,15 @@ func (s *Store) OpenDispute(ctx context.Context, jobID string, build func(domain
 		return domain.Dispute{}, domain.ProviderEarning{}, false, err
 	}
 
-	var earningID string
-	err = tx.QueryRow(ctx, `SELECT id FROM provider_earnings WHERE job_id=$1`, jobID).Scan(&earningID)
+	earning, err := scanEarning(tx.QueryRow(ctx, `SELECT `+earningColumns+` FROM provider_earnings WHERE settlement_id=$1 FOR UPDATE`, settlementID))
 	earningExists := true
 	if errors.Is(err, pgx.ErrNoRows) {
+		earning = domain.ProviderEarning{}
 		earningExists = false
 		err = nil
 	}
 	if err != nil {
 		return domain.Dispute{}, domain.ProviderEarning{}, false, err
-	}
-
-	var earning domain.ProviderEarning
-	if earningExists {
-		if err := lockTransactionKey(ctx, tx, "earning", earningID); err != nil {
-			return domain.Dispute{}, domain.ProviderEarning{}, false, err
-		}
-		earning, err = scanEarning(tx.QueryRow(ctx, `SELECT `+earningColumns+` FROM provider_earnings WHERE id=$1 FOR UPDATE`, earningID))
-		if err != nil {
-			return domain.Dispute{}, domain.ProviderEarning{}, false, err
-		}
 	}
 
 	dispute, nextEarning, err := build(earning, earningExists)
@@ -333,8 +326,9 @@ func (s *Store) UpdateDispute(ctx context.Context, id string, fn func(domain.Dis
 }
 
 // UpdateDisputeAndEarning row-locks the dispute (by id) and the
-// ProviderEarning it references (found by job_id, locked by earning id)
-// in that order, then commits fn's result to both in one transaction.
+// ProviderEarning it references (by the dispute's own immutable
+// EarningID, never re-derived from job_id) in that order, then commits
+// fn's result to both in one transaction.
 func (s *Store) UpdateDisputeAndEarning(ctx context.Context, disputeID string, fn func(domain.Dispute, domain.ProviderEarning, bool) (domain.Dispute, domain.ProviderEarning, error)) (domain.Dispute, domain.ProviderEarning, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -353,25 +347,17 @@ func (s *Store) UpdateDisputeAndEarning(ctx context.Context, disputeID string, f
 		return domain.Dispute{}, domain.ProviderEarning{}, err
 	}
 
-	var earningID string
-	err = tx.QueryRow(ctx, `SELECT id FROM provider_earnings WHERE job_id=$1`, currentDispute.JobID).Scan(&earningID)
+	// Locked by the dispute's own immutable EarningID, never re-derived
+	// from job_id.
+	currentEarning, err := scanEarning(tx.QueryRow(ctx, `SELECT `+earningColumns+` FROM provider_earnings WHERE id=$1 FOR UPDATE`, currentDispute.EarningID))
 	earningExists := true
 	if errors.Is(err, pgx.ErrNoRows) {
+		currentEarning = domain.ProviderEarning{}
 		earningExists = false
 		err = nil
 	}
 	if err != nil {
 		return domain.Dispute{}, domain.ProviderEarning{}, err
-	}
-	var currentEarning domain.ProviderEarning
-	if earningExists {
-		if err := lockTransactionKey(ctx, tx, "earning", earningID); err != nil {
-			return domain.Dispute{}, domain.ProviderEarning{}, err
-		}
-		currentEarning, err = scanEarning(tx.QueryRow(ctx, `SELECT `+earningColumns+` FROM provider_earnings WHERE id=$1 FOR UPDATE`, earningID))
-		if err != nil {
-			return domain.Dispute{}, domain.ProviderEarning{}, err
-		}
 	}
 
 	nextDispute, nextEarning, err := fn(currentDispute, currentEarning, earningExists)
@@ -404,24 +390,15 @@ func (s *Store) UpdateDisputeAndEarning(ctx context.Context, disputeID string, f
 	return nextDispute, nextEarning, nil
 }
 
-// UpdateDisputeAndAccount mirrors UpdateJobAndAccount's exact transactional
-// shape (Dispute in place of Job): the principal's account credit and the
-// dispute's own checkpoint commit together in one transaction, so a crash
-// between "credit applied" and "dispute marked refunded" is impossible --
-// eliminating the double-credit risk a separate pair of operations would
-// have. Lock order (dispute, then account) is consistent with
-// UpdateDisputeAndEarning's (dispute, then earning); no dispute operation
-// ever locks both earning and account in the same transaction, so there is
-// no additional ordering to reconcile against UpdateJobAndAccount's
-// (account, then job) order.
 // ResolveDispute row-locks the dispute (by id), the ProviderEarning it
-// references (found by job_id, locked by earning id), and the principal's
-// Account -- in that order (dispute, earning, account), consistent with
-// UpdateDisputeAndEarning's (dispute, earning) order and never conflicting
-// with UpdateJobAndAccount's (account, job) order since no code path locks
-// both earning and job together -- then commits fn's result to all three
-// in one transaction. A principal-win's earning reversal and account
-// credit therefore can never be observed partially applied.
+// references (by the dispute's own immutable EarningID, never re-derived
+// from job_id), and the principal's Account -- in that order (dispute,
+// earning, account), consistent with UpdateDisputeAndEarning's (dispute,
+// earning) order and never conflicting with UpdateJobAndAccount's
+// (account, job) order since no code path locks both earning and job
+// together -- then commits fn's result to all three in one transaction.
+// A principal-win's earning reversal and account credit therefore can
+// never be observed partially applied.
 func (s *Store) ResolveDispute(ctx context.Context, disputeID, principalID string, seed domain.Account, fn func(domain.Dispute, domain.ProviderEarning, bool, domain.Account, bool) (domain.Dispute, domain.ProviderEarning, domain.Account, error)) (domain.Dispute, domain.ProviderEarning, domain.Account, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -440,25 +417,17 @@ func (s *Store) ResolveDispute(ctx context.Context, disputeID, principalID strin
 		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
 	}
 
-	var earningID string
-	err = tx.QueryRow(ctx, `SELECT id FROM provider_earnings WHERE job_id=$1`, currentDispute.JobID).Scan(&earningID)
+	// Locked by the dispute's own immutable EarningID, never re-derived
+	// from job_id.
+	currentEarning, err := scanEarning(tx.QueryRow(ctx, `SELECT `+earningColumns+` FROM provider_earnings WHERE id=$1 FOR UPDATE`, currentDispute.EarningID))
 	earningExists := true
 	if errors.Is(err, pgx.ErrNoRows) {
+		currentEarning = domain.ProviderEarning{}
 		earningExists = false
 		err = nil
 	}
 	if err != nil {
 		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
-	}
-	var currentEarning domain.ProviderEarning
-	if earningExists {
-		if err := lockTransactionKey(ctx, tx, "earning", earningID); err != nil {
-			return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
-		}
-		currentEarning, err = scanEarning(tx.QueryRow(ctx, `SELECT `+earningColumns+` FROM provider_earnings WHERE id=$1 FOR UPDATE`, earningID))
-		if err != nil {
-			return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
-		}
 	}
 
 	if err := lockTransactionKey(ctx, tx, "account", principalID); err != nil {

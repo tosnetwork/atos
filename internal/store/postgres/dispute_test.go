@@ -46,7 +46,7 @@ func TestOpenDisputeFreezesEarningAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dispute, nextEarning, created, err := s.OpenDispute(ctx, jobID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
+	dispute, nextEarning, created, err := s.OpenDispute(ctx, jobID, earning.SettlementID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
 		if !exists {
 			t.Fatal("expected earning to exist")
 		}
@@ -90,7 +90,7 @@ func TestOpenDisputeIsIdempotentByJob(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, _, created, err := s.OpenDispute(ctx, jobID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
+	first, _, created, err := s.OpenDispute(ctx, jobID, earning.SettlementID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
 		d := testDisputeFor(jobID, e)
 		next := e
 		next.Status = domain.EarningFrozen
@@ -101,7 +101,7 @@ func TestOpenDisputeIsIdempotentByJob(t *testing.T) {
 	}
 
 	buildCalled := false
-	second, _, created, err := s.OpenDispute(ctx, jobID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
+	second, _, created, err := s.OpenDispute(ctx, jobID, earning.SettlementID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
 		buildCalled = true
 		return domain.Dispute{}, domain.ProviderEarning{}, nil
 	})
@@ -142,7 +142,7 @@ func TestOpenDisputeConcurrentOpenersConvergeToOne(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			d, _, created, err := s.OpenDispute(ctx, jobID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
+			d, _, created, err := s.OpenDispute(ctx, jobID, earning.SettlementID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
 				dd := testDisputeFor(jobID, e)
 				next := e
 				next.Status = domain.EarningFrozen
@@ -230,7 +230,7 @@ func TestOpenDisputeRacesPayoutTransitionExactlyOneOutcome(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			d, _, _, err := s.OpenDispute(ctx, jobID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
+			d, _, _, err := s.OpenDispute(ctx, jobID, earning.SettlementID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
 				dd := testDisputeFor(jobID, e)
 				next := e
 				switch e.Status {
@@ -295,7 +295,7 @@ func TestUpdateDisputeRejectsIdentityFieldChange(t *testing.T) {
 	if _, _, err := s.CreateEarning(ctx, earning); err != nil {
 		t.Fatal(err)
 	}
-	dispute, _, _, err := s.OpenDispute(ctx, jobID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
+	dispute, _, _, err := s.OpenDispute(ctx, jobID, earning.SettlementID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
 		d := testDisputeFor(jobID, e)
 		next := e
 		next.Status = domain.EarningFrozen
@@ -339,7 +339,7 @@ func TestResolveDisputeCreditsExactlyOnceConcurrently(t *testing.T) {
 	if _, _, err := s.CreateEarning(ctx, earning); err != nil {
 		t.Fatal(err)
 	}
-	dispute, _, _, err := s.OpenDispute(ctx, jobID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
+	dispute, _, _, err := s.OpenDispute(ctx, jobID, earning.SettlementID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
 		d := testDisputeFor(jobID, e)
 		d.PrincipalID = principalID
 		next := e

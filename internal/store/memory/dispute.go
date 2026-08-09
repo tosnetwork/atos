@@ -32,13 +32,17 @@ func disputeContentHash(d domain.Dispute) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (s *Store) OpenDispute(ctx context.Context, jobID string, build func(domain.ProviderEarning, bool) (domain.Dispute, domain.ProviderEarning, error)) (domain.Dispute, domain.ProviderEarning, bool, error) {
+func (s *Store) OpenDispute(ctx context.Context, jobID, settlementID string, build func(domain.ProviderEarning, bool) (domain.Dispute, domain.ProviderEarning, error)) (domain.Dispute, domain.ProviderEarning, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existingID, ok := s.disputesByJob[jobID]; ok {
 		return s.disputes[existingID], domain.ProviderEarning{}, false, nil
 	}
-	earningID, earningExists := s.earningsByJob[jobID]
+	// Looked up by settlementID -- provider_earnings.settlement_id carries
+	// a real UNIQUE constraint, unlike job_id (a plain index) -- so this
+	// can never resolve to the wrong earning even if a bug elsewhere ever
+	// produced more than one earning row referencing the same job_id.
+	earningID, earningExists := s.earningsBySettlement[settlementID]
 	earning := s.earnings[earningID]
 	dispute, nextEarning, err := build(earning, earningExists)
 	if err != nil {
@@ -201,8 +205,9 @@ func (s *Store) UpdateDisputeAndEarning(ctx context.Context, disputeID string, f
 	if !exists {
 		return domain.Dispute{}, domain.ProviderEarning{}, store.ErrNotFound
 	}
-	earningID, earningExists := s.earningsByJob[currentDispute.JobID]
-	currentEarning := s.earnings[earningID]
+	// Locked by the dispute's own immutable EarningID, never re-derived
+	// from job_id.
+	currentEarning, earningExists := s.earnings[currentDispute.EarningID]
 	nextDispute, nextEarning, err := fn(currentDispute, currentEarning, earningExists)
 	if err != nil {
 		return domain.Dispute{}, domain.ProviderEarning{}, err
@@ -238,8 +243,9 @@ func (s *Store) ResolveDispute(ctx context.Context, disputeID, principalID strin
 	if !disputeExists {
 		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, store.ErrNotFound
 	}
-	earningID, earningExists := s.earningsByJob[currentDispute.JobID]
-	currentEarning := s.earnings[earningID]
+	// Locked by the dispute's own immutable EarningID, never re-derived
+	// from job_id.
+	currentEarning, earningExists := s.earnings[currentDispute.EarningID]
 	account, accountExists := s.accounts[principalID]
 	if !accountExists {
 		account = seed

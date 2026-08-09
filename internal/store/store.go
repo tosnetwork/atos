@@ -233,24 +233,26 @@ type Earnings interface {
 // recovery checkpoints. See domain.Dispute's doc comment for the
 // immutability contract every implementation must uphold.
 type Disputes interface {
-	// OpenDispute atomically resolves the ProviderEarning bound to jobID
-	// (row-locked in the same transaction the dispute row is created in)
-	// and applies build to decide the dispute's initial durable state
-	// together with the earning's next state -- see
-	// domain.DisputeEconomicState's doc comments for the three possible
-	// branches (frozen / pending_payout_resolution / paid) build must
-	// choose between based on the earning's current, row-locked status.
-	// This is what makes "opening a dispute atomically freezes provider
-	// funds" (or correctly defers to pending_payout_resolution/paid when
-	// it cannot) a single durable transaction rather than two operations
-	// with a crash window between them.
+	// OpenDispute atomically resolves the ProviderEarning bound to
+	// settlementID (row-locked, by its real UNIQUE identity -- never by
+	// job_id, which carries no uniqueness guarantee -- in the same
+	// transaction the dispute row is created in) and applies build to
+	// decide the dispute's initial durable state together with the
+	// earning's next state -- see domain.DisputeEconomicState's doc
+	// comments for the three possible branches (frozen /
+	// pending_payout_resolution / paid) build must choose between based on
+	// the earning's current, row-locked status. This is what makes
+	// "opening a dispute atomically freezes provider funds" (or correctly
+	// defers to pending_payout_resolution/paid when it cannot) a single
+	// durable transaction rather than two operations with a crash window
+	// between them.
 	//
 	// If a dispute already exists for jobID, build is never called and the
 	// existing dispute is returned with created=false and a nil error --
 	// enforced by a database UNIQUE(job_id) constraint, not a
 	// service-layer race, so "at most one dispute per Job" holds even
 	// under 8+ concurrent callers or two independent ATOS replicas.
-	OpenDispute(ctx context.Context, jobID string, build func(earning domain.ProviderEarning, earningExists bool) (domain.Dispute, domain.ProviderEarning, error)) (dispute domain.Dispute, earning domain.ProviderEarning, created bool, err error)
+	OpenDispute(ctx context.Context, jobID, settlementID string, build func(earning domain.ProviderEarning, earningExists bool) (domain.Dispute, domain.ProviderEarning, error)) (dispute domain.Dispute, earning domain.ProviderEarning, created bool, err error)
 	GetDispute(ctx context.Context, id string) (domain.Dispute, error)
 	DisputeByJob(ctx context.Context, jobID string) (domain.Dispute, error)
 	DisputeByIdempotencyKey(ctx context.Context, principalID, key string) (domain.Dispute, error)
@@ -274,15 +276,17 @@ type Disputes interface {
 	// timestamps) may change through this method.
 	UpdateDispute(ctx context.Context, id string, fn func(d domain.Dispute, exists bool) (domain.Dispute, error)) (domain.Dispute, error)
 	// UpdateDisputeAndEarning atomically applies fn to the dispute AND the
-	// ProviderEarning it references (both row-locked in the same
-	// transaction), for resolution transitions that must durably commit
-	// both together in one instruction (reversing/releasing the earning
-	// together with the dispute's own checkpoint). Same immutability
-	// contract as UpdateDispute for the dispute side, and the same as
-	// UpdateEarning for the earning side.
+	// ProviderEarning it references -- both row-locked in the same
+	// transaction, the earning by the dispute's own immutable EarningID
+	// (never re-derived from job_id) -- for resolution transitions that
+	// must durably commit both together in one instruction (reversing/
+	// releasing the earning together with the dispute's own checkpoint).
+	// Same immutability contract as UpdateDispute for the dispute side,
+	// and the same as UpdateEarning for the earning side.
 	UpdateDisputeAndEarning(ctx context.Context, disputeID string, fn func(d domain.Dispute, e domain.ProviderEarning, earningExists bool) (domain.Dispute, domain.ProviderEarning, error)) (domain.Dispute, domain.ProviderEarning, error)
 	// ResolveDispute atomically row-locks the dispute, the ProviderEarning
-	// it references (found by job_id), and the principal's Account (in
+	// it references (by the dispute's own immutable EarningID, never
+	// re-derived from job_id), and the principal's Account (in
 	// that order: dispute, then earning, then account) and commits fn's
 	// result to all three in one transaction. This is the sole primitive
 	// DisputeService.Resolve uses for every outcome (principal, provider,

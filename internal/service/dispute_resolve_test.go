@@ -6,10 +6,31 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
+	payoutmock "github.com/tosnetwork/atos/internal/adapters/payout/mock"
+	"github.com/tosnetwork/atos/internal/adapters/storage/local"
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/service"
 )
+
+// disputeHarnessWithMaturation is disputeHarness with a caller-controlled
+// maturation period, for tests that need to observe a still-Maturing
+// earning (disputeHarness/earningsHarness fix it at time.Nanosecond so
+// every other test's earnings are immediately Available).
+func disputeHarnessWithMaturation(t *testing.T, period time.Duration) (harness, *service.EarningsService, *service.DisputeService) {
+	t.Helper()
+	h := newHarness()
+	earnings := service.NewEarningsService(h.store(), payoutmock.New()).WithMaturationPeriod(period)
+	h.jobs.WithEarnings(earnings)
+	blobStorage, err := local.New(t.TempDir(), "http://localhost", h.store())
+	if err != nil {
+		t.Fatalf("local.New: %v", err)
+	}
+	artifacts := service.NewArtifactService(h.store(), blobStorage)
+	disputes := service.NewDisputeService(h.store(), h.jobs, earnings, h.accounts, artifacts)
+	return h, earnings, disputes
+}
 
 func openedDispute(t *testing.T, h harness, disputes *service.DisputeService, providerID, principalID, price string) (domain.Job, domain.Dispute) {
 	t.Helper()
@@ -26,10 +47,11 @@ func openedDispute(t *testing.T, h harness, disputes *service.DisputeService, pr
 }
 
 // TestDisputeResolve_PrincipalWinHappyPath proves the full atomic pipeline:
-// reversal + refund_pending checkpoint commit together, then the refund
-// completes and the dispute reaches its terminal checkpoint -- with money
-// conservation checked explicitly (principal balance increases by exactly
-// ChargedAmount, the reversed earning never subsequently pays out).
+// the earning reversal and the account credit commit together in one
+// ResolveDispute transaction, landing the dispute directly at its terminal
+// checkpoint -- with money conservation checked explicitly (principal
+// balance increases by exactly ChargedAmount, the reversed earning never
+// subsequently pays out).
 func TestDisputeResolve_PrincipalWinHappyPath(t *testing.T) {
 	ctx := context.Background()
 	h, earnings, disputes := disputeHarness(t)
@@ -184,12 +206,6 @@ func TestDisputeResolve_PrincipalWinConcurrentResolveConvergesToOneCredit(t *tes
 	}
 }
 
-// TestDisputeReconcile_CompletesInterruptedRefund simulates a crash between
-// the earning-reversal step (which commits atomically with the
-// refund_pending checkpoint) and the account-credit step: the dispute is
-// driven directly to refund_pending without going through Resolve's
-// second half, then ReconcileDispute must complete the credit -- exactly
-// once, even if invoked twice (a duplicate reconciler sweep).
 // TestDisputeResolve_PrincipalWinHasNoObservableIntermediateState proves
 // ResolveDispute's atomicity claim directly: a principal-win resolution
 // against a Frozen earning can never be observed with the earning already
@@ -495,5 +511,114 @@ func TestDisputeResolve_PartyCannotResolveInOwnFavor(t *testing.T) {
 	_, err = disputes.Resolve(ctx, service.ResolveDisputeInput{DisputeID: d.ID, ReviewerID: d.PrincipalID, Outcome: domain.DisputeOutcomePrincipal})
 	if err == nil {
 		t.Fatal("expected the principal to be rejected resolving in its own favor")
+	}
+}
+
+// TestDisputeResolve_ProviderWinBeforeMaturityStaysMaturing proves a
+// provider-win/rejected resolution cannot let a provider collect earlier
+// than the earning's own original maturation schedule would have allowed:
+// if MaturesAt has not passed yet at resolution time, the earning must
+// return to EarningMaturing (unchanged MaturesAt, no AvailableAt) rather
+// than jumping straight to EarningAvailable -- otherwise disputing (and
+// winning) a Job would be a strictly better outcome for a provider than
+// never having been disputed at all.
+func TestDisputeResolve_ProviderWinBeforeMaturityStaysMaturing(t *testing.T) {
+	ctx := context.Background()
+	h, earnings, disputes := disputeHarnessWithMaturation(t, time.Hour)
+	job, d := openedDispute(t, h, disputes, "agt_resolve_early", "prn_resolve_early", "1.00")
+
+	before, err := earnings.Get(ctx, d.EarningID, job.ProviderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !before.MaturesAt.After(time.Now().UTC()) {
+		t.Fatal("test setup invalid: earning already matured, does not exercise the early-release guard")
+	}
+
+	if _, err := disputes.Review(ctx, d.ID, "rev_1"); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := disputes.Resolve(ctx, service.ResolveDisputeInput{DisputeID: d.ID, ReviewerID: "rev_1", Outcome: domain.DisputeOutcomeProvider})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if resolved.EconomicState != domain.DisputeEconomicReleased {
+		t.Fatalf("economic state = %s, want released", resolved.EconomicState)
+	}
+
+	after, err := earnings.Get(ctx, d.EarningID, job.ProviderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != domain.EarningMaturing {
+		t.Fatalf("earning status = %s, want maturing (resolved before its original MaturesAt)", after.Status)
+	}
+	if after.AvailableAt != nil {
+		t.Fatalf("AvailableAt = %v, want nil while still maturing", after.AvailableAt)
+	}
+	if !after.MaturesAt.Equal(before.MaturesAt) {
+		t.Fatalf("MaturesAt changed by dispute resolution: %v -> %v", before.MaturesAt, after.MaturesAt)
+	}
+
+	// A payout sweep run immediately after must not pay out early either.
+	if _, err := earnings.PayoutSweep(ctx, 100); err != nil {
+		t.Fatal(err)
+	}
+	stillMaturing, err := earnings.Get(ctx, d.EarningID, job.ProviderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stillMaturing.Status != domain.EarningMaturing {
+		t.Fatalf("earning status after PayoutSweep = %s, want still maturing", stillMaturing.Status)
+	}
+}
+
+// TestDisputeReview_ClaimIsExclusiveToFirstReviewer proves Review() claims a
+// dispute exclusively for the calling reviewer: a second, different
+// reviewer may not also claim it, and may not resolve it even directly from
+// Opened via its own Resolve call once another reviewer holds the claim.
+func TestDisputeReview_ClaimIsExclusiveToFirstReviewer(t *testing.T) {
+	ctx := context.Background()
+	h, _, disputes := disputeHarness(t)
+	_, d := openedDispute(t, h, disputes, "agt_review_exclusive", "prn_review_exclusive", "1.00")
+
+	claimed, err := disputes.Review(ctx, d.ID, "rev_first")
+	if err != nil {
+		t.Fatalf("first Review: %v", err)
+	}
+	if claimed.ReviewerID != "rev_first" {
+		t.Fatalf("reviewer_id = %s, want rev_first", claimed.ReviewerID)
+	}
+
+	// The same reviewer re-claiming is idempotent, not an error.
+	again, err := disputes.Review(ctx, d.ID, "rev_first")
+	if err != nil {
+		t.Fatalf("re-claim by the same reviewer: %v", err)
+	}
+	if again.ReviewerID != "rev_first" {
+		t.Fatalf("reviewer_id after re-claim = %s, want rev_first", again.ReviewerID)
+	}
+
+	// A different reviewer must not be able to claim it.
+	_, err = disputes.Review(ctx, d.ID, "rev_second")
+	var domainErr *domain.Error
+	if !errors.As(err, &domainErr) || domainErr.Code != domain.ErrDisputeInvalidTransition {
+		t.Fatalf("second reviewer claim: got %v, want domain.ErrDisputeInvalidTransition", err)
+	}
+
+	// Nor resolve it, even though the dispute is still Opened-equivalent
+	// (review status transitions happen inside Resolve too).
+	_, err = disputes.Resolve(ctx, service.ResolveDisputeInput{DisputeID: d.ID, ReviewerID: "rev_second", Outcome: domain.DisputeOutcomeRejected, ReasonRejected: "trying to hijack"})
+	if !errors.As(err, &domainErr) || domainErr.Code != domain.ErrDisputeInvalidTransition {
+		t.Fatalf("second reviewer resolve: got %v, want domain.ErrDisputeInvalidTransition", err)
+	}
+
+	// The original reviewer can still resolve it normally.
+	resolved, err := disputes.Resolve(ctx, service.ResolveDisputeInput{DisputeID: d.ID, ReviewerID: "rev_first", Outcome: domain.DisputeOutcomeRejected, ReasonRejected: "insufficient evidence"})
+	if err != nil {
+		t.Fatalf("original reviewer resolve: %v", err)
+	}
+	if resolved.ReviewerID != "rev_first" {
+		t.Fatalf("resolved reviewer_id = %s, want rev_first", resolved.ReviewerID)
 	}
 }

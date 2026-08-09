@@ -232,6 +232,15 @@ func (s *DisputeService) Open(ctx context.Context, in OpenDisputeInput) (domain.
 			nextEarning.Status = domain.EarningFrozen
 			dispute.EconomicState = domain.DisputeEconomicFrozen
 		case domain.EarningPayoutPending:
+			// The in-flight payout attempt is allowed to resolve on its
+			// own (Query/recover to Paid, or fail back to Available), but
+			// the durable hold set here durably marks this earning as
+			// disputed so that if it does fail back to Available,
+			// beginPayoutUnderLock refuses to start a *new* payout intent
+			// before the dispute reconciler gets a chance to freeze it
+			// late -- see domain.ProviderEarning.DisputeHoldID's doc
+			// comment.
+			nextEarning.DisputeHoldID = dispute.ID
 			dispute.EconomicState = domain.DisputeEconomicPendingPayoutResolution
 		case domain.EarningPaid:
 			dispute.EconomicState = domain.DisputeEconomicPaid
@@ -240,7 +249,7 @@ func (s *DisputeService) Open(ctx context.Context, in OpenDisputeInput) (domain.
 		}
 		return dispute, nextEarning, nil
 	}
-	dispute, _, _, err := s.store.OpenDispute(ctx, job.ID, build)
+	dispute, _, _, err := s.store.OpenDispute(ctx, job.ID, settlementReceipt.ID, build)
 	if err != nil {
 		return domain.Dispute{}, err
 	}
@@ -251,10 +260,12 @@ func (s *DisputeService) Open(ctx context.Context, in OpenDisputeInput) (domain.
 	return dispute, nil
 }
 
-// Review transitions a dispute from Opened to UnderReview, claiming it for
-// reviewerID. reviewerID must be neither the dispute's principal nor its
-// provider -- callers MUST pass an authenticated identity here, never a
-// caller-supplied one.
+// Review transitions a dispute from Opened to UnderReview, claiming it
+// exclusively for reviewerID: once claimed, no other reviewer may claim or
+// resolve it (see Resolve's ReviewerID check) -- only the original
+// claimant may act on it, or claim again idempotently. reviewerID must be
+// neither the dispute's principal nor its provider -- callers MUST pass an
+// authenticated identity here, never a caller-supplied one.
 func (s *DisputeService) Review(ctx context.Context, disputeID, reviewerID string) (domain.Dispute, error) {
 	if reviewerID == "" {
 		return domain.Dispute{}, domain.NewError(domain.ErrAuthenticationRequired, "reviewer is required", false)
@@ -267,7 +278,10 @@ func (s *DisputeService) Review(ctx context.Context, disputeID, reviewerID strin
 			return domain.Dispute{}, domain.NewError(domain.ErrPermissionDenied, "a party to the dispute cannot review it", false)
 		}
 		if d.ReviewStatus == domain.DisputeUnderReview {
-			return d, nil
+			if d.ReviewerID == reviewerID {
+				return d, nil
+			}
+			return domain.Dispute{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute is already claimed by another reviewer", false)
 		}
 		if d.ReviewStatus != domain.DisputeOpened {
 			return domain.Dispute{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute is not in a reviewable state", false)
@@ -298,8 +312,11 @@ type ResolveDisputeInput struct {
 //     principal credited exactly once, dispute reaches its terminal
 //     checkpoint -- all three in the same transaction.
 //   - DisputeOutcomeProvider / DisputeOutcomeRejected against a Frozen
-//     earning: released back to Available in the same transaction as the
-//     terminal checkpoint, account left untouched.
+//     earning: released back to Maturing or Available (whichever the
+//     earning's original, untouched MaturesAt now implies -- being
+//     disputed must never let a provider skip ahead of its normal
+//     maturation schedule) in the same transaction as the terminal
+//     checkpoint, account left untouched, and the dispute hold cleared.
 //   - Any outcome against an earning already known Paid: no earning or
 //     account mutation is possible (the money already left ATOS). A
 //     principal-win records ClawbackRequired; provider-win/rejected
@@ -330,6 +347,14 @@ func (s *DisputeService) Resolve(ctx context.Context, in ResolveDisputeInput) (d
 			if d.PrincipalID == in.ReviewerID || d.ProviderID == in.ReviewerID {
 				return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrPermissionDenied, "a party to the dispute cannot resolve it", false)
 			}
+			// A dispute claimed via Review belongs exclusively to that
+			// reviewer for the rest of its life -- an unclaimed dispute
+			// (ReviewerID == "", only reachable by resolving Rejected
+			// directly from Opened) may be resolved by anyone with
+			// disputes:review, which implicitly claims it here.
+			if d.ReviewerID != "" && d.ReviewerID != in.ReviewerID {
+				return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute is claimed by a different reviewer", false)
+			}
 			if d.ReviewStatus.Terminal() {
 				if d.Outcome == in.Outcome {
 					return d, e, a, nil
@@ -345,6 +370,7 @@ func (s *DisputeService) Resolve(ctx context.Context, in ResolveDisputeInput) (d
 
 			now := time.Now().UTC()
 			d.Outcome = in.Outcome
+			d.ReviewerID = in.ReviewerID
 			if in.Outcome == domain.DisputeOutcomeRejected {
 				d.ReasonRejected = in.ReasonRejected
 			}
@@ -365,11 +391,15 @@ func (s *DisputeService) Resolve(ctx context.Context, in ResolveDisputeInput) (d
 				}
 				d.ResolvedAt = &now
 				d.UpdatedAt = now
+				if earningExists {
+					e.DisputeHoldID = ""
+				}
 				return d, e, a, nil
 			case domain.DisputeEconomicFrozen:
 				if !earningExists || e.Status != domain.EarningFrozen {
 					return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrSettlementFailed, "disputed earning is not in the expected frozen state", false)
 				}
+				e.DisputeHoldID = ""
 				switch in.Outcome {
 				case domain.DisputeOutcomePrincipal:
 					nextAccount, err := s.accounts.creditAccountValue(a, d.ChargedAmount.Amount, d.ChargedAmount.Currency)
@@ -383,7 +413,21 @@ func (s *DisputeService) Resolve(ctx context.Context, in ResolveDisputeInput) (d
 					d.UpdatedAt = now
 					return d, e, nextAccount, nil
 				case domain.DisputeOutcomeProvider, domain.DisputeOutcomeRejected:
-					e.Status = domain.EarningAvailable
+					// Being disputed must not let a provider skip ahead of
+					// the earning's original maturation schedule: release
+					// back to Maturing (unchanged MaturesAt) if maturity
+					// genuinely has not passed yet, and only to Available
+					// once it has -- exactly the timing the earning would
+					// have followed had it never been disputed at all.
+					if now.Before(e.MaturesAt) {
+						e.Status = domain.EarningMaturing
+						e.AvailableAt = nil
+					} else {
+						e.Status = domain.EarningAvailable
+						if e.AvailableAt == nil {
+							e.AvailableAt = &now
+						}
+					}
 					d.EconomicState = domain.DisputeEconomicReleased
 					if in.Outcome == domain.DisputeOutcomeProvider {
 						d.ReviewStatus = domain.DisputeResolvedForProvider

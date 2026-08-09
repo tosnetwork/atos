@@ -108,4 +108,18 @@ type ProviderEarning struct {
 	PayoutAttempts       int       `json:"-"`
 	PayoutLastAttemptAt  time.Time `json:"-"`
 	PayoutFailureReason  string    `json:"-"`
+
+	// DisputeHoldID is the ID of the Dispute currently holding this earning
+	// out of the payout pipeline, or empty if none. It is set (in the same
+	// transaction as the dispute's own checkpoint) when a Dispute is
+	// opened against an earning that was mid-payout (PayoutPending) at
+	// open time -- the payout attempt already in flight is allowed to
+	// resolve (Query/recover to Paid, or fail to Available), but once
+	// this hold is set, no *new* payout intent may begin for as long as it
+	// remains set, even if the earning is transiently Available again
+	// (e.g. the in-flight attempt was rejected). It is cleared when the
+	// Dispute reaches a terminal economic outcome. Deliberately excluded
+	// from the public JSON contract and from earningContentHash (a
+	// lifecycle field, not identity/economic).
+	DisputeHoldID string `json:"-"`
 }

@@ -7,11 +7,25 @@
 -- what happened to the ProviderEarning they produced.
 --
 -- provider_earnings has no index on job_id as of migration 008 (every
--- existing lookup goes through id or settlement_id); the dispute workflow
--- is Job-keyed (the principal-facing identity), so OpenDispute and
--- UpdateDisputeAndEarning both need an efficient, row-lockable lookup by
--- job_id -- see internal/store.Earnings.EarningByJob.
+-- existing lookup goes through id or settlement_id); DisputeService's
+-- reconciler (EarningByJob) needs an efficient lookup by job_id -- the
+-- dispute workflow's own OpenDispute/ResolveDispute lock the earning by
+-- its real UNIQUE identities (settlement_id at open time, id thereafter
+-- via the dispute's own frozen EarningID) instead, deliberately never by
+-- job_id, which carries no uniqueness guarantee.
 CREATE INDEX IF NOT EXISTS idx_provider_earnings_job ON provider_earnings (job_id);
+
+-- dispute_hold_id durably marks a ProviderEarning as held out of the
+-- payout pipeline by an open Dispute, set in the same transaction as the
+-- dispute's own checkpoint (store.Disputes.OpenDispute). Without this, an
+-- earning whose in-flight payout attempt is rejected (PayoutPending ->
+-- Available) while a Dispute sits in PendingPayoutResolution would be
+-- transiently indistinguishable from any other Available earning to a
+-- concurrent PayoutSweep, which could begin a brand new payout before the
+-- dispute reconciler gets a chance to freeze it late -- violating "a
+-- disputed earning cannot pay out while disputed". See
+-- EarningsService.beginPayoutUnderLock's hold check.
+ALTER TABLE provider_earnings ADD COLUMN IF NOT EXISTS dispute_hold_id TEXT NOT NULL DEFAULT '';
 
 -- job_id is UNIQUE: at most one dispute may ever exist for a given Job.
 -- This is what makes "at most one dispute per settlement" a database
