@@ -327,6 +327,47 @@ func TestUpdateEarningCASConcurrentPayoutTransitionHasSingleWinner(t *testing.T)
 	}
 }
 
+// TestUpdateEarningRejectsEconomicFieldChange proves UpdateEarning rejects a
+// callback that mutates an earning's identity/economic fields (ProviderID,
+// SettlementID, GrossAmount, GatewayFee, NetAmount, ...) instead of
+// persisting it. upsertEarningSQL's ON CONFLICT already excludes the
+// dedicated economic columns from its SET clause, but it does still refresh
+// the JSONB payload column (which also carries those fields, for lifecycle
+// data) -- without this invariant, a buggy callback could make a later
+// scanEarning (which applies that payload on top of the dedicated columns)
+// read back a different economic value than what CreateEarning originally
+// committed.
+func TestUpdateEarningRejectsEconomicFieldChange(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	settlementID := "settle_economic_" + suffix
+	e := testEarning("prov_economic_"+suffix, "job_economic_"+suffix, settlementID)
+	if _, _, err := s.CreateEarning(ctx, e); err != nil {
+		t.Fatalf("CreateEarning: %v", err)
+	}
+
+	_, err := s.UpdateEarning(ctx, e.ID, func(current domain.ProviderEarning, exists bool) (domain.ProviderEarning, error) {
+		if !exists {
+			t.Fatal("expected earning to exist")
+		}
+		current.NetAmount = domain.Money{Amount: "999.99", Currency: "USD"}
+		return current, nil
+	})
+	var domainErr *domain.Error
+	if !errors.As(err, &domainErr) || domainErr.Code != domain.ErrIdempotencyConflict {
+		t.Fatalf("got %v, want domain.ErrIdempotencyConflict", err)
+	}
+
+	got, err := s.GetEarning(ctx, e.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NetAmount.Amount != "1.00" {
+		t.Fatalf("stored earning mutated by a rejected economic-field update: net_amount = %s, want 1.00", got.NetAmount.Amount)
+	}
+}
+
 // TestSettledJobsMissingEarningFindsGapAndExcludesCompleted proves the
 // backfill scan finds a settled Job with no earning row, and stops finding
 // it once an earning exists.

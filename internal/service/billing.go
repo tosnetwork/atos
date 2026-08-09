@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/tosnetwork/atos/internal/domain"
@@ -93,6 +94,42 @@ func computeBillingSnapshot(quote domain.Quote, receipt domain.ExecutionReceipt)
 // Rescale -- never per-dimension, which would compound truncation error
 // across dimensions before the final clamp against the frozen subtotal.
 const meteredRateDecimals = 9
+
+// validatePricing eagerly parses every configured MeteredRate at
+// meteredRateDecimals precision so a malformed rate (negative, non-numeric,
+// or more precise than meteredRateDecimals allows) is rejected as soon as a
+// provider submits it -- at Capability registration/update, and again as
+// defense in depth when a Quote freezes it -- rather than being discovered
+// for the first time inside computeBillingSnapshot at settlement, by which
+// point the Job has already been debited and escrowed and a permanently
+// invalid frozen rate would fail identically on every reconciliation retry
+// forever. Free/Fixed/PerUse/Negotiated capabilities and metered
+// capabilities with no rates configured have nothing to validate.
+func validatePricing(pricing domain.Pricing) error {
+	if pricing.MeteredRates == nil {
+		return nil
+	}
+	currency := pricing.PriceHint.Currency
+	dimensions := []struct {
+		field string
+		rate  string
+	}{
+		{"per_input_byte", pricing.MeteredRates.PerInputByte},
+		{"per_output_byte", pricing.MeteredRates.PerOutputByte},
+		{"per_input_token", pricing.MeteredRates.PerInputToken},
+		{"per_output_token", pricing.MeteredRates.PerOutputToken},
+		{"per_execution_millisecond", pricing.MeteredRates.PerExecutionMillisecond},
+	}
+	for _, d := range dimensions {
+		if d.rate == "" {
+			continue
+		}
+		if _, err := money.Parse(d.rate, currency, meteredRateDecimals); err != nil {
+			return fmt.Errorf("metered_rates.%s: %w", d.field, err)
+		}
+	}
+	return nil
+}
 
 // meterUsage sums each configured per-dimension rate times its
 // corresponding verified usage count. A dimension with no configured rate

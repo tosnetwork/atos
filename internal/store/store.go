@@ -216,7 +216,12 @@ type Earnings interface {
 	// UpdateEarning atomically applies fn to the earning's current stored
 	// state (or domain.ProviderEarning{} with exists=false if it isn't
 	// stored yet) and persists whatever fn returns, mirroring
-	// store.Jobs.UpdateJob's compare-and-swap pattern.
+	// store.Jobs.UpdateJob's compare-and-swap pattern. Implementations MUST
+	// reject (domain.ErrIdempotencyConflict) a returned value whose
+	// identity/economic fields (ProviderID, SettlementID, GrossAmount,
+	// GatewayFee, NetAmount, ...) differ from the existing stored earning --
+	// only lifecycle fields (Status, timestamps, payout checkpoints) may
+	// change through this method.
 	UpdateEarning(ctx context.Context, id string, fn func(e domain.ProviderEarning, exists bool) (domain.ProviderEarning, error)) (domain.ProviderEarning, error)
 }
 

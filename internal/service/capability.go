@@ -63,6 +63,9 @@ func (s *CapabilityService) Register(ctx context.Context, in RegisterCapabilityI
 	if in.InputSchema == nil || in.OutputSchema == nil {
 		return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "input_schema and output_schema are required", false)
 	}
+	if err := validatePricing(in.Pricing); err != nil {
+		return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "invalid pricing: "+err.Error(), false)
+	}
 	requested, err := normalizeRequestedModes(in.RequestedTrustModes)
 	if err != nil {
 		return domain.Capability{}, err
@@ -195,6 +198,9 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 		b, _ := json.Marshal(pricing)
 		if err := json.Unmarshal(b, &p); err != nil {
 			return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "invalid pricing", false)
+		}
+		if err := validatePricing(p); err != nil {
+			return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "invalid pricing: "+err.Error(), false)
 		}
 		if !samePricing(c.Pricing, p) {
 			c.Pricing = p
@@ -509,7 +515,15 @@ func isArtifactSchema(obj map[string]any) bool {
 }
 
 func samePricing(a, b domain.Pricing) bool {
-	return a.Model == b.Model && a.Unit == b.Unit && a.PriceHint.Amount == b.PriceHint.Amount && a.PriceHint.Currency == b.PriceHint.Currency
+	return a.Model == b.Model && a.Unit == b.Unit && a.PriceHint.Amount == b.PriceHint.Amount &&
+		a.PriceHint.Currency == b.PriceHint.Currency && sameMeteredRates(a.MeteredRates, b.MeteredRates)
+}
+
+func sameMeteredRates(a, b *domain.MeteredRates) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 func bumpMinorVersion(version string) string {

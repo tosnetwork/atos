@@ -207,6 +207,16 @@ func (s *Store) UpdateEarning(ctx context.Context, id string, fn func(domain.Pro
 	if err != nil {
 		return domain.ProviderEarning{}, err
 	}
+	// Identity/economic fields (ProviderID, SettlementID, GrossAmount,
+	// GatewayFee, NetAmount, ...) are immutable for the lifetime of an
+	// earning once created -- only lifecycle fields (Status, timestamps,
+	// payout checkpoints) may legitimately change through UpdateEarning. A
+	// callback that changes economic content is always a bug, not a valid
+	// state transition, so it is rejected here rather than silently
+	// persisted.
+	if exists && earningContentHash(current) != earningContentHash(next) {
+		return domain.ProviderEarning{}, domain.NewError(domain.ErrIdempotencyConflict, "earning update must not change identity/economic fields", false)
+	}
 	s.earnings[id] = next
 	if next.SettlementID != "" {
 		s.earningsBySettlement[next.SettlementID] = next.ID

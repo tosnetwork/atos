@@ -133,3 +133,67 @@ func TestCreateEarningConflictingContentIsRejected(t *testing.T) {
 		t.Fatalf("stored earning mutated by rejected conflict: %s", got.NetAmount.Amount)
 	}
 }
+
+// TestUpdateEarningAllowsLifecycleFieldChanges proves the normal payout
+// state machine (status/timestamp transitions) still works through
+// UpdateEarning once the economic-field invariant is enforced.
+func TestUpdateEarningAllowsLifecycleFieldChanges(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+	e := testMemEarning("prov_1", "job_lifecycle", "settle_lifecycle")
+	if _, _, err := s.CreateEarning(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := s.UpdateEarning(ctx, e.ID, func(current domain.ProviderEarning, exists bool) (domain.ProviderEarning, error) {
+		if !exists {
+			t.Fatal("expected earning to exist")
+		}
+		current.Status = domain.EarningAvailable
+		now := time.Now().UTC()
+		current.AvailableAt = &now
+		return current, nil
+	})
+	if err != nil {
+		t.Fatalf("UpdateEarning (lifecycle-only): %v", err)
+	}
+	if updated.Status != domain.EarningAvailable {
+		t.Fatalf("status = %s, want available", updated.Status)
+	}
+}
+
+// TestUpdateEarningRejectsEconomicFieldChange proves a callback that
+// mutates an earning's identity/economic fields (ProviderID, SettlementID,
+// GrossAmount, GatewayFee, NetAmount, ...) -- whether by a bug in a Phase 2C
+// dispute callback or any other caller -- is rejected instead of silently
+// persisted, so those fields stay immutable for the life of the earning
+// exactly as CreateEarning's own idempotency-conflict check already
+// guarantees at creation time.
+func TestUpdateEarningRejectsEconomicFieldChange(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+	e := testMemEarning("prov_1", "job_economic", "settle_economic")
+	if _, _, err := s.CreateEarning(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.UpdateEarning(ctx, e.ID, func(current domain.ProviderEarning, exists bool) (domain.ProviderEarning, error) {
+		if !exists {
+			t.Fatal("expected earning to exist")
+		}
+		current.NetAmount = domain.Money{Amount: "999.99", Currency: "USD"}
+		return current, nil
+	})
+	var domainErr *domain.Error
+	if !errors.As(err, &domainErr) || domainErr.Code != domain.ErrIdempotencyConflict {
+		t.Fatalf("got %v, want domain.ErrIdempotencyConflict", err)
+	}
+
+	got, err := s.GetEarning(ctx, e.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NetAmount.Amount != "1.00" {
+		t.Fatalf("stored earning mutated by rejected economic-field update: %s", got.NetAmount.Amount)
+	}
+}

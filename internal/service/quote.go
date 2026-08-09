@@ -98,6 +98,14 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 	if err != nil {
 		return domain.Quote{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability has an invalid price_hint", false)
 	}
+	// Defense in depth: Register/Update already reject invalid MeteredRates,
+	// but this catches a capability that was written before that validation
+	// existed (or reached storage by some other path) before it gets frozen
+	// into a new Quote and eventually causes an unrecoverable settlement
+	// failure long after funds are committed.
+	if err := validatePricing(cap.Pricing); err != nil {
+		return domain.Quote{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability has invalid metered pricing: "+err.Error(), false)
+	}
 	fees, err := applyFeeRate(subtotal, defaultFeeRate)
 	if err != nil {
 		return domain.Quote{}, err

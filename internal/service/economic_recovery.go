@@ -388,6 +388,24 @@ func (s *JobService) settleProviderResultUnderLock(ctx context.Context, current 
 	// provider's earning.
 	billingSnapshot, billErr := computeBillingSnapshot(quote, receipt)
 	if billErr != nil {
+		// computeBillingSnapshot is a pure function of the already-durable,
+		// frozen Quote and verified Receipt: any error it returns (e.g. an
+		// invalid/legacy frozen MeteredRate) is deterministic and fails
+		// identically on every future reconciliation retry, so it can never
+		// be treated as a transient outcome to reconcile away. Before the
+		// receipt has been durably committed and verified (EconomicState is
+		// still EconomicEscrowReserved), it is safe -- and required -- to
+		// fail the Job now and release the escrow back to the principal
+		// rather than leaving both the Job and its reserved funds stuck in
+		// JobReconciling/EconomicEscrowReserved forever. Once a receipt has
+		// already been verified (EconomicSettlementPending or later), the
+		// provider's delivered work has already been proven and settlement
+		// must still be recovered rather than unwound, so that case is left
+		// to the existing reconciliation handling below.
+		if current.EconomicState != domain.EconomicSettlementPending {
+			failed, _ := s.releaseForTerminalUnderLock(ctx, current, domain.JobFailed, domain.ErrSettlementFailed, "billing calculation failed: "+billErr.Error())
+			return failed
+		}
 		return s.markEconomicReconciliationUnderLock(ctx, current.ID, current.EconomicState, domain.JobCompleted, domain.ErrSettlementFailed, "billing calculation failed: "+billErr.Error())
 	}
 	receipt.Cost = billingSnapshot.GrossCharge

@@ -230,6 +230,63 @@ func TestComputeBillingSnapshot_NeverExceedsTotalMax(t *testing.T) {
 	}
 }
 
+// validatePricing must accept a nil MeteredRates (Fixed/Free/PerUse/
+// Negotiated capabilities, or a Metered capability with no rates
+// configured) and any empty-string dimension within a configured
+// MeteredRates.
+func TestValidatePricing_NoRatesConfigured(t *testing.T) {
+	pricing := domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}}
+	if err := validatePricing(pricing); err != nil {
+		t.Fatalf("nil MeteredRates should be valid, got %v", err)
+	}
+	pricing.MeteredRates = &domain.MeteredRates{}
+	if err := validatePricing(pricing); err != nil {
+		t.Fatalf("empty MeteredRates should be valid, got %v", err)
+	}
+}
+
+// validatePricing must reject exactly the malformed rates that would
+// otherwise only be discovered deterministically-forever-failing at
+// settlement time inside computeBillingSnapshot (negative, non-numeric, or
+// more precise than meteredRateDecimals allows).
+func TestValidatePricing_RejectsMalformedRates(t *testing.T) {
+	basePricing := func(rates domain.MeteredRates) domain.Pricing {
+		return domain.Pricing{
+			Model: domain.PricingMetered, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"},
+			MeteredRates: &rates,
+		}
+	}
+	cases := []struct {
+		name  string
+		rates domain.MeteredRates
+	}{
+		{"negative", domain.MeteredRates{PerOutputToken: "-1"}},
+		{"non-numeric", domain.MeteredRates{PerOutputToken: "abc"}},
+		{"excess-precision", domain.MeteredRates{PerOutputToken: "0.0000000001"}}, // 10 decimals > meteredRateDecimals=9
+		{"negative-per-input-byte", domain.MeteredRates{PerInputByte: "-0.01"}},
+		{"non-numeric-per-execution-ms", domain.MeteredRates{PerExecutionMillisecond: "n/a"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if err := validatePricing(basePricing(c.rates)); err == nil {
+				t.Fatalf("expected an error for %+v", c.rates)
+			}
+		})
+	}
+}
+
+// A valid sub-cent rate at exactly meteredRateDecimals=9 precision must be
+// accepted, matching computeBillingSnapshot's own acceptance boundary.
+func TestValidatePricing_AcceptsValidSubCentRate(t *testing.T) {
+	pricing := domain.Pricing{
+		Model: domain.PricingMetered, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"},
+		MeteredRates: &domain.MeteredRates{PerOutputToken: "0.000001", PerInputToken: "0.000000001"},
+	}
+	if err := validatePricing(pricing); err != nil {
+		t.Fatalf("expected a valid 9-decimal rate to be accepted, got %v", err)
+	}
+}
+
 // parseTestAmount converts a 2-decimal string like "1.05" into integer cents
 // for simple arithmetic assertions in tests, independent of the money
 // package under test.

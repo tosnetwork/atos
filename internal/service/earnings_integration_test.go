@@ -219,6 +219,89 @@ func TestJobSettlement_FailedVerificationNeverChargesOrEarns(t *testing.T) {
 	}
 }
 
+// TestJobSettlement_LegacyBadFrozenPricingReleasesAndRefunds proves that a
+// Quote whose frozen MeteredRates are invalid -- e.g. persisted before
+// validatePricing existed, or otherwise corrupted -- cannot leave a Job (and
+// the principal's escrowed funds) stuck retrying settlement forever.
+// computeBillingSnapshot's failure for such a Quote is deterministic (same
+// frozen Quote + same verified Receipt every time), so settlement must fail
+// the Job outright, release the escrow, and refund the principal in full --
+// not loop the Job through JobReconciling/EconomicEscrowReserved.
+func TestJobSettlement_LegacyBadFrozenPricingReleasesAndRefunds(t *testing.T) {
+	ctx := context.Background()
+	h, earnings := earningsHarness(t)
+
+	cap, err := h.capabilities.Register(ctx, service.RegisterCapabilityInput{
+		ProviderID: "agt_badrate_provider", Name: "Metered Capability", Description: "for tests",
+		DeliveryMode: domain.DeliveryInstant,
+		InputSchema:  map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing: domain.Pricing{
+			Model:        domain.PricingMetered,
+			PriceHint:    domain.PriceHint{Amount: "1.00", Currency: "USD"},
+			MeteredRates: &domain.MeteredRates{PerOutputToken: "0.01"},
+		},
+		IdempotencyKey: "register-badrate-provider",
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	quote := createQuote(t, h, cap.ID)
+
+	// Simulate a Quote whose frozen pricing predates validatePricing (or was
+	// otherwise corrupted in storage): overwrite the already-created Quote
+	// directly in the store with an invalid rate, bypassing
+	// QuoteService.Create's defense-in-depth check entirely.
+	quote.MeteredRates = &domain.MeteredRates{PerOutputToken: "not-a-number"}
+	if err := h.store().PutQuote(ctx, quote); err != nil {
+		t.Fatalf("PutQuote (corrupting frozen rate): %v", err)
+	}
+
+	before, err := h.accounts.Get(ctx, "prn_badrate_client")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, invokeErr := h.jobs.Invoke(ctx, service.SubmitInput{
+		PrincipalID: "prn_badrate_client", CapabilityID: cap.ID, QuoteID: quote.ID,
+		Input: map[string]any{"x": 1}, IdempotencyKey: "badrate-1",
+	})
+	if result.Job.State != domain.JobFailed {
+		t.Fatalf("job state = %s (err=%v), want failed", result.Job.State, invokeErr)
+	}
+	if result.Job.EconomicState != domain.EconomicReleased {
+		t.Fatalf("economic state = %s, want released", result.Job.EconomicState)
+	}
+	if result.Job.ReconciliationRequired {
+		t.Fatal("a terminal Job must not be left with reconciliation still required")
+	}
+
+	after, err := h.accounts.Get(ctx, "prn_badrate_client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Balance != before.Balance {
+		t.Fatalf("balance after bad-pricing settlement failure = %s, want unchanged from %s (full refund)", after.Balance.Amount, before.Balance.Amount)
+	}
+
+	list, err := earnings.ListByProvider(ctx, "agt_badrate_provider")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("earnings for a bad-pricing settlement failure = %+v, want none", list)
+	}
+
+	// A Job already terminal (Failed) must not be reconciled again --
+	// proving there is no infinite reconciliation loop left behind.
+	reconciled, err := h.jobs.ReconcileJob(ctx, result.Job.ID)
+	if err != nil {
+		t.Fatalf("ReconcileJob on a terminal job: %v", err)
+	}
+	if reconciled.State != domain.JobFailed || reconciled.ReconciliationRequired {
+		t.Fatalf("reconciling a terminal job changed its state: %+v", reconciled)
+	}
+}
+
 func parseCents(t *testing.T, amount string) (int, error) {
 	t.Helper()
 	parts := strings.SplitN(amount, ".", 2)
