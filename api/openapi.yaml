@@ -27,6 +27,7 @@ tags:
   - name: account
   - name: receipts
   - name: earnings
+  - name: disputes
   - name: artifacts
   - name: metadata
   - name: confirmations
@@ -629,6 +630,118 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/ProviderEarning'}
         default: {$ref: '#/components/responses/Error'}
+  /v1/jobs/{id}/disputes:
+    parameters:
+      - {$ref: '#/components/parameters/JobID'}
+    post:
+      tags: [disputes]
+      summary: Open a Managed-mode dispute against a completed, settled Job
+      description: >-
+        Requires `disputes:open` and that the caller is the Job's owning
+        principal. Only `reason`, `description` and `evidence` (durable
+        Artifact references) are accepted from the caller -- every economic
+        fact on the resulting Dispute (provider, amounts, settlement
+        identity) is resolved internally from the Job's frozen Quote,
+        BillingSnapshot and ProviderEarning, never from request input.
+        Idempotent under the `Idempotency-Key` header. Opening a dispute
+        atomically freezes the disputed ProviderEarning (or records why it
+        could not: `pending_payout_resolution` if a payout was already in
+        flight, `paid` if it already completed). Only Managed-mode Jobs are
+        eligible, and only within the dispute window committed to by the
+        Job's Quote at Quote-creation time.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/OpenDisputeRequest'}
+      responses:
+        '201':
+          description: Dispute opened (or the existing dispute, if already open for this Job)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Dispute'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/disputes:
+    get:
+      tags: [disputes]
+      summary: List disputes
+      description: >-
+        Requires `disputes:read`. A caller holding `disputes:review` sees
+        the reviewer queue (disputes still awaiting a decision); any other
+        caller sees only disputes they are a party to, as principal or as
+        provider.
+      responses:
+        '200':
+          description: Disputes
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [disputes]
+                properties:
+                  disputes: {type: array, items: {$ref: '#/components/schemas/Dispute'}}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/disputes/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/DisputeID'}
+    get:
+      tags: [disputes]
+      summary: Get one Dispute
+      description: Requires `disputes:read`. Visible to the dispute's own principal, its own provider, or a caller holding `disputes:review`.
+      responses:
+        '200':
+          description: Dispute
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Dispute'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/disputes/{id}/review:
+    parameters:
+      - {$ref: '#/components/parameters/DisputeID'}
+    post:
+      tags: [disputes]
+      summary: Claim a dispute for review
+      description: >-
+        Requires `disputes:review`. The reviewer identity is always the
+        authenticated caller, never caller-supplied; a party to the dispute
+        (its principal or its provider) cannot review it. Transitions
+        `opened` -> `under_review`; idempotent if already claimed.
+      responses:
+        '200':
+          description: Dispute now under review
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Dispute'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/disputes/{id}/resolve:
+    parameters:
+      - {$ref: '#/components/parameters/DisputeID'}
+    post:
+      tags: [disputes]
+      summary: Resolve a dispute under review
+      description: >-
+        Requires `disputes:review`. `outcome=principal` reverses the frozen
+        ProviderEarning and refunds the principal exactly once (both
+        durably atomic, crash-safe to retry); `outcome=provider` or
+        `outcome=rejected` release the frozen earning back to payout
+        eligibility with no principal refund. Against an earning already
+        known paid, a `principal` outcome cannot auto-refund (no clawback
+        rail exists) and durably records `clawback_required` instead of
+        pretending funds were recovered. Against an earning whose payout
+        was still in flight when the dispute opened, resolution is
+        rejected until that ambiguity resolves.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ResolveDisputeRequest'}
+      responses:
+        '200':
+          description: Dispute resolved (or its economic recovery advanced as far as currently possible)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Dispute'}
+        default: {$ref: '#/components/responses/Error'}
   /v1/uploads:
     post:
       tags: [artifacts]
@@ -764,6 +877,11 @@ components:
       in: path
       required: true
       schema: {type: string, pattern: '^earn_'}
+    DisputeID:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, pattern: '^dispute_'}
   responses:
     Error:
       description: ATOS error envelope
@@ -1103,6 +1221,59 @@ components:
         payout_requested_at: {type: string, format: date-time}
         payout_reference: {type: string}
         paid_at: {type: string, format: date-time}
+    DisputeEvidence:
+      type: object
+      description: A durable reference to a previously uploaded Artifact -- never an inline payload.
+      required: [artifact_id]
+      properties:
+        artifact_id: {type: string, pattern: '^art_'}
+        description: {type: string}
+    OpenDisputeRequest:
+      type: object
+      description: >-
+        Only legitimate user input is accepted here. provider_id, amounts,
+        trust mode and settlement status are never caller-supplied -- they
+        are resolved internally from the Job's own durable state.
+      required: [reason]
+      properties:
+        reason: {type: string, minLength: 1}
+        description: {type: string}
+        evidence: {type: array, items: {$ref: '#/components/schemas/DisputeEvidence'}}
+    ResolveDisputeRequest:
+      type: object
+      required: [outcome]
+      properties:
+        outcome: {type: string, enum: [principal, provider, rejected]}
+        reason_rejected: {type: string}
+    Dispute:
+      type: object
+      description: >-
+        A Managed-mode economic/legal workflow layered on top of an
+        already-completed, already-settled Job. Opening or resolving one
+        never modifies the Job's Quote, Execution Receipt, or
+        BillingSnapshot -- those remain immutable historical evidence.
+      required: [dispute_id, provider_id, job_id, quote_id, capability_id, execution_receipt_id, settlement_id, earning_id, charged_amount, original_refund_amount, reason, status, opened_at]
+      properties:
+        dispute_id: {type: string, pattern: '^dispute_'}
+        provider_id: {type: string}
+        job_id: {type: string}
+        quote_id: {type: string}
+        capability_id: {type: string}
+        execution_receipt_id: {type: string}
+        settlement_id: {type: string}
+        earning_id: {type: string}
+        charged_amount: {$ref: '#/components/schemas/Money'}
+        original_refund_amount: {$ref: '#/components/schemas/Money'}
+        reason: {type: string}
+        description: {type: string}
+        evidence: {type: array, items: {$ref: '#/components/schemas/DisputeEvidence'}}
+        status: {type: string, enum: [opened, under_review, resolved_for_principal, resolved_for_provider, rejected]}
+        economic_recovery_state: {type: string, enum: [pending_payout_resolution, frozen, paid, refund_pending, refunded, released, clawback_required]}
+        outcome: {type: string, enum: [principal, provider, rejected]}
+        reason_rejected: {type: string}
+        opened_at: {type: string, format: date-time}
+        under_review_at: {type: string, format: date-time}
+        resolved_at: {type: string, format: date-time}
     Account:
       type: object
       required: [balance, spend_policy, trust_policy]

@@ -38,6 +38,9 @@ const (
 	ErrStreamCursorMismatch         ErrorCode = "stream_cursor_mismatch"
 	ErrStreamJobBindingMismatch     ErrorCode = "stream_job_binding_mismatch"
 	ErrStreamEventTypeUnsupported   ErrorCode = "stream_event_type_unsupported"
+	ErrDisputeWindowExpired         ErrorCode = "dispute_window_expired"
+	ErrDisputeNotEligible           ErrorCode = "dispute_not_eligible"
+	ErrDisputeInvalidTransition     ErrorCode = "dispute_invalid_transition"
 )
 
 type Error struct {

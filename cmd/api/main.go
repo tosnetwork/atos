@@ -153,6 +153,14 @@ func main() {
 	earnings := service.NewEarningsService(st, payoutAdapter)
 	jobs.WithEarnings(earnings)
 
+	blobStorage, err := local.New(cfg.BlobDir, cfg.PublicBaseURL, st)
+	if err != nil {
+		logger.Error("storage init failed", "error", err)
+		os.Exit(1)
+	}
+	artifacts := service.NewArtifactService(st, blobStorage)
+	disputes := service.NewDisputeService(st, jobs, earnings, accounts, artifacts)
+
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
 	defer reconcileCancel()
 	go jobs.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
@@ -161,13 +169,10 @@ func main() {
 	go earnings.RunReconciler(reconcileCtx, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("provider earnings reconciliation pending", "error", reconcileErr)
 	})
+	go disputes.RunReconciler(reconcileCtx, 20*time.Second, 30*time.Second, 100, func(reconcileErr error) {
+		logger.Error("dispute economic reconciliation pending", "error", reconcileErr)
+	})
 
-	blobStorage, err := local.New(cfg.BlobDir, cfg.PublicBaseURL, st)
-	if err != nil {
-		logger.Error("storage init failed", "error", err)
-		os.Exit(1)
-	}
-	artifacts := service.NewArtifactService(st, blobStorage)
 	if err := seedDemoCapability(capabilities, cfg.TOSBackend); err != nil {
 		logger.Error("failed to seed demo capability", "error", err)
 		os.Exit(1)
@@ -176,7 +181,7 @@ func main() {
 	restServer := &httpapi.Server{
 		Auth: authorization, Capabilities: capabilities, Quotes: quotes,
 		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts,
-		Earnings: earnings, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
+		Earnings: earnings, Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 		ApprovalToken: cfg.Auth.ApprovalToken,
 	}
 	mcpServer := &mcp.Server{

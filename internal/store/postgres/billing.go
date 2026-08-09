@@ -237,6 +237,14 @@ func (s *Store) EarningBySettlement(ctx context.Context, settlementID string) (d
 	return e, err
 }
 
+func (s *Store) EarningByJob(ctx context.Context, jobID string) (domain.ProviderEarning, error) {
+	e, err := scanEarning(s.pool.QueryRow(ctx, `SELECT `+earningColumns+` FROM provider_earnings WHERE job_id=$1`, jobID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ProviderEarning{}, store.ErrNotFound
+	}
+	return e, err
+}
+
 func (s *Store) EarningsByProvider(ctx context.Context, providerID string) ([]domain.ProviderEarning, error) {
 	rows, err := s.pool.Query(ctx, `SELECT `+earningColumns+` FROM provider_earnings WHERE provider_id=$1 ORDER BY created_at DESC, id ASC`, providerID)
 	if err != nil {

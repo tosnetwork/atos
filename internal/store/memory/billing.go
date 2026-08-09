@@ -91,6 +91,7 @@ func (s *Store) CreateEarning(ctx context.Context, e domain.ProviderEarning) (do
 	}
 	s.earnings[e.ID] = e
 	s.earningsBySettlement[e.SettlementID] = e.ID
+	s.earningsByJob[e.JobID] = e.ID
 	return e, true, nil
 }
 
@@ -108,6 +109,16 @@ func (s *Store) EarningBySettlement(ctx context.Context, settlementID string) (d
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id, ok := s.earningsBySettlement[settlementID]
+	if !ok {
+		return domain.ProviderEarning{}, store.ErrNotFound
+	}
+	return s.earnings[id], nil
+}
+
+func (s *Store) EarningByJob(ctx context.Context, jobID string) (domain.ProviderEarning, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.earningsByJob[jobID]
 	if !ok {
 		return domain.ProviderEarning{}, store.ErrNotFound
 	}
