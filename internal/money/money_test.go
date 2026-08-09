@@ -113,6 +113,71 @@ func TestIsZeroIsPositive(t *testing.T) {
 	}
 }
 
+func TestMulUint64(t *testing.T) {
+	rate, _ := Parse("0.001", "USD", 3)
+	got := rate.MulUint64(2500)
+	if got.String() != "2.500" {
+		t.Fatalf("MulUint64 = %q, want 2.500", got.String())
+	}
+	zeroRate, _ := Parse("0", "USD", 2)
+	if got := zeroRate.MulUint64(1_000_000); !got.IsZero() {
+		t.Fatalf("zero rate * n should stay zero, got %q", got.String())
+	}
+}
+
+func TestMulDivProportionalSplit(t *testing.T) {
+	fees, _ := Parse("0.05", "USD", 2)
+	subtotal, _ := Parse("1.00", "USD", 2)
+	half, _ := Parse("0.50", "USD", 2)
+
+	got, err := fees.MulDiv(half, subtotal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 0.05 * 0.50 / 1.00 = 0.025 -> truncates to 0.02 at 2 decimals.
+	if got.String() != "0.02" {
+		t.Fatalf("MulDiv = %q, want 0.02 (truncated)", got.String())
+	}
+
+	full, err := fees.MulDiv(subtotal, subtotal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full.String() != fees.String() {
+		t.Fatalf("scaling by numerator==denominator should be a no-op, got %q want %q", full.String(), fees.String())
+	}
+}
+
+func TestMulDivRejectsZeroDenominator(t *testing.T) {
+	fees, _ := Parse("0.05", "USD", 2)
+	zero, _ := Parse("0", "USD", 2)
+	if _, err := fees.MulDiv(fees, zero); err == nil {
+		t.Fatal("expected an error for a zero denominator")
+	}
+}
+
+func TestMulDivRejectsCurrencyMismatch(t *testing.T) {
+	usd, _ := Parse("1.00", "USD", 2)
+	eur, _ := Parse("1.00", "EUR", 2)
+	if _, err := usd.MulDiv(eur, usd); err == nil {
+		t.Fatal("expected a currency mismatch error")
+	}
+	if _, err := usd.MulDiv(usd, eur); err == nil {
+		t.Fatal("expected a currency mismatch error")
+	}
+}
+
+func TestMin(t *testing.T) {
+	small, _ := Parse("1.00", "USD", 2)
+	big, _ := Parse("2.00", "USD", 2)
+	if got := small.Min(big); got.String() != "1.00" {
+		t.Fatalf("Min = %q, want 1.00", got.String())
+	}
+	if got := big.Min(small); got.String() != "1.00" {
+		t.Fatalf("Min = %q, want 1.00", got.String())
+	}
+}
+
 func TestParseRejectsTooManyDecimals(t *testing.T) {
 	if _, err := Parse("1.999", "USD", 2); err == nil {
 		t.Error("expected error for excess decimal precision")

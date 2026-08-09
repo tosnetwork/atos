@@ -184,6 +184,11 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 		ExecutionDeadline:      executionDeadline,
 		CreatedAt:              now,
 		RequiresConfirmation:   requiresConfirmation,
+		// Frozen here, not re-read at settlement time: metered billing must
+		// never reinterpret an old Job using the Capability's current live
+		// pricing configuration.
+		MeteredRates: cap.Pricing.MeteredRates,
+		PricingModel: cap.Pricing.Model,
 	}
 	if serviceQuote.ID != "" {
 		q.ServiceQuoteID = serviceQuote.ID

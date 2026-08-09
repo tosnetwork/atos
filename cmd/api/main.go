@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/tosnetwork/atos/internal/a2a"
+	"github.com/tosnetwork/atos/internal/adapters/payout"
+	payoutmock "github.com/tosnetwork/atos/internal/adapters/payout/mock"
 	"github.com/tosnetwork/atos/internal/adapters/storage/local"
 	"github.com/tosnetwork/atos/internal/adapters/tosai"
 	tosaimock "github.com/tosnetwork/atos/internal/adapters/tosai/mock"
@@ -129,10 +131,26 @@ func main() {
 	jobs := service.NewJobService(st, execution, core, accounts)
 	streams := service.NewStreamService(st, execution)
 	receipts := service.NewReceiptService(st, core)
+
+	// No production payout rail is configured yet -- this deployment has no
+	// real bank/stablecoin transfer integration. payoutmock is an explicit,
+	// deterministic test/development adapter (see
+	// internal/adapters/payout/mock) that never moves real funds; it is
+	// wired here only so the earnings ledger and payout state machine are
+	// exercised end to end. Swap in a real payout.Adapter implementation
+	// before this deployment pays anyone for real.
+	var payoutAdapter payout.Adapter = payoutmock.New()
+	logger.Warn("no production payout adapter configured; using the mock payout adapter, which never moves real funds")
+	earnings := service.NewEarningsService(st, payoutAdapter)
+	jobs.WithEarnings(earnings)
+
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
 	defer reconcileCancel()
 	go jobs.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("managed economic reconciliation pending", "error", reconcileErr)
+	})
+	go earnings.RunReconciler(reconcileCtx, 30*time.Second, 100, func(reconcileErr error) {
+		logger.Error("provider earnings reconciliation pending", "error", reconcileErr)
 	})
 
 	blobStorage, err := local.New(cfg.BlobDir, cfg.PublicBaseURL, st)
@@ -149,12 +167,12 @@ func main() {
 	restServer := &httpapi.Server{
 		Auth: authorization, Capabilities: capabilities, Quotes: quotes,
 		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts,
-		Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
+		Earnings: earnings, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 		ApprovalToken: cfg.Auth.ApprovalToken,
 	}
 	mcpServer := &mcp.Server{
 		Auth: authorization, Capabilities: capabilities, Quotes: quotes,
-		Jobs: jobs, Accounts: accounts, Receipts: receipts,
+		Jobs: jobs, Accounts: accounts, Receipts: receipts, Earnings: earnings,
 		Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}
 	a2aServer := &a2a.Server{

@@ -26,6 +26,7 @@ var orderedToolSpecs = []toolSpec{
 	{Definition: updateCapabilityTool(), RequiredScopes: []auth.Scope{auth.ScopeCapabilitiesWrite}},
 	{Definition: listMyCapabilitiesTool(), RequiredScopes: []auth.Scope{auth.ScopeCapabilitiesWrite}},
 	{Definition: pauseCapabilityTool(), RequiredScopes: []auth.Scope{auth.ScopeCapabilitiesWrite}},
+	{Definition: providerEarningsTool(), RequiredScopes: []auth.Scope{auth.ScopeEarningsRead}},
 }
 
 func toolName(spec toolSpec) string {
@@ -270,5 +271,17 @@ func pauseCapabilityTool() map[string]any {
 		"name": "atos_pause_capability", "description": "Pause one capability owned by the authenticated provider.",
 		"inputSchema":  objectSchema([]string{"capability_id"}, map[string]any{"capability_id": map[string]any{"type": "string", "minLength": 1}}),
 		"outputSchema": map[string]any{"type": "object"},
+	}
+}
+
+func providerEarningsTool() map[string]any {
+	return map[string]any{
+		"name":        "atos_provider_earnings",
+		"description": "List earnings owned by the authenticated provider, or get one by earning_id.",
+		"inputSchema": objectSchema(nil, map[string]any{"earning_id": map[string]any{"type": "string", "minLength": 1}}),
+		"outputSchema": map[string]any{"oneOf": []any{
+			objectSchema([]string{"earnings"}, map[string]any{"earnings": map[string]any{"type": "array"}}),
+			map[string]any{"type": "object"},
+		}},
 	}
 }

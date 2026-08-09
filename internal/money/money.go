@@ -140,3 +140,41 @@ func (a Amount) IsZero() bool {
 func (a Amount) IsPositive() bool {
 	return a.Minor.Sign() > 0
 }
+
+// MulUint64 returns a*n. big.Int has no fixed-width overflow, so this is
+// exact regardless of magnitude. Used to price a metered usage count
+// (e.g. output tokens) against a per-unit rate.
+func (a Amount) MulUint64(n uint64) Amount {
+	return Amount{Minor: new(big.Int).Mul(a.Minor, new(big.Int).SetUint64(n)), Currency: a.Currency, Decimals: a.Decimals}
+}
+
+// MulDiv returns a*numerator/denominator, truncating toward zero (Go's
+// big.Int.Div semantics), checked for currency/decimals agreement between
+// a, numerator and denominator. Used to scale one amount in proportion to
+// the ratio of two others -- e.g. splitting a quoted gateway fee in
+// proportion to how much of the quoted provider subtotal was actually
+// metered, so the split amounts are always guaranteed to sum to at most
+// the original quoted total. denominator must not be zero.
+func (a Amount) MulDiv(numerator, denominator Amount) (Amount, error) {
+	if err := a.sameUnit(numerator); err != nil {
+		return Amount{}, err
+	}
+	if err := a.sameUnit(denominator); err != nil {
+		return Amount{}, err
+	}
+	if denominator.Minor.Sign() == 0 {
+		return Amount{}, errors.New("money: division by zero")
+	}
+	product := new(big.Int).Mul(a.Minor, numerator.Minor)
+	result := new(big.Int).Div(product, denominator.Minor)
+	return Amount{Minor: result, Currency: a.Currency, Decimals: a.Decimals}, nil
+}
+
+// Min returns the smaller of a and b, checked for currency/decimals
+// agreement.
+func (a Amount) Min(b Amount) Amount {
+	if a.Cmp(b) <= 0 {
+		return a
+	}
+	return b
+}

@@ -33,6 +33,14 @@ type Quote struct {
 	InputSummaryCommitment    string               `json:"input_summary_commitment,omitempty"`
 	ExecutionDeadline         time.Time            `json:"execution_deadline,omitempty"`
 	CreatedAt                 time.Time            `json:"-"`
+	// MeteredRates is frozen from the Capability's pricing at Quote-creation
+	// time (nil if the Capability has none configured). Settlement billing
+	// (internal/service/billing.go) reads only this frozen copy, never the
+	// Capability's current live pricing -- see domain.MeteredRates.
+	MeteredRates *MeteredRates `json:"metered_rates,omitempty"`
+	// PricingModel is likewise frozen from the Capability's pricing at
+	// Quote-creation time, recorded here purely for billing audit trail.
+	PricingModel PricingModel `json:"pricing_model,omitempty"`
 }
 
 func (q Quote) Expired(now time.Time) bool {

@@ -28,6 +28,7 @@ func (s *Server) dispatch() map[string]toolHandler {
 		"atos_update_capability":    s.toolUpdateCapability,
 		"atos_list_my_capabilities": s.toolListMyCapabilities,
 		"atos_pause_capability":     s.toolPauseCapability,
+		"atos_provider_earnings":    s.toolProviderEarnings,
 	}
 }
 
@@ -249,6 +250,17 @@ func (s *Server) toolListMyCapabilities(ctx context.Context, principal auth.Prin
 		return nil, err
 	}
 	return map[string]any{"capabilities": caps}, nil
+}
+
+func (s *Server) toolProviderEarnings(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
+	if id := argString(args, "earning_id"); id != "" {
+		return s.Earnings.Get(ctx, id, principal.ID)
+	}
+	earnings, err := s.Earnings.ListByProvider(ctx, principal.ID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"earnings": earnings}, nil
 }
 
 func (s *Server) toolPauseCapability(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
