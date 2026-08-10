@@ -29,6 +29,10 @@ func (s *Server) dispatch() map[string]toolHandler {
 		"atos_list_my_capabilities": s.toolListMyCapabilities,
 		"atos_pause_capability":     s.toolPauseCapability,
 		"atos_provider_earnings":    s.toolProviderEarnings,
+		"atos_provider_jobs":        s.toolProviderJobs,
+		"atos_deliver_job":          s.toolDeliverJob,
+		"atos_request_settlement":   s.toolRequestSettlement,
+		"atos_dispute_job":          s.toolDisputeJob,
 	}
 }
 
@@ -261,6 +265,83 @@ func (s *Server) toolProviderEarnings(ctx context.Context, principal auth.Princi
 		return nil, err
 	}
 	return map[string]any{"earnings": earnings}, nil
+}
+
+func (s *Server) toolProviderJobs(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
+	if id := argString(args, "job_id"); id != "" {
+		job, err := s.Jobs.Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if job.ProviderID != principal.ID {
+			return nil, domain.NewError(domain.ErrPermissionDenied, "not the job's owning provider", false)
+		}
+		return job, nil
+	}
+	jobs, err := s.Jobs.ListByProvider(ctx, principal.ID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"jobs": jobs}, nil
+}
+
+func (s *Server) toolDeliverJob(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
+	output, _ := args["output"].(map[string]any)
+	return s.Jobs.DeliverResult(ctx, service.DeliverResultInput{
+		JobID: argString(args, "job_id"), ProviderID: principal.ID,
+		Output: output, IdempotencyKey: argString(args, "idempotency_key"),
+	})
+}
+
+// toolRequestSettlement is a thin facade over JobService.ReconcileJob --
+// the same durable-state-driven economic reconciliation entry point the
+// reconciler itself uses -- never a second settlement engine. It resolves
+// every economic fact from the Job's own already-durable record; the only
+// caller-supplied value is which Job to reconcile.
+func (s *Server) toolRequestSettlement(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
+	jobID := argString(args, "job_id")
+	if jobID == "" {
+		return nil, domain.NewError(domain.ErrValidationFailed, "job_id is required", false)
+	}
+	job, err := s.Jobs.Get(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	if job.ProviderID != principal.ID {
+		return nil, domain.NewError(domain.ErrPermissionDenied, "not the job's owning provider", false)
+	}
+	return s.Jobs.ReconcileJob(ctx, jobID)
+}
+
+// toolDisputeJob is a thin, operation-discriminated facade over the
+// existing Phase 2C DisputeService -- no parallel dispute state machine.
+// ReviewerID always comes from the authenticated principal, never request
+// JSON, so every Phase 2C invariant (parties cannot review their own
+// dispute, exclusive reviewer claim, honest clawback_required, atomic
+// resolution, ...) is preserved automatically by delegating to the exact
+// same methods the REST surface calls.
+func (s *Server) toolDisputeJob(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
+	disputeID := argString(args, "dispute_id")
+	if disputeID == "" {
+		return nil, domain.NewError(domain.ErrValidationFailed, "dispute_id is required", false)
+	}
+	switch operation := argString(args, "operation"); operation {
+	case "review":
+		return s.Disputes.Review(ctx, disputeID, principal.ID)
+	case "resolve":
+		outcome := domain.DisputeOutcome(argString(args, "outcome"))
+		switch outcome {
+		case domain.DisputeOutcomePrincipal, domain.DisputeOutcomeProvider, domain.DisputeOutcomeRejected:
+		default:
+			return nil, domain.NewError(domain.ErrValidationFailed, "outcome must be principal, provider or rejected", false)
+		}
+		return s.Disputes.Resolve(ctx, service.ResolveDisputeInput{
+			DisputeID: disputeID, ReviewerID: principal.ID, Outcome: outcome,
+			ReasonRejected: argString(args, "reason_rejected"),
+		})
+	default:
+		return nil, domain.NewError(domain.ErrValidationFailed, "operation must be review or resolve", false)
+	}
 }
 
 func (s *Server) toolPauseCapability(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {

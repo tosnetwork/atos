@@ -63,6 +63,9 @@ func (s *CapabilityService) Register(ctx context.Context, in RegisterCapabilityI
 	if in.InputSchema == nil || in.OutputSchema == nil {
 		return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "input_schema and output_schema are required", false)
 	}
+	if err := validateCapabilitySchemas(in.InputSchema, in.OutputSchema); err != nil {
+		return domain.Capability{}, err
+	}
 	if err := validatePricing(in.Pricing); err != nil {
 		return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "invalid pricing: "+err.Error(), false)
 	}
@@ -234,6 +237,15 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 	}
 	if termsChanged {
 		c.Version = bumpMinorVersion(c.Version)
+	}
+
+	// Validated against the fully-built candidate, after every patched
+	// field has been applied but before anything is persisted -- a
+	// schema-invalid patch must leave the stored Capability's version,
+	// manifest commitment, schemas, and every other field byte-for-byte
+	// unchanged, never a partial update.
+	if err := validateCapabilitySchemas(c.InputSchema, c.OutputSchema); err != nil {
+		return domain.Capability{}, err
 	}
 
 	c.ArtifactInputFields = artifactFields(c.InputSchema)

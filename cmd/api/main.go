@@ -14,8 +14,13 @@ import (
 	"github.com/tosnetwork/atos/internal/a2a"
 	"github.com/tosnetwork/atos/internal/adapters/payout"
 	payoutmock "github.com/tosnetwork/atos/internal/adapters/payout/mock"
+	"github.com/tosnetwork/atos/internal/adapters/provideradapter"
+	"github.com/tosnetwork/atos/internal/adapters/provideradapter/a2aadapter"
+	"github.com/tosnetwork/atos/internal/adapters/provideradapter/httpadapter"
+	"github.com/tosnetwork/atos/internal/adapters/provideradapter/mcpadapter"
 	"github.com/tosnetwork/atos/internal/adapters/storage/local"
 	"github.com/tosnetwork/atos/internal/adapters/tosai"
+	"github.com/tosnetwork/atos/internal/adapters/tosai/dispatch"
 	tosaimock "github.com/tosnetwork/atos/internal/adapters/tosai/mock"
 	"github.com/tosnetwork/atos/internal/adapters/toscore"
 	toscoremock "github.com/tosnetwork/atos/internal/adapters/toscore/mock"
@@ -110,6 +115,19 @@ func main() {
 		os.Exit(2)
 	}
 
+	// Wraps whichever native execution backend was just selected: a
+	// Capability whose binding is tos-native/human/absent executes exactly
+	// as before (unchanged behavior); one bound to http/mcp/a2a routes
+	// through the matching outbound provider adapter instead. JobService
+	// and StreamService still talk to exactly one tosai.Provider -- this
+	// is the only place execution fans out by transport, never a second
+	// execution path. See internal/adapters/tosai/dispatch's package doc.
+	execution = dispatch.New(execution, provideradapter.NewResolver(
+		httpadapter.New(httpadapter.Config{}),
+		mcpadapter.New(mcpadapter.Config{}),
+		a2aadapter.New(a2aadapter.Config{}),
+	))
+
 	capabilities := service.NewCapabilityService(st)
 	var quotes *service.QuoteService
 	if quoter == nil {
@@ -187,7 +205,7 @@ func main() {
 	mcpServer := &mcp.Server{
 		Auth: authorization, Capabilities: capabilities, Quotes: quotes,
 		Jobs: jobs, Accounts: accounts, Receipts: receipts, Earnings: earnings,
-		Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
+		Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}
 	a2aServer := &a2a.Server{
 		Auth: authorization, Quotes: quotes, Jobs: jobs,

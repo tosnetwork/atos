@@ -165,10 +165,26 @@ func (s *JobService) submit(ctx context.Context, in SubmitInput, waitInline bool
 	if quote.TrustMode != domain.TrustModeManaged {
 		proofStatus.Quote = domain.ProofPending
 	}
+	// Before outbound dispatch, request data must satisfy the frozen input
+	// schema -- checked once, here, against the schema current at Job
+	// creation (never re-checked against a later-updated Capability).
+	if err := validateAgainstSchema("input", capability.InputSchema, in.Input); err != nil {
+		return SubmitResult{}, domain.NewError(domain.ErrValidationFailed, err.Error(), false)
+	}
+	// The binding is selected and frozen onto the Job once, here, at
+	// creation time -- execution must never re-resolve it from the
+	// Capability's live (possibly later-updated) Bindings. See
+	// domain.Job.Binding's doc comment.
+	var frozenBinding *domain.CapabilityBinding
+	if binding, ok := domain.SelectBinding(capability.Bindings, quote.TrustMode); ok {
+		frozenBinding = &binding
+	}
 	job := domain.Job{
 		ID: idPrefix + uuid.NewString(), CapabilityID: capability.ID,
-		CapabilityVersion: capability.Version, ProviderID: capability.ProviderID,
-		QuoteID: quote.ID, ServiceQuoteID: quote.ServiceQuoteID,
+		CapabilityVersion: capability.Version, Binding: frozenBinding,
+		InputSchema: capability.InputSchema, OutputSchema: capability.OutputSchema,
+		ProviderID: capability.ProviderID,
+		QuoteID:    quote.ID, ServiceQuoteID: quote.ServiceQuoteID,
 		PrincipalID: in.PrincipalID, TrustMode: quote.TrustMode,
 		ProofProfile: quote.ProofProfile, ProofStatus: proofStatus,
 		State: state, Input: cloneMap(in.Input), IdempotencyKey: in.IdempotencyKey,
@@ -506,6 +522,111 @@ func (s *JobService) Get(ctx context.Context, jobID string) (domain.Job, error) 
 		return reconciled, domain.NewError(domain.ErrSettlementFailed, "job economic reconciliation is still pending: "+reconcileErr.Error(), true)
 	}
 	return job, nil
+}
+
+// ListByProvider returns every Job owned by providerID, for
+// atos_provider_jobs. A provider sees only its own Jobs -- the caller is
+// responsible for passing the authenticated principal's own ID, never a
+// caller-supplied provider_id.
+func (s *JobService) ListByProvider(ctx context.Context, providerID string) ([]domain.Job, error) {
+	return s.store.JobsByProvider(ctx, providerID)
+}
+
+// DeliverResultInput carries a provider-delivered Job result. ProviderID
+// MUST come from the authenticated caller, never request JSON -- callers
+// (httpapi/mcp) are responsible for that; DeliverResult itself still
+// re-checks it against the Job's own record rather than trusting the
+// caller not to have made a mistake.
+type DeliverResultInput struct {
+	JobID          string
+	ProviderID     string
+	Output         map[string]any
+	IdempotencyKey string
+}
+
+// DeliverResult completes a Job with a provider-supplied output, for
+// providers that pull their Jobs (atos_provider_jobs) and push results
+// back explicitly (e.g. a human-in-the-loop or otherwise pull-model
+// Capability, as opposed to the push-model http/mcp/a2a bindings
+// internal/adapters/tosai/dispatch dispatches to automatically).
+//
+// The Job's Quote remains the sole source of truth for trust_mode/proof
+// profile/pricing -- delivery only ever supplies Output; every other
+// economic fact is read from the Job's own already-durable record, never
+// accepted from the caller. A duplicate delivery for an already-Completed
+// Job is a safe, idempotent no-op (returns the existing Job unchanged,
+// never re-settling); a delivery attempt against a Job that has already
+// reached a terminal non-completed state, or that is not in the
+// escrow-reserved economic state delivery requires, is rejected.
+func (s *JobService) DeliverResult(ctx context.Context, in DeliverResultInput) (domain.Job, error) {
+	if in.JobID == "" || in.ProviderID == "" || in.IdempotencyKey == "" {
+		return domain.Job{}, domain.NewError(domain.ErrValidationFailed, "job_id, provider_id and idempotency_key are required", false)
+	}
+	lock := s.jobLock(in.JobID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	job, err := s.store.GetJob(ctx, in.JobID)
+	if err != nil {
+		if err == store.ErrNotFound {
+			return domain.Job{}, domain.NewError(domain.ErrNotFound, "job not found", false)
+		}
+		return domain.Job{}, err
+	}
+	if job.ProviderID != in.ProviderID {
+		return domain.Job{}, domain.NewError(domain.ErrPermissionDenied, "not the job's owning provider", false)
+	}
+	if job.State == domain.JobCompleted {
+		return job, nil
+	}
+	if job.State.Terminal() {
+		return domain.Job{}, domain.NewError(domain.ErrValidationFailed, "job already reached a terminal state and cannot be delivered", false)
+	}
+	if job.EconomicState != domain.EconomicEscrowReserved {
+		return domain.Job{}, domain.NewError(domain.ErrValidationFailed, "job is not ready for delivery", true)
+	}
+	// Successful output must pass the frozen output schema before
+	// settlement -- checked against job.OutputSchema (captured at Job
+	// creation time), never the Capability's possibly-since-updated
+	// current one.
+	if err := validateAgainstSchema("output", job.OutputSchema, in.Output); err != nil {
+		return domain.Job{}, domain.NewError(domain.ErrValidationFailed, err.Error(), false)
+	}
+
+	receipt := synthesizeDeliveredReceipt(job, in.Output)
+	result := tosai.SubmitJobResult{State: domain.JobCompleted, Output: in.Output, Receipt: receipt}
+	return s.settleProviderResultUnderLock(ctx, job, result), nil
+}
+
+// synthesizeDeliveredReceipt builds an ATOS-self-signed ExecutionReceipt
+// for a provider-delivered result -- there is no TOS network signer
+// material for a manually-delivered Job any more than there is for a
+// dispatched third-party one; see
+// internal/adapters/tosai/dispatch.synthesizeReceipt's identical reasoning
+// (kept as a separate, smaller copy here rather than a shared export,
+// since the two call sites build from different source structs -- a
+// tosai.SubmitJobRequest there, a domain.Job here -- and economic_recovery.go's
+// settlement path only needs the Result/InputHash/OutputHash/Signature/
+// ExecutionSignerID fields to accept it). A distinct ExecutionSignerID
+// ("...delivered" vs dispatch's "...dispatch") keeps the two paths'
+// receipts distinguishable in audit/evidence review.
+func synthesizeDeliveredReceipt(job domain.Job, output map[string]any) *domain.ExecutionReceipt {
+	now := time.Now().UTC()
+	inputHash := hashCommitment(job.Input)
+	outputHash := hashCommitment(output)
+	receiptID := "xrcpt_" + uuid.NewString()
+	signerID := "sig_atos_managed_delivered"
+	return &domain.ExecutionReceipt{
+		ID: receiptID, QuoteID: job.QuoteID, EscrowID: job.EscrowID, JobID: job.ID,
+		PrincipalID: job.PrincipalID, ProviderID: job.ProviderID,
+		CapabilityID: job.CapabilityID, CapabilityVersion: job.CapabilityVersion,
+		TrustMode: job.TrustMode, ProofProfile: job.ProofProfile,
+		Result: domain.ExecutionSuccess, InputHash: inputHash, OutputHash: outputHash,
+		StartedAt: now, CompletedAt: now,
+		ExecutionSignerID:  signerID,
+		SignatureAlgorithm: "atos-managed-sha256",
+		Signature:          hashCommitment(map[string]any{"receipt_id": receiptID, "job_id": job.ID, "input": inputHash, "output": outputHash}),
+	}
 }
 
 func (s *JobService) Cancel(ctx context.Context, jobID, principalID, reason, idempotencyKey string) (domain.Job, error) {

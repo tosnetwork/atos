@@ -1,7 +1,10 @@
 // Package domain holds the ATOS business objects defined in atos-spec.
 package domain
 
-import "time"
+import (
+	"slices"
+	"time"
+)
 
 type DeliveryMode string
 
@@ -115,4 +118,23 @@ type Capability struct {
 
 func (c Capability) Supports(mode TrustMode) bool {
 	return c.ModeSupport.Active(mode)
+}
+
+// SelectBinding picks the binding a Job executing under mode should freeze
+// at creation time: the first binding whose EligibleTrustModes includes
+// mode, falling back to the first binding at all if none declare
+// eligibility explicitly (matching normalizeBindings' own permissive
+// default at registration time). ok is false only when bindings is empty.
+// Callers MUST freeze the result onto the Job at creation time (never
+// re-resolve it live at execution time) -- see Job.Binding's doc comment.
+func SelectBinding(bindings []CapabilityBinding, mode TrustMode) (CapabilityBinding, bool) {
+	for _, b := range bindings {
+		if slices.Contains(b.EligibleTrustModes, mode) {
+			return b, true
+		}
+	}
+	if len(bindings) > 0 {
+		return bindings[0], true
+	}
+	return CapabilityBinding{}, false
 }

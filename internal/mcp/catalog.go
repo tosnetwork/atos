@@ -27,6 +27,10 @@ var orderedToolSpecs = []toolSpec{
 	{Definition: listMyCapabilitiesTool(), RequiredScopes: []auth.Scope{auth.ScopeCapabilitiesWrite}},
 	{Definition: pauseCapabilityTool(), RequiredScopes: []auth.Scope{auth.ScopeCapabilitiesWrite}},
 	{Definition: providerEarningsTool(), RequiredScopes: []auth.Scope{auth.ScopeEarningsRead}},
+	{Definition: providerJobsTool(), RequiredScopes: []auth.Scope{auth.ScopeProviderJobsRead}},
+	{Definition: deliverJobTool(), RequiredScopes: []auth.Scope{auth.ScopeProviderJobsDeliver}},
+	{Definition: requestSettlementTool(), RequiredScopes: []auth.Scope{auth.ScopeSettlementWrite}},
+	{Definition: disputeJobTool(), RequiredScopes: []auth.Scope{auth.ScopeDisputesReview}},
 }
 
 func toolName(spec toolSpec) string {
@@ -283,5 +287,54 @@ func providerEarningsTool() map[string]any {
 			objectSchema([]string{"earnings"}, map[string]any{"earnings": map[string]any{"type": "array"}}),
 			map[string]any{"type": "object"},
 		}},
+	}
+}
+
+func providerJobsTool() map[string]any {
+	return map[string]any{
+		"name":        "atos_provider_jobs",
+		"description": "List Jobs owned by the authenticated provider, or get one by job_id.",
+		"inputSchema": objectSchema(nil, map[string]any{"job_id": map[string]any{"type": "string", "minLength": 1}}),
+		"outputSchema": map[string]any{"oneOf": []any{
+			objectSchema([]string{"jobs"}, map[string]any{"jobs": map[string]any{"type": "array"}}),
+			map[string]any{"type": "object"},
+		}},
+	}
+}
+
+func deliverJobTool() map[string]any {
+	return map[string]any{
+		"name":        "atos_deliver_job",
+		"description": "Deliver a completed result for a Job owned by the authenticated provider. The Job's Quote remains authoritative for trust_mode/pricing; only output is accepted here.",
+		"inputSchema": objectSchema([]string{"job_id", "output"}, map[string]any{
+			"job_id": map[string]any{"type": "string", "minLength": 1},
+			"output": map[string]any{"type": "object"},
+		}),
+		"outputSchema": map[string]any{"type": "object"},
+	}
+}
+
+func requestSettlementTool() map[string]any {
+	return map[string]any{
+		"name":        "atos_request_settlement",
+		"description": "Request settlement reconciliation for a Job owned by the authenticated provider. Never accepts a caller-supplied settlement amount -- the frozen Quote, verified Receipt and durable Job/settlement state remain the sole source of economic truth.",
+		"inputSchema": objectSchema([]string{"job_id"}, map[string]any{
+			"job_id": map[string]any{"type": "string", "minLength": 1},
+		}),
+		"outputSchema": map[string]any{"type": "object"},
+	}
+}
+
+func disputeJobTool() map[string]any {
+	return map[string]any{
+		"name":        "atos_dispute_job",
+		"description": "Provider/admin dispute operations (review, resolve) over the existing Phase 2C dispute workflow. Strictly operation-discriminated -- exactly one of review/resolve fields is honored per call, per the value of \"operation\".",
+		"inputSchema": objectSchema([]string{"operation", "dispute_id"}, map[string]any{
+			"operation":       map[string]any{"type": "string", "enum": []string{"review", "resolve"}},
+			"dispute_id":      map[string]any{"type": "string", "minLength": 1},
+			"outcome":         map[string]any{"type": "string", "enum": []string{"principal", "provider", "rejected"}, "description": "Required when operation=resolve."},
+			"reason_rejected": map[string]any{"type": "string", "description": "Optional detail when outcome=rejected."},
+		}),
+		"outputSchema": map[string]any{"type": "object"},
 	}
 }

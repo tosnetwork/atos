@@ -6,6 +6,7 @@ require (
 	connectrpc.com/connect v1.19.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/tosnetwork/tos-protocol v0.0.0-20260809092546-ff4fb5a28526
 	go.etcd.io/bbolt v1.4.3
 	google.golang.org/protobuf v1.36.11

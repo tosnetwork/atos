@@ -7,7 +7,8 @@ package mcp
 func init() {
 	for _, spec := range orderedToolSpecs {
 		switch toolName(spec) {
-		case "atos_register_capability", "atos_update_capability", "atos_pause_capability":
+		case "atos_register_capability", "atos_update_capability", "atos_pause_capability",
+			"atos_deliver_job", "atos_request_settlement":
 			requireStringProperty(spec.Definition, "idempotency_key")
 		}
 	}

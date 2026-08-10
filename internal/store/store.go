@@ -75,6 +75,10 @@ type Jobs interface {
 	PutJob(ctx context.Context, j domain.Job) error
 	GetJob(ctx context.Context, id string) (domain.Job, error)
 	JobsByPrincipal(ctx context.Context, principalID string) ([]domain.Job, error)
+	// JobsByProvider returns every Job whose ProviderID matches providerID,
+	// newest first -- the provider-side counterpart to JobsByPrincipal, for
+	// atos_provider_jobs.
+	JobsByProvider(ctx context.Context, providerID string) ([]domain.Job, error)
 	JobsForRecovery(ctx context.Context, updatedBefore time.Time, limit int) ([]domain.Job, error)
 	JobByConfirmationCode(ctx context.Context, userCode string) (domain.Job, error)
 	JobByIdempotencyKey(ctx context.Context, principalID, key string) (domain.Job, error)
@@ -310,6 +314,51 @@ type Artifacts interface {
 	GetArtifact(ctx context.Context, id string) (domain.StoredArtifact, error)
 }
 
+// ProviderHealth stores the single most recent observed health result per
+// (capability_id, capability_version, transport). Health is a point-in-time
+// probe with no history worth preserving -- unlike Disputes/Certifications
+// there is no idempotency or immutability contract here, only overwrite.
+type ProviderHealth interface {
+	// PutHealthCheck upserts the most recent health result for the
+	// (CapabilityID, CapabilityVersion, Transport) triple in check.
+	PutHealthCheck(ctx context.Context, check domain.AdapterHealthCheck) error
+	// HealthCheck returns the most recently recorded health for that
+	// binding, if any has ever been recorded. found=false is a normal,
+	// expected state for a binding never checked yet -- never an error.
+	HealthCheck(ctx context.Context, capabilityID, capabilityVersion string, transport domain.EndpointAdapterType) (check domain.AdapterHealthCheck, found bool, err error)
+}
+
+// Certifications stores durable, idempotent sandbox-certification records.
+// Passing certification is readiness evidence only -- see
+// domain.SandboxCertification's doc comment -- and no method here mutates
+// domain.ModeSupport or SupportedTrustModes; that activation path does not
+// exist yet (Phase 3B).
+type Certifications interface {
+	// OpenCertification idempotently creates a certification record keyed
+	// by (providerID, idempotencyKey): the first call for that pair
+	// creates cert (created=true); a replay with the SAME key and
+	// identical semantic content (see domain.SandboxCertification's
+	// content-hash contract, mirrored on the Postgres implementation via
+	// certificationContentHash) returns the existing record unchanged
+	// (created=false, nil error); a replay with the SAME key but
+	// DIFFERENT content returns domain.ErrIdempotencyConflict.
+	OpenCertification(ctx context.Context, providerID string, cert domain.SandboxCertification) (domain.SandboxCertification, bool, error)
+	GetCertification(ctx context.Context, id string) (domain.SandboxCertification, error)
+	CertificationByIdempotencyKey(ctx context.Context, providerID, key string) (domain.SandboxCertification, error)
+	// CertificationsByCapability returns every certification ever opened
+	// for capabilityID, newest first.
+	CertificationsByCapability(ctx context.Context, capabilityID string) ([]domain.SandboxCertification, error)
+	// UpdateCertification atomically applies fn to the certification's
+	// current stored state. Implementations MUST reject
+	// (domain.ErrIdempotencyConflict) a returned value whose ID or
+	// identity fields (ProviderID/CapabilityID/CapabilityVersion/
+	// Transport/EndpointRef/IdempotencyKey) differ from the existing
+	// stored record -- only Status/FailureReason/Evidence/CompletedAt/
+	// UpdatedAt may change through this method, exactly mirroring
+	// UpdateDispute's own immutability contract.
+	UpdateCertification(ctx context.Context, id string, fn func(c domain.SandboxCertification, exists bool) (domain.SandboxCertification, error)) (domain.SandboxCertification, error)
+}
+
 type Idempotency interface {
 	// Reserve atomically claims (principalID, key) in the InProgress state.
 	// If the key was already used it returns the prior record and ok=false
@@ -339,5 +388,7 @@ type Store interface {
 	Earnings
 	Disputes
 	Artifacts
+	ProviderHealth
+	Certifications
 	Idempotency
 }

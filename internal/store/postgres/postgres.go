@@ -451,6 +451,27 @@ func (s *Store) JobsByPrincipal(ctx context.Context, principalID string) ([]doma
 	return out, rows.Err()
 }
 
+// JobsByProvider filters on the JSONB payload, not a dedicated column --
+// jobs has no provider_id column of its own; ProviderID lives only inside
+// payload, exactly like trust_mode (see jobs_trust_mode_idx). Migration
+// 010 creates a matching expression index.
+func (s *Store) JobsByProvider(ctx context.Context, providerID string) ([]domain.Job, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+jobColumns+` FROM jobs WHERE payload->>'provider_id'=$1 ORDER BY created_at DESC, id ASC`, providerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) JobsForRecovery(ctx context.Context, updatedBefore time.Time, limit int) ([]domain.Job, error) {
 	if limit <= 0 {
 		limit = 100

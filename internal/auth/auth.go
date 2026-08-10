@@ -34,18 +34,25 @@ const (
 	ScopeProviderJobsDeliver Scope = "provider_jobs:deliver"
 	ScopeEarningsRead        Scope = "earnings:read"
 	ScopeSettlementRead      Scope = "settlement:read"
-	ScopeProofsRead          Scope = "proofs:read"
-	ScopeNetworkRead         Scope = "network:read"
-	ScopeDisputesOpen        Scope = "disputes:open"
-	ScopeDisputesRead        Scope = "disputes:read"
-	ScopeDisputesReview      Scope = "disputes:review"
+	// ScopeSettlementWrite authorizes settlement-mutation operations
+	// (atos_request_settlement) -- deliberately a separate scope from
+	// ScopeSettlementRead, never overloading a read-only scope to
+	// authorize a money-changing operation. Explicit-grant-only, like
+	// ScopeDisputesReview: never a default consumer scope, and never
+	// implied by ScopeProviderJobsDeliver or any other provider scope.
+	ScopeSettlementWrite Scope = "settlement:write"
+	ScopeProofsRead      Scope = "proofs:read"
+	ScopeNetworkRead     Scope = "network:read"
+	ScopeDisputesOpen    Scope = "disputes:open"
+	ScopeDisputesRead    Scope = "disputes:read"
+	ScopeDisputesReview  Scope = "disputes:review"
 )
 
 var allowedScopes = map[Scope]struct{}{
 	ScopeCapabilitiesRead: {}, ScopeCapabilitiesWrite: {}, ScopeQuotesRead: {},
 	ScopeInvocationsCreate: {}, ScopeJobsCreate: {}, ScopeJobsRead: {}, ScopeJobsCancel: {},
 	ScopeAccountRead: {}, ScopeProviderJobsRead: {}, ScopeProviderJobsDeliver: {},
-	ScopeEarningsRead: {}, ScopeSettlementRead: {}, ScopeProofsRead: {}, ScopeNetworkRead: {},
+	ScopeEarningsRead: {}, ScopeSettlementRead: {}, ScopeSettlementWrite: {}, ScopeProofsRead: {}, ScopeNetworkRead: {},
 	ScopeDisputesOpen: {}, ScopeDisputesRead: {}, ScopeDisputesReview: {},
 }
 

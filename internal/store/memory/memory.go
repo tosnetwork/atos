@@ -33,7 +33,10 @@ type Store struct {
 	disputes             map[string]domain.Dispute         // disputeID -> dispute
 	disputesByJob        map[string]string                 // jobID -> disputeID
 	artifacts            map[string]domain.StoredArtifact
-	idempotency          map[string]store.IdempotencyRecord // principalID+":"+key
+	healthChecks         map[string]domain.AdapterHealthCheck   // capabilityID+":"+capabilityVersion+":"+transport -> check
+	certifications       map[string]domain.SandboxCertification // certID -> certification
+	certByIdempotencyKey map[string]string                      // providerID+":"+key -> certID
+	idempotency          map[string]store.IdempotencyRecord     // principalID+":"+key
 }
 
 func New() *Store {
@@ -56,6 +59,9 @@ func New() *Store {
 		disputes:             make(map[string]domain.Dispute),
 		disputesByJob:        make(map[string]string),
 		artifacts:            make(map[string]domain.StoredArtifact),
+		healthChecks:         make(map[string]domain.AdapterHealthCheck),
+		certifications:       make(map[string]domain.SandboxCertification),
+		certByIdempotencyKey: make(map[string]string),
 		idempotency:          make(map[string]store.IdempotencyRecord),
 	}
 }
@@ -235,6 +241,18 @@ func (s *Store) JobsByPrincipal(ctx context.Context, principalID string) ([]doma
 	var out []domain.Job
 	for _, j := range s.jobs {
 		if j.PrincipalID == principalID {
+			out = append(out, j)
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) JobsByProvider(ctx context.Context, providerID string) ([]domain.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []domain.Job
+	for _, j := range s.jobs {
+		if j.ProviderID == providerID {
 			out = append(out, j)
 		}
 	}

@@ -526,11 +526,6 @@ func (s *JobService) recoverProviderExecution(ctx context.Context, jobID string,
 		result := tosai.SubmitJobResult{State: domain.JobCompleted, Output: cloneMap(job.Output), Artifacts: append([]domain.Artifact(nil), job.Artifacts...), Receipt: job.ExecutionReceipt}
 		return s.settleProviderResultUnderLock(ctx, job, result), nil
 	}
-	capability, err := s.store.Get(ctx, job.CapabilityID)
-	if err != nil {
-		return job, err
-	}
-	capability = normalizeCapability(capability)
 	result, getErr := s.provider.GetJob(ctx, job.ID)
 	if getErr != nil {
 		if !domainErrorIs(getErr, domain.ErrNotFound) {
@@ -544,6 +539,12 @@ func (s *JobService) recoverProviderExecution(ctx context.Context, jobID string,
 			released, releaseErr := s.releaseForTerminalUnderLock(ctx, job, domain.JobFailed, domain.ErrProviderFailed, "execution was never admitted before its deadline")
 			return released, releaseErr
 		}
+		// job.Binding was frozen once, at creation time (domain.SelectBinding),
+		// and is passed through unchanged here -- execution never re-fetches
+		// or re-resolves the Capability's current bindings, so a live
+		// Capability update (a semantically different provider binding,
+		// possibly a version bump) can never silently redirect an
+		// already-committed Job. See domain.Job.Binding's doc comment.
 		result, getErr = s.provider.SubmitJob(ctx, tosai.SubmitJobRequest{
 			JobID: job.ID, InvocationID: job.InvocationID,
 			QuoteID: job.QuoteID, ServiceQuoteID: job.ServiceQuoteID,
@@ -552,6 +553,7 @@ func (s *JobService) recoverProviderExecution(ctx context.Context, jobID string,
 			ProviderID: job.ProviderID, TrustMode: job.TrustMode, ProofProfile: job.ProofProfile,
 			Input: job.Input, InputCommitment: hashCommitment(job.Input),
 			ExecutionDeadline: job.ExecutionDeadline, RetainUntil: time.Now().UTC().Add(executionRetention),
+			Binding: job.Binding,
 		})
 		if getErr != nil {
 			pending := s.markEconomicReconciliationUnderLock(ctx, job.ID, job.EconomicState, domain.JobWorking, domain.ErrProviderFailed, "provider submission outcome requires recovery: "+getErr.Error())
@@ -559,6 +561,16 @@ func (s *JobService) recoverProviderExecution(ctx context.Context, jobID string,
 		}
 	}
 	if result.State == domain.JobCompleted {
+		// Before accepting provider output into a successful settlement,
+		// it must satisfy the frozen output schema -- checked against the
+		// schema captured on the Job at creation time (job.OutputSchema),
+		// never the Capability's possibly-since-updated current one.
+		// Schema failure is a provider failure, never a successful
+		// settlement.
+		if err := validateAgainstSchema("output", job.OutputSchema, result.Output); err != nil {
+			released, releaseErr := s.releaseForTerminalUnderLock(ctx, job, domain.JobFailed, domain.ErrProviderFailed, "provider output failed schema validation: "+err.Error())
+			return released, releaseErr
+		}
 		return s.settleProviderResultUnderLock(ctx, job, result), nil
 	}
 	if result.State.Terminal() {

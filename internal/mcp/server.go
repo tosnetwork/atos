@@ -22,6 +22,7 @@ type Server struct {
 	Accounts      *service.AccountService
 	Receipts      *service.ReceiptService
 	Earnings      *service.EarningsService
+	Disputes      *service.DisputeService
 	Artifacts     *service.ArtifactService
 	Logger        *slog.Logger
 	PublicBaseURL string
