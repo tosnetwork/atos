@@ -97,6 +97,77 @@ func TestOpenSignerOperation_DifferentContentConflicts(t *testing.T) {
 	}
 }
 
+// TestOpenSignerOperation_DifferentRevocationReasonConflicts proves
+// RevocationReasonCode is identity content like every other caller-supplied
+// field: it is forwarded verbatim into tos-protocol's RevokeExecutionSigner
+// request and hashed into ITS commitment digest, so an idempotency-key
+// replay that supplies a different reason must conflict rather than
+// silently keeping whatever reason the first call happened to persist.
+func TestOpenSignerOperation_DifferentRevocationReasonConflicts(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	providerID := "prov_sigop_reason_" + suffix
+	op := testSignerOperation(providerID, "cap_sigop_reason_"+suffix, "key_"+suffix)
+	op.RevocationReasonCode = "rotation"
+	if _, _, err := s.OpenSignerOperation(ctx, providerID, op); err != nil {
+		t.Fatal(err)
+	}
+	changed := op
+	changed.RevocationReasonCode = "compromised"
+	_, _, err := s.OpenSignerOperation(ctx, providerID, changed)
+	var domainErr *domain.Error
+	if !errors.As(err, &domainErr) || domainErr.Code != domain.ErrIdempotencyConflict {
+		t.Fatalf("got %v, want domain.ErrIdempotencyConflict", err)
+	}
+}
+
+// TestLatestCompletedSignerOperationByCapability_NotMaskedByOlderVersionsLaterCompletion
+// proves the version filter lives in the query itself: a stuck v1
+// operation that a reconciler only finishes recovering AFTER a v2 signer
+// was already authorized and completed can have a LATER updated_at than
+// v2's own completed operation. Before this fix, the query selected "most
+// recently updated completed operation for this capability_id, any
+// version" and the version check happened afterward in Go, which resolved
+// to the v1 row here, got rejected as the wrong version, and reported no
+// current signer at all -- even though the real, current v2 signer sits
+// right next to it in the same table.
+func TestLatestCompletedSignerOperationByCapability_NotMaskedByOlderVersionsLaterCompletion(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	providerID := "prov_sigop_vermask_" + suffix
+	capabilityID := "cap_sigop_vermask_" + suffix
+
+	newerVersionEarlierCompletion := testSignerOperation(providerID, capabilityID, "key_"+suffix+"_v2")
+	newerVersionEarlierCompletion.CapabilityVersion = "2.0.0"
+	newerVersionEarlierCompletion.Checkpoint = domain.CheckpointCompleted
+	newerVersionEarlierCompletion.UpdatedAt = time.Now().UTC().Add(-time.Hour)
+	if _, _, err := s.OpenSignerOperation(ctx, providerID, newerVersionEarlierCompletion); err != nil {
+		t.Fatal(err)
+	}
+
+	olderVersionLaterCompletion := testSignerOperation(providerID, capabilityID, "key_"+suffix+"_v1")
+	olderVersionLaterCompletion.CapabilityVersion = "1.0.0"
+	olderVersionLaterCompletion.Checkpoint = domain.CheckpointCompleted
+	olderVersionLaterCompletion.UpdatedAt = time.Now().UTC()
+	if _, _, err := s.OpenSignerOperation(ctx, providerID, olderVersionLaterCompletion); err != nil {
+		t.Fatal(err)
+	}
+
+	got, found, err := s.LatestCompletedSignerOperationByCapability(ctx, capabilityID, "2.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected to find the current version's completed operation")
+	}
+	if got.ID != newerVersionEarlierCompletion.ID {
+		t.Fatalf("got operation %s (version %s), want %s (version 2.0.0) -- masked by the older version's later completion",
+			got.ID, got.CapabilityVersion, newerVersionEarlierCompletion.ID)
+	}
+}
+
 // TestOpenSignerOperation_TwoIndependentPostgresInstancesConvergeToOne
 // simulates two ATOS replicas racing to open the same execution-signer
 // operation -- the §7.2.4 success criterion's "two replicas converge on

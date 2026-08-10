@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"time"
@@ -49,23 +50,31 @@ func NewExecutionSignerService(s store.Store, core toscore.Core, capabilities *C
 //
 // Signer authorization currency is itself version-scoped (§7.2.0: a
 // Capability version bump resets per-version readiness evidence,
-// including signer authorization currency): a completed operation whose
-// CapabilityVersion no longer matches the capability's CURRENT version is
-// not current, even though it remains part of that operation's own
-// auditable history untouched. This was an earlier bug too -- the version
-// check was previously missing entirely, so a signer authorized for a
-// superseded version stayed "current" forever across version bumps.
+// including signer authorization currency): only a completed operation
+// whose CapabilityVersion matches the capability's CURRENT version can be
+// current, even though a superseded version's own operation remains part
+// of its auditable history untouched. This was an earlier bug too -- the
+// version check was previously missing entirely, so a signer authorized
+// for a superseded version stayed "current" forever across version bumps.
+//
+// The version filter MUST live inside LatestCompletedSignerOperationByCapability's
+// own query (capability_id AND capability_version), not be applied here in
+// Go after fetching "the single most recently updated completed operation
+// for this capability across every version": a second bug shared that same
+// shape -- a stuck v1 operation that a reconciler only finishes recovering
+// AFTER a v2 signer was already authorized and completed can have a later
+// updated_at than v2's own completed operation, so the unfiltered "latest"
+// query returns the v1 row, this function correctly rejects it as the
+// wrong version, and reports no current signer at all even though a real,
+// current v2 signer exists just one row away in the same table.
 func (s *ExecutionSignerService) CurrentSigner(ctx context.Context, capabilityID string) (authorizationID, signerID string, found bool, err error) {
 	cap, err := s.capabilities.Get(ctx, capabilityID)
 	if err != nil {
 		return "", "", false, err
 	}
-	op, ok, err := s.store.LatestCompletedSignerOperationByCapability(ctx, capabilityID)
+	op, ok, err := s.store.LatestCompletedSignerOperationByCapability(ctx, capabilityID, cap.Version)
 	if err != nil || !ok {
 		return "", "", false, err
-	}
-	if op.CapabilityVersion != cap.Version {
-		return "", "", false, nil
 	}
 	switch op.Type {
 	case domain.SignerOperationAuthorize, domain.SignerOperationRotate:
@@ -73,6 +82,50 @@ func (s *ExecutionSignerService) CurrentSigner(ctx context.Context, capabilityID
 	default: // revoke
 		return "", "", false, nil
 	}
+}
+
+// resumeOrConflict looks up a prior attempt under (providerID,
+// idempotencyKey) and, if found, returns it with resume=true so
+// Authorize/Revoke/Rotate can drive it forward directly -- BEFORE they
+// touch anything that depends on mutable state (CurrentSigner) or on a
+// freshly-recomputed default (httpapi/mcp's omitted-validity-window
+// default, recomputed from time.Now() on every delivery).
+//
+// This ordering is itself the fix for two real bugs, not a style choice:
+//   - Comparing a freshly-defaulted validity window against an
+//     already-persisted operation's identical-in-intent-but-different-in-
+//     value window produced a spurious IdempotencyConflict on a
+//     legitimate retry that simply omitted valid_from/valid_until again.
+//   - Reading CurrentSigner before checking for an existing operation made
+//     a replay AFTER the original call completed see whatever the CURRENT
+//     signer is now (nothing, for Revoke; the NEW signer, for Rotate) --
+//     never the value the original call actually opened the operation
+//     with -- so Revoke returned NotFound and Rotate's own idempotency
+//     conflict-detection spuriously fired on OldAuthorizationID/
+//     OldExecutionSignerID, neither of which the caller ever supplied.
+//
+// sameStableIdentity must compare only fields the caller genuinely
+// controls and that must not vary between the original call and a retry
+// -- never CurrentSigner-derived Old* fields or a freshly-defaulted
+// validity window, which legitimately differ across delivery attempts of
+// the exact same logical request. A mismatch there is a genuine
+// idempotency_key reused for a different logical request, which must
+// still conflict rather than silently resuming the wrong operation.
+func (s *ExecutionSignerService) resumeOrConflict(
+	ctx context.Context, providerID, idempotencyKey string,
+	sameStableIdentity func(existing domain.ExecutionSignerOperation) bool,
+) (op domain.ExecutionSignerOperation, resume bool, err error) {
+	existing, err := s.store.SignerOperationByIdempotencyKey(ctx, providerID, idempotencyKey)
+	if errors.Is(err, store.ErrNotFound) {
+		return domain.ExecutionSignerOperation{}, false, nil
+	}
+	if err != nil {
+		return domain.ExecutionSignerOperation{}, false, err
+	}
+	if !sameStableIdentity(existing) {
+		return domain.ExecutionSignerOperation{}, false, domain.NewError(domain.ErrIdempotencyConflict, "idempotency_key reused with different execution-signer operation content", false)
+	}
+	return existing, true, nil
 }
 
 type AuthorizeSignerInput struct {
@@ -104,6 +157,11 @@ func (in AuthorizeSignerInput) validate() error {
 // provider mutation in this codebase: provider identity comes only from
 // in.ProviderID (the caller's authenticated principal in the REST/MCP
 // layer), never trusted from anywhere else.
+//
+// A prior attempt under in.IdempotencyKey is looked up and resumed FIRST,
+// before anything that depends on freshly-computed state is touched --
+// see resumeOrConflict's doc comment for why this ordering itself is the
+// fix for a real bug, not a style preference.
 func (s *ExecutionSignerService) Authorize(ctx context.Context, in AuthorizeSignerInput) (domain.ExecutionSignerOperation, error) {
 	if err := in.validate(); err != nil {
 		return domain.ExecutionSignerOperation{}, err
@@ -114,6 +172,19 @@ func (s *ExecutionSignerService) Authorize(ctx context.Context, in AuthorizeSign
 	}
 	if cap.ProviderID != in.ProviderID {
 		return domain.ExecutionSignerOperation{}, domain.NewError(domain.ErrPermissionDenied, "not the owning provider", false)
+	}
+	existing, resume, err := s.resumeOrConflict(ctx, in.ProviderID, in.IdempotencyKey, func(existing domain.ExecutionSignerOperation) bool {
+		return existing.Type == domain.SignerOperationAuthorize &&
+			existing.CapabilityID == in.CapabilityID &&
+			existing.NewExecutionSignerID == in.ExecutionSignerID &&
+			bytes.Equal(existing.NewSignerPublicKey, in.SignerPublicKey) &&
+			existing.NewSignatureAlgorithm == in.SignatureAlgorithm
+	})
+	if err != nil {
+		return domain.ExecutionSignerOperation{}, err
+	}
+	if resume {
+		return s.driveAuthorize(ctx, existing)
 	}
 	now := time.Now().UTC()
 	op := domain.ExecutionSignerOperation{
@@ -164,30 +235,43 @@ func (s *ExecutionSignerService) Revoke(ctx context.Context, in RevokeSignerInpu
 	if cap.ProviderID != in.ProviderID {
 		return domain.ExecutionSignerOperation{}, domain.NewError(domain.ErrPermissionDenied, "not the owning provider", false)
 	}
+	existing, resume, err := s.resumeOrConflict(ctx, in.ProviderID, in.IdempotencyKey, func(existing domain.ExecutionSignerOperation) bool {
+		return existing.Type == domain.SignerOperationRevoke &&
+			existing.CapabilityID == in.CapabilityID &&
+			existing.RevocationReasonCode == in.ReasonCode
+	})
+	if err != nil {
+		return domain.ExecutionSignerOperation{}, err
+	}
+	if resume {
+		return s.driveRevoke(ctx, existing)
+	}
 	for _, mode := range []domain.TrustMode{domain.TrustModeVerified, domain.TrustModeNative} {
 		if cap.ModeSupport.Active(mode) {
 			return domain.ExecutionSignerOperation{}, domain.NewError(domain.ErrValidationFailed, "cannot revoke the only authorized execution signer while a stronger trust mode is active -- rotate instead", false)
 		}
 	}
-	authorizationID, signerID, found, err := s.CurrentSigner(ctx, cap.ID)
-	if err != nil {
-		return domain.ExecutionSignerOperation{}, err
-	}
-	if !found {
-		return domain.ExecutionSignerOperation{}, domain.NewError(domain.ErrNotFound, "capability has no currently authorized execution signer to revoke", false)
-	}
 	now := time.Now().UTC()
-	op := domain.ExecutionSignerOperation{
-		ID: "sigop_" + uuid.NewString(), ProviderID: in.ProviderID,
-		CapabilityID: cap.ID, CapabilityVersion: cap.Version,
-		Type: domain.SignerOperationRevoke, Checkpoint: domain.CheckpointIntentPersisted,
-		IdempotencyKey:       in.IdempotencyKey,
-		OldAuthorizationID:   authorizationID,
-		OldExecutionSignerID: signerID,
-		RevocationReasonCode: in.ReasonCode,
-		CreatedAt:            now, UpdatedAt: now,
-	}
-	stored, _, err := s.store.OpenSignerOperation(ctx, in.ProviderID, op)
+	// OpenSignerOperationForCapability, not a separate CurrentSigner call
+	// followed by OpenSignerOperation: see its doc comment
+	// (internal/store/store.go) for the race two separate calls cannot
+	// close.
+	stored, _, err := s.store.OpenSignerOperationForCapability(ctx, in.ProviderID, cap.ID, cap.Version,
+		func(currentAuthorizationID, currentExecutionSignerID string, found bool) (domain.ExecutionSignerOperation, error) {
+			if !found {
+				return domain.ExecutionSignerOperation{}, domain.NewError(domain.ErrNotFound, "capability has no currently authorized execution signer to revoke", false)
+			}
+			return domain.ExecutionSignerOperation{
+				ID: "sigop_" + uuid.NewString(), ProviderID: in.ProviderID,
+				CapabilityID: cap.ID, CapabilityVersion: cap.Version,
+				Type: domain.SignerOperationRevoke, Checkpoint: domain.CheckpointIntentPersisted,
+				IdempotencyKey:       in.IdempotencyKey,
+				OldAuthorizationID:   currentAuthorizationID,
+				OldExecutionSignerID: currentExecutionSignerID,
+				RevocationReasonCode: in.ReasonCode,
+				CreatedAt:            now, UpdatedAt: now,
+			}, nil
+		})
 	if err != nil {
 		return domain.ExecutionSignerOperation{}, err
 	}
@@ -228,31 +312,49 @@ func (s *ExecutionSignerService) Rotate(ctx context.Context, in RotateSignerInpu
 	if cap.ProviderID != in.ProviderID {
 		return domain.ExecutionSignerOperation{}, domain.NewError(domain.ErrPermissionDenied, "not the owning provider", false)
 	}
-	oldAuthorizationID, oldSignerID, found, err := s.CurrentSigner(ctx, cap.ID)
+	existing, resume, err := s.resumeOrConflict(ctx, in.ProviderID, in.IdempotencyKey, func(existing domain.ExecutionSignerOperation) bool {
+		return existing.Type == domain.SignerOperationRotate &&
+			existing.CapabilityID == in.CapabilityID &&
+			existing.NewExecutionSignerID == in.NewExecutionSignerID &&
+			bytes.Equal(existing.NewSignerPublicKey, in.NewSignerPublicKey) &&
+			existing.NewSignatureAlgorithm == in.NewSignatureAlgorithm &&
+			existing.RevocationReasonCode == in.RevocationReasonCode
+	})
 	if err != nil {
 		return domain.ExecutionSignerOperation{}, err
 	}
-	if !found {
-		return domain.ExecutionSignerOperation{}, domain.NewError(domain.ErrNotFound, "capability has no currently authorized execution signer to rotate -- use Authorize for the first signer", false)
+	if resume {
+		return s.driveRotate(ctx, existing)
 	}
 	now := time.Now().UTC()
-	op := domain.ExecutionSignerOperation{
-		ID: "sigop_" + uuid.NewString(), ProviderID: in.ProviderID,
-		CapabilityID: cap.ID, CapabilityVersion: cap.Version,
-		Type: domain.SignerOperationRotate, Checkpoint: domain.CheckpointIntentPersisted,
-		IdempotencyKey:        in.IdempotencyKey,
-		NewAuthorizationID:    "authz_" + uuid.NewString(),
-		NewExecutionSignerID:  in.NewExecutionSignerID,
-		NewSignerPublicKey:    in.NewSignerPublicKey,
-		NewSignatureAlgorithm: in.NewSignatureAlgorithm,
-		NewValidFrom:          in.NewValidFrom,
-		NewValidUntil:         in.NewValidUntil,
-		OldAuthorizationID:    oldAuthorizationID,
-		OldExecutionSignerID:  oldSignerID,
-		RevocationReasonCode:  in.RevocationReasonCode,
-		CreatedAt:             now, UpdatedAt: now,
-	}
-	stored, _, err := s.store.OpenSignerOperation(ctx, in.ProviderID, op)
+	// OpenSignerOperationForCapability, not a separate CurrentSigner call
+	// followed by OpenSignerOperation: see its doc comment
+	// (internal/store/store.go) for the race two separate calls cannot
+	// close -- this is the exact P0 finding, two concurrent Rotate calls
+	// on different idempotency keys both reading the same old signer
+	// before either persists an operation that would change it.
+	stored, _, err := s.store.OpenSignerOperationForCapability(ctx, in.ProviderID, cap.ID, cap.Version,
+		func(currentAuthorizationID, currentExecutionSignerID string, found bool) (domain.ExecutionSignerOperation, error) {
+			if !found {
+				return domain.ExecutionSignerOperation{}, domain.NewError(domain.ErrNotFound, "capability has no currently authorized execution signer to rotate -- use Authorize for the first signer", false)
+			}
+			return domain.ExecutionSignerOperation{
+				ID: "sigop_" + uuid.NewString(), ProviderID: in.ProviderID,
+				CapabilityID: cap.ID, CapabilityVersion: cap.Version,
+				Type: domain.SignerOperationRotate, Checkpoint: domain.CheckpointIntentPersisted,
+				IdempotencyKey:        in.IdempotencyKey,
+				NewAuthorizationID:    "authz_" + uuid.NewString(),
+				NewExecutionSignerID:  in.NewExecutionSignerID,
+				NewSignerPublicKey:    in.NewSignerPublicKey,
+				NewSignatureAlgorithm: in.NewSignatureAlgorithm,
+				NewValidFrom:          in.NewValidFrom,
+				NewValidUntil:         in.NewValidUntil,
+				OldAuthorizationID:    currentAuthorizationID,
+				OldExecutionSignerID:  currentExecutionSignerID,
+				RevocationReasonCode:  in.RevocationReasonCode,
+				CreatedAt:             now, UpdatedAt: now,
+			}, nil
+		})
 	if err != nil {
 		return domain.ExecutionSignerOperation{}, err
 	}
@@ -319,17 +421,32 @@ func (s *ExecutionSignerService) PublicStatus(ctx context.Context, requestingPro
 	return view, nil
 }
 
-// advance atomically moves op (by id) to checkpoint, optionally recording
-// a newly obtained NewAuthorizationRef and/or a failureReason (cleared to
-// "" on a clean transition). A concurrent caller that already drove the
-// operation to Completed wins -- this is a no-op in that case, never a
-// backwards transition.
-func (s *ExecutionSignerService) advance(ctx context.Context, id string, checkpoint domain.SignerOperationCheckpoint, newAuthorizationRef, failureReason string) (domain.ExecutionSignerOperation, error) {
+// advance atomically moves op (by id) from expectedFrom to checkpoint,
+// optionally recording a newly obtained NewAuthorizationRef and/or a
+// failureReason (cleared to "" on a clean transition). expectedFrom is the
+// checkpoint the caller last observed op at -- every call site passes its
+// own local op.Checkpoint, the exact state it decided this transition from.
+//
+// If the stored checkpoint is no longer expectedFrom -- another driver
+// (a concurrent caller, a racing reconciler pass, or the same operation
+// resumed on a second replica) already moved it on from the state this
+// caller is acting on -- this is a no-op that returns the ACTUAL current
+// record unchanged, never a backwards transition. UpdateSignerOperation's
+// own per-ID row lock already makes any single advance call atomic; this
+// additionally makes advance a compare-and-swap on the checkpoint itself,
+// closing the window where a stale-snapshot caller could overwrite a
+// checkpoint another driver had already legitimately advanced past (e.g.
+// a slow driver still deciding to move new_authorized -> cutover_pending
+// after a faster one already reached old_revocation_pending). A caller
+// that gets back a checkpoint other than what it targeted must treat that
+// as "someone else is driving this operation" and stop, exactly like the
+// pre-existing Terminal() no-op case below.
+func (s *ExecutionSignerService) advance(ctx context.Context, id string, expectedFrom, checkpoint domain.SignerOperationCheckpoint, newAuthorizationRef, failureReason string) (domain.ExecutionSignerOperation, error) {
 	return s.store.UpdateSignerOperation(ctx, id, func(current domain.ExecutionSignerOperation, exists bool) (domain.ExecutionSignerOperation, error) {
 		if !exists {
 			return domain.ExecutionSignerOperation{}, domain.NewError(domain.ErrNotFound, "execution-signer operation not found", false)
 		}
-		if current.Checkpoint.Terminal() {
+		if current.Checkpoint.Terminal() || current.Checkpoint != expectedFrom {
 			return current, nil
 		}
 		current.Checkpoint = checkpoint
@@ -374,13 +491,13 @@ func isAmbiguousSignerFailure(err error) bool {
 // idempotency key, exactly like every other provider mutation).
 func (s *ExecutionSignerService) handleAmbiguousOrFail(ctx context.Context, op domain.ExecutionSignerOperation, callErr error) (domain.ExecutionSignerOperation, error) {
 	if isAmbiguousSignerFailure(callErr) {
-		updated, err := s.advance(ctx, op.ID, domain.CheckpointReconciling, "", callErr.Error())
+		updated, err := s.advance(ctx, op.ID, op.Checkpoint, domain.CheckpointReconciling, "", callErr.Error())
 		if err != nil {
 			return updated, err
 		}
 		return updated, domain.NewError(domain.ErrNetworkUnavailable, "execution-signer operation outcome is uncertain, retry", true)
 	}
-	updated, err := s.advance(ctx, op.ID, op.Checkpoint, "", callErr.Error())
+	updated, err := s.advance(ctx, op.ID, op.Checkpoint, op.Checkpoint, "", callErr.Error())
 	if err != nil {
 		return updated, err
 	}
@@ -397,7 +514,7 @@ func (s *ExecutionSignerService) driveAuthorize(ctx context.Context, op domain.E
 	}
 	var err error
 	if op.Checkpoint == domain.CheckpointIntentPersisted {
-		op, err = s.advance(ctx, op.ID, domain.CheckpointNewAuthorizationPending, "", "")
+		op, err = s.advance(ctx, op.ID, op.Checkpoint, domain.CheckpointNewAuthorizationPending, "", "")
 		if err != nil {
 			return op, err
 		}
@@ -412,12 +529,12 @@ func (s *ExecutionSignerService) driveAuthorize(ctx context.Context, op domain.E
 		if callErr != nil {
 			return s.handleAmbiguousOrFail(ctx, op, callErr)
 		}
-		op, err = s.advance(ctx, op.ID, domain.CheckpointNewAuthorized, authorization.AuthorizationRef, "")
+		op, err = s.advance(ctx, op.ID, op.Checkpoint, domain.CheckpointNewAuthorized, authorization.AuthorizationRef, "")
 		if err != nil {
 			return op, err
 		}
 	}
-	return s.advance(ctx, op.ID, domain.CheckpointCompleted, "", "")
+	return s.advance(ctx, op.ID, op.Checkpoint, domain.CheckpointCompleted, "", "")
 }
 
 // driveRevoke walks op from wherever its persisted Checkpoint is to
@@ -429,7 +546,7 @@ func (s *ExecutionSignerService) driveRevoke(ctx context.Context, op domain.Exec
 	}
 	var err error
 	if op.Checkpoint == domain.CheckpointIntentPersisted {
-		op, err = s.advance(ctx, op.ID, domain.CheckpointOldRevocationPending, "", "")
+		op, err = s.advance(ctx, op.ID, op.Checkpoint, domain.CheckpointOldRevocationPending, "", "")
 		if err != nil {
 			return op, err
 		}
@@ -441,12 +558,12 @@ func (s *ExecutionSignerService) driveRevoke(ctx context.Context, op domain.Exec
 		if callErr != nil {
 			return s.handleAmbiguousOrFail(ctx, op, callErr)
 		}
-		op, err = s.advance(ctx, op.ID, domain.CheckpointOldRevoked, "", "")
+		op, err = s.advance(ctx, op.ID, op.Checkpoint, domain.CheckpointOldRevoked, "", "")
 		if err != nil {
 			return op, err
 		}
 	}
-	return s.advance(ctx, op.ID, domain.CheckpointCompleted, "", "")
+	return s.advance(ctx, op.ID, op.Checkpoint, domain.CheckpointCompleted, "", "")
 }
 
 // driveRotate walks op through the full §7.2.2 sequence:
@@ -464,7 +581,7 @@ func (s *ExecutionSignerService) driveRotate(ctx context.Context, op domain.Exec
 	}
 	var err error
 	if op.Checkpoint == domain.CheckpointIntentPersisted {
-		op, err = s.advance(ctx, op.ID, domain.CheckpointNewAuthorizationPending, "", "")
+		op, err = s.advance(ctx, op.ID, op.Checkpoint, domain.CheckpointNewAuthorizationPending, "", "")
 		if err != nil {
 			return op, err
 		}
@@ -481,7 +598,7 @@ func (s *ExecutionSignerService) driveRotate(ctx context.Context, op domain.Exec
 		if callErr != nil {
 			return s.handleAmbiguousOrFail(ctx, op, callErr)
 		}
-		op, err = s.advance(ctx, op.ID, domain.CheckpointNewAuthorized, authorization.AuthorizationRef, "")
+		op, err = s.advance(ctx, op.ID, op.Checkpoint, domain.CheckpointNewAuthorized, authorization.AuthorizationRef, "")
 		if err != nil {
 			return op, err
 		}
@@ -492,13 +609,13 @@ func (s *ExecutionSignerService) driveRotate(ctx context.Context, op domain.Exec
 		// is the moment ATOS may start advertising the new signer as
 		// current (see currentSigner), strictly before the old signer's
 		// revocation ever begins.
-		op, err = s.advance(ctx, op.ID, domain.CheckpointCutoverPending, "", "")
+		op, err = s.advance(ctx, op.ID, op.Checkpoint, domain.CheckpointCutoverPending, "", "")
 		if err != nil {
 			return op, err
 		}
 	}
 	if op.Checkpoint == domain.CheckpointCutoverPending {
-		op, err = s.advance(ctx, op.ID, domain.CheckpointOldRevocationPending, "", "")
+		op, err = s.advance(ctx, op.ID, op.Checkpoint, domain.CheckpointOldRevocationPending, "", "")
 		if err != nil {
 			return op, err
 		}
@@ -512,12 +629,12 @@ func (s *ExecutionSignerService) driveRotate(ctx context.Context, op domain.Exec
 		if callErr != nil {
 			return s.handleAmbiguousOrFail(ctx, op, callErr)
 		}
-		op, err = s.advance(ctx, op.ID, domain.CheckpointOldRevoked, "", "")
+		op, err = s.advance(ctx, op.ID, op.Checkpoint, domain.CheckpointOldRevoked, "", "")
 		if err != nil {
 			return op, err
 		}
 	}
-	return s.advance(ctx, op.ID, domain.CheckpointCompleted, "", "")
+	return s.advance(ctx, op.ID, op.Checkpoint, domain.CheckpointCompleted, "", "")
 }
 
 // RunReconciler periodically drives forward every non-terminal operation

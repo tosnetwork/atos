@@ -208,6 +208,55 @@ func TestExecutionSignerRevoke_GoldenPath(t *testing.T) {
 	}
 }
 
+// TestExecutionSignerRevoke_ReplayAfterCompletionReturnsSameOperation
+// proves a retry with the same idempotency_key, made AFTER the original
+// Revoke already completed, resumes/returns the original operation
+// instead of failing. Before this fix, Revoke read CurrentSigner before
+// checking for an existing operation -- and a completed revoke leaves no
+// current signer, so the retry hit "no currently authorized execution
+// signer to revoke" (NotFound) before it ever got a chance to recognize
+// its own idempotency_key.
+func TestExecutionSignerRevoke_ReplayAfterCompletionReturnsSameOperation(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	core := toscoremock.NewContractFixture(st)
+	signers := service.NewExecutionSignerService(st, core, capabilities)
+	cap := registerSignerTestCapability(t, capabilities, "agt_sig_revoke_replay", domain.TrustModeManaged)
+
+	if _, err := signers.Authorize(ctx, service.AuthorizeSignerInput{
+		ProviderID: "agt_sig_revoke_replay", CapabilityID: cap.ID,
+		ExecutionSignerID: "signer-revoke-replay", SignerPublicKey: testSignerKey(t), SignatureAlgorithm: "ed25519",
+		ValidFrom: time.Now().UTC().Add(-time.Minute), ValidUntil: time.Now().UTC().Add(24 * time.Hour),
+		IdempotencyKey: "authz-revoke-replay-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	revokeIn := service.RevokeSignerInput{
+		ProviderID: "agt_sig_revoke_replay", CapabilityID: cap.ID, ReasonCode: "rotation",
+		IdempotencyKey: "revoke-replay-1",
+	}
+	first, err := signers.Revoke(ctx, revokeIn)
+	if err != nil {
+		t.Fatalf("first Revoke: %v", err)
+	}
+	if first.Checkpoint != domain.CheckpointCompleted {
+		t.Fatalf("checkpoint = %s, want completed", first.Checkpoint)
+	}
+
+	second, err := signers.Revoke(ctx, revokeIn)
+	if err != nil {
+		t.Fatalf("replayed Revoke after completion: %v", err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("replay returned a different operation: %s vs %s", second.ID, first.ID)
+	}
+	if second.Checkpoint != domain.CheckpointCompleted {
+		t.Fatalf("replay checkpoint = %s, want completed", second.Checkpoint)
+	}
+}
+
 func TestExecutionSignerRevoke_RefusedWhileStrongerModeActive(t *testing.T) {
 	ctx := context.Background()
 	st := memory.New()
@@ -323,6 +372,67 @@ func TestExecutionSignerRotate_GoldenPath(t *testing.T) {
 	}
 	if !foundCurrent || signerID != "signer-new" {
 		t.Fatalf("current signer = %q found=%v, want signer-new", signerID, foundCurrent)
+	}
+}
+
+// TestExecutionSignerRotate_ReplayAfterCompletionReturnsSameOperation
+// proves a retry with the same idempotency_key, made AFTER the original
+// Rotate already completed, resumes/returns the original operation instead
+// of failing. Before this fix, Rotate read CurrentSigner before checking
+// for an existing operation -- and a completed rotation makes the NEW
+// signer current, so the retry built a fresh candidate operation whose
+// OldAuthorizationID/OldExecutionSignerID were the NEW signer (not the
+// original old signer the first call actually persisted), which
+// OpenSignerOperation's content-hash comparison then rejected as a
+// genuine conflict.
+func TestExecutionSignerRotate_ReplayAfterCompletionReturnsSameOperation(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	core := toscoremock.NewContractFixture(st)
+	signers := service.NewExecutionSignerService(st, core, capabilities)
+	cap := registerSignerTestCapability(t, capabilities, "agt_sig_rotate_replay", domain.TrustModeManaged)
+
+	if _, err := signers.Authorize(ctx, service.AuthorizeSignerInput{
+		ProviderID: "agt_sig_rotate_replay", CapabilityID: cap.ID,
+		ExecutionSignerID: "signer-old-replay", SignerPublicKey: testSignerKey(t), SignatureAlgorithm: "ed25519",
+		ValidFrom: time.Now().UTC().Add(-time.Minute), ValidUntil: time.Now().UTC().Add(24 * time.Hour),
+		IdempotencyKey: "authz-rotate-replay-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rotateIn := service.RotateSignerInput{
+		ProviderID: "agt_sig_rotate_replay", CapabilityID: cap.ID,
+		NewExecutionSignerID: "signer-new-replay", NewSignerPublicKey: testSignerKey(t), NewSignatureAlgorithm: "ed25519",
+		NewValidFrom: time.Now().UTC().Add(-time.Minute), NewValidUntil: time.Now().UTC().Add(24 * time.Hour),
+		RevocationReasonCode: "rotation", IdempotencyKey: "rotate-replay-1",
+	}
+	first, err := signers.Rotate(ctx, rotateIn)
+	if err != nil {
+		t.Fatalf("first Rotate: %v", err)
+	}
+	if first.Checkpoint != domain.CheckpointCompleted {
+		t.Fatalf("checkpoint = %s, want completed", first.Checkpoint)
+	}
+
+	second, err := signers.Rotate(ctx, rotateIn)
+	if err != nil {
+		t.Fatalf("replayed Rotate after completion: %v", err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("replay returned a different operation: %s vs %s", second.ID, first.ID)
+	}
+	if second.Checkpoint != domain.CheckpointCompleted {
+		t.Fatalf("replay checkpoint = %s, want completed", second.Checkpoint)
+	}
+
+	_, signerID, foundCurrent, err := signers.CurrentSigner(ctx, cap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !foundCurrent || signerID != "signer-new-replay" {
+		t.Fatalf("current signer after replay = %q found=%v, want signer-new-replay", signerID, foundCurrent)
 	}
 }
 

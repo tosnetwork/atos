@@ -78,6 +78,36 @@ func TestOpenSignerOperation_ChangedContentConflicts(t *testing.T) {
 	}
 }
 
+// TestOpenSignerOperation_ChangedRevocationReasonConflicts proves
+// RevocationReasonCode is identity content like every other caller-supplied
+// field: it is forwarded verbatim into tos-protocol's RevokeExecutionSigner
+// request and hashed into ITS commitment digest, so an idempotency-key
+// replay that supplies a different reason must conflict rather than
+// silently keeping whatever reason the first call happened to persist.
+func TestOpenSignerOperation_ChangedRevocationReasonConflicts(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+	// Build the base value once and copy it for the second call (not two
+	// separate testSignerOp(...) invocations) -- NewValidFrom/NewValidUntil
+	// are themselves part of the identity content hash, and two calls to
+	// the builder made at genuinely different wall-clock instants would
+	// already differ on those alone, which would make this test pass for
+	// the wrong reason regardless of whether RevocationReasonCode is
+	// hashed at all.
+	op := testSignerOp("prov_1", "key-reason")
+	op.RevocationReasonCode = "rotation"
+	if _, _, err := s.OpenSignerOperation(ctx, "prov_1", op); err != nil {
+		t.Fatal(err)
+	}
+	changed := op
+	changed.RevocationReasonCode = "compromised"
+	_, _, err := s.OpenSignerOperation(ctx, "prov_1", changed)
+	var domainErr *domain.Error
+	if !errors.As(err, &domainErr) || domainErr.Code != domain.ErrIdempotencyConflict {
+		t.Fatalf("got %v, want domain.ErrIdempotencyConflict", err)
+	}
+}
+
 func TestUpdateSignerOperation_AllowsCheckpointAdvance(t *testing.T) {
 	ctx := context.Background()
 	s := New()
@@ -111,6 +141,49 @@ func TestUpdateSignerOperation_RejectsIdentityFieldChange(t *testing.T) {
 	var domainErr *domain.Error
 	if !errors.As(err, &domainErr) || domainErr.Code != domain.ErrIdempotencyConflict {
 		t.Fatalf("got %v, want domain.ErrIdempotencyConflict", err)
+	}
+}
+
+// TestLatestCompletedSignerOperationByCapability_NotMaskedByOlderVersionsLaterCompletion
+// proves the version filter lives in the query itself: a stuck v1
+// operation that a reconciler only finishes recovering AFTER a v2 signer
+// was already authorized and completed can have a LATER updated_at than
+// v2's own completed operation. Before this fix, the query selected "most
+// recently updated completed operation for this capability_id, any
+// version" and the version check happened afterward in Go, which resolved
+// to the v1 row here, got rejected as the wrong version, and reported no
+// current signer at all -- even though the real, current v2 signer sits
+// right next to it in the same table.
+func TestLatestCompletedSignerOperationByCapability_NotMaskedByOlderVersionsLaterCompletion(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+
+	newerVersionEarlierCompletion := testSignerOp("prov_1", "key-v2-early")
+	newerVersionEarlierCompletion.CapabilityVersion = "2.0.0"
+	newerVersionEarlierCompletion.Checkpoint = domain.CheckpointCompleted
+	newerVersionEarlierCompletion.UpdatedAt = time.Now().UTC().Add(-time.Hour)
+	if _, _, err := s.OpenSignerOperation(ctx, "prov_1", newerVersionEarlierCompletion); err != nil {
+		t.Fatal(err)
+	}
+
+	olderVersionLaterCompletion := testSignerOp("prov_1", "key-v1-late")
+	olderVersionLaterCompletion.CapabilityVersion = "1.0.0"
+	olderVersionLaterCompletion.Checkpoint = domain.CheckpointCompleted
+	olderVersionLaterCompletion.UpdatedAt = time.Now().UTC()
+	if _, _, err := s.OpenSignerOperation(ctx, "prov_1", olderVersionLaterCompletion); err != nil {
+		t.Fatal(err)
+	}
+
+	got, found, err := s.LatestCompletedSignerOperationByCapability(ctx, "cap_1", "2.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected to find the current version's completed operation")
+	}
+	if got.ID != newerVersionEarlierCompletion.ID {
+		t.Fatalf("got operation %s (version %s), want %s (version 2.0.0) -- masked by the older version's later completion",
+			got.ID, got.CapabilityVersion, newerVersionEarlierCompletion.ID)
 	}
 }
 

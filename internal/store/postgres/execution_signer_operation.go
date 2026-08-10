@@ -35,6 +35,14 @@ const signerOperationColumns = `id, provider_id, capability_id, capability_versi
 // differs from the original in-memory value's, which would otherwise make
 // a genuine same-content replay hash differently depending on whether the
 // comparison side came fresh from a caller or back from a SELECT.
+//
+// RevocationReasonCode is caller-supplied content for Revoke/Rotate (it is
+// forwarded verbatim into the RevokeExecutionSigner request tos-protocol
+// hashes into its own commitment digest) and must be part of this
+// operation's identity like every other caller-supplied field: an
+// idempotency-key replay that supplies a different reason code is a
+// different logical request and must conflict, not silently keep whatever
+// reason the first call happened to persist.
 func signerOperationContentHash(op domain.ExecutionSignerOperation) string {
 	encoded, _ := json.Marshal(struct {
 		ProviderID, CapabilityID, CapabilityVersion   string
@@ -45,11 +53,13 @@ func signerOperationContentHash(op domain.ExecutionSignerOperation) string {
 		NewSignatureAlgorithm                         string
 		NewValidFromUnixMicro, NewValidUntilUnixMicro int64
 		OldAuthorizationID, OldExecutionSignerID      string
+		RevocationReasonCode                          string
 	}{
 		op.ProviderID, op.CapabilityID, op.CapabilityVersion, op.Type,
 		op.IdempotencyKey, op.NewExecutionSignerID,
 		op.NewSignerPublicKey, op.NewSignatureAlgorithm, op.NewValidFrom.UnixMicro(), op.NewValidUntil.UnixMicro(),
 		op.OldAuthorizationID, op.OldExecutionSignerID,
+		op.RevocationReasonCode,
 	})
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
@@ -124,7 +134,17 @@ func (s *Store) OpenSignerOperation(ctx context.Context, providerID string, op d
 	if err := lockTransactionKey(ctx, tx, "signer-operation", providerID, op.IdempotencyKey); err != nil {
 		return domain.ExecutionSignerOperation{}, false, err
 	}
+	return openSignerOperationTx(ctx, tx, providerID, op)
+}
 
+// openSignerOperationTx is OpenSignerOperation's body, factored out so
+// OpenSignerOperationForCapability can run it inside a transaction that
+// already holds a different advisory lock (the capability-scoped one) --
+// it still takes out its own "signer-operation" lock itself, exactly like
+// OpenSignerOperation does, since Postgres advisory xact locks are
+// independent per lock key and holding one does not exempt a caller from
+// taking another.
+func openSignerOperationTx(ctx context.Context, tx pgx.Tx, providerID string, op domain.ExecutionSignerOperation) (domain.ExecutionSignerOperation, bool, error) {
 	existing, err := scanSignerOperation(tx.QueryRow(ctx, `
 		SELECT `+signerOperationColumns+` FROM execution_signer_operations
 		WHERE provider_id=$1 AND idempotency_key=$2 FOR UPDATE
@@ -156,6 +176,111 @@ func (s *Store) OpenSignerOperation(ctx context.Context, providerID string, op d
 		return domain.ExecutionSignerOperation{}, false, err
 	}
 	return op, true, nil
+}
+
+// currentSignerTx derives "the currently authorized execution signer" for
+// (capabilityID, capabilityVersion) exactly like
+// service.ExecutionSignerService.CurrentSigner does from
+// LatestCompletedSignerOperationByCapability's result -- duplicated here
+// (rather than shared across the service/store package boundary) because
+// OpenSignerOperationForCapability needs this same derivation available
+// INSIDE the transaction that holds its advisory lock, at a snapshot
+// consistent with the operation it is about to open, not as a separate
+// store call the service layer could only make before or after that lock
+// is held.
+func currentSignerTx(ctx context.Context, tx pgx.Tx, capabilityID, capabilityVersion string) (authorizationID, executionSignerID string, found bool, err error) {
+	op, err := scanSignerOperation(tx.QueryRow(ctx, `
+		SELECT `+signerOperationColumns+` FROM execution_signer_operations
+		WHERE capability_id=$1 AND capability_version=$2 AND checkpoint='completed'
+		ORDER BY updated_at DESC, id ASC
+		LIMIT 1
+	`, capabilityID, capabilityVersion))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	switch op.Type {
+	case domain.SignerOperationAuthorize, domain.SignerOperationRotate:
+		return op.NewAuthorizationID, op.NewExecutionSignerID, true, nil
+	default: // revoke
+		return "", "", false, nil
+	}
+}
+
+// hasNonTerminalSignerOperationTx reports whether a non-terminal
+// (checkpoint <> 'completed') signer operation already exists for
+// (capabilityID, capabilityVersion) -- the "at most one in-flight signer
+// mutation per capability version" invariant OpenSignerOperationForCapability
+// enforces. Scoped to the transaction so it observes the same snapshot
+// currentSignerTx did, under the same advisory lock.
+func hasNonTerminalSignerOperationTx(ctx context.Context, tx pgx.Tx, capabilityID, capabilityVersion string) (bool, error) {
+	var exists bool
+	err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM execution_signer_operations
+			WHERE capability_id=$1 AND capability_version=$2 AND checkpoint <> 'completed'
+		)
+	`, capabilityID, capabilityVersion).Scan(&exists)
+	return exists, err
+}
+
+// OpenSignerOperationForCapability -- see the interface doc comment
+// (internal/store/store.go) for why this must be one atomic sequence
+// rather than two separate store calls. The capability-scoped advisory
+// lock is taken out BEFORE reading the current signer and held for the
+// whole transaction, including the eventual insert, exactly mirroring
+// OpenSignerOperation's own lock-before-read discipline one level up.
+//
+// Locking the read-then-open sequence alone is NOT sufficient on its
+// own: it prevents two concurrent callers from reading current-signer at
+// the exact same instant, but does nothing about two callers that read it
+// in QUICK SUCCESSION, before the first one's operation has reached
+// Completed -- the second would still see the same stale "current"
+// signer and open a second, independently-completable operation against
+// it. Rejecting a new open while ANY non-terminal operation already
+// exists for this capability version is what actually closes that
+// window: the second caller is forced to fail and retry AFTER the first
+// either completes (and it will then correctly see the new signer as
+// current) or is itself recovered by the reconciler.
+func (s *Store) OpenSignerOperationForCapability(
+	ctx context.Context, providerID, capabilityID, capabilityVersion string,
+	build func(currentAuthorizationID, currentExecutionSignerID string, found bool) (domain.ExecutionSignerOperation, error),
+) (domain.ExecutionSignerOperation, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.ExecutionSignerOperation{}, false, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err := lockTransactionKey(ctx, tx, "signer-current", capabilityID, capabilityVersion); err != nil {
+		return domain.ExecutionSignerOperation{}, false, err
+	}
+
+	inFlight, err := hasNonTerminalSignerOperationTx(ctx, tx, capabilityID, capabilityVersion)
+	if err != nil {
+		return domain.ExecutionSignerOperation{}, false, err
+	}
+	if inFlight {
+		return domain.ExecutionSignerOperation{}, false, domain.NewError(domain.ErrSignerOperationInProgress,
+			"a signer mutation is already in progress for this capability version", true)
+	}
+
+	currentAuthorizationID, currentExecutionSignerID, found, err := currentSignerTx(ctx, tx, capabilityID, capabilityVersion)
+	if err != nil {
+		return domain.ExecutionSignerOperation{}, false, err
+	}
+
+	op, err := build(currentAuthorizationID, currentExecutionSignerID, found)
+	if err != nil {
+		return domain.ExecutionSignerOperation{}, false, err
+	}
+
+	if err := lockTransactionKey(ctx, tx, "signer-operation", providerID, op.IdempotencyKey); err != nil {
+		return domain.ExecutionSignerOperation{}, false, err
+	}
+	return openSignerOperationTx(ctx, tx, providerID, op)
 }
 
 func (s *Store) GetSignerOperation(ctx context.Context, id string) (domain.ExecutionSignerOperation, error) {
@@ -192,13 +317,13 @@ func (s *Store) LatestSignerOperationByCapability(ctx context.Context, capabilit
 	return op, true, nil
 }
 
-func (s *Store) LatestCompletedSignerOperationByCapability(ctx context.Context, capabilityID string) (domain.ExecutionSignerOperation, bool, error) {
+func (s *Store) LatestCompletedSignerOperationByCapability(ctx context.Context, capabilityID, capabilityVersion string) (domain.ExecutionSignerOperation, bool, error) {
 	op, err := scanSignerOperation(s.pool.QueryRow(ctx, `
 		SELECT `+signerOperationColumns+` FROM execution_signer_operations
-		WHERE capability_id=$1 AND checkpoint='completed'
+		WHERE capability_id=$1 AND capability_version=$2 AND checkpoint='completed'
 		ORDER BY updated_at DESC, id ASC
 		LIMIT 1
-	`, capabilityID))
+	`, capabilityID, capabilityVersion))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.ExecutionSignerOperation{}, false, nil
 	}

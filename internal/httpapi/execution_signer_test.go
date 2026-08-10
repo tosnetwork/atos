@@ -95,6 +95,60 @@ func TestHandleAuthorizeExecutionSigner_GoldenPath(t *testing.T) {
 	}
 }
 
+// TestHandleAuthorizeExecutionSigner_RetryWithOmittedValidityDoesNotConflict
+// proves a genuine transport-level retry -- the same Idempotency-Key,
+// the exact request body docs/API.md's own example shows (validity
+// omitted entirely) -- succeeds identically the second time. Before this
+// fix, signerValidityWindow recomputed defaults from time.Now() on EVERY
+// delivery, so two deliveries of "the same" request produced two
+// different NewValidFrom/NewValidUntil values; the service's own
+// content-hash comparison then saw that as a genuinely different request
+// under a reused idempotency key and rejected the retry as a conflict.
+func TestHandleAuthorizeExecutionSigner_RetryWithOmittedValidityDoesNotConflict(t *testing.T) {
+	server, _, cap, token := newSignerTestServer(t)
+
+	body, _ := json.Marshal(map[string]any{
+		"execution_signer_id": "sig_rest_retry",
+		"signer_public_key":   "base64:" + base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef")),
+		"signature_algorithm": "ed25519",
+	})
+	newRequest := func() *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/v1/capabilities/"+cap.ID+"/execution-signer/authorize", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "authz-rest-retry")
+		return req
+	}
+
+	first := httptest.NewRecorder()
+	server.Mux().ServeHTTP(first, newRequest())
+	if first.Code != http.StatusOK {
+		t.Fatalf("first attempt status = %d, body = %s", first.Code, first.Body.String())
+	}
+
+	// A real retry from the caller's transport layer, not a literal replay
+	// of the same in-memory *http.Request -- exactly what a client that
+	// never received the first response would send: same Idempotency-Key,
+	// same omitted-validity body, at a genuinely later wall-clock instant.
+	second := httptest.NewRecorder()
+	server.Mux().ServeHTTP(second, newRequest())
+	if second.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200 (a same-idempotency-key retry must not conflict just because the server recomputed a default validity window), body = %s",
+			second.Code, second.Body.String())
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(second.Body.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode retry response: %v", err)
+	}
+	if decoded["checkpoint"] != "completed" {
+		t.Fatalf("retry checkpoint = %v, want completed: %s", decoded["checkpoint"], second.Body.String())
+	}
+	if decoded["current_execution_signer_id"] != "sig_rest_retry" {
+		t.Fatalf("retry current_execution_signer_id = %v, want sig_rest_retry: %s", decoded["current_execution_signer_id"], second.Body.String())
+	}
+}
+
 func TestHandleAuthorizeExecutionSigner_RejectsBadBase64Key(t *testing.T) {
 	server, _, cap, token := newSignerTestServer(t)
 
