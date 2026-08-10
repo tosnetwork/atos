@@ -34,9 +34,9 @@ func NewExecutionSignerService(s store.Store, core toscore.Core, capabilities *C
 }
 
 // CurrentSigner derives "the currently authorized execution signer" for
-// capabilityID from the most recent COMPLETED operation -- a completed
-// authorize/rotate makes its New* identity current; a completed revoke
-// leaves no current signer.
+// capabilityID from the most recent COMPLETED operation FOR THE
+// CAPABILITY'S CURRENT VERSION -- a completed authorize/rotate makes its
+// New* identity current; a completed revoke leaves no current signer.
 //
 // This deliberately queries LatestCompletedSignerOperationByCapability,
 // NOT LatestSignerOperationByCapability: a newer operation that is still
@@ -46,10 +46,26 @@ func NewExecutionSignerService(s store.Store, core toscore.Core, capabilities *C
 // one is durably new_authorized (§7.2.2). Using the unfiltered "latest"
 // query here was an earlier bug: it made an in-flight rotation
 // momentarily erase the still-valid old signer from view.
+//
+// Signer authorization currency is itself version-scoped (§7.2.0: a
+// Capability version bump resets per-version readiness evidence,
+// including signer authorization currency): a completed operation whose
+// CapabilityVersion no longer matches the capability's CURRENT version is
+// not current, even though it remains part of that operation's own
+// auditable history untouched. This was an earlier bug too -- the version
+// check was previously missing entirely, so a signer authorized for a
+// superseded version stayed "current" forever across version bumps.
 func (s *ExecutionSignerService) CurrentSigner(ctx context.Context, capabilityID string) (authorizationID, signerID string, found bool, err error) {
+	cap, err := s.capabilities.Get(ctx, capabilityID)
+	if err != nil {
+		return "", "", false, err
+	}
 	op, ok, err := s.store.LatestCompletedSignerOperationByCapability(ctx, capabilityID)
 	if err != nil || !ok {
 		return "", "", false, err
+	}
+	if op.CapabilityVersion != cap.Version {
+		return "", "", false, nil
 	}
 	switch op.Type {
 	case domain.SignerOperationAuthorize, domain.SignerOperationRotate:
