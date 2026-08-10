@@ -561,6 +561,16 @@ func (s *JobService) recoverProviderExecution(ctx context.Context, jobID string,
 		}
 	}
 	if result.State == domain.JobCompleted {
+		// Before accepting provider output into a successful settlement,
+		// it must satisfy the frozen output schema -- checked against the
+		// schema captured on the Job at creation time (job.OutputSchema),
+		// never the Capability's possibly-since-updated current one.
+		// Schema failure is a provider failure, never a successful
+		// settlement.
+		if err := validateAgainstSchema("output", job.OutputSchema, result.Output); err != nil {
+			released, releaseErr := s.releaseForTerminalUnderLock(ctx, job, domain.JobFailed, domain.ErrProviderFailed, "provider output failed schema validation: "+err.Error())
+			return released, releaseErr
+		}
 		return s.settleProviderResultUnderLock(ctx, job, result), nil
 	}
 	if result.State.Terminal() {

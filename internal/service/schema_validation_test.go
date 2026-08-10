@@ -68,3 +68,36 @@ func TestValidateCapabilitySchemas_BothMustBeValid(t *testing.T) {
 		t.Fatalf("expected two valid schemas to pass: %v", err)
 	}
 }
+
+func TestValidateAgainstSchema_ValidInstancePasses(t *testing.T) {
+	schema := map[string]any{
+		"type": "object", "required": []any{"name"},
+		"properties": map[string]any{"name": map[string]any{"type": "string"}, "count": map[string]any{"type": "integer"}},
+	}
+	instance := map[string]any{"name": "hello", "count": 3}
+	if err := validateAgainstSchema("input", schema, instance); err != nil {
+		t.Fatalf("expected a valid instance to pass: %v", err)
+	}
+}
+
+func TestValidateAgainstSchema_MissingRequiredFieldFails(t *testing.T) {
+	schema := map[string]any{"type": "object", "required": []any{"name"}}
+	instance := map[string]any{"other": "x"}
+	if err := validateAgainstSchema("input", schema, instance); err == nil {
+		t.Fatal("expected an error for a missing required field")
+	}
+}
+
+func TestValidateAgainstSchema_WrongTypeFails(t *testing.T) {
+	schema := map[string]any{"type": "object", "properties": map[string]any{"count": map[string]any{"type": "integer"}}}
+	instance := map[string]any{"count": "not a number"}
+	if err := validateAgainstSchema("input", schema, instance); err == nil {
+		t.Fatal("expected an error for a type mismatch")
+	}
+}
+
+func TestValidateAgainstSchema_EmptySchemaAcceptsAnything(t *testing.T) {
+	if err := validateAgainstSchema("input", map[string]any{}, map[string]any{"anything": true}); err != nil {
+		t.Fatalf("expected {} to accept any instance: %v", err)
+	}
+}

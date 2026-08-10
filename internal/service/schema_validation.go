@@ -60,3 +60,53 @@ func validateCapabilitySchemas(inputSchema, outputSchema map[string]any) error {
 	}
 	return nil
 }
+
+// validateAgainstSchema compiles schemaDoc (already known to be a valid
+// document -- see validateSchemaDocument, run at Capability
+// registration/update time) and validates instance against it. Both
+// schemaDoc and instance are round-tripped through jsonschema.UnmarshalJSON
+// (never validated as raw Go map[string]any) so number representations
+// match what the compiled schema actually expects, mirroring
+// validateSchemaDocument's own safe-decode pattern.
+//
+// An empty/nil schemaDoc is treated as "no frozen schema recorded" and
+// skips validation entirely (permissive), rather than failing to compile
+// a null document -- this is deliberate, not just a compile-error
+// workaround: a Job persisted before domain.Job.InputSchema/OutputSchema
+// existed has no frozen schema to validate against, and retroactively
+// rejecting its legitimate completion would be worse than not enforcing a
+// schema ATOS never actually recorded for it.
+func validateAgainstSchema(name string, schemaDoc, instance map[string]any) error {
+	if len(schemaDoc) == 0 {
+		return nil
+	}
+	encodedSchema, err := json.Marshal(schemaDoc)
+	if err != nil {
+		return fmt.Errorf("%s schema: %w", name, err)
+	}
+	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(encodedSchema))
+	if err != nil {
+		return fmt.Errorf("%s schema: %w", name, err)
+	}
+	compiler := jsonschema.NewCompiler()
+	if err := compiler.AddResource(schemaResourceURL, doc); err != nil {
+		return fmt.Errorf("%s schema: %w", name, err)
+	}
+	schema, err := compiler.Compile(schemaResourceURL)
+	if err != nil {
+		return fmt.Errorf("%s schema: %w", name, err)
+	}
+
+	encodedInstance, err := json.Marshal(instance)
+	if err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	decodedInstance, err := jsonschema.UnmarshalJSON(bytes.NewReader(encodedInstance))
+	if err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	if err := schema.Validate(decodedInstance); err != nil {
+		return fmt.Errorf("%s does not satisfy the frozen schema: %w", name, err)
+	}
+	return nil
+}

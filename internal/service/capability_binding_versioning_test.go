@@ -80,7 +80,7 @@ func (a *countingInvokeAdapter) Invoke(ctx context.Context, req provideradapter.
 	if a.failFirst && a.invokeCalls == 1 {
 		return provideradapter.InvokeResult{}, errors.New("simulated submission failure -- provider never admitted this attempt")
 	}
-	return provideradapter.InvokeResult{Status: provideradapter.InvokeCompleted}, nil
+	return provideradapter.InvokeResult{Status: provideradapter.InvokeCompleted, Output: map[string]any{}}, nil
 }
 func (a *countingInvokeAdapter) Query(ctx context.Context, endpointRef, idempotencyKey string) (provideradapter.InvokeResult, bool, error) {
 	return provideradapter.InvokeResult{}, false, nil

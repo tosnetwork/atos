@@ -165,6 +165,12 @@ func (s *JobService) submit(ctx context.Context, in SubmitInput, waitInline bool
 	if quote.TrustMode != domain.TrustModeManaged {
 		proofStatus.Quote = domain.ProofPending
 	}
+	// Before outbound dispatch, request data must satisfy the frozen input
+	// schema -- checked once, here, against the schema current at Job
+	// creation (never re-checked against a later-updated Capability).
+	if err := validateAgainstSchema("input", capability.InputSchema, in.Input); err != nil {
+		return SubmitResult{}, domain.NewError(domain.ErrValidationFailed, err.Error(), false)
+	}
 	// The binding is selected and frozen onto the Job once, here, at
 	// creation time -- execution must never re-resolve it from the
 	// Capability's live (possibly later-updated) Bindings. See
@@ -175,8 +181,10 @@ func (s *JobService) submit(ctx context.Context, in SubmitInput, waitInline bool
 	}
 	job := domain.Job{
 		ID: idPrefix + uuid.NewString(), CapabilityID: capability.ID,
-		CapabilityVersion: capability.Version, Binding: frozenBinding, ProviderID: capability.ProviderID,
-		QuoteID: quote.ID, ServiceQuoteID: quote.ServiceQuoteID,
+		CapabilityVersion: capability.Version, Binding: frozenBinding,
+		InputSchema: capability.InputSchema, OutputSchema: capability.OutputSchema,
+		ProviderID: capability.ProviderID,
+		QuoteID:    quote.ID, ServiceQuoteID: quote.ServiceQuoteID,
 		PrincipalID: in.PrincipalID, TrustMode: quote.TrustMode,
 		ProofProfile: quote.ProofProfile, ProofStatus: proofStatus,
 		State: state, Input: cloneMap(in.Input), IdempotencyKey: in.IdempotencyKey,
@@ -576,6 +584,13 @@ func (s *JobService) DeliverResult(ctx context.Context, in DeliverResultInput) (
 	}
 	if job.EconomicState != domain.EconomicEscrowReserved {
 		return domain.Job{}, domain.NewError(domain.ErrValidationFailed, "job is not ready for delivery", true)
+	}
+	// Successful output must pass the frozen output schema before
+	// settlement -- checked against job.OutputSchema (captured at Job
+	// creation time), never the Capability's possibly-since-updated
+	// current one.
+	if err := validateAgainstSchema("output", job.OutputSchema, in.Output); err != nil {
+		return domain.Job{}, domain.NewError(domain.ErrValidationFailed, err.Error(), false)
 	}
 
 	receipt := synthesizeDeliveredReceipt(job, in.Output)
