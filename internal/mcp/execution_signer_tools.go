@@ -84,6 +84,7 @@ func (s *Server) toolAuthorizeExecutionSigner(ctx context.Context, principal aut
 		ProviderID: principal.ID, CapabilityID: capabilityID,
 		ExecutionSignerID: argString(args, "execution_signer_id"), SignerPublicKey: publicKey,
 		SignatureAlgorithm: argString(args, "signature_algorithm"), ValidFrom: validFrom, ValidUntil: validUntil,
+		ValidFromExplicit: argString(args, "valid_from") != "", ValidUntilExplicit: argString(args, "valid_until") != "",
 		IdempotencyKey: argString(args, "idempotency_key"),
 	}); err != nil {
 		return nil, err
@@ -108,6 +109,7 @@ func (s *Server) toolRotateExecutionSigner(ctx context.Context, principal auth.P
 		ProviderID: principal.ID, CapabilityID: capabilityID,
 		NewExecutionSignerID: argString(args, "execution_signer_id"), NewSignerPublicKey: publicKey,
 		NewSignatureAlgorithm: argString(args, "signature_algorithm"), NewValidFrom: validFrom, NewValidUntil: validUntil,
+		NewValidFromExplicit: argString(args, "valid_from") != "", NewValidUntilExplicit: argString(args, "valid_until") != "",
 		RevocationReasonCode: argString(args, "reason_code"), IdempotencyKey: argString(args, "idempotency_key"),
 	}); err != nil {
 		return nil, err

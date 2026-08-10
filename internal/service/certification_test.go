@@ -100,8 +100,8 @@ func TestCertificationOpen_UsesRemoteProberWhenConfigured(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if prober.calls != 1 {
-		t.Fatalf("remote prober called %d times, want 1", prober.calls)
+	if prober.calls.Load() != 1 {
+		t.Fatalf("remote prober called %d times, want 1", prober.calls.Load())
 	}
 	if cert.Status != domain.CertificationPassed {
 		t.Fatalf("status = %s, want passed", cert.Status)

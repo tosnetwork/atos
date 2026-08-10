@@ -28,8 +28,8 @@ func TestHealthService_SweepStaleCapabilities_ChecksMissingHealthEvidence(t *tes
 	if err := health.SweepStaleCapabilities(ctx, 100); err != nil {
 		t.Fatalf("SweepStaleCapabilities: %v", err)
 	}
-	if prober.calls != 1 {
-		t.Fatalf("prober calls = %d, want exactly 1 (missing evidence must be checked)", prober.calls)
+	if prober.calls.Load() != 1 {
+		t.Fatalf("prober calls = %d, want exactly 1 (missing evidence must be checked)", prober.calls.Load())
 	}
 	_, found, err := st.HealthCheck(ctx, cap.ID, cap.Version, domain.AdapterHTTP)
 	if err != nil {
@@ -62,8 +62,8 @@ func TestHealthService_SweepStaleCapabilities_SkipsFreshEvidence(t *testing.T) {
 	if err := health.SweepStaleCapabilities(ctx, 100); err != nil {
 		t.Fatalf("SweepStaleCapabilities: %v", err)
 	}
-	if prober.calls != 0 {
-		t.Fatalf("prober calls = %d, want 0 (fresh evidence must not be re-probed)", prober.calls)
+	if prober.calls.Load() != 0 {
+		t.Fatalf("prober calls = %d, want 0 (fresh evidence must not be re-probed)", prober.calls.Load())
 	}
 }
 
@@ -89,8 +89,8 @@ func TestHealthService_SweepStaleCapabilities_ChecksAgedEvidence(t *testing.T) {
 	if err := health.SweepStaleCapabilities(ctx, 100); err != nil {
 		t.Fatalf("SweepStaleCapabilities: %v", err)
 	}
-	if prober.calls != 1 {
-		t.Fatalf("prober calls = %d, want exactly 1 (aged evidence must be re-checked)", prober.calls)
+	if prober.calls.Load() != 1 {
+		t.Fatalf("prober calls = %d, want exactly 1 (aged evidence must be re-checked)", prober.calls.Load())
 	}
 }
 
@@ -114,13 +114,13 @@ func TestHealthService_RunReconciler_SweepsImmediatelyOnStart(t *testing.T) {
 		close(done)
 	}()
 	deadline := time.Now().Add(2 * time.Second)
-	for prober.calls == 0 && time.Now().Before(deadline) {
+	for prober.calls.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	cancel()
 	<-done
 
-	if prober.calls == 0 {
+	if prober.calls.Load() == 0 {
 		t.Fatal("expected RunReconciler to sweep at least once immediately on start")
 	}
 }

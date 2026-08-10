@@ -111,6 +111,82 @@ func TestExecutionSignerAuthorize_GoldenPath(t *testing.T) {
 	}
 }
 
+// TestExecutionSignerAuthorize_RejectsSecondSignerWhileOneCurrent proves
+// Authorize is only for the FIRST signer: once a capability has a current
+// signer, a second Authorize (a genuinely new idempotency_key, a
+// different execution_signer_id) must be rejected rather than silently
+// creating a second, independently-valid-at-tos-protocol signer that
+// CurrentSigner never selects -- Rotate is the only path that replaces an
+// existing signer.
+func TestExecutionSignerAuthorize_RejectsSecondSignerWhileOneCurrent(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	core := toscoremock.NewContractFixture(st)
+	signers := service.NewExecutionSignerService(st, core, capabilities)
+	cap := registerSignerTestCapability(t, capabilities, "agt_sig_second", domain.TrustModeManaged)
+
+	now := time.Now().UTC()
+	if _, err := signers.Authorize(ctx, service.AuthorizeSignerInput{
+		ProviderID: "agt_sig_second", CapabilityID: cap.ID,
+		ExecutionSignerID: "signer-second-first", SignerPublicKey: testSignerKey(t), SignatureAlgorithm: "ed25519",
+		ValidFrom: now.Add(-time.Minute), ValidUntil: now.Add(24 * time.Hour),
+		IdempotencyKey: "authz-second-1",
+	}); err != nil {
+		t.Fatalf("first Authorize: %v", err)
+	}
+
+	if _, err := signers.Authorize(ctx, service.AuthorizeSignerInput{
+		ProviderID: "agt_sig_second", CapabilityID: cap.ID,
+		ExecutionSignerID: "signer-second-second", SignerPublicKey: testSignerKey(t), SignatureAlgorithm: "ed25519",
+		ValidFrom: now.Add(-time.Minute), ValidUntil: now.Add(24 * time.Hour),
+		IdempotencyKey: "authz-second-2",
+	}); err == nil {
+		t.Fatal("expected a second Authorize (different idempotency_key, different signer) to be rejected while a signer is already current")
+	}
+
+	_, signerID, found, err := signers.CurrentSigner(ctx, cap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || signerID != "signer-second-first" {
+		t.Fatalf("current signer = %q found=%v, want signer-second-first (unaffected by the rejected second Authorize)", signerID, found)
+	}
+}
+
+// TestExecutionSignerAuthorize_ExplicitValidityChangeConflicts proves the
+// validity comparison in resumeOrConflict is a partial exception, not a
+// blanket one: when the caller EXPLICITLY supplies a different validity
+// window under the SAME idempotency_key, that must conflict like any
+// other changed field -- omitting the field (letting the transport layer
+// default it) is the only case allowed to differ across delivery attempts.
+func TestExecutionSignerAuthorize_ExplicitValidityChangeConflicts(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	core := toscoremock.NewContractFixture(st)
+	signers := service.NewExecutionSignerService(st, core, capabilities)
+	cap := registerSignerTestCapability(t, capabilities, "agt_sig_validity", domain.TrustModeManaged)
+
+	now := time.Now().UTC()
+	first := service.AuthorizeSignerInput{
+		ProviderID: "agt_sig_validity", CapabilityID: cap.ID,
+		ExecutionSignerID: "signer-validity", SignerPublicKey: testSignerKey(t), SignatureAlgorithm: "ed25519",
+		ValidFrom: now.Add(-time.Minute), ValidUntil: now.Add(24 * time.Hour),
+		ValidFromExplicit: true, ValidUntilExplicit: true,
+		IdempotencyKey: "authz-validity-1",
+	}
+	if _, err := signers.Authorize(ctx, first); err != nil {
+		t.Fatalf("first Authorize: %v", err)
+	}
+
+	changed := first
+	changed.ValidUntil = now.Add(48 * time.Hour) // explicitly different from the persisted window
+	if _, err := signers.Authorize(ctx, changed); err == nil {
+		t.Fatal("expected an explicit valid_until change under the same idempotency_key to conflict")
+	}
+}
+
 func TestExecutionSignerAuthorize_IdempotentReplayDoesNotCallRPCTwice(t *testing.T) {
 	ctx := context.Background()
 	st := memory.New()

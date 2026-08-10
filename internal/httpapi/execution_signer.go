@@ -102,6 +102,7 @@ func (s *Server) handleAuthorizeExecutionSigner(w http.ResponseWriter, r *http.R
 		ProviderID: principalFrom(r), CapabilityID: capabilityID,
 		ExecutionSignerID: req.ExecutionSignerID, SignerPublicKey: publicKey,
 		SignatureAlgorithm: req.SignatureAlgorithm, ValidFrom: validFrom, ValidUntil: validUntil,
+		ValidFromExplicit: req.ValidFrom != nil, ValidUntilExplicit: req.ValidUntil != nil,
 		IdempotencyKey: idempotencyKeyFrom(r),
 	}); err != nil {
 		writeDomainErr(w, err)
@@ -141,6 +142,7 @@ func (s *Server) handleRotateExecutionSigner(w http.ResponseWriter, r *http.Requ
 		ProviderID: principalFrom(r), CapabilityID: capabilityID,
 		NewExecutionSignerID: req.NewExecutionSignerID, NewSignerPublicKey: publicKey,
 		NewSignatureAlgorithm: req.SignatureAlgorithm, NewValidFrom: validFrom, NewValidUntil: validUntil,
+		NewValidFromExplicit: req.ValidFrom != nil, NewValidUntilExplicit: req.ValidUntil != nil,
 		RevocationReasonCode: req.ReasonCode, IdempotencyKey: idempotencyKeyFrom(r),
 	}); err != nil {
 		writeDomainErr(w, err)

@@ -73,6 +73,114 @@ func (c *blockingSignerCore) AuthorizeExecutionSigner(ctx context.Context, req t
 // valid-at-tos-protocol signers (B and C) with only one ever visible
 // through CurrentSigner: the other permanently orphaned, unnamed and
 // unrevokable.
+// TestExecutionSignerService_ConcurrentAuthorizationsOnDifferentIdempotencyKeysDoNotBothSucceed
+// is Authorize's counterpart to the Rotate test below: Authorize is not
+// exempt from capability-scoped serialization just because it never reads
+// CurrentSigner going in -- two concurrent Authorize calls on different
+// idempotency keys for a capability with NO current signer yet could
+// previously both open and complete independently, leaving two
+// valid-at-tos-protocol signers (B and C) with only one ever visible
+// through CurrentSigner. Uses the same blockingSignerCore-forced-overlap
+// technique as the Rotate test for the same reason: a fast mock core
+// makes two "concurrent" calls routinely run sequentially by accident.
+func TestExecutionSignerService_ConcurrentAuthorizationsOnDifferentIdempotencyKeysDoNotBothSucceed(t *testing.T) {
+	url := os.Getenv("ATOS_TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("ATOS_TEST_DATABASE_URL not set; skipping Postgres integration test")
+	}
+	ctx := context.Background()
+	sA, err := postgres.Open(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sA.Close()
+	sB, err := postgres.Open(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sB.Close()
+
+	providerID := "prov_sigop_concurrentauth_" + uuid.NewString()
+	capabilities := service.NewCapabilityService(sA)
+	blocking := &blockingSignerCore{
+		Core: toscoremock.NewContractFixture(sA), blockOnExecutionSignerID: "signer-auth-B",
+		authorizeStarted: make(chan struct{}), proceed: make(chan struct{}),
+	}
+	signersA := service.NewExecutionSignerService(sA, blocking, capabilities)
+	signersB := service.NewExecutionSignerService(sB, blocking, capabilities)
+
+	cap, err := capabilities.Register(ctx, service.RegisterCapabilityInput{
+		ProviderID: providerID, Name: "Concurrent Authorize Test", Description: "for tests",
+		DeliveryMode: domain.DeliveryInstant,
+		InputSchema:  map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing:        domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
+		IdempotencyKey: "register-" + providerID,
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	authorizeAs := func(signers *service.ExecutionSignerService, signerID, idempotencyKey string) (domain.ExecutionSignerOperation, error) {
+		return signers.Authorize(ctx, service.AuthorizeSignerInput{
+			ProviderID: providerID, CapabilityID: cap.ID,
+			ExecutionSignerID: signerID, SignerPublicKey: testSignerKey(t), SignatureAlgorithm: "ed25519",
+			ValidFrom: time.Now().UTC().Add(-time.Minute), ValidUntil: time.Now().UTC().Add(24 * time.Hour),
+			IdempotencyKey: idempotencyKey,
+		})
+	}
+
+	var wg sync.WaitGroup
+	var firstOp domain.ExecutionSignerOperation
+	var firstErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		firstOp, firstErr = authorizeAs(signersA, "signer-auth-B", "authz-to-b")
+	}()
+
+	select {
+	case <-blocking.authorizeStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the first authorize to reach AuthorizeExecutionSigner")
+	}
+
+	secondOp, secondErr := authorizeAs(signersB, "signer-auth-C", "authz-to-c")
+	close(blocking.proceed)
+	wg.Wait()
+
+	if firstErr != nil {
+		t.Fatalf("first authorize (which was already in flight) unexpectedly failed: %v", firstErr)
+	}
+	if firstOp.Checkpoint != domain.CheckpointCompleted {
+		t.Fatalf("first authorize checkpoint = %s, want completed", firstOp.Checkpoint)
+	}
+	if secondErr == nil {
+		t.Fatalf("expected the second authorize to be rejected while the first was still in flight, got %+v", secondOp)
+	}
+	var domainErr *domain.Error
+	if !errors.As(secondErr, &domainErr) || domainErr.Code != domain.ErrSignerOperationInProgress {
+		t.Fatalf("second authorize error = %v, want domain.ErrSignerOperationInProgress", secondErr)
+	}
+
+	_, signerID, found, err := signersA.CurrentSigner(ctx, cap.ID)
+	if err != nil {
+		t.Fatalf("CurrentSigner: %v", err)
+	}
+	if !found || signerID != "signer-auth-B" {
+		t.Fatalf("current signer = %q found=%v, want signer-auth-B (the authorize that was already in flight)", signerID, found)
+	}
+
+	// The rejected second authorize's target must never have reached
+	// tos-protocol at all.
+	_, loserFound, err := blocking.Core.ResolveExecutionSignerAuthorization(ctx, providerID, cap.ID, cap.Version, "signer-auth-C", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("ResolveExecutionSignerAuthorization: %v", err)
+	}
+	if loserFound {
+		t.Fatal("the rejected authorize's signer-auth-C was authorized at tos-protocol despite being rejected before opening -- orphaned signer")
+	}
+}
+
 func TestExecutionSignerService_ConcurrentRotationsOnDifferentIdempotencyKeysDoNotBothSucceed(t *testing.T) {
 	url := os.Getenv("ATOS_TEST_DATABASE_URL")
 	if url == "" {

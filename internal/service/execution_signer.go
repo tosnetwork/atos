@@ -106,11 +106,22 @@ func (s *ExecutionSignerService) CurrentSigner(ctx context.Context, capabilityID
 //
 // sameStableIdentity must compare only fields the caller genuinely
 // controls and that must not vary between the original call and a retry
-// -- never CurrentSigner-derived Old* fields or a freshly-defaulted
-// validity window, which legitimately differ across delivery attempts of
-// the exact same logical request. A mismatch there is a genuine
-// idempotency_key reused for a different logical request, which must
-// still conflict rather than silently resuming the wrong operation.
+// -- never CurrentSigner-derived Old* fields. A mismatch there is a
+// genuine idempotency_key reused for a different logical request, which
+// must still conflict rather than silently resuming the wrong operation.
+//
+// The validity window is a partial exception, not a blanket one: it must
+// be compared when the caller EXPLICITLY supplied valid_from/valid_until
+// (a genuine change of validity under a reused idempotency_key is exactly
+// the kind of different-content reuse that must conflict, not silently
+// resume the original window) but skipped when the transport layer
+// defaulted it because the caller omitted the field (recomputed from
+// time.Now() on every delivery, so two deliveries of an otherwise-identical
+// omitted-validity request would otherwise spuriously conflict on that
+// alone). See AuthorizeSignerInput.ValidFromExplicit/ValidUntilExplicit
+// and RotateSignerInput's identically-named fields -- callers of
+// resumeOrConflict are responsible for making sameStableIdentity honor
+// this distinction, not resumeOrConflict itself.
 func (s *ExecutionSignerService) resumeOrConflict(
 	ctx context.Context, providerID, idempotencyKey string,
 	sameStableIdentity func(existing domain.ExecutionSignerOperation) bool,
@@ -136,6 +147,14 @@ type AuthorizeSignerInput struct {
 	SignatureAlgorithm string
 	ValidFrom          time.Time
 	ValidUntil         time.Time
+	// ValidFromExplicit/ValidUntilExplicit distinguish "the caller
+	// literally supplied this field" from "the transport layer defaulted
+	// it because the caller omitted it" (REST/MCP recompute a
+	// time.Now()-based default on every delivery when omitted). Only an
+	// explicit value must match on an idempotency-key replay -- see
+	// resumeOrConflict's doc comment.
+	ValidFromExplicit  bool
+	ValidUntilExplicit bool
 	IdempotencyKey     string
 }
 
@@ -153,10 +172,15 @@ func (in AuthorizeSignerInput) validate() error {
 }
 
 // Authorize authorizes ExecutionSignerID as the (first) execution signer
-// for CapabilityID. Ownership is enforced identically to every other
-// provider mutation in this codebase: provider identity comes only from
-// in.ProviderID (the caller's authenticated principal in the REST/MCP
-// layer), never trusted from anywhere else.
+// for CapabilityID. Refused once a current signer already exists --
+// Authorize is only for the FIRST signer; Rotate is the only path that
+// replaces an existing one, because only Rotate walks the
+// authorize-new-before-revoke-old ordering that keeps the old signer
+// authoritative until the new one is durably authorized. Ownership is
+// enforced identically to every other provider mutation in this codebase:
+// provider identity comes only from in.ProviderID (the caller's
+// authenticated principal in the REST/MCP layer), never trusted from
+// anywhere else.
 //
 // A prior attempt under in.IdempotencyKey is looked up and resumed FIRST,
 // before anything that depends on freshly-computed state is touched --
@@ -178,7 +202,9 @@ func (s *ExecutionSignerService) Authorize(ctx context.Context, in AuthorizeSign
 			existing.CapabilityID == in.CapabilityID &&
 			existing.NewExecutionSignerID == in.ExecutionSignerID &&
 			bytes.Equal(existing.NewSignerPublicKey, in.SignerPublicKey) &&
-			existing.NewSignatureAlgorithm == in.SignatureAlgorithm
+			existing.NewSignatureAlgorithm == in.SignatureAlgorithm &&
+			(!in.ValidFromExplicit || existing.NewValidFrom.Equal(in.ValidFrom)) &&
+			(!in.ValidUntilExplicit || existing.NewValidUntil.Equal(in.ValidUntil))
 	})
 	if err != nil {
 		return domain.ExecutionSignerOperation{}, err
@@ -187,20 +213,34 @@ func (s *ExecutionSignerService) Authorize(ctx context.Context, in AuthorizeSign
 		return s.driveAuthorize(ctx, existing)
 	}
 	now := time.Now().UTC()
-	op := domain.ExecutionSignerOperation{
-		ID: "sigop_" + uuid.NewString(), ProviderID: in.ProviderID,
-		CapabilityID: cap.ID, CapabilityVersion: cap.Version,
-		Type: domain.SignerOperationAuthorize, Checkpoint: domain.CheckpointIntentPersisted,
-		IdempotencyKey:        in.IdempotencyKey,
-		NewAuthorizationID:    "authz_" + uuid.NewString(),
-		NewExecutionSignerID:  in.ExecutionSignerID,
-		NewSignerPublicKey:    in.SignerPublicKey,
-		NewSignatureAlgorithm: in.SignatureAlgorithm,
-		NewValidFrom:          in.ValidFrom,
-		NewValidUntil:         in.ValidUntil,
-		CreatedAt:             now, UpdatedAt: now,
-	}
-	stored, _, err := s.store.OpenSignerOperation(ctx, in.ProviderID, op)
+	// OpenSignerOperationForCapability, not a plain OpenSignerOperation:
+	// without the capability-scoped lock and non-terminal-operation check,
+	// two concurrent Authorize calls with different idempotency keys (or
+	// Authorize racing a concurrent Rotate/Revoke) could each open and
+	// complete independently, exactly the P0 finding this closes --
+	// Authorize is not exempt just because it does not itself read
+	// CurrentSigner going in; found=true here means a current signer
+	// already exists and this call is rejected in favor of Rotate.
+	stored, _, err := s.store.OpenSignerOperationForCapability(ctx, in.ProviderID, cap.ID, cap.Version,
+		func(_, _ string, found bool) (domain.ExecutionSignerOperation, error) {
+			if found {
+				return domain.ExecutionSignerOperation{}, domain.NewError(domain.ErrValidationFailed,
+					"capability already has a currently authorized execution signer -- use Rotate instead", false)
+			}
+			return domain.ExecutionSignerOperation{
+				ID: "sigop_" + uuid.NewString(), ProviderID: in.ProviderID,
+				CapabilityID: cap.ID, CapabilityVersion: cap.Version,
+				Type: domain.SignerOperationAuthorize, Checkpoint: domain.CheckpointIntentPersisted,
+				IdempotencyKey:        in.IdempotencyKey,
+				NewAuthorizationID:    "authz_" + uuid.NewString(),
+				NewExecutionSignerID:  in.ExecutionSignerID,
+				NewSignerPublicKey:    in.SignerPublicKey,
+				NewSignatureAlgorithm: in.SignatureAlgorithm,
+				NewValidFrom:          in.ValidFrom,
+				NewValidUntil:         in.ValidUntil,
+				CreatedAt:             now, UpdatedAt: now,
+			}, nil
+		})
 	if err != nil {
 		return domain.ExecutionSignerOperation{}, err
 	}
@@ -286,6 +326,10 @@ type RotateSignerInput struct {
 	NewSignatureAlgorithm string
 	NewValidFrom          time.Time
 	NewValidUntil         time.Time
+	// NewValidFromExplicit/NewValidUntilExplicit -- see the identically-named
+	// fields on AuthorizeSignerInput.
+	NewValidFromExplicit  bool
+	NewValidUntilExplicit bool
 	RevocationReasonCode  string
 	IdempotencyKey        string
 }
@@ -318,7 +362,9 @@ func (s *ExecutionSignerService) Rotate(ctx context.Context, in RotateSignerInpu
 			existing.NewExecutionSignerID == in.NewExecutionSignerID &&
 			bytes.Equal(existing.NewSignerPublicKey, in.NewSignerPublicKey) &&
 			existing.NewSignatureAlgorithm == in.NewSignatureAlgorithm &&
-			existing.RevocationReasonCode == in.RevocationReasonCode
+			existing.RevocationReasonCode == in.RevocationReasonCode &&
+			(!in.NewValidFromExplicit || existing.NewValidFrom.Equal(in.NewValidFrom)) &&
+			(!in.NewValidUntilExplicit || existing.NewValidUntil.Equal(in.NewValidUntil))
 	})
 	if err != nil {
 		return domain.ExecutionSignerOperation{}, err

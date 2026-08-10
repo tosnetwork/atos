@@ -134,6 +134,29 @@ func (m ModeSupport) ActiveModes() []TrustMode {
 	return out
 }
 
+// with returns a shallow copy of m with mode set to entry -- it NEVER
+// mutates the receiver. This is why AdvanceToPending/Suspend/Activate are
+// safe to call on a ModeSupport a caller obtained from a store's Get and
+// has not yet Put back: the memory store's Get returns a domain.Capability
+// by value, but Go copies a struct's map fields by reference, so the
+// returned Capability's ModeSupport is still the SAME map object the
+// store holds internally. Mutating that map in place (the previous
+// implementation) is therefore a genuine, unsynchronized concurrent
+// read/write on the store's own state -- proven by go test -race, not
+// theoretical -- the instant a second goroutine calls Get and reads
+// ModeSupport (e.g. via ActiveModes) while this one is still mid-mutation,
+// before its own Put ever runs. Copy-on-write closes this at the source:
+// the store's map is never touched until the caller's own Put swaps in an
+// entirely new Capability value under the store's lock.
+func (m ModeSupport) with(mode TrustMode, entry ModeSupportEntry) ModeSupport {
+	next := make(ModeSupport, len(m)+1)
+	for k, v := range m {
+		next[k] = v
+	}
+	next[mode] = entry
+	return next
+}
+
 // AdvanceToPending applies the `requested -> pending` transition from
 // atos-spec docs/IMPLEMENTATION_ROADMAP.md §7.2.0's frozen matrix, whose
 // sole authority is the readiness pipeline recording a first evidence
@@ -149,8 +172,7 @@ func (m ModeSupport) AdvanceToPending(mode TrustMode) ModeSupport {
 	}
 	entry.Status = ModeSupportPending
 	entry.Reason = "readiness evidence recorded, awaiting activation authority"
-	m[mode] = entry
-	return m
+	return m.with(mode, entry)
 }
 
 // Suspend applies the `active -> suspended` transition from §7.2.0, whose
@@ -165,8 +187,7 @@ func (m ModeSupport) Suspend(mode TrustMode, reason string) ModeSupport {
 	}
 	entry.Status = ModeSupportSuspended
 	entry.Reason = reason
-	m[mode] = entry
-	return m
+	return m.with(mode, entry)
 }
 
 // Activate applies the `pending -> active` or `suspended -> active`
@@ -181,8 +202,7 @@ func (m ModeSupport) Activate(mode TrustMode) ModeSupport {
 	}
 	entry.Status = ModeSupportActive
 	entry.Reason = ""
-	m[mode] = entry
-	return m
+	return m.with(mode, entry)
 }
 
 type ProofRequirements struct {
