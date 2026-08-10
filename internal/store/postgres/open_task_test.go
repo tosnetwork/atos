@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/tosnetwork/atos/internal/domain"
+	"github.com/tosnetwork/atos/internal/store"
 )
 
 // TestOpenAcceptanceOperation_ConcurrentAcceptHasSingleWinner is Phase 3C's
@@ -574,5 +575,220 @@ func TestUpdateAcceptanceOperation_TerminalIsImmutable(t *testing.T) {
 	}
 	if staleAdvance.Checkpoint != domain.AcceptanceCompleted {
 		t.Fatalf("stale advance result checkpoint = %s, want completed", staleAdvance.Checkpoint)
+	}
+}
+
+// TestListPublicOpenTasks_ExcludesExpiredBeforeApplyingLimit is the
+// regression test for a P1 finding: expiry is lazy (no reconciler sweep
+// flips Status away from Open when ExpiresAt passes), and the query used
+// to filter status only, applying LIMIT before any expiry check. If the
+// newest `limit` rows were all expired-but-still-stored-Open, the caller
+// (OpenTaskService.ListPublic) would filter every one of them out after
+// the fact, permanently hiding older rows that are still genuinely open --
+// even though those older rows exist and would fit within the requested
+// limit. The fix pushes the expiry filter into the store query itself, so
+// LIMIT is only ever applied to rows that are actually still live.
+func TestListPublicOpenTasks_ExcludesExpiredBeforeApplyingLimit(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	now := time.Now().UTC()
+
+	// Both synthetic rows below are anchored far in the future (CreatedAt
+	// 10h/20h ahead of now) so they always rank above any genuine row left
+	// behind by other tests sharing this Postgres instance -- real rows
+	// never have a CreatedAt in the future, so this makes the test
+	// deterministic regardless of what else is in the table.
+	olderOpenID := "task_pg_older_open_" + suffix
+	if err := s.PutOpenTask(ctx, domain.OpenTask{
+		ID: olderOpenID, PrincipalID: "principal_" + suffix, Title: "older, still genuinely open",
+		Status: domain.OpenTaskOpen, ExpiresAt: now.Add(11 * time.Hour),
+		CreatedAt: now.Add(10 * time.Hour), UpdatedAt: now.Add(10 * time.Hour),
+	}); err != nil {
+		t.Fatalf("PutOpenTask(older open): %v", err)
+	}
+
+	const expiredCount = 3
+	for i := 0; i < expiredCount; i++ {
+		id := fmt.Sprintf("task_pg_expired_%s_%d", suffix, i)
+		if err := s.PutOpenTask(ctx, domain.OpenTask{
+			ID: id, PrincipalID: "principal_" + suffix, Title: "newer, but expired -- no sweep yet",
+			Status: domain.OpenTaskOpen, ExpiresAt: now.Add(-time.Minute),
+			CreatedAt: now.Add(20 * time.Hour), UpdatedAt: now.Add(20 * time.Hour),
+		}); err != nil {
+			t.Fatalf("PutOpenTask(expired %d): %v", i, err)
+		}
+	}
+
+	tasks, err := s.ListPublicOpenTasks(ctx, expiredCount, now)
+	if err != nil {
+		t.Fatalf("ListPublicOpenTasks: %v", err)
+	}
+	found := false
+	for _, task := range tasks {
+		if task.ID == olderOpenID {
+			found = true
+		}
+		if task.Status == domain.OpenTaskOpen && task.Expired(now) {
+			t.Fatalf("ListPublicOpenTasks returned an expired-but-stored-open row: %+v", task)
+		}
+	}
+	if !found {
+		t.Fatalf("older genuinely-open task was hidden behind %d newer expired rows consuming the limit window; got %+v", expiredCount, tasks)
+	}
+}
+
+// TestCreateOpenTaskProposal_RejectsOnAlreadyClosedTask is the regression
+// test for the P2 finding that PutOpenTaskProposal is a plain unconditional
+// insert with no task-state validation and no lock shared with
+// Accept/Cancel/Withdraw: OpenTaskService.Propose's live-state check ran
+// against an unlocked GetOpenTask read, so a concurrent Accept or Cancel
+// that committed in the gap before the insert would let a provider receive
+// a successful proposal against a task that, by the time the row actually
+// landed, was no longer open. CreateOpenTaskProposal closes this by
+// locking the task and re-validating Status/Expired fresh, in the same
+// transaction as the insert -- proven here by cancelling the task FIRST,
+// then confirming CreateOpenTaskProposal refuses (without ever invoking
+// build, and without inserting anything).
+func TestCreateOpenTaskProposal_RejectsOnAlreadyClosedTask(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	taskID := "task_pg_closed_propose_" + suffix
+	now := time.Now().UTC()
+
+	if err := s.PutOpenTask(ctx, domain.OpenTask{
+		ID: taskID, PrincipalID: "principal_" + suffix, Title: "closed before propose lands",
+		Status: domain.OpenTaskOpen, ExpiresAt: now.Add(time.Hour),
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("PutOpenTask: %v", err)
+	}
+	if _, err := s.UpdateOpenTask(ctx, taskID, func(t domain.OpenTask, exists bool) (domain.OpenTask, error) {
+		t.Status = domain.OpenTaskCancelled
+		t.UpdatedAt = time.Now().UTC()
+		return t, nil
+	}); err != nil {
+		t.Fatalf("cancel via UpdateOpenTask: %v", err)
+	}
+
+	buildCalled := false
+	proposalID := "otprop_closed_" + suffix
+	_, err := s.CreateOpenTaskProposal(ctx, taskID, now, func(task domain.OpenTask) (domain.OpenTaskProposal, error) {
+		buildCalled = true
+		n := time.Now().UTC()
+		return domain.OpenTaskProposal{
+			ID: proposalID, TaskID: taskID, ProviderID: "provider_" + suffix,
+			CapabilityID: "cap_" + suffix, CapabilityVersion: "v1",
+			CreatedAt: n, UpdatedAt: n,
+		}, nil
+	})
+	if err == nil {
+		t.Fatal("expected CreateOpenTaskProposal to refuse a proposal against an already-cancelled task")
+	}
+	derr, ok := err.(*domain.Error)
+	if !ok || derr.Code != domain.ErrOpenTaskNotOpen {
+		t.Fatalf("expected ErrOpenTaskNotOpen, got %v", err)
+	}
+	if buildCalled {
+		t.Fatal("build must not be invoked when the task is not open -- the exact P2 bug this test targets would have inserted regardless")
+	}
+	if _, err := s.GetOpenTaskProposal(ctx, proposalID); err != store.ErrNotFound {
+		t.Fatalf("expected no proposal row to have been inserted, got err=%v", err)
+	}
+}
+
+// TestCreateOpenTaskProposal_ConcurrentWithCancelConverges races proposal
+// creation against a task cancellation on real Postgres (not the in-memory
+// store's single mutex) -- every result must be either a created proposal
+// or a properly classified domain.ErrOpenTaskNotOpen, never a raw/
+// unclassified error (which would indicate a lock-ordering deadlock or a
+// missed edge case), and the final set of persisted proposals must be
+// self-consistent with the fact that CreateOpenTaskProposal only ever
+// inserts under the same "open-task" lock Cancel uses.
+func TestCreateOpenTaskProposal_ConcurrentWithCancelConverges(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	taskID := "task_pg_propose_cancel_race_" + suffix
+	now := time.Now().UTC()
+
+	if err := s.PutOpenTask(ctx, domain.OpenTask{
+		ID: taskID, PrincipalID: "principal_" + suffix, Title: "propose vs cancel race",
+		Status: domain.OpenTaskOpen, ExpiresAt: now.Add(time.Hour),
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("PutOpenTask: %v", err)
+	}
+
+	const attempts = 12
+	var wg sync.WaitGroup
+	type outcome struct {
+		created    bool
+		proposalID string
+		err        error
+	}
+	results := make(chan outcome, attempts)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		if i%2 == 0 {
+			go func(i int) {
+				defer wg.Done()
+				proposalID := fmt.Sprintf("otprop_race_%s_%d", suffix, i)
+				_, err := s.CreateOpenTaskProposal(ctx, taskID, time.Now().UTC(), func(task domain.OpenTask) (domain.OpenTaskProposal, error) {
+					n := time.Now().UTC()
+					return domain.OpenTaskProposal{
+						ID: proposalID, TaskID: taskID, ProviderID: fmt.Sprintf("provider_%s_%d", suffix, i),
+						CapabilityID: "cap_" + suffix, CapabilityVersion: "v1",
+						CreatedAt: n, UpdatedAt: n,
+					}, nil
+				})
+				results <- outcome{created: err == nil, proposalID: proposalID, err: err}
+			}(i)
+		} else {
+			go func() {
+				defer wg.Done()
+				_, err := s.UpdateOpenTask(ctx, taskID, func(t domain.OpenTask, exists bool) (domain.OpenTask, error) {
+					if !exists {
+						return t, domain.NewError(domain.ErrNotFound, "not found", false)
+					}
+					if t.Status != domain.OpenTaskOpen {
+						return t, domain.NewError(domain.ErrOpenTaskNotOpen, "not open", false)
+					}
+					t.Status = domain.OpenTaskCancelled
+					t.UpdatedAt = time.Now().UTC()
+					return t, nil
+				})
+				results <- outcome{err: err}
+			}()
+		}
+	}
+	wg.Wait()
+	close(results)
+
+	var createdIDs []string
+	for r := range results {
+		if r.created {
+			createdIDs = append(createdIDs, r.proposalID)
+			continue
+		}
+		if r.err == nil {
+			continue
+		}
+		derr, ok := r.err.(*domain.Error)
+		if !ok {
+			t.Fatalf("unexpected non-domain error: %v", r.err)
+		}
+		if derr.Code != domain.ErrOpenTaskNotOpen {
+			t.Fatalf("unexpected domain error code: %v", derr)
+		}
+	}
+
+	proposals, err := s.ProposalsByTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("ProposalsByTask: %v", err)
+	}
+	if len(proposals) != len(createdIDs) {
+		t.Fatalf("persisted proposal count = %d, want %d (every created=true result must have actually landed)", len(proposals), len(createdIDs))
 	}
 }

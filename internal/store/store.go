@@ -517,15 +517,18 @@ type OpenTasks interface {
 	// unlike the public listing includes Input and every other
 	// owner-visible field.
 	OpenTasksByPrincipal(ctx context.Context, principalID string) ([]domain.OpenTask, error)
-	// ListPublicOpenTasks returns up to limit OpenTasks with Status=Open,
-	// newest first, for marketplace search/browse. Callers MUST still call
+	// ListPublicOpenTasks returns up to limit OpenTasks with Status=Open
+	// that have not yet passed ExpiresAt as of now, newest first, for
+	// marketplace search/browse. Callers MUST still call
 	// domain.OpenTask.Public() on each result before returning it outside
-	// the service layer -- this query filters by status only, it does not
-	// redact fields. An expired-but-still-Open row (ExpiresAt passed, no
-	// reconciler sweep has caught up yet) may still appear here; callers
-	// that care must check Expired(now) themselves, exactly like
-	// domain.Quote.Expired's lazy-check convention.
-	ListPublicOpenTasks(ctx context.Context, limit int) ([]domain.OpenTask, error)
+	// the service layer -- this query filters by status and expiry only,
+	// it does not redact fields. The expiry filter MUST be applied here,
+	// before limit, not by the caller after fetching: since expiry is lazy
+	// (no reconciler sweep flips Status away from Open), filtering
+	// client-side after the store already applied limit would let a run
+	// of newest-but-expired rows consume the whole limit window and hide
+	// older rows that are still genuinely open.
+	ListPublicOpenTasks(ctx context.Context, limit int, now time.Time) ([]domain.OpenTask, error)
 	// UpdateOpenTask atomically applies fn to the task's current stored
 	// state (or domain.OpenTask{} with exists=false if it isn't stored yet)
 	// and persists whatever fn returns -- the compare-and-swap primitive
@@ -537,8 +540,26 @@ type OpenTasks interface {
 	UpdateOpenTask(ctx context.Context, id string, fn func(t domain.OpenTask, exists bool) (domain.OpenTask, error)) (domain.OpenTask, error)
 
 	// PutOpenTaskProposal inserts a new proposal row. Insert-only, like
-	// PutOpenTask.
+	// PutOpenTask. It performs no task-state validation of its own --
+	// CreateOpenTaskProposal is the path that must be used whenever the
+	// caller needs to guarantee the task was still open at insert time.
 	PutOpenTaskProposal(ctx context.Context, p domain.OpenTaskProposal) error
+	// CreateOpenTaskProposal atomically re-validates that taskID is
+	// currently Status=Open and not Expired(now), then calls build with
+	// the freshly locked task to construct the proposal to insert -- this
+	// closes the race where a plain "read task, check it's open, then
+	// PutOpenTaskProposal" sequence at the service layer cannot see a
+	// concurrent Accept/Cancel that commits in the gap between the check
+	// and the insert, letting a provider receive a successful proposal
+	// against a task that is, by the time the insert lands, already
+	// accepted or cancelled. Implementations MUST lock "open-task"+taskID
+	// (the same lock key OpenAcceptanceOperation/UpdateOpenTask/
+	// WithdrawOpenTaskProposal already use) before reading the task, so
+	// this participates in the same global lock-ordering discipline as
+	// every other task-mutating path. Returns domain.ErrNotFound if
+	// taskID does not exist, domain.ErrOpenTaskNotOpen (without calling
+	// build) if the task is not currently open for new proposals.
+	CreateOpenTaskProposal(ctx context.Context, taskID string, now time.Time, build func(task domain.OpenTask) (domain.OpenTaskProposal, error)) (domain.OpenTaskProposal, error)
 	GetOpenTaskProposal(ctx context.Context, id string) (domain.OpenTaskProposal, error)
 	// OpenTaskProposalByIdempotencyKey mirrors OpenTaskByIdempotencyKey,
 	// scoped by (providerID, key) instead of (principalID, key) -- a

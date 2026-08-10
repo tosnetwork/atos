@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -51,7 +52,7 @@ func TestMemoryOpenTaskCRUD(t *testing.T) {
 		t.Fatalf("OpenTasksByPrincipal = %+v", byPrincipal)
 	}
 
-	public, err := s.ListPublicOpenTasks(ctx, 10)
+	public, err := s.ListPublicOpenTasks(ctx, 10, now)
 	if err != nil {
 		t.Fatalf("ListPublicOpenTasks: %v", err)
 	}
@@ -72,7 +73,7 @@ func TestMemoryOpenTaskCRUD(t *testing.T) {
 	if updated.Status != domain.OpenTaskCancelled {
 		t.Fatalf("updated status = %s, want cancelled", updated.Status)
 	}
-	publicAfterCancel, err := s.ListPublicOpenTasks(ctx, 10)
+	publicAfterCancel, err := s.ListPublicOpenTasks(ctx, 10, now)
 	if err != nil {
 		t.Fatalf("ListPublicOpenTasks after cancel: %v", err)
 	}
@@ -339,5 +340,105 @@ func TestMemoryUpdateAcceptanceOperation_TerminalIsImmutable(t *testing.T) {
 	}
 	if staleAdvance.Checkpoint != domain.AcceptanceCompleted {
 		t.Fatalf("stale advance result checkpoint = %s, want completed", staleAdvance.Checkpoint)
+	}
+}
+
+// TestMemoryListPublicOpenTasks_ExcludesExpiredBeforeApplyingLimit is the
+// memory-store counterpart of the Postgres regression test with the same
+// name: an older, genuinely open task must not be hidden behind newer
+// rows that are lazily expired (Status still Open, ExpiresAt already
+// passed) consuming the limit window.
+func TestMemoryListPublicOpenTasks_ExcludesExpiredBeforeApplyingLimit(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+	now := time.Now().UTC()
+
+	olderOpenID := "task_mem_older_open"
+	if err := s.PutOpenTask(ctx, domain.OpenTask{
+		ID: olderOpenID, PrincipalID: "prn_1", Title: "older, still genuinely open",
+		Status: domain.OpenTaskOpen, ExpiresAt: now.Add(time.Hour),
+		CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("PutOpenTask(older open): %v", err)
+	}
+
+	const expiredCount = 3
+	for i := 0; i < expiredCount; i++ {
+		id := fmt.Sprintf("task_mem_expired_%d", i)
+		if err := s.PutOpenTask(ctx, domain.OpenTask{
+			ID: id, PrincipalID: "prn_1", Title: "newer, but expired -- no sweep yet",
+			Status: domain.OpenTaskOpen, ExpiresAt: now.Add(-time.Minute),
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("PutOpenTask(expired %d): %v", i, err)
+		}
+	}
+
+	tasks, err := s.ListPublicOpenTasks(ctx, expiredCount, now)
+	if err != nil {
+		t.Fatalf("ListPublicOpenTasks: %v", err)
+	}
+	found := false
+	for _, task := range tasks {
+		if task.ID == olderOpenID {
+			found = true
+		}
+		if task.Status == domain.OpenTaskOpen && task.Expired(now) {
+			t.Fatalf("ListPublicOpenTasks returned an expired-but-stored-open row: %+v", task)
+		}
+	}
+	if !found {
+		t.Fatalf("older genuinely-open task was hidden behind %d newer expired rows consuming the limit window; got %+v", expiredCount, tasks)
+	}
+}
+
+// TestMemoryCreateOpenTaskProposal_RejectsOnAlreadyClosedTask is the
+// memory-store counterpart of the Postgres regression test with the same
+// name: CreateOpenTaskProposal must refuse (without calling build, without
+// inserting) once the task is no longer open.
+func TestMemoryCreateOpenTaskProposal_RejectsOnAlreadyClosedTask(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+	taskID := "task_mem_closed_propose"
+	now := time.Now().UTC()
+
+	if err := s.PutOpenTask(ctx, domain.OpenTask{
+		ID: taskID, PrincipalID: "prn_1", Title: "closed before propose lands",
+		Status: domain.OpenTaskOpen, ExpiresAt: now.Add(time.Hour),
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("PutOpenTask: %v", err)
+	}
+	if _, err := s.UpdateOpenTask(ctx, taskID, func(t domain.OpenTask, exists bool) (domain.OpenTask, error) {
+		t.Status = domain.OpenTaskCancelled
+		t.UpdatedAt = time.Now().UTC()
+		return t, nil
+	}); err != nil {
+		t.Fatalf("cancel via UpdateOpenTask: %v", err)
+	}
+
+	buildCalled := false
+	proposalID := "otprop_closed_mem"
+	_, err := s.CreateOpenTaskProposal(ctx, taskID, now, func(task domain.OpenTask) (domain.OpenTaskProposal, error) {
+		buildCalled = true
+		n := time.Now().UTC()
+		return domain.OpenTaskProposal{
+			ID: proposalID, TaskID: taskID, ProviderID: "provider_1",
+			CapabilityID: "cap_1", CapabilityVersion: "v1",
+			CreatedAt: n, UpdatedAt: n,
+		}, nil
+	})
+	if err == nil {
+		t.Fatal("expected CreateOpenTaskProposal to refuse a proposal against an already-cancelled task")
+	}
+	derr, ok := err.(*domain.Error)
+	if !ok || derr.Code != domain.ErrOpenTaskNotOpen {
+		t.Fatalf("expected ErrOpenTaskNotOpen, got %v", err)
+	}
+	if buildCalled {
+		t.Fatal("build must not be invoked when the task is not open")
+	}
+	if _, err := s.GetOpenTaskProposal(ctx, proposalID); err != store.ErrNotFound {
+		t.Fatalf("expected no proposal row to have been inserted, got err=%v", err)
 	}
 }

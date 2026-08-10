@@ -573,3 +573,78 @@ This same round also re-verified, using the stronger
 server-log-inspection method from the third round, that the lock-ordering
 fix and idempotency digest fix from earlier rounds remain correct at the
 current commit -- both were already fixed and nothing regressed.
+
+### Fifth review round
+
+An automated GitHub Codex review (`chatgpt-codex-connector[bot]`) had left
+three inline findings against commit `38d1ed1` that predated all four
+review rounds above. Checked each against the current commit individually:
+
+1. **P2, lock order for accept vs withdraw** -- already fixed by the
+   second review round (`WithdrawOpenTaskProposal`'s lock-free preview
+   read + task-before-proposal ordering). Confirmed `OpenAcceptanceOperation`
+   and `WithdrawOpenTaskProposal` still acquire `"open-task"` before
+   `"open-task-proposal"` identically. No change needed.
+2. **P1, expired tasks consuming the ListPublic page limit** -- still
+   present, not fixed by any prior round. `ListPublicOpenTasks` filtered by
+   `status='open'` only and applied `LIMIT` before the caller's lazy
+   `Expired(now)` check ever ran. Since expiry is lazy (no reconciler flips
+   Status away from Open), a batch of newest rows that all happen to be
+   expired-but-still-stored-Open would consume the entire limit window,
+   and `OpenTaskService.ListPublic` would filter every one of them out
+   client-side -- hiding older rows that are still genuinely open, even
+   though they exist and would fit within the requested limit. Fixed by
+   pushing the expiry filter into the store query itself (`AND expires_at
+   > $2`, both stores), so `LIMIT` is only ever applied to rows that are
+   actually still live. `store.OpenTasks.ListPublicOpenTasks` now takes
+   `now time.Time`. New tests:
+   `TestListPublicOpenTasks_ExcludesExpiredBeforeApplyingLimit` /
+   `TestMemoryListPublicOpenTasks_ExcludesExpiredBeforeApplyingLimit`
+   (older genuinely-open task must not be hidden behind newer expired
+   rows).
+3. **P2, proposal insertion not conditional on the task remaining open** --
+   also still present. `PutOpenTaskProposal` was a plain unconditional
+   insert with no lock and no task-state validation of its own;
+   `OpenTaskService.Propose`'s live-state check ran against an unlocked
+   `GetOpenTask` read, so a concurrent `Accept`/`Cancel` committing in the
+   gap before the insert would let a provider receive a successful
+   proposal against a task that, by the time the row actually landed, was
+   no longer open. Fixed with a new store method,
+   `CreateOpenTaskProposal(ctx, taskID, now, build)`, that locks
+   `"open-task"+taskID` (the same lock key `OpenAcceptanceOperation`/
+   `UpdateOpenTask`/`WithdrawOpenTaskProposal` already use), re-reads the
+   task fresh, and refuses (`ErrOpenTaskNotOpen`, without calling `build`)
+   if it is not `Open` and not expired -- all inside one transaction with
+   the insert. `Propose` still does its capability lookup and an initial
+   fast-path task check *before* calling this (kept out of `build` for the
+   same reason `Accept` keeps Capability lookup out of
+   `OpenAcceptanceOperation`'s `build`: a nested store call from `build`
+   would deadlock the in-memory store's single mutex and would not
+   participate in the Postgres transaction), but the actual
+   correctness-critical check now happens fresh under lock, atomically
+   with the insert. New tests:
+   `TestCreateOpenTaskProposal_RejectsOnAlreadyClosedTask` /
+   `TestMemoryCreateOpenTaskProposal_RejectsOnAlreadyClosedTask`
+   (deterministic: cancel the task first, then prove `CreateOpenTaskProposal`
+   refuses without ever invoking `build` and without inserting anything --
+   the exact validation the old unconditional insert never had), plus
+   `TestCreateOpenTaskProposal_ConcurrentWithCancelConverges` (Postgres-only
+   concurrency stress: races proposal creation against cancellation,
+   asserting every result is either a created proposal or a properly
+   classified `ErrOpenTaskNotOpen`, and that the persisted proposal count
+   matches exactly the count of calls that reported success).
+
+Verification: `gofmt`/`go vet`/`go build` clean; full `go test ./... -race
+-count=1` clean against a freshly created, never-reused Postgres 16
+instance (a full-suite run against a long-lived container reused across
+many manual verification runs this session produced two unrelated false
+failures -- `TestOpenAcceptanceOperation_ConcurrentAcceptHasSingleWinner`
+and `TestEarningsService_TwoRealPostgresInstancesConvergeToOnePayout` --
+both traced to accumulated rows from earlier runs exceeding those tests'
+own `LIMIT`/count assumptions, confirmed via `git stash` bisection and a
+side-by-side fresh-container rerun to be pure test-fixture pollution, not
+product bugs); deadlock re-check using the third round's methodology
+(`deadlock_timeout=200ms`, `log_lock_waits=on`, grepping the server log)
+across all open-task/proposal/acceptance concurrency and immutability
+tests at `-count=20` (160 sub-test runs) against a fresh container --
+160/160 pass, 0 occurrences of `deadlock detected`.

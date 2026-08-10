@@ -107,10 +107,10 @@ func (s *Store) OpenTasksByPrincipal(ctx context.Context, principalID string) ([
 	return out, rows.Err()
 }
 
-func (s *Store) ListPublicOpenTasks(ctx context.Context, limit int) ([]domain.OpenTask, error) {
+func (s *Store) ListPublicOpenTasks(ctx context.Context, limit int, now time.Time) ([]domain.OpenTask, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT `+openTaskColumns+` FROM open_tasks WHERE status='open' ORDER BY created_at DESC LIMIT $1
-	`, limit)
+		SELECT `+openTaskColumns+` FROM open_tasks WHERE status='open' AND expires_at > $2 ORDER BY created_at DESC LIMIT $1
+	`, limit, now)
 	if err != nil {
 		return nil, err
 	}
@@ -200,6 +200,41 @@ func scanProposal(row pgx.Row) (domain.OpenTaskProposal, error) {
 func (s *Store) PutOpenTaskProposal(ctx context.Context, p domain.OpenTaskProposal) error {
 	_, err := s.pool.Exec(ctx, putProposalSQL, proposalWriteArgs(p)...)
 	return err
+}
+
+func (s *Store) CreateOpenTaskProposal(ctx context.Context, taskID string, now time.Time, build func(domain.OpenTask) (domain.OpenTaskProposal, error)) (domain.OpenTaskProposal, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.OpenTaskProposal{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err := lockTransactionKey(ctx, tx, "open-task", taskID); err != nil {
+		return domain.OpenTaskProposal{}, err
+	}
+	task, err := scanOpenTask(tx.QueryRow(ctx, `SELECT `+openTaskColumns+` FROM open_tasks WHERE id=$1 FOR UPDATE`, taskID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.OpenTaskProposal{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.OpenTaskProposal{}, err
+	}
+	if task.Status != domain.OpenTaskOpen || task.Expired(now) {
+		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrOpenTaskNotOpen, "open task is not accepting proposals", false)
+	}
+
+	proposal, err := build(task)
+	if err != nil {
+		return domain.OpenTaskProposal{}, err
+	}
+
+	if _, err := tx.Exec(ctx, putProposalSQL, proposalWriteArgs(proposal)...); err != nil {
+		return domain.OpenTaskProposal{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.OpenTaskProposal{}, err
+	}
+	return proposal, nil
 }
 
 func (s *Store) GetOpenTaskProposal(ctx context.Context, id string) (domain.OpenTaskProposal, error) {

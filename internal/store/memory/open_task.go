@@ -55,12 +55,12 @@ func (s *Store) OpenTasksByPrincipal(ctx context.Context, principalID string) ([
 	return out, nil
 }
 
-func (s *Store) ListPublicOpenTasks(ctx context.Context, limit int) ([]domain.OpenTask, error) {
+func (s *Store) ListPublicOpenTasks(ctx context.Context, limit int, now time.Time) ([]domain.OpenTask, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []domain.OpenTask
 	for _, t := range s.openTasks {
-		if t.Status == domain.OpenTaskOpen {
+		if t.Status == domain.OpenTaskOpen && !t.Expired(now) {
 			out = append(out, t)
 		}
 	}
@@ -90,6 +90,24 @@ func (s *Store) PutOpenTaskProposal(ctx context.Context, p domain.OpenTaskPropos
 	defer s.mu.Unlock()
 	s.openTaskProposals[p.ID] = p
 	return nil
+}
+
+func (s *Store) CreateOpenTaskProposal(ctx context.Context, taskID string, now time.Time, build func(domain.OpenTask) (domain.OpenTaskProposal, error)) (domain.OpenTaskProposal, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, exists := s.openTasks[taskID]
+	if !exists {
+		return domain.OpenTaskProposal{}, store.ErrNotFound
+	}
+	if task.Status != domain.OpenTaskOpen || task.Expired(now) {
+		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrOpenTaskNotOpen, "open task is not accepting proposals", false)
+	}
+	proposal, err := build(task)
+	if err != nil {
+		return domain.OpenTaskProposal{}, err
+	}
+	s.openTaskProposals[proposal.ID] = proposal
+	return proposal, nil
 }
 
 func (s *Store) GetOpenTaskProposal(ctx context.Context, id string) (domain.OpenTaskProposal, error) {

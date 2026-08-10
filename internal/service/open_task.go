@@ -230,11 +230,11 @@ func (s *OpenTaskService) ListPublic(ctx context.Context, limit int) ([]domain.O
 	} else if limit > maxOpenTaskListLimit {
 		limit = maxOpenTaskListLimit
 	}
-	tasks, err := s.store.ListPublicOpenTasks(ctx, limit)
+	now := time.Now().UTC()
+	tasks, err := s.store.ListPublicOpenTasks(ctx, limit, now)
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now().UTC()
 	out := make([]domain.OpenTask, 0, len(tasks))
 	for _, t := range tasks {
 		t = s.view(t, now)
@@ -398,7 +398,12 @@ func (s *OpenTaskService) Propose(ctx context.Context, in ProposeInput) (domain.
 
 	// Reached only on a genuinely fresh (first-ever) attempt -- nothing has
 	// been committed under this key yet, so live-state validation is safe
-	// here.
+	// here. This first read is a fast-path check only (not-found /
+	// self-dealing / a plainly-closed task can be rejected without ever
+	// taking the "open-task" lock) -- CreateOpenTaskProposal below
+	// re-validates Status/Expired fresh under lock regardless, closing the
+	// race where Accept/Cancel commits between this read and the actual
+	// insert.
 	task, err := s.store.GetOpenTask(ctx, in.TaskID)
 	if err != nil {
 		if err == store.ErrNotFound {
@@ -432,13 +437,26 @@ func (s *OpenTaskService) Propose(ctx context.Context, in ProposeInput) (domain.
 		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability is not active", false)
 	}
 
-	proposal := domain.OpenTaskProposal{
-		ID: "otprop_" + uuid.NewString(), TaskID: in.TaskID, ProviderID: in.ProviderID,
-		CapabilityID: cap.ID, CapabilityVersion: cap.Version,
-		Message: in.Message, ProposedPrice: in.ProposedPrice,
-		ProposalIdempotencyKey: in.IdempotencyKey, CreatedAt: now, UpdatedAt: now,
-	}
-	if err := s.store.PutOpenTaskProposal(ctx, proposal); err != nil {
+	// Capability is fetched and validated BEFORE calling
+	// CreateOpenTaskProposal, never from inside its build() callback, for
+	// the same reason Accept keeps Capability lookup out of
+	// OpenAcceptanceOperation's build(): a nested store call from within
+	// build would deadlock the in-memory store's single non-reentrant
+	// mutex, and would read a separate, non-transactional snapshot
+	// through the Postgres store's connection pool instead of
+	// participating in the same transaction.
+	proposal, err := s.store.CreateOpenTaskProposal(ctx, in.TaskID, now, func(task domain.OpenTask) (domain.OpenTaskProposal, error) {
+		if task.PrincipalID == in.ProviderID {
+			return domain.OpenTaskProposal{}, domain.NewError(domain.ErrPermissionDenied, "cannot propose on your own open task", false)
+		}
+		return domain.OpenTaskProposal{
+			ID: "otprop_" + uuid.NewString(), TaskID: in.TaskID, ProviderID: in.ProviderID,
+			CapabilityID: cap.ID, CapabilityVersion: cap.Version,
+			Message: in.Message, ProposedPrice: in.ProposedPrice,
+			ProposalIdempotencyKey: in.IdempotencyKey, CreatedAt: now, UpdatedAt: now,
+		}, nil
+	})
+	if err != nil {
 		return domain.OpenTaskProposal{}, err
 	}
 	if err := s.store.Finish(ctx, in.ProviderID, in.IdempotencyKey, proposal.ID); err != nil {
