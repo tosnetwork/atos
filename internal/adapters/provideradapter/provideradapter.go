@@ -102,6 +102,38 @@ type ProviderAdapter interface {
 	Transport() domain.EndpointAdapterType
 }
 
+// CertificationProbe is an optional, deeper readiness check a
+// ProviderAdapter may implement for sandbox certification, beyond Health.
+// Certification is supposed to "exercise the actual adapter path and
+// validate protocol handshake, bounded execution, response shape and
+// schema compatibility" (atos-spec IMPLEMENTATION_ROADMAP.md §7.1.3) --
+// strictly more than reachability. A probe implementation MUST remain
+// side-effect-free against the provider (no real Invoke, no state created
+// on the provider side); it may only exercise read-side/introspection
+// operations the transport's wire contract already defines.
+//
+// Not every transport's current wire contract has an introspection
+// surface rich enough to check schema compatibility: MCP's tools/list
+// exposes a per-tool input schema, so mcpadapter implements this; HTTP's
+// and A2A's wire contracts as currently specified have no discovery
+// operation, so certification for those transports either falls back to
+// Health alone (A2A) or can only verify protocol handshake/response shape
+// via the existing Query operation, not schema compatibility (HTTP) --
+// see each adapter's own doc comment. CertificationService records which
+// evidence was actually gathered rather than implying a uniform depth
+// across transports; closing this fully for HTTP/A2A requires extending
+// their normative wire contract in atos-spec first (per §3.1's spec-first
+// gate), not inventing one here.
+type CertificationProbe interface {
+	// ProbeCertification runs the deeper, transport-specific check against
+	// endpointRef. inputSchema/outputSchema are the Capability's own
+	// currently-registered schema documents, passed through for adapters
+	// that can cross-check them against a provider-declared schema. A
+	// non-nil error means certification must fail; evidence is returned
+	// even on failure so the reason is durably recorded.
+	ProbeCertification(ctx context.Context, endpointRef string, inputSchema, outputSchema map[string]any) (evidence map[string]any, err error)
+}
+
 // ErrCancelUnsupported is returned by ProviderAdapter.Cancel implementations
 // whose underlying protocol has no safe way to stop an in-flight attempt.
 var ErrCancelUnsupported = cancelUnsupportedError{}

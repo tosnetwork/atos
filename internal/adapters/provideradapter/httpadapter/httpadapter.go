@@ -281,6 +281,54 @@ func (a *Adapter) Health(ctx context.Context, endpointRef string) domain.Adapter
 	return check
 }
 
+// certificationProbeIdempotencyKey is a fixed, reserved idempotency key
+// used only by ProbeCertification's read-only Query call. It never
+// corresponds to a real Job, so a compliant provider always answers with
+// "no record" (404) for it -- the point of the probe is not to find a
+// record but to prove the provider's GET-by-idempotency-key path speaks
+// the real wire contract at all, not just that some HTTP response comes
+// back for an arbitrary GET the way Health checks.
+const certificationProbeIdempotencyKey = "atos-certification-probe-00000000"
+
+// ProbeCertification implements provideradapter.CertificationProbe by
+// exercising the adapter's real Query operation (GET
+// {endpoint}?idempotency_key=...) against a reserved, never-real
+// idempotency key, rather than Health's unstructured bare GET. Any of
+// three outcomes is acceptable evidence the provider correctly speaks the
+// wire contract: a clean 404 (found=false, no error -- the expected
+// answer for an unknown key), or a well-formed wire envelope response
+// (found=true). Anything else -- a connection failure, a non-2xx/non-404
+// status, a response that isn't valid JSON in the expected shape --
+// proves the provider does not correctly implement the contract this
+// binding claims to speak, and fails certification.
+//
+// This validates protocol handshake and response envelope shape using
+// only the adapter's already-mandatory wire contract (see package doc) --
+// no new contract invented. It cannot validate schema compatibility the
+// way mcpadapter's ProbeCertification does: the HTTP wire contract as
+// currently specified has no discovery/introspection operation a provider
+// can use to declare its own expected input/output schema, so there is
+// nothing to structurally compare against inputSchema/outputSchema here.
+// Closing that gap needs a normative HTTP wire-contract extension in
+// atos-spec first (per its own §3.1 spec-first gate), not an invented one.
+func (a *Adapter) ProbeCertification(ctx context.Context, endpointRef string, _, _ map[string]any) (map[string]any, error) {
+	if endpointRef == "" {
+		return nil, errors.New("httpadapter: endpoint_ref is empty")
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, defaultHealthTimeout)
+	defer cancel()
+	_, found, err := a.Query(probeCtx, endpointRef, certificationProbeIdempotencyKey)
+	if err != nil {
+		return map[string]any{"query_responded": false}, fmt.Errorf("httpadapter: certification query failed: %w", err)
+	}
+	return map[string]any{
+		"protocol":                     "http",
+		"query_responded":              true,
+		"record_found":                 found,
+		"schema_compatibility_checked": false,
+	}, nil
+}
+
 // AllowPrivateNetworksEnv exposes the outbound-policy escape-hatch env var
 // name for tests and operators; the policy defaults to rejecting
 // private/loopback/link-local destinations and this must be set

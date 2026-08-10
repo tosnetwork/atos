@@ -273,3 +273,19 @@ func (a *Adapter) Health(ctx context.Context, endpointRef string) domain.Adapter
 	check.Status = domain.AdapterHealthHealthy
 	return check
 }
+
+// This adapter deliberately does NOT implement
+// provideradapter.CertificationProbe. Health above already exercises a
+// real A2A JSON-RPC operation (tasks/get), unlike httpadapter's original
+// bare GET, so certification for this transport is not weaker than what
+// Health itself already proves about protocol handshake. What it cannot
+// do is the schema-compatibility half of atos-spec
+// IMPLEMENTATION_ROADMAP.md §7.1.3's certification requirement: A2A has no
+// skill/schema-discovery convention (an Agent Card at a well-known URI,
+// declaring per-skill input schemas, is the natural candidate) defined
+// anywhere in this codebase or in atos-spec today. Inventing one
+// unilaterally here would violate §3.1's spec-first gate -- that
+// convention needs to be frozen in atos-spec before an adapter-side probe
+// can honestly claim to check it. Until then, A2A certification evidence
+// is Health-equivalent, and CertificationService records that explicitly
+// rather than implying a depth this transport does not yet have.

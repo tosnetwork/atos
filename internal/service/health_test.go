@@ -15,6 +15,25 @@ import (
 	"github.com/tosnetwork/atos/internal/store/memory"
 )
 
+// certifiableHTTPHandler returns an httptest handler whose GET responses
+// cleanly report "no record" (404) for a Query-shaped request (one
+// carrying an idempotency_key query param) -- the expected,
+// certification-passing answer for httpadapter's ProbeCertification,
+// which probes a synthetic idempotency key that never corresponds to a
+// real Job. A bare GET with no idempotency_key (what Health itself sends)
+// still succeeds with 200, and any other method (Invoke's POST) succeeds
+// trivially too. This lets one handler serve both Health-only tests and
+// tests that also run certification through the same server.
+func certifiableHTTPHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Query().Get("idempotency_key") != "" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
 func registerHTTPBoundCapability(t *testing.T, capabilities *service.CapabilityService, providerID, endpointRef string, requestedModes []domain.TrustMode) domain.Capability {
 	t.Helper()
 	cap, err := capabilities.Register(context.Background(), service.RegisterCapabilityInput{
@@ -125,7 +144,7 @@ func TestHealthService_CheckCapability_NeverMutatesModeSupport(t *testing.T) {
 
 func TestHealthService_Availability_ReadyRequiresHealthyAndCertified(t *testing.T) {
 	ctx := context.Background()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	srv := httptest.NewServer(certifiableHTTPHandler())
 	defer srv.Close()
 
 	st := memory.New()

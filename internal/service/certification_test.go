@@ -29,7 +29,9 @@ func TestCertificationOpen_SuccessfulMCPCertification(t *testing.T) {
 	ctx := context.Background()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "result": map[string]any{"tools": []any{}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "result": map[string]any{
+			"tools": []any{map[string]any{"name": "analyze", "inputSchema": map[string]any{"type": "object"}}},
+		}})
 	}))
 	defer srv.Close()
 
@@ -106,7 +108,7 @@ func TestCertificationOpen_SuccessfulA2ACertification(t *testing.T) {
 
 func TestCertificationOpen_SuccessfulHTTPCertification(t *testing.T) {
 	ctx := context.Background()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	srv := httptest.NewServer(certifiableHTTPHandler())
 	defer srv.Close()
 
 	st := memory.New()
@@ -175,6 +177,10 @@ func TestCertificationOpen_DuplicateRetryConverges(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&calls, 1)
+		if r.Method == http.MethodGet && r.URL.Query().Get("idempotency_key") != "" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
@@ -201,15 +207,17 @@ func TestCertificationOpen_DuplicateRetryConverges(t *testing.T) {
 	if first.Status != second.Status {
 		t.Fatalf("retry produced a different status: %s vs %s", first.Status, second.Status)
 	}
-	// A terminal (Passed) result must not be re-probed on replay.
-	if calls != 1 {
-		t.Fatalf("adapter Health probed %d times, want exactly 1 (terminal replay must not re-probe)", calls)
+	// The first Open makes exactly 2 real requests (Health's GET, then
+	// ProbeCertification's Query GET); a terminal (Passed) result must not
+	// be re-probed on replay, so the second Open adds zero more.
+	if calls != 2 {
+		t.Fatalf("adapter probed %d times, want exactly 2 (1 Health + 1 certification probe; terminal replay must not re-probe)", calls)
 	}
 }
 
 func TestCertificationOpen_ChangedSemanticsUnderSameKeyConflicts(t *testing.T) {
 	ctx := context.Background()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	srv := httptest.NewServer(certifiableHTTPHandler())
 	defer srv.Close()
 
 	st := memory.New()
@@ -258,7 +266,7 @@ func TestCertificationOpen_ChangedSemanticsUnderSameKeyConflicts(t *testing.T) {
 // HealthService's equivalent test).
 func TestCertificationOpen_PassedNeverActivatesVerifiedOrNative(t *testing.T) {
 	ctx := context.Background()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	srv := httptest.NewServer(certifiableHTTPHandler())
 	defer srv.Close()
 
 	st := memory.New()
@@ -304,7 +312,7 @@ func TestCertificationOpen_PassedNeverActivatesVerifiedOrNative(t *testing.T) {
 // independently cause supported_trust_modes += verified.
 func TestCertificationOpen_CombinedReadinessSignalsStillDoNotActivate(t *testing.T) {
 	ctx := context.Background()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	srv := httptest.NewServer(certifiableHTTPHandler())
 	defer srv.Close()
 
 	st := memory.New()
@@ -341,6 +349,10 @@ func TestCertificationOpen_ConcurrentOpenersConvergeToOneProbe(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&calls, 1)
+		if r.Method == http.MethodGet && r.URL.Query().Get("idempotency_key") != "" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()

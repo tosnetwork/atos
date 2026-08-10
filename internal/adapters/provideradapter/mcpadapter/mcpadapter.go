@@ -266,3 +266,105 @@ func (a *Adapter) Health(ctx context.Context, endpointRef string) domain.Adapter
 	check.Status = domain.AdapterHealthHealthy
 	return check
 }
+
+type toolListResult struct {
+	Tools []toolDescriptor `json:"tools"`
+}
+
+type toolDescriptor struct {
+	Name        string         `json:"name"`
+	InputSchema map[string]any `json:"inputSchema,omitempty"`
+}
+
+// ProbeCertification implements provideradapter.CertificationProbe: unlike
+// Health (which only proves tools/list itself is reachable), this proves
+// the specific tool this binding names actually exists on the provider's
+// server, and -- since tools/list is the one MCP-native place a provider
+// can declare a real JSON Schema for its tool's arguments -- cross-checks
+// that declared schema against the Capability's own registered
+// input_schema. This is genuinely more than reachability, entirely
+// side-effect-free (tools/list never invokes anything), and uses no wire
+// operation beyond what Health already calls.
+func (a *Adapter) ProbeCertification(ctx context.Context, endpointRef string, inputSchema, _ map[string]any) (map[string]any, error) {
+	serverURL, tool, err := splitEndpoint(endpointRef)
+	if err != nil {
+		return nil, err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, defaultHealthTimeout)
+	defer cancel()
+	rpcResp, err := a.call(probeCtx, serverURL, "tools/list", map[string]any{})
+	if err != nil {
+		return nil, fmt.Errorf("mcpadapter: certification tools/list failed: %w", err)
+	}
+	if rpcResp.Error != nil {
+		return nil, fmt.Errorf("mcpadapter: certification tools/list error: %s", rpcResp.Error.Message)
+	}
+	var listed toolListResult
+	if err := json.Unmarshal(rpcResp.Result, &listed); err != nil {
+		return nil, fmt.Errorf("mcpadapter: malformed tools/list result: %w", err)
+	}
+
+	var declared map[string]any
+	found := false
+	for _, t := range listed.Tools {
+		if t.Name == tool {
+			found, declared = true, t.InputSchema
+			break
+		}
+	}
+	if !found {
+		return map[string]any{"tool_found": false}, fmt.Errorf("mcpadapter: tool %q not found in provider's tools/list", tool)
+	}
+	evidence := map[string]any{"tool_found": true, "provider_input_schema_declared": len(declared) > 0}
+	if len(declared) == 0 {
+		return evidence, nil
+	}
+	compatible, reason := inputSchemasStructurallyCompatible(inputSchema, declared)
+	evidence["provider_input_schema_compatible"] = compatible
+	if !compatible {
+		return evidence, fmt.Errorf("mcpadapter: provider tool %q declares an input schema incompatible with the registered capability input_schema: %s", tool, reason)
+	}
+	return evidence, nil
+}
+
+// inputSchemasStructurallyCompatible is a bounded structural compatibility
+// heuristic, NOT a full JSON Schema subsumption/equivalence check --
+// deciding true schema-language equivalence in general is not something
+// certification needs to solve. It catches the two most operationally
+// dangerous kinds of drift between what ATOS's Capability registration
+// promises callers and what the provider's own MCP tool actually declares:
+//
+//  1. a top-level "type" mismatch (e.g. ATOS promises "object", the
+//     provider's tool now declares "string");
+//  2. the provider requiring an argument ATOS's own schema does not know
+//     about (ATOS would never tell a caller to send it, so every call
+//     would be rejected by the provider).
+//
+// A capability schema with no "properties" restriction is treated as
+// permissive (compatible with anything the provider requires), matching
+// how an absent "properties"/"required" keyword behaves in JSON Schema
+// itself.
+func inputSchemasStructurallyCompatible(capabilitySchema, providerSchema map[string]any) (bool, string) {
+	if capType, ok := capabilitySchema["type"].(string); ok {
+		if provType, ok := providerSchema["type"].(string); ok && provType != capType {
+			return false, fmt.Sprintf("capability input_schema type %q does not match provider tool schema type %q", capType, provType)
+		}
+	}
+	capProps, hasCapProps := capabilitySchema["properties"].(map[string]any)
+	provRequired, _ := providerSchema["required"].([]any)
+	for _, r := range provRequired {
+		name, ok := r.(string)
+		if !ok {
+			continue
+		}
+		if !hasCapProps {
+			// Capability schema places no restriction on properties at
+			// all -- permissive, nothing to conflict with.
+			continue
+		}
+		if _, declared := capProps[name]; !declared {
+			return false, fmt.Sprintf("provider tool requires argument %q that the registered capability input_schema does not declare", name)
+		}
+	}
+	return true, ""
+}

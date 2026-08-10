@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"maps"
 	"time"
 
 	"github.com/google/uuid"
@@ -34,22 +35,31 @@ type OpenCertificationInput struct {
 }
 
 // Open idempotently opens (or recovers) a certification for one
-// Capability transport binding, and runs the certification probe itself
-// -- currently scoped to the adapter's Health check (endpoint reachable,
-// protocol handshake succeeds), the minimum the roadmap's certification
-// checklist requires; deeper functional probing (dispatching an actual
-// sample invocation against a real third-party endpoint) is deliberately
-// out of scope for Phase 3A to avoid causing a real side effect against a
-// provider merely to certify it.
+// Capability transport binding, and runs the certification probe itself:
+// first Health (bounded reachability, cheap fail-fast), then -- if the
+// resolved adapter implements provideradapter.CertificationProbe -- the
+// deeper, transport-specific check that validates more than reachability
+// (see each adapter's own doc comment for exactly what it can and cannot
+// check). Dispatching an actual sample invocation against a real
+// third-party endpoint remains deliberately out of scope for Phase 3A, to
+// avoid causing a real side effect against a provider merely to certify
+// it; CertificationProbe implementations are constrained to read-only/
+// introspection wire operations for exactly this reason.
 //
-// The probe is a read-only reachability check, so it is always safe to
-// repeat: a replay of the same (providerID, IdempotencyKey) whose prior
-// attempt is still Pending (e.g. a crash between OpenCertification's
-// commit and the completing UpdateCertification) re-runs the probe rather
-// than being stuck forever -- this is what makes "restart/retry
-// converges" hold without needing a separate reconciler loop. A replay
-// whose prior attempt already reached a terminal status (Passed/Failed)
-// returns it unchanged, never re-probing.
+// Evidence always records whether the deeper probe ran ("deep_probe":
+// true/false) so a Passed certification is never mistaken for uniform
+// depth across transports -- an HTTP or A2A Passed result today is
+// weaker evidence than an MCP Passed result, and that difference is
+// visible in the persisted record, not hidden.
+//
+// The probe is read-only, so it is always safe to repeat: a replay of the
+// same (providerID, IdempotencyKey) whose prior attempt is still Pending
+// (e.g. a crash between OpenCertification's commit and the completing
+// UpdateCertification) re-runs the probe rather than being stuck forever
+// -- this is what makes "restart/retry converges" hold without needing a
+// separate reconciler loop. A replay whose prior attempt already reached
+// a terminal status (Passed/Failed) returns it unchanged, never
+// re-probing.
 func (s *CertificationService) Open(ctx context.Context, in OpenCertificationInput) (domain.SandboxCertification, error) {
 	if in.ProviderID == "" || in.CapabilityID == "" || in.Transport == "" || in.IdempotencyKey == "" {
 		return domain.SandboxCertification{}, domain.NewError(domain.ErrValidationFailed, "provider_id, capability_id, transport and idempotency_key are required", false)
@@ -95,10 +105,21 @@ func (s *CertificationService) Open(ctx context.Context, in OpenCertificationInp
 	}
 	check := adapter.Health(ctx, binding.EndpointRef)
 	evidence := map[string]any{"health_status": string(check.Status), "latency_ms": check.LatencyMS}
-	if check.Status == domain.AdapterHealthHealthy {
+	if check.Status != domain.AdapterHealthHealthy {
+		return s.completeCertification(ctx, stored.ID, domain.CertificationFailed, check.FailureReason, evidence)
+	}
+
+	prober, deepProbeSupported := adapter.(provideradapter.CertificationProbe)
+	evidence["deep_probe"] = deepProbeSupported
+	if !deepProbeSupported {
 		return s.completeCertification(ctx, stored.ID, domain.CertificationPassed, "", evidence)
 	}
-	return s.completeCertification(ctx, stored.ID, domain.CertificationFailed, check.FailureReason, evidence)
+	probeEvidence, err := prober.ProbeCertification(ctx, binding.EndpointRef, cap.InputSchema, cap.OutputSchema)
+	maps.Copy(evidence, probeEvidence)
+	if err != nil {
+		return s.completeCertification(ctx, stored.ID, domain.CertificationFailed, err.Error(), evidence)
+	}
+	return s.completeCertification(ctx, stored.ID, domain.CertificationPassed, "", evidence)
 }
 
 func (s *CertificationService) completeCertification(ctx context.Context, id string, status domain.CertificationStatus, failureReason string, evidence map[string]any) (domain.SandboxCertification, error) {
