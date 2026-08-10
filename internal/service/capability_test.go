@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/tosnetwork/atos/internal/domain"
@@ -274,5 +275,77 @@ func TestQuoteCreate_RejectsLegacyCapabilityWithIncompatiblePricing(t *testing.T
 
 	if _, err := quotes.Create(ctx, CreateQuoteInput{CapabilityID: cap.ID}); err == nil {
 		t.Fatal("expected QuoteService.Create to reject a capability with an incompatible frozen pricing_model/metered_rates combination")
+	}
+}
+
+// TestCapabilityService_RegisterRejectsInvalidSchema proves a schema-
+// invalid input_schema/output_schema is rejected before the Capability is
+// ever persisted -- the roadmap's explicit Phase 3A success criterion.
+func TestCapabilityService_RegisterRejectsInvalidSchema(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := NewCapabilityService(st)
+
+	in := testRegisterInput("agt_bad_schema", domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}})
+	in.InputSchema = map[string]any{"type": "not_a_real_type"}
+	_, err := capabilities.Register(ctx, in)
+	if err == nil {
+		t.Fatal("expected Register to reject an invalid input_schema")
+	}
+
+	all, err := capabilities.ListByProvider(ctx, "agt_bad_schema")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 0 {
+		t.Fatalf("a rejected registration must not have persisted a partial Capability, found %d", len(all))
+	}
+}
+
+// TestCapabilityService_UpdateRejectsInvalidSchemaWithNoPartialUpdate is the
+// roadmap's explicit "schema update atomicity" test: a valid Capability,
+// PATCHed with an invalid output_schema, must be rejected and leave the
+// stored Capability's version, manifest commitment, schemas, and transport
+// binding completely unchanged -- no partial update.
+func TestCapabilityService_UpdateRejectsInvalidSchemaWithNoPartialUpdate(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := NewCapabilityService(st)
+
+	in := testRegisterInput("agt_schema_update", domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}})
+	in.Bindings = []domain.CapabilityBinding{{Transport: domain.AdapterHTTP, EndpointRef: "https://provider.example.com/invoke", EligibleTrustModes: []domain.TrustMode{domain.TrustModeManaged}}}
+	original, err := capabilities.Register(ctx, in)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	_, err = capabilities.Update(ctx, original.ID, "agt_schema_update", map[string]any{
+		"output_schema": map[string]any{"type": "definitely_not_a_json_schema_type"},
+	}, "update-bad-schema")
+	if err == nil {
+		t.Fatal("expected Update to reject an invalid output_schema")
+	}
+
+	after, err := capabilities.Get(ctx, original.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Version != original.Version {
+		t.Fatalf("version changed by a rejected update: %s -> %s", original.Version, after.Version)
+	}
+	if after.ManifestCommitment != original.ManifestCommitment {
+		t.Fatalf("manifest_commitment changed by a rejected update: %s -> %s", original.ManifestCommitment, after.ManifestCommitment)
+	}
+	if fmt.Sprintf("%v", after.OutputSchema) != fmt.Sprintf("%v", original.OutputSchema) {
+		t.Fatalf("output_schema changed by a rejected update: %+v -> %+v", original.OutputSchema, after.OutputSchema)
+	}
+	if fmt.Sprintf("%v", after.RequestedTrustModes) != fmt.Sprintf("%v", original.RequestedTrustModes) {
+		t.Fatalf("requested_trust_modes changed by a rejected update")
+	}
+	if fmt.Sprintf("%v", after.SupportedTrustModes) != fmt.Sprintf("%v", original.SupportedTrustModes) {
+		t.Fatalf("supported_trust_modes changed by a rejected update")
+	}
+	if len(after.Bindings) != 1 || after.Bindings[0].EndpointRef != "https://provider.example.com/invoke" {
+		t.Fatalf("transport binding changed by a rejected update: %+v", after.Bindings)
 	}
 }
