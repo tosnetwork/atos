@@ -250,6 +250,59 @@ func (s *ExecutionSignerService) Status(ctx context.Context, capabilityID string
 	return s.store.LatestSignerOperationByCapability(ctx, capabilityID)
 }
 
+// SignerOperationStatusView is the atos-spec docs/API.md §2.1 public
+// response shape for GET /capabilities/{id}/execution-signer and
+// atos_get_execution_signer_status -- the sole builder is PublicStatus
+// below, mirroring service.CapabilityReadiness's precedent of one shared
+// function feeding both REST and MCP rather than two independent
+// implementations that could drift.
+type SignerOperationStatusView struct {
+	CapabilityID         string `json:"capability_id"`
+	CapabilityVersion    string `json:"capability_version"`
+	OperationID          string `json:"operation_id,omitempty"`
+	OperationType        string `json:"operation_type,omitempty"`
+	Checkpoint           string `json:"checkpoint,omitempty"`
+	OldExecutionSignerID string `json:"old_execution_signer_id,omitempty"`
+	NewExecutionSignerID string `json:"new_execution_signer_id,omitempty"`
+	// CurrentExecutionSignerID MUST remain the old signer until Checkpoint
+	// reaches new_authorized, per §7.2.2's rotation ordering -- it is
+	// derived from CurrentSigner (LatestCompletedSignerOperationByCapability),
+	// never from OperationID's own (possibly non-terminal) operation, so a
+	// caller can never observe the new signer advertised as current before
+	// its authorization is confirmed durable.
+	CurrentExecutionSignerID string `json:"current_execution_signer_id,omitempty"`
+}
+
+// PublicStatus builds the public status view for capabilityID, enforcing
+// the same provider-ownership rule every execution-signer operation in
+// this file enforces (§2.1: "Provider/admin only ... the authenticated
+// provider MUST own capability_id").
+func (s *ExecutionSignerService) PublicStatus(ctx context.Context, requestingProviderID, capabilityID string) (SignerOperationStatusView, error) {
+	cap, err := s.capabilities.Get(ctx, capabilityID)
+	if err != nil {
+		return SignerOperationStatusView{}, err
+	}
+	if cap.ProviderID != requestingProviderID {
+		return SignerOperationStatusView{}, domain.NewError(domain.ErrPermissionDenied, "not the owning provider", false)
+	}
+	view := SignerOperationStatusView{CapabilityID: cap.ID, CapabilityVersion: cap.Version}
+	if op, found, err := s.store.LatestSignerOperationByCapability(ctx, capabilityID); err != nil {
+		return SignerOperationStatusView{}, err
+	} else if found {
+		view.OperationID = op.ID
+		view.OperationType = string(op.Type)
+		view.Checkpoint = string(op.Checkpoint)
+		view.OldExecutionSignerID = op.OldExecutionSignerID
+		view.NewExecutionSignerID = op.NewExecutionSignerID
+	}
+	if _, signerID, found, err := s.CurrentSigner(ctx, capabilityID); err != nil {
+		return SignerOperationStatusView{}, err
+	} else if found {
+		view.CurrentExecutionSignerID = signerID
+	}
+	return view, nil
+}
+
 // advance atomically moves op (by id) to checkpoint, optionally recording
 // a newly obtained NewAuthorizationRef and/or a failureReason (cleared to
 // "" on a clean transition). A concurrent caller that already drove the

@@ -51,18 +51,19 @@ type Server struct {
 	// Health is optional: nil omits the readiness projection from
 	// GET /capabilities/{id} entirely rather than erroring (see
 	// service.CapabilityReadiness's doc comment).
-	Health        *service.HealthService
-	Quotes        *service.QuoteService
-	Jobs          *service.JobService
-	Streams       *service.StreamService
-	Accounts      *service.AccountService
-	Receipts      *service.ReceiptService
-	Earnings      *service.EarningsService
-	Disputes      *service.DisputeService
-	Artifacts     *service.ArtifactService
-	Logger        *slog.Logger
-	PublicBaseURL string
-	ApprovalToken string
+	Health           *service.HealthService
+	ExecutionSigners *service.ExecutionSignerService
+	Quotes           *service.QuoteService
+	Jobs             *service.JobService
+	Streams          *service.StreamService
+	Accounts         *service.AccountService
+	Receipts         *service.ReceiptService
+	Earnings         *service.EarningsService
+	Disputes         *service.DisputeService
+	Artifacts        *service.ArtifactService
+	Logger           *slog.Logger
+	PublicBaseURL    string
+	ApprovalToken    string
 }
 
 func (s *Server) Mux() *http.ServeMux {
@@ -89,6 +90,11 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("PATCH /v1/capabilities/{id}", s.withScopes(s.handleUpdateCapability, auth.ScopeCapabilitiesWrite))
 	mux.HandleFunc("POST /v1/capabilities/{id}/pause", s.withScopes(s.handlePauseCapability, auth.ScopeCapabilitiesWrite))
 	mux.HandleFunc("POST /v1/capabilities/{id}/resume", s.withScopes(s.handleResumeCapability, auth.ScopeCapabilitiesWrite))
+
+	mux.HandleFunc("POST /v1/capabilities/{id}/execution-signer/authorize", s.withScopes(s.handleAuthorizeExecutionSigner, auth.ScopeExecutionSignersWrite))
+	mux.HandleFunc("POST /v1/capabilities/{id}/execution-signer/rotate", s.withScopes(s.handleRotateExecutionSigner, auth.ScopeExecutionSignersWrite))
+	mux.HandleFunc("POST /v1/capabilities/{id}/execution-signer/revoke", s.withScopes(s.handleRevokeExecutionSigner, auth.ScopeExecutionSignersWrite))
+	mux.HandleFunc("GET /v1/capabilities/{id}/execution-signer", s.withScopes(s.handleGetExecutionSignerStatus, auth.ScopeExecutionSignersRead))
 
 	mux.HandleFunc("POST /v1/quotes", s.withScopes(s.handleCreateQuote, auth.ScopeQuotesRead))
 	mux.HandleFunc("GET /v1/quotes/{id}", s.withScopes(s.handleGetQuote, auth.ScopeQuotesRead))

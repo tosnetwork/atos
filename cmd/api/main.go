@@ -223,13 +223,13 @@ func main() {
 	}
 
 	restServer := &httpapi.Server{
-		Auth: authorization, Capabilities: capabilities, Health: health, Quotes: quotes,
+		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners, Quotes: quotes,
 		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts,
 		Earnings: earnings, Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 		ApprovalToken: cfg.Auth.ApprovalToken,
 	}
 	mcpServer := &mcp.Server{
-		Auth: authorization, Capabilities: capabilities, Health: health, Quotes: quotes,
+		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners, Quotes: quotes,
 		Jobs: jobs, Accounts: accounts, Receipts: receipts, Earnings: earnings,
 		Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}

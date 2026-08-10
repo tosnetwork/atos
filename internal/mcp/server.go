@@ -20,16 +20,17 @@ type Server struct {
 	// Health is optional: nil omits the readiness projection from
 	// atos_get_capability entirely rather than erroring (see
 	// service.CapabilityReadiness's doc comment).
-	Health        *service.HealthService
-	Quotes        *service.QuoteService
-	Jobs          *service.JobService
-	Accounts      *service.AccountService
-	Receipts      *service.ReceiptService
-	Earnings      *service.EarningsService
-	Disputes      *service.DisputeService
-	Artifacts     *service.ArtifactService
-	Logger        *slog.Logger
-	PublicBaseURL string
+	Health           *service.HealthService
+	ExecutionSigners *service.ExecutionSignerService
+	Quotes           *service.QuoteService
+	Jobs             *service.JobService
+	Accounts         *service.AccountService
+	Receipts         *service.ReceiptService
+	Earnings         *service.EarningsService
+	Disputes         *service.DisputeService
+	Artifacts        *service.ArtifactService
+	Logger           *slog.Logger
+	PublicBaseURL    string
 }
 
 type rpcRequest struct {
