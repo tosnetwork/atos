@@ -95,8 +95,16 @@ type Core interface {
 	// business logic MUST NOT write it directly (atos-spec
 	// docs/IMPLEMENTATION_ROADMAP.md §7.2.2). created/revoked mirror
 	// tos-protocol's own AuthorizeExecutionSignerResponse.created /
-	// RevokeExecutionSignerResponse.revoked -- false on an idempotent
-	// replay of an already-completed request, true on first application.
+	// RevokeExecutionSignerResponse.revoked, but neither is a reliable "did
+	// THIS call do the work" signal: a literal retry with the same
+	// caller_id+idempotency_key replays the original response verbatim (so
+	// created keeps whatever value the original call set, not necessarily
+	// false), and RevokeExecutionSigner in particular always reports
+	// revoked=true once the signer is revoked, by any call -- there is no
+	// revoked=false path once a signer has ever been revoked. Verified
+	// directly against a real tos-protocol server, not only the Go-interface
+	// mock, by internal/adapters/tosprotocol/signer_integration_test.go. No
+	// caller in this codebase currently branches on either value.
 	AuthorizeExecutionSigner(ctx context.Context, req AuthorizeExecutionSignerRequest) (authorization ExecutionSignerAuthorization, created bool, err error)
 	RevokeExecutionSigner(ctx context.Context, req RevokeExecutionSignerRequest) (authorization ExecutionSignerAuthorization, revoked bool, err error)
 
