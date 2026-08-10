@@ -215,11 +215,15 @@ them exactly like any other caller.
     acceptance per task, defense in depth beyond the non-terminal index
     above.
 - `store.OpenTasks.OpenAcceptanceOperation` (implemented for both `memory`
-  and `postgres`) is the sole path that can claim a winner: under one lock
-  scoped to `task_id`, it rejects a second opener while any non-terminal
-  operation exists, loads the current `OpenTask` snapshot, calls a
-  caller-supplied `build(task)` closure to construct the operation (which
-  must not itself call back into the store — see the doc comments on that
+  and `postgres`) is the sole path that can claim a winner: under locks
+  scoped to both `task_id` and `proposal_id` (the same locks
+  `UpdateOpenTask`/`WithdrawOpenTaskProposal`/`CompleteAcceptance`/
+  `FailAcceptance` all share, so Accept is race-free against a concurrent
+  Cancel or Withdraw, not merely against a concurrent Accept), it rejects a
+  second opener while any non-terminal operation exists, loads the current
+  `OpenTask`/`OpenTaskProposal` snapshots, calls a caller-supplied
+  `build(task, proposal)` closure to construct the operation (which must
+  not itself call back into the store — see the doc comments on that
   method for why: a nested store call would deadlock the in-memory
   implementation's single mutex, and would read a non-transactional
   snapshot through the Postgres implementation's separate pool connection),
@@ -329,26 +333,96 @@ follow-ups" below.
 
 ### Known follow-ups (not addressed in this change; `atos-spec` was not modified)
 
-- **Proposal withdrawal** (`atos_withdraw_open_task_proposal` /
-  `POST .../withdraw`) is an implementation addition beyond
-  `atos-spec/docs/IMPLEMENTATION_ROADMAP.md` §7.3's explicit endpoint list.
-  `OpenTaskService.Withdraw` checks the task's current accepted-proposal
-  state before its CAS update but does not hold the same `task_id`-scoped
-  lock `OpenAcceptanceOperation` does, so there is a narrow window where a
-  concurrent Accept can claim the same proposal a Withdraw call is
-  in flight against; the accepted binding always wins (it is committed
-  first and is never unwound by a later `WithdrawnAt` write) but the
-  proposal can end up simultaneously "accepted" and carrying a
-  `WithdrawnAt` timestamp. `effectiveProposalStatus` resolves this in favor
-  of `accepted`, so no incorrect status is ever reported, but `atos-spec`
-  does not yet define withdrawal's semantics formally — worth
-  standardizing there before other implementations add the same endpoint.
-- A bug found and fixed by this change, worth noting for anyone building
-  on `domain.Quote`/`domain.Job`-adjacent types: a `map[string]any` field
-  tagged `json:"...,omitempty"` that round-trips through the Postgres
-  store's jsonb-payload convention silently collapses an explicitly-empty
-  (but non-nil) map into `nil` on read-back, because Go's `omitempty`
-  treats a zero-length map the same as a nil one. `domain.OpenTask.Input`
-  was fixed by dropping `,omitempty`; any future jsonb-payload-backed field
-  of map/slice type should default to no `omitempty` unless "explicitly
-  empty" and "absent" are genuinely meant to be indistinguishable.
+- A bug found and fixed during initial development, worth noting for
+  anyone building on `domain.Quote`/`domain.Job`-adjacent types: a
+  `map[string]any` field tagged `json:"...,omitempty"` that round-trips
+  through the Postgres store's jsonb-payload convention silently collapses
+  an explicitly-empty (but non-nil) map into `nil` on read-back, because
+  Go's `omitempty` treats a zero-length map the same as a nil one.
+  `domain.OpenTask.Input` was fixed by dropping `,omitempty`; any future
+  jsonb-payload-backed field of map/slice type should default to no
+  `omitempty` unless "explicitly empty" and "absent" are genuinely meant
+  to be indistinguishable.
+
+### Manual review round (post-implementation, pre-merge)
+
+A manual code review of the Draft PR found and this change fixed three P0s
+and three P1s, all verified by reading the affected code directly and
+reproduced/closed with new tests (`go test -race` against real PostgreSQL
+16 for every concurrency claim below):
+
+- **P0: Accept and Cancel were not actually serialized.**
+  `OpenAcceptanceOperation` locked `"open-task-acceptance"+taskID` while
+  `UpdateOpenTask` (Cancel's primitive) locked a DIFFERENT
+  `"open-task"+id` key and read the task row without `FOR UPDATE` --
+  different PostgreSQL advisory lock keys provide no mutual exclusion, so
+  a concurrent Accept and Cancel could both read a stale `open` snapshot
+  and both commit. Fixed by having `OpenAcceptanceOperation` also acquire
+  the `"open-task"` lock and read the row `FOR UPDATE`, the same
+  lock/row-lock `UpdateOpenTask`, `CompleteAcceptance` and
+  `FailAcceptance` all now share. Regression test:
+  `TestOpenAcceptanceOperation_ConcurrentWithCancelConverges`.
+- **P0: a crash between "operation Completed" and "task Fulfilled" (or
+  between "operation Failed" and "task reopened") permanently stranded
+  the task.** Both transitions were two separate store calls/commits;
+  `Completed`/`Failed` are terminal and therefore excluded from the
+  reconciler's stale-operation sweep, so nothing would ever revisit an
+  operation stuck in that gap. Fixed by two new store methods,
+  `CompleteAcceptance` and `FailAcceptance`, each performing its
+  checkpoint transition AND the corresponding `OpenTask` projection
+  (Fulfilled+bindings, or reopened-to-Open) in ONE database transaction --
+  see their doc comments in `internal/store/store.go`.
+- **P0: a Capability version bump between winner-claim and the actual
+  Quote call could silently bind a different version than the one the
+  proposal/operation both still claim.** `CreateQuoteInput` gained an
+  optional `ExpectedCapabilityVersion` field; `QuoteService.Create`
+  refuses (`domain.ErrQuoteMismatch`, non-retryable) if the live
+  Capability's version no longer matches, and `driveAcceptance` now passes
+  `op.CapabilityVersion`. A rejection here reopens the task via the same
+  `FailAcceptance` path as any other definitive acceptance failure.
+  Regression test: `TestOpenTaskAcceptRejectsCapabilityVersionDriftDuringResume`.
+- **P1: Withdraw and Accept raced on the same proposal row with no shared
+  lock**, so a proposal could end up simultaneously withdrawn and claimed
+  as the task's accepted winner. Fixed with a new store method,
+  `WithdrawOpenTaskProposal`, that locks `"open-task-proposal"+proposalID`
+  (the same lock `OpenAcceptanceOperation` now also takes before reading
+  the proposal it's about to claim) and re-checks the task's
+  `AcceptedProposalID` under `"open-task"+task_id` before allowing the
+  withdrawal to commit. `OpenTaskService.Withdraw` now just delegates to
+  it. Regression test:
+  `TestWithdrawOpenTaskProposal_ConcurrentWithAcceptConverges`.
+- **P1: Publish/Propose validated live state (expires_at-in-the-future,
+  task still open, capability still active) BEFORE the idempotency
+  replay/crash-recovery lookup**, so a legitimate retry of an
+  already-successful call could spuriously fail once real state moved on
+  (time passing past the original `expires_at`; the task being accepted
+  by a different proposal; the capability being paused) instead of
+  replaying the original result. Fixed by reordering both methods to run
+  the Reserve/replay/crash-recovery gates FIRST, exactly mirroring
+  `Accept`'s own (already-correct) discipline; `Propose`'s idempotency
+  digest also no longer includes the live-resolved Capability version
+  (only caller-supplied content), since that field drifting independently
+  of caller intent must never make a genuine replay hash differently.
+  Regression tests: `TestOpenTaskPublishReplaySucceedsAfterOriginalExpiresAtElapses`,
+  `TestOpenTaskProposeReplaySucceedsAfterTaskAccepted`.
+- **P1: an omitted MCP `limit` argument meant opposite things to the two
+  store backends** (memory: unbounded; Postgres: `LIMIT 0`, zero rows),
+  so `atos_search_open_tasks` with no `limit` returned every open task
+  under one backend and none under the other. Fixed by centralizing the
+  default/max clamp inside `OpenTaskService.ListPublic` (removing the
+  REST handler's separate, now-redundant default) rather than duplicating
+  it per transport. Regression test:
+  `TestOpenTaskListPublicDefaultLimitParityAgainstPostgres`.
+- **P2: `OpenTaskProposal.Public()` did not clear `ProposedPrice`**, so a
+  provider's price hint -- meant to be visible only to the task owner and
+  the submitting provider, per the same rule already applied to
+  `Message` -- leaked to any caller with plain `open_tasks:read`. Fixed.
+- **Self-dealing**: neither `Propose` nor `Accept` checked that the
+  proposing/accepting identity differed from the task owner. Added an
+  explicit guard to both (Propose rejects up front; Accept re-checks as
+  defense in depth), per this codebase's own
+  self-referential-operation-check discipline.
+
+All of the above are covered by tests that fail on the pre-fix code and
+pass after -- see `internal/store/postgres/open_task_test.go` and
+`internal/service/open_task_review_fixes_test.go`.

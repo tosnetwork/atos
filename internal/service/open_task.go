@@ -14,6 +14,18 @@ const (
 	defaultOpenTaskReconcileInterval   = 15 * time.Second
 	defaultOpenTaskReconcileStaleAfter = 30 * time.Second
 	defaultOpenTaskReconcileBatch      = 100
+
+	// defaultOpenTaskListLimit/maxOpenTaskListLimit are applied here, in
+	// ListPublic, rather than duplicated per-transport (REST/MCP): the two
+	// store backends disagree on what an unclamped limit<=0 means (memory
+	// treats it as "no limit"; Postgres's `LIMIT $1` with 0 returns zero
+	// rows), so any caller that forwards a caller-omitted "0" straight to
+	// the store gets a different answer depending on which store is
+	// running underneath -- MCP's atos_search_open_tasks previously did
+	// exactly that. Clamping once, centrally, makes every transport
+	// behave identically regardless of backend.
+	defaultOpenTaskListLimit = 50
+	maxOpenTaskListLimit     = 100
 )
 
 // OpenTaskService implements Phase 3C's Open Task Marketplace (atos-spec
@@ -88,12 +100,20 @@ func (in PublishOpenTaskInput) validate() error {
 // store.Idempotency primitive rather than a bespoke journal -- Publish is a
 // single durable create with no multi-step remote side effect, unlike
 // Accept.
+//
+// The expires_at-must-be-in-the-future check runs AFTER the Reserve/replay/
+// crash-recovery gates, not before -- deliberately, not a style choice: it
+// depends on time.Now(), which keeps moving forward, so checking it BEFORE
+// those gates would make a legitimate retry (the client's original
+// response was lost; it resends the exact same request, including the same
+// original expires_at) spuriously fail once enough real time has passed,
+// even though the original Publish already succeeded and a stored result
+// exists to replay. Every check in this function that depends on anything
+// other than the caller-supplied request content itself must be ordered
+// the same way, for the same reason.
 func (s *OpenTaskService) Publish(ctx context.Context, in PublishOpenTaskInput) (domain.OpenTask, error) {
 	if err := in.validate(); err != nil {
 		return domain.OpenTask{}, err
-	}
-	if !in.ExpiresAt.After(time.Now().UTC()) {
-		return domain.OpenTask{}, domain.NewError(domain.ErrValidationFailed, "expires_at must be in the future", false)
 	}
 
 	requestHash := hashRequest("atos-open-task-publish-v1", in.Title, in.Description, in.Input,
@@ -128,6 +148,13 @@ func (s *OpenTaskService) Publish(ctx context.Context, in PublishOpenTaskInput) 
 		return existing, nil
 	} else if lookupErr != store.ErrNotFound {
 		return domain.OpenTask{}, lookupErr
+	}
+
+	// Reached only on a genuinely fresh (first-ever) attempt -- nothing has
+	// been committed under this key yet, so it's safe to validate against
+	// current time here.
+	if !in.ExpiresAt.After(now) {
+		return domain.OpenTask{}, domain.NewError(domain.ErrValidationFailed, "expires_at must be in the future", false)
 	}
 
 	task := domain.OpenTask{
@@ -178,8 +205,15 @@ func (s *OpenTaskService) Get(ctx context.Context, requestingPrincipalID, taskID
 
 // ListPublic is the marketplace browse/search view: every currently-Open,
 // non-expired task, redacted to domain.OpenTask.Public() -- Input and every
-// other owner-only field is never included here.
+// other owner-only field is never included here. limit<=0 (a caller that
+// omitted it) defaults to defaultOpenTaskListLimit; anything above
+// maxOpenTaskListLimit is clamped down to it.
 func (s *OpenTaskService) ListPublic(ctx context.Context, limit int) ([]domain.OpenTask, error) {
+	if limit <= 0 {
+		limit = defaultOpenTaskListLimit
+	} else if limit > maxOpenTaskListLimit {
+		limit = maxOpenTaskListLimit
+	}
 	tasks, err := s.store.ListPublicOpenTasks(ctx, limit)
 	if err != nil {
 		return nil, err
@@ -284,37 +318,27 @@ func (in ProposeInput) validate() error {
 // supplied version), so a later Accept re-verifying "is this still the
 // current version" is checking against something this service itself
 // derived, not something a caller could have lied about upfront.
+//
+// The idempotency digest is deliberately a function ONLY of caller-supplied
+// content (task_id, capability_id, message, proposed_price) -- it must NOT
+// include the live-resolved Capability version, or a legitimate retry whose
+// capability was re-versioned between the original call and the retry would
+// compute a different hash and be spuriously rejected as a conflicting
+// reuse of the same key. Likewise, every live-state validation below (task
+// still open, capability still active/owned) runs AFTER the Reserve/replay/
+// crash-recovery gates, not before: those checks are only valid against a
+// request that hasn't already succeeded once under this exact key, since
+// state legitimately moves on after a successful Propose (the task can be
+// accepted or expire, the capability can be paused) without invalidating
+// the caller's right to receive their own already-created proposal back on
+// retry.
 func (s *OpenTaskService) Propose(ctx context.Context, in ProposeInput) (domain.OpenTaskProposal, error) {
 	if err := in.validate(); err != nil {
 		return domain.OpenTaskProposal{}, err
 	}
-	task, err := s.store.GetOpenTask(ctx, in.TaskID)
-	if err != nil {
-		if err == store.ErrNotFound {
-			return domain.OpenTaskProposal{}, domain.NewError(domain.ErrNotFound, "open task not found", false)
-		}
-		return domain.OpenTaskProposal{}, err
-	}
-	now := time.Now().UTC()
-	if task.Status != domain.OpenTaskOpen || task.Expired(now) {
-		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrOpenTaskNotOpen, "open task is not accepting proposals", false)
-	}
-	cap, err := s.store.Get(ctx, in.CapabilityID)
-	if err != nil {
-		if err == store.ErrNotFound {
-			return domain.OpenTaskProposal{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability not found", false)
-		}
-		return domain.OpenTaskProposal{}, err
-	}
-	cap = normalizeCapability(cap)
-	if cap.ProviderID != in.ProviderID {
-		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrPermissionDenied, "not the owning provider", false)
-	}
-	if cap.Status != domain.CapabilityActive {
-		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability is not active", false)
-	}
 
-	requestHash := hashRequest("atos-open-task-propose-v1", in.TaskID, in.CapabilityID, cap.Version, in.Message, in.ProposedPrice)
+	requestHash := hashRequest("atos-open-task-propose-v1", in.TaskID, in.CapabilityID, in.Message, in.ProposedPrice)
+	now := time.Now().UTC()
 	rec, reserved, err := s.store.Reserve(ctx, in.ProviderID, in.IdempotencyKey, requestHash, now.Add(idempotencyLease))
 	if err != nil {
 		return domain.OpenTaskProposal{}, err
@@ -346,6 +370,42 @@ func (s *OpenTaskService) Propose(ctx context.Context, in ProposeInput) (domain.
 		return domain.OpenTaskProposal{}, lookupErr
 	}
 
+	// Reached only on a genuinely fresh (first-ever) attempt -- nothing has
+	// been committed under this key yet, so live-state validation is safe
+	// here.
+	task, err := s.store.GetOpenTask(ctx, in.TaskID)
+	if err != nil {
+		if err == store.ErrNotFound {
+			return domain.OpenTaskProposal{}, domain.NewError(domain.ErrNotFound, "open task not found", false)
+		}
+		return domain.OpenTaskProposal{}, err
+	}
+	if task.Status != domain.OpenTaskOpen || task.Expired(now) {
+		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrOpenTaskNotOpen, "open task is not accepting proposals", false)
+	}
+	// Self-dealing guard: a task owner cannot apply to fulfill their own
+	// task -- a self-referential operation this codebase's own
+	// zero-trust/self-referential-operation-check discipline requires
+	// explicitly rejecting, not merely leaving implicit. Accept re-checks
+	// this independently as defense in depth (see its own doc comment).
+	if task.PrincipalID == in.ProviderID {
+		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrPermissionDenied, "cannot propose on your own open task", false)
+	}
+	cap, err := s.store.Get(ctx, in.CapabilityID)
+	if err != nil {
+		if err == store.ErrNotFound {
+			return domain.OpenTaskProposal{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability not found", false)
+		}
+		return domain.OpenTaskProposal{}, err
+	}
+	cap = normalizeCapability(cap)
+	if cap.ProviderID != in.ProviderID {
+		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrPermissionDenied, "not the owning provider", false)
+	}
+	if cap.Status != domain.CapabilityActive {
+		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability is not active", false)
+	}
+
 	proposal := domain.OpenTaskProposal{
 		ID: "otprop_" + uuid.NewString(), TaskID: in.TaskID, ProviderID: in.ProviderID,
 		CapabilityID: cap.ID, CapabilityVersion: cap.Version,
@@ -362,17 +422,12 @@ func (s *OpenTaskService) Propose(ctx context.Context, in ProposeInput) (domain.
 	return proposal, nil
 }
 
-// Withdraw marks a provider's own proposal withdrawn. There is a small,
-// deliberately-accepted TOCTOU race between the pre-check below and the
-// CAS update: a concurrent Accept can still claim this proposal as winner
-// in between. That is safe, not just tolerated -- the winner-claim and
-// Quote/Job binding are already durably committed by
-// store.OpenTasks.OpenAcceptanceOperation before this method could ever
-// observe it, so a Withdraw landing microseconds later never unwinds a
-// binding, it only leaves WithdrawnAt set on a proposal that has ALSO been
-// accepted, which effectiveProposalStatus resolves in favor of Accepted
-// (checked first). Not retryable failures here are permanent for this
-// call, matching every other ownership check in this codebase.
+// Withdraw marks a provider's own proposal withdrawn. Delegates entirely to
+// store.OpenTasks.WithdrawOpenTaskProposal, which performs the ownership
+// check and the "not already accepted" check under the same lock/row-lock
+// discipline OpenAcceptanceOperation uses for this same proposal row -- see
+// that method's own doc comment for why a plain pre-check-then-update
+// sequence at this layer cannot close the race against a concurrent Accept.
 type WithdrawProposalInput struct {
 	ProviderID string
 	ProposalID string
@@ -382,34 +437,7 @@ func (s *OpenTaskService) Withdraw(ctx context.Context, in WithdrawProposalInput
 	if in.ProviderID == "" || in.ProposalID == "" {
 		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrValidationFailed, "provider_id and proposal_id are required", false)
 	}
-	existing, err := s.store.GetOpenTaskProposal(ctx, in.ProposalID)
-	if err != nil {
-		if err == store.ErrNotFound {
-			return domain.OpenTaskProposal{}, domain.NewError(domain.ErrNotFound, "proposal not found", false)
-		}
-		return domain.OpenTaskProposal{}, err
-	}
-	if existing.ProviderID != in.ProviderID {
-		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrPermissionDenied, "not the submitting provider", false)
-	}
-	if task, err := s.store.GetOpenTask(ctx, existing.TaskID); err == nil && task.AcceptedProposalID == in.ProposalID {
-		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrOpenTaskNotOpen, "cannot withdraw a proposal that has already been accepted", false)
-	}
-	return s.store.UpdateOpenTaskProposal(ctx, in.ProposalID, func(p domain.OpenTaskProposal, exists bool) (domain.OpenTaskProposal, error) {
-		if !exists {
-			return p, domain.NewError(domain.ErrNotFound, "proposal not found", false)
-		}
-		if p.ProviderID != in.ProviderID {
-			return p, domain.NewError(domain.ErrPermissionDenied, "not the submitting provider", false)
-		}
-		if p.WithdrawnAt != nil {
-			return p, nil
-		}
-		now := time.Now().UTC()
-		p.WithdrawnAt = &now
-		p.UpdatedAt = now
-		return p, nil
-	})
+	return s.store.WithdrawOpenTaskProposal(ctx, in.ProposalID, in.ProviderID)
 }
 
 // --- Cancel ---
@@ -501,34 +529,43 @@ func (s *OpenTaskService) Accept(ctx context.Context, in AcceptProposalInput) (d
 		return domain.OpenTask{}, domain.AcceptanceOperation{}, err
 	}
 
-	// Proposal/Capability are fetched and validated BEFORE calling
-	// OpenAcceptanceOperation, never from inside its build() callback:
-	// the in-memory store holds a single non-reentrant mutex for its
-	// entire OpenAcceptanceOperation call, so a nested store call from
-	// within build would deadlock; the Postgres store's build() runs
-	// inside the acceptance transaction but on a callback that has no
-	// access to that transaction's connection, so a nested store call
-	// there would read a separate, non-transactional snapshot instead of
-	// participating in the same transaction. This narrows the
-	// consistency window slightly (a concurrent Withdraw or Capability
-	// update landing between this fetch and the lock below is possible)
-	// but is the same class of residual race Withdraw's own doc comment
-	// already accepts, and is far preferable to a deadlock or a broken
-	// isolation guarantee.
-	proposal, perr := s.store.GetOpenTaskProposal(ctx, in.ProposalID)
+	// Capability is fetched and validated BEFORE calling
+	// OpenAcceptanceOperation, never from inside its build() callback: a
+	// nested store call from within build would deadlock the in-memory
+	// store's single non-reentrant mutex, and would read a separate,
+	// non-transactional snapshot through the Postgres store's connection
+	// pool instead of participating in the same transaction. This narrows
+	// the consistency window slightly for CAPABILITY staleness (a
+	// concurrent Capability update landing between this check and the
+	// actual Quote-creation step below is possible) -- but that window is
+	// independently closed by QuoteService.Create's own
+	// ExpectedCapabilityVersion pin (see driveAcceptance), which refuses
+	// and reopens the task via FailAcceptance if the version has drifted
+	// by the time Quote creation actually runs. proposalPreview is used
+	// ONLY to pick which Capability to check and to reject self-dealing
+	// early; its WithdrawnAt/TaskID fields are NOT trusted here -- build()
+	// re-reads the proposal fresh, under the same lock/row-lock a
+	// concurrent Withdraw uses, before ever claiming it as winner.
+	proposalPreview, perr := s.store.GetOpenTaskProposal(ctx, in.ProposalID)
 	if perr != nil {
 		if perr == store.ErrNotFound {
 			return domain.OpenTask{}, domain.AcceptanceOperation{}, domain.NewError(domain.ErrNotFound, "proposal not found", false)
 		}
 		return domain.OpenTask{}, domain.AcceptanceOperation{}, perr
 	}
-	if proposal.TaskID != in.TaskID {
+	if proposalPreview.TaskID != in.TaskID {
 		return domain.OpenTask{}, domain.AcceptanceOperation{}, domain.NewError(domain.ErrValidationFailed, "proposal does not belong to this open task", false)
 	}
-	if proposal.WithdrawnAt != nil {
-		return domain.OpenTask{}, domain.AcceptanceOperation{}, domain.NewError(domain.ErrOpenTaskProposalWithdrawn, "proposal has been withdrawn", false)
+	// Self-dealing guard: the task owner can never accept a proposal
+	// submitted by themselves (Propose already refuses to create one in
+	// the first place, but a proposal predating that check, or a future
+	// bypass, must not be exploitable here either -- defense in depth for
+	// a self-referential operation, per this codebase's own
+	// zero-trust/self-referential-operation-check discipline).
+	if proposalPreview.ProviderID == in.PrincipalID {
+		return domain.OpenTask{}, domain.AcceptanceOperation{}, domain.NewError(domain.ErrPermissionDenied, "cannot accept your own proposal", false)
 	}
-	cap, cerr := s.store.Get(ctx, proposal.CapabilityID)
+	cap, cerr := s.store.Get(ctx, proposalPreview.CapabilityID)
 	if cerr != nil {
 		if cerr == store.ErrNotFound {
 			return domain.OpenTask{}, domain.AcceptanceOperation{}, domain.NewError(domain.ErrOpenTaskProposalStale, "proposal's capability no longer exists", false)
@@ -539,15 +576,24 @@ func (s *OpenTaskService) Accept(ctx context.Context, in AcceptProposalInput) (d
 	// The proposal is refused outright, never silently rebound to
 	// whatever the capability's CURRENT version happens to be -- see
 	// domain.OpenTaskProposal.CapabilityVersion's doc comment.
-	if cap.ProviderID != proposal.ProviderID || cap.Version != proposal.CapabilityVersion || cap.Status != domain.CapabilityActive {
+	if cap.ProviderID != proposalPreview.ProviderID || cap.Version != proposalPreview.CapabilityVersion || cap.Status != domain.CapabilityActive {
 		return domain.OpenTask{}, domain.AcceptanceOperation{}, domain.NewError(domain.ErrOpenTaskProposalStale,
 			"proposal's capability version is stale or no longer active; the provider must submit a fresh proposal", false)
 	}
 
-	op, _, _, err := s.store.OpenAcceptanceOperation(ctx, in.TaskID, func(snapshot domain.OpenTask) (domain.AcceptanceOperation, error) {
+	op, _, _, err := s.store.OpenAcceptanceOperation(ctx, in.TaskID, in.ProposalID, func(snapshot domain.OpenTask, proposal domain.OpenTaskProposal) (domain.AcceptanceOperation, error) {
 		now := time.Now().UTC()
 		if snapshot.Status != domain.OpenTaskOpen || snapshot.Expired(now) {
 			return domain.AcceptanceOperation{}, domain.NewError(domain.ErrOpenTaskNotOpen, "open task is not open", false)
+		}
+		if proposal.TaskID != in.TaskID {
+			return domain.AcceptanceOperation{}, domain.NewError(domain.ErrValidationFailed, "proposal does not belong to this open task", false)
+		}
+		if proposal.WithdrawnAt != nil {
+			return domain.AcceptanceOperation{}, domain.NewError(domain.ErrOpenTaskProposalWithdrawn, "proposal has been withdrawn", false)
+		}
+		if proposal.ProviderID == in.PrincipalID {
+			return domain.AcceptanceOperation{}, domain.NewError(domain.ErrPermissionDenied, "cannot accept your own proposal", false)
 		}
 		return domain.AcceptanceOperation{
 			ID: "accop_" + uuid.NewString(), TaskID: in.TaskID, ProposalID: in.ProposalID,
@@ -602,7 +648,14 @@ func (s *OpenTaskService) advanceAcceptance(ctx context.Context, id string, expe
 // the Quote/Job creation calls, exactly mirroring
 // ExecutionSignerService.handleAmbiguousOrFail -- isAmbiguousSignerFailure
 // is reused as-is (it inspects only domain.Error.Retryable, nothing
-// signer-specific) rather than duplicated under a new name.
+// signer-specific) rather than duplicated under a new name. The definitive
+// (non-ambiguous) branch calls store.OpenTasks.FailAcceptance, which
+// transitions the operation to Failed AND reopens the task (if it is still
+// claimed by this exact operation) in ONE database transaction -- never a
+// separate advance-then-reopen pair of calls, since Failed is terminal and
+// therefore excluded from the reconciler's sweep: a crash between two
+// separate commits here would leave the task permanently stuck Accepted
+// with no future recovery path (see FailAcceptance's own doc comment).
 func (s *OpenTaskService) handleAcceptanceFailure(ctx context.Context, op domain.AcceptanceOperation, callErr error) (domain.OpenTask, domain.AcceptanceOperation, error) {
 	if isAmbiguousSignerFailure(callErr) {
 		updated, err := s.advanceAcceptance(ctx, op.ID, op.Checkpoint, domain.AcceptanceReconciling, "", "", callErr.Error())
@@ -615,36 +668,11 @@ func (s *OpenTaskService) handleAcceptanceFailure(ctx context.Context, op domain
 		}
 		return task, updated, domain.NewError(domain.ErrNetworkUnavailable, "open task acceptance outcome is uncertain, retry", true)
 	}
-	updated, err := s.advanceAcceptance(ctx, op.ID, op.Checkpoint, domain.AcceptanceFailed, "", "", callErr.Error())
+	updated, task, err := s.store.FailAcceptance(ctx, op.ID, callErr.Error())
 	if err != nil {
 		return domain.OpenTask{}, updated, err
 	}
-	task, taskErr := s.reopenTask(ctx, op.TaskID, op.ProposalID)
-	if taskErr != nil {
-		return domain.OpenTask{}, updated, taskErr
-	}
 	return task, updated, callErr
-}
-
-// reopenTask reverses a winner claim after a definitive (non-retryable)
-// acceptance failure -- atos-spec §7.3's "an accepted winner must never be
-// permanently stranded" rule. The CAS guard (only reopening while still
-// Accepted with THIS proposal as the claimed winner) makes it a safe no-op
-// if the task has already moved on through some other path by the time
-// this runs.
-func (s *OpenTaskService) reopenTask(ctx context.Context, taskID, proposalID string) (domain.OpenTask, error) {
-	return s.store.UpdateOpenTask(ctx, taskID, func(t domain.OpenTask, exists bool) (domain.OpenTask, error) {
-		if !exists {
-			return t, domain.NewError(domain.ErrNotFound, "open task not found", false)
-		}
-		if t.Status != domain.OpenTaskAccepted || t.AcceptedProposalID != proposalID {
-			return t, nil
-		}
-		t.Status = domain.OpenTaskOpen
-		t.AcceptedProposalID = ""
-		t.UpdatedAt = time.Now().UTC()
-		return t, nil
-	})
 }
 
 // driveAcceptance walks op from wherever its persisted Checkpoint is to
@@ -655,8 +683,16 @@ func (s *OpenTaskService) reopenTask(ctx context.Context, taskID, proposalID str
 // ExecutionSignerService.driveRotate's NewAuthorizationRef check.
 func (s *OpenTaskService) driveAcceptance(ctx context.Context, op domain.AcceptanceOperation) (domain.OpenTask, domain.AcceptanceOperation, error) {
 	if op.Checkpoint == domain.AcceptanceCompleted {
-		task, err := s.store.GetOpenTask(ctx, op.TaskID)
-		return task, op, err
+		// Re-run through CompleteAcceptance rather than a plain GetOpenTask:
+		// it is a safe, idempotent no-op for the checkpoint itself, but
+		// still re-applies the OpenTask projection (BoundQuoteID/BoundJobID/
+		// Status=Fulfilled) if an EARLIER call reached Completed but never
+		// got to project it -- see CompleteAcceptance's own doc comment for
+		// why that projection is no longer at risk of being split across
+		// two separate commits, but this call remains the self-healing path
+		// for anything that predates this fix.
+		completedOp, task, err := s.store.CompleteAcceptance(ctx, op.ID)
+		return task, completedOp, err
 	}
 	if op.Checkpoint == domain.AcceptanceFailed {
 		task, err := s.store.GetOpenTask(ctx, op.TaskID)
@@ -686,6 +722,16 @@ func (s *OpenTaskService) driveAcceptance(ctx context.Context, op domain.Accepta
 			InputSummary: task.Input, RequestedTrustMode: task.RequestedTrustMode,
 			ProofRequirements: task.ProofRequirements, MaxTotal: task.MaxTotal,
 			IdempotencyKey: op.NewQuoteIdempotencyKey(),
+			// Pin the Capability version this operation's winner claim
+			// actually verified at Accept time. Without this, a Capability
+			// version bump landing between winner-claim and this call (or a
+			// resumed retry/reconciler pass running long after) would
+			// silently price and bind a DIFFERENT version than the one the
+			// proposal/operation both still claim -- QuoteService.Create
+			// refuses instead, and that definitive rejection reopens the
+			// task via handleAcceptanceFailure/FailAcceptance rather than
+			// binding a version nobody re-verified.
+			ExpectedCapabilityVersion: op.CapabilityVersion,
 		})
 		if quoteErr != nil {
 			return s.handleAcceptanceFailure(ctx, op, quoteErr)
@@ -724,25 +770,17 @@ func (s *OpenTaskService) driveAcceptance(ctx context.Context, op domain.Accepta
 	}
 
 	if op.Checkpoint == domain.AcceptanceJobBound {
-		op, err = s.advanceAcceptance(ctx, op.ID, op.Checkpoint, domain.AcceptanceCompleted, "", "", "")
-		if err != nil {
-			return domain.OpenTask{}, op, err
-		}
-		if _, err := s.store.UpdateOpenTask(ctx, op.TaskID, func(t domain.OpenTask, exists bool) (domain.OpenTask, error) {
-			if !exists {
-				return t, domain.NewError(domain.ErrNotFound, "open task not found", false)
-			}
-			if t.Status != domain.OpenTaskAccepted {
-				return t, nil
-			}
-			t.BoundQuoteID = op.QuoteID
-			t.BoundJobID = op.JobID
-			t.Status = domain.OpenTaskFulfilled
-			t.UpdatedAt = time.Now().UTC()
-			return t, nil
-		}); err != nil {
-			return domain.OpenTask{}, op, err
-		}
+		// CompleteAcceptance -- not advanceAcceptance followed by a
+		// separate UpdateOpenTask call -- transitions the operation to
+		// Completed AND projects the OpenTask to Fulfilled in ONE database
+		// transaction. See its doc comment for why splitting this into two
+		// commits is unsafe: Completed is terminal and excluded from the
+		// reconciler's stale sweep, so a crash between "operation marked
+		// Completed" and "task projected Fulfilled" would otherwise strand
+		// the task at Status=Accepted forever, with nothing left to trigger
+		// a third attempt.
+		completedOp, task, err := s.store.CompleteAcceptance(ctx, op.ID)
+		return task, completedOp, err
 	}
 
 	task, err := s.store.GetOpenTask(ctx, op.TaskID)

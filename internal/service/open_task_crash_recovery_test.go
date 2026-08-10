@@ -55,7 +55,7 @@ func TestOpenTaskAcceptRecoversQuoteSucceededButCheckpointLost(t *testing.T) {
 		Checkpoint: domain.AcceptanceQuoteBindingPending, IdempotencyKey: idemKey,
 		CreatedAt: now, UpdatedAt: now,
 	}
-	opened, _, created, err := h.store().OpenAcceptanceOperation(ctx, task.ID, func(domain.OpenTask) (domain.AcceptanceOperation, error) {
+	opened, _, created, err := h.store().OpenAcceptanceOperation(ctx, task.ID, p.ID, func(domain.OpenTask, domain.OpenTaskProposal) (domain.AcceptanceOperation, error) {
 		return seed, nil
 	})
 	if err != nil {
@@ -66,10 +66,14 @@ func TestOpenTaskAcceptRecoversQuoteSucceededButCheckpointLost(t *testing.T) {
 	}
 
 	// The REAL underlying call: QuoteService.Create genuinely commits a
-	// Quote under the exact idempotency key driveAcceptance would use.
+	// Quote under the exact idempotency key driveAcceptance would use --
+	// including ExpectedCapabilityVersion, since driveAcceptance's own
+	// resumed call passes op.CapabilityVersion and the idempotency digest
+	// must match for this to be a genuine same-request replay rather than
+	// a spurious conflict.
 	realQuote, err := h.quotes.Create(ctx, service.CreateQuoteInput{
 		PrincipalID: task.PrincipalID, CapabilityID: p.CapabilityID, InputSummary: task.Input,
-		IdempotencyKey: opened.NewQuoteIdempotencyKey(),
+		IdempotencyKey: opened.NewQuoteIdempotencyKey(), ExpectedCapabilityVersion: p.CapabilityVersion,
 	})
 	if err != nil {
 		t.Fatalf("Create quote: %v", err)
@@ -123,7 +127,7 @@ func TestOpenTaskAcceptRecoversJobSucceededButCheckpointLost(t *testing.T) {
 		Checkpoint: domain.AcceptanceQuoteBindingPending, IdempotencyKey: idemKey,
 		CreatedAt: now, UpdatedAt: now,
 	}
-	opened, _, created, err := h.store().OpenAcceptanceOperation(ctx, task.ID, func(domain.OpenTask) (domain.AcceptanceOperation, error) {
+	opened, _, created, err := h.store().OpenAcceptanceOperation(ctx, task.ID, p.ID, func(domain.OpenTask, domain.OpenTaskProposal) (domain.AcceptanceOperation, error) {
 		return seed, nil
 	})
 	if err != nil {
@@ -208,7 +212,7 @@ func TestOpenTaskReconcilerResumesStuckOperation(t *testing.T) {
 		Checkpoint: domain.AcceptanceQuoteBindingPending, IdempotencyKey: idemKey,
 		CreatedAt: now, UpdatedAt: now,
 	}
-	opened, _, created, err := h.store().OpenAcceptanceOperation(ctx, task.ID, func(domain.OpenTask) (domain.AcceptanceOperation, error) {
+	opened, _, created, err := h.store().OpenAcceptanceOperation(ctx, task.ID, p.ID, func(domain.OpenTask, domain.OpenTaskProposal) (domain.AcceptanceOperation, error) {
 		return seed, nil
 	})
 	if err != nil {
@@ -293,7 +297,7 @@ func TestOpenTaskAcceptDefinitiveFailureReopensTask(t *testing.T) {
 		Checkpoint: domain.AcceptanceQuoteBindingPending, IdempotencyKey: idemKey,
 		CreatedAt: now, UpdatedAt: now,
 	}
-	if _, _, created, err := h.store().OpenAcceptanceOperation(ctx, task.ID, func(domain.OpenTask) (domain.AcceptanceOperation, error) {
+	if _, _, created, err := h.store().OpenAcceptanceOperation(ctx, task.ID, p.ID, func(domain.OpenTask, domain.OpenTaskProposal) (domain.AcceptanceOperation, error) {
 		return seed, nil
 	}); err != nil || !created {
 		t.Fatalf("OpenAcceptanceOperation: created=%v err=%v", created, err)

@@ -9,8 +9,6 @@ import (
 	"github.com/tosnetwork/atos/internal/service"
 )
 
-const defaultOpenTaskListLimit = 50
-
 type publishOpenTaskRequest struct {
 	Title              string                    `json:"title"`
 	Description        string                    `json:"description"`
@@ -58,12 +56,11 @@ func (s *Server) handleListOpenTasks(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"open_tasks": tasks})
 		return
 	}
-	limit := defaultOpenTaskListLimit
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
-			limit = parsed
-		}
-	}
+	// limit=0 (omitted or unparsable) is passed straight through --
+	// OpenTaskService.ListPublic itself applies the default/max clamp, the
+	// single place that logic lives now (see its own doc comment for why
+	// centralizing it here matters).
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	tasks, err := s.OpenTasks.ListPublic(r.Context(), limit)
 	if err != nil {
 		writeDomainErr(w, err)

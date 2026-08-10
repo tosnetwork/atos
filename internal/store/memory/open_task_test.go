@@ -165,21 +165,21 @@ func TestMemoryOpenAcceptanceOperation_InFlightGuard(t *testing.T) {
 		t.Fatalf("PutOpenTaskProposal: %v", err)
 	}
 
-	build := func(idemKey string) func(domain.OpenTask) (domain.AcceptanceOperation, error) {
-		return func(task domain.OpenTask) (domain.AcceptanceOperation, error) {
+	build := func(idemKey string) func(domain.OpenTask, domain.OpenTaskProposal) (domain.AcceptanceOperation, error) {
+		return func(task domain.OpenTask, proposal domain.OpenTaskProposal) (domain.AcceptanceOperation, error) {
 			if task.Status != domain.OpenTaskOpen {
 				return domain.AcceptanceOperation{}, domain.NewError(domain.ErrOpenTaskNotOpen, "not open", false)
 			}
 			n := time.Now().UTC()
 			return domain.AcceptanceOperation{
-				ID: "accop_mem_" + idemKey, TaskID: taskID, ProposalID: propID,
-				PrincipalID: task.PrincipalID, ProviderID: "agt_1", CapabilityID: "cap_1", CapabilityVersion: "1.0.0",
+				ID: "accop_mem_" + idemKey, TaskID: taskID, ProposalID: proposal.ID,
+				PrincipalID: task.PrincipalID, ProviderID: proposal.ProviderID, CapabilityID: proposal.CapabilityID, CapabilityVersion: proposal.CapabilityVersion,
 				Checkpoint: domain.AcceptanceWinnerClaimed, IdempotencyKey: idemKey, CreatedAt: n, UpdatedAt: n,
 			}, nil
 		}
 	}
 
-	first, claimedTask, created, err := s.OpenAcceptanceOperation(ctx, taskID, build("first"))
+	first, claimedTask, created, err := s.OpenAcceptanceOperation(ctx, taskID, propID, build("first"))
 	if err != nil || !created {
 		t.Fatalf("first OpenAcceptanceOperation: created=%v err=%v", created, err)
 	}
@@ -187,7 +187,7 @@ func TestMemoryOpenAcceptanceOperation_InFlightGuard(t *testing.T) {
 		t.Fatalf("winner claim not reflected on task: %+v", claimedTask)
 	}
 
-	_, _, created, err = s.OpenAcceptanceOperation(ctx, taskID, build("second"))
+	_, _, created, err = s.OpenAcceptanceOperation(ctx, taskID, propID, build("second"))
 	if err == nil {
 		t.Fatalf("expected ErrOpenTaskAcceptanceInProgress, got created=%v", created)
 	}

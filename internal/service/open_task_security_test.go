@@ -206,8 +206,8 @@ func TestOpenTaskWithdrawRejectsNonOwningProvider(t *testing.T) {
 
 // TestOpenTaskPublicListingRedactsInputAndProposalMessage proves the
 // public marketplace view never leaks owner-only OpenTask.Input or a
-// proposal's private Message to a caller who is neither the task owner
-// nor (for a proposal) its own submitting provider.
+// proposal's private Message/ProposedPrice to a caller who is neither the
+// task owner nor (for a proposal) its own submitting provider.
 func TestOpenTaskPublicListingRedactsInputAndProposalMessage(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness()
@@ -223,7 +223,8 @@ func TestOpenTaskPublicListingRedactsInputAndProposalMessage(t *testing.T) {
 	}
 	if _, err := openTasks.Propose(ctx, service.ProposeInput{
 		ProviderID: "agt_redact", TaskID: task.ID, CapabilityID: cap.ID,
-		Message: "private negotiation note", IdempotencyKey: "propose-redact",
+		Message: "private negotiation note", ProposedPrice: &domain.Money{Amount: "0.50", Currency: "USD"},
+		IdempotencyKey: "propose-redact",
 	}); err != nil {
 		t.Fatalf("Propose: %v", err)
 	}
@@ -261,6 +262,9 @@ func TestOpenTaskPublicListingRedactsInputAndProposalMessage(t *testing.T) {
 	}
 	if len(strangerProposals) != 1 || strangerProposals[0].Message != "" {
 		t.Fatalf("stranger view leaked proposal message: %+v", strangerProposals)
+	}
+	if strangerProposals[0].ProposedPrice != nil {
+		t.Fatalf("stranger view leaked proposed_price: %+v", strangerProposals)
 	}
 
 	ownerProposals, err := openTasks.ListProposals(ctx, "prn_redact", task.ID)

@@ -145,6 +145,35 @@ func (s *Store) UpdateOpenTaskProposal(ctx context.Context, id string, fn func(p
 	return next, nil
 }
 
+// WithdrawOpenTaskProposal -- see the interface doc comment. The single
+// global s.mu already makes this atomic with respect to
+// OpenAcceptanceOperation (both hold it for their entire body), so the
+// task's AcceptedProposalID check below is race-free even though it reads
+// a second map -- no separate per-task/per-proposal lock is needed in this
+// backend, unlike Postgres.
+func (s *Store) WithdrawOpenTaskProposal(ctx context.Context, proposalID, providerID string) (domain.OpenTaskProposal, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.openTaskProposals[proposalID]
+	if !ok {
+		return domain.OpenTaskProposal{}, store.ErrNotFound
+	}
+	if p.ProviderID != providerID {
+		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrPermissionDenied, "not the submitting provider", false)
+	}
+	if p.WithdrawnAt != nil {
+		return p, nil
+	}
+	if task, ok := s.openTasks[p.TaskID]; ok && task.AcceptedProposalID == proposalID {
+		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrOpenTaskNotOpen, "cannot withdraw a proposal that has already been accepted", false)
+	}
+	now := time.Now().UTC()
+	p.WithdrawnAt = &now
+	p.UpdatedAt = now
+	s.openTaskProposals[proposalID] = p
+	return p, nil
+}
+
 // --- AcceptanceOperation ---
 
 // acceptanceOperationContentHash summarizes the identity fields that must
@@ -199,8 +228,8 @@ func (s *Store) hasNonTerminalAcceptanceOperationLocked(taskID string) bool {
 // so the loser's insert safely resolves to "return the winner's row" rather
 // than a spurious conflict.
 func (s *Store) OpenAcceptanceOperation(
-	ctx context.Context, taskID string,
-	build func(task domain.OpenTask) (domain.AcceptanceOperation, error),
+	ctx context.Context, taskID, proposalID string,
+	build func(task domain.OpenTask, proposal domain.OpenTaskProposal) (domain.AcceptanceOperation, error),
 ) (domain.AcceptanceOperation, domain.OpenTask, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -214,8 +243,12 @@ func (s *Store) OpenAcceptanceOperation(
 	if !ok {
 		return domain.AcceptanceOperation{}, domain.OpenTask{}, false, store.ErrNotFound
 	}
+	proposal, ok := s.openTaskProposals[proposalID]
+	if !ok {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, false, store.ErrNotFound
+	}
 
-	op, err := build(task)
+	op, err := build(task, proposal)
 	if err != nil {
 		return domain.AcceptanceOperation{}, domain.OpenTask{}, false, err
 	}
@@ -325,4 +358,67 @@ func (s *Store) UpdateAcceptanceOperation(ctx context.Context, id string, fn fun
 	}
 	s.acceptanceOperations[id] = next
 	return next, nil
+}
+
+// CompleteAcceptance -- see the interface doc comment. s.mu already makes
+// the checkpoint transition and the OpenTask projection atomic in this
+// backend (both happen while holding the same lock, with no possibility of
+// a partial commit between them the way two separate exported method calls
+// would allow).
+func (s *Store) CompleteAcceptance(ctx context.Context, opID string) (domain.AcceptanceOperation, domain.OpenTask, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	op, ok := s.acceptanceOperations[opID]
+	if !ok {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, store.ErrNotFound
+	}
+	if op.Checkpoint == domain.AcceptanceJobBound {
+		now := time.Now().UTC()
+		op.Checkpoint = domain.AcceptanceCompleted
+		op.UpdatedAt = now
+		op.CompletedAt = &now
+		s.acceptanceOperations[opID] = op
+	} else if op.Checkpoint != domain.AcceptanceCompleted {
+		return op, s.openTasks[op.TaskID], nil
+	}
+	task, ok := s.openTasks[op.TaskID]
+	if !ok {
+		return op, domain.OpenTask{}, store.ErrNotFound
+	}
+	if task.Status == domain.OpenTaskAccepted {
+		task.BoundQuoteID = op.QuoteID
+		task.BoundJobID = op.JobID
+		task.Status = domain.OpenTaskFulfilled
+		task.UpdatedAt = time.Now().UTC()
+		s.openTasks[op.TaskID] = task
+	}
+	return op, task, nil
+}
+
+// FailAcceptance -- see the interface doc comment. Same single-lock
+// atomicity argument as CompleteAcceptance.
+func (s *Store) FailAcceptance(ctx context.Context, opID, failureReason string) (domain.AcceptanceOperation, domain.OpenTask, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	op, ok := s.acceptanceOperations[opID]
+	if !ok {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, store.ErrNotFound
+	}
+	if !op.Checkpoint.Terminal() {
+		op.Checkpoint = domain.AcceptanceFailed
+		op.FailureReason = failureReason
+		op.UpdatedAt = time.Now().UTC()
+		s.acceptanceOperations[opID] = op
+	}
+	task, ok := s.openTasks[op.TaskID]
+	if !ok {
+		return op, domain.OpenTask{}, store.ErrNotFound
+	}
+	if op.Checkpoint == domain.AcceptanceFailed && task.Status == domain.OpenTaskAccepted && task.AcceptedProposalID == op.ProposalID {
+		task.Status = domain.OpenTaskOpen
+		task.AcceptedProposalID = ""
+		task.UpdatedAt = time.Now().UTC()
+		s.openTasks[op.TaskID] = task
+	}
+	return op, task, nil
 }

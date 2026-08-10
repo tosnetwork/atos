@@ -66,6 +66,17 @@ type CreateQuoteInput struct {
 	// a second Quote for the same accepted proposal -- see Create's
 	// Reserve/Finish/Release wrapper below, which mirrors JobService.submit.
 	IdempotencyKey string
+	// ExpectedCapabilityVersion is optional and backward-compatible (empty
+	// skips the check, exactly like every pre-existing caller). When set,
+	// Create refuses (domain.ErrQuoteMismatch, non-retryable) rather than
+	// silently pricing against whatever the Capability's CURRENT version
+	// happens to be if it no longer matches. This exists for callers that
+	// pinned a Capability version at an earlier commitment point (Phase
+	// 3C's OpenTaskProposal.CapabilityVersion, frozen at Propose time) and
+	// must never let a version bump that happens between that commitment
+	// and a later/resumed Quote-creation attempt (e.g. after a crash, or a
+	// reconciler-driven retry) silently rebind to a different version.
+	ExpectedCapabilityVersion string
 }
 
 // Create resolves trust mode, computes pricing and freezes a new Quote from
@@ -93,7 +104,7 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 	}
 
 	requestHash := hashRequest("atos-quote-v1", in.CapabilityID, in.InputSummary,
-		string(in.RequestedTrustMode), in.ProofRequirements, in.MaxTotal)
+		string(in.RequestedTrustMode), in.ProofRequirements, in.MaxTotal, in.ExpectedCapabilityVersion)
 	now := time.Now().UTC()
 	rec, reserved, err := s.store.Reserve(ctx, in.PrincipalID, in.IdempotencyKey, requestHash, now.Add(idempotencyLease))
 	if err != nil {
@@ -162,6 +173,10 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 	cap = normalizeCapability(cap)
 	if cap.Status != domain.CapabilityActive {
 		return domain.Quote{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability is not active", false)
+	}
+	if in.ExpectedCapabilityVersion != "" && cap.Version != in.ExpectedCapabilityVersion {
+		return domain.Quote{}, domain.NewError(domain.ErrQuoteMismatch,
+			"capability version has changed since this request was committed", false)
 	}
 
 	requested := in.RequestedTrustMode

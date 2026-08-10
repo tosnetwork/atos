@@ -254,6 +254,7 @@ type ProposalView struct {
 // service.OpenTaskService.redactProposal.
 func (p OpenTaskProposal) Public() OpenTaskProposal {
 	p.Message = ""
+	p.ProposedPrice = nil
 	p.ProposalIdempotencyKey = ""
 	return p
 }

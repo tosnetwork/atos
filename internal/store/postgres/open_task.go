@@ -282,6 +282,67 @@ func (s *Store) UpdateOpenTaskProposal(ctx context.Context, id string, fn func(d
 	return next, nil
 }
 
+// WithdrawOpenTaskProposal -- see the interface doc comment
+// (internal/store/store.go). Locks "open-task-proposal"+proposalID (the
+// same lock/row UpdateOpenTaskProposal and OpenAcceptanceOperation's
+// proposal read both use) for the whole transaction, then additionally
+// locks "open-task"+task_id (the same lock/row UpdateOpenTask/
+// OpenAcceptanceOperation/CompleteAcceptance/FailAcceptance all use)
+// before checking whether the task's AcceptedProposalID already names this
+// proposal -- whichever of a concurrent Accept/Withdraw pair commits first
+// is authoritative, and the other observes that committed state from
+// inside its own transaction, never a snapshot read before either
+// transaction began.
+func (s *Store) WithdrawOpenTaskProposal(ctx context.Context, proposalID, providerID string) (domain.OpenTaskProposal, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.OpenTaskProposal{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err := lockTransactionKey(ctx, tx, "open-task-proposal", proposalID); err != nil {
+		return domain.OpenTaskProposal{}, err
+	}
+	p, err := scanProposal(tx.QueryRow(ctx, `SELECT `+proposalColumns+` FROM open_task_proposals WHERE id=$1 FOR UPDATE`, proposalID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.OpenTaskProposal{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.OpenTaskProposal{}, err
+	}
+	if p.ProviderID != providerID {
+		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrPermissionDenied, "not the submitting provider", false)
+	}
+	if p.WithdrawnAt != nil {
+		if err := tx.Commit(ctx); err != nil {
+			return domain.OpenTaskProposal{}, err
+		}
+		return p, nil
+	}
+
+	if err := lockTransactionKey(ctx, tx, "open-task", p.TaskID); err != nil {
+		return domain.OpenTaskProposal{}, err
+	}
+	task, err := scanOpenTask(tx.QueryRow(ctx, `SELECT `+openTaskColumns+` FROM open_tasks WHERE id=$1 FOR UPDATE`, p.TaskID))
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return domain.OpenTaskProposal{}, err
+	}
+	if err == nil && task.AcceptedProposalID == proposalID {
+		return domain.OpenTaskProposal{}, domain.NewError(domain.ErrOpenTaskNotOpen, "cannot withdraw a proposal that has already been accepted", false)
+	}
+
+	now := time.Now().UTC()
+	p.WithdrawnAt = &now
+	p.UpdatedAt = now
+	if _, err := tx.Exec(ctx, upsertProposalSQL, proposalWriteArgs(p)...); err != nil {
+		return domain.OpenTaskProposal{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.OpenTaskProposal{}, err
+	}
+	return p, nil
+}
+
 // --- AcceptanceOperation ---
 
 const acceptanceColumns = `id, task_id, proposal_id, principal_id, provider_id, capability_id, capability_version, checkpoint, idempotency_key, quote_id, job_id, failure_reason, created_at, completed_at, updated_at`
@@ -357,12 +418,18 @@ func hasNonTerminalAcceptanceOperationTx(ctx context.Context, tx pgx.Tx, taskID 
 // instead be caught by the caller (service.OpenTaskService.Accept) via
 // AcceptanceOperationByIdempotencyKey before this method is ever called.
 //
-// The task-scoped advisory lock is held for the whole transaction,
-// including the eventual claim + insert, exactly mirroring
-// OpenSignerOperationForCapability's capability-scoped lock discipline.
+// Three advisory locks are held for the whole transaction: the
+// task-scoped "open-task-acceptance" in-flight guard (mirroring
+// OpenSignerOperationForCapability's capability-scoped lock discipline),
+// then "open-task"+taskID and "open-task-proposal"+proposalID -- the
+// SAME two locks UpdateOpenTask/WithdrawOpenTaskProposal/
+// CompleteAcceptance/FailAcceptance use, which is what makes this method
+// race-free against a concurrent Cancel or Withdraw, not merely against a
+// concurrent Accept. Both the task and proposal rows are read FOR UPDATE
+// under those locks, not via a plain SELECT.
 func (s *Store) OpenAcceptanceOperation(
-	ctx context.Context, taskID string,
-	build func(task domain.OpenTask) (domain.AcceptanceOperation, error),
+	ctx context.Context, taskID, proposalID string,
+	build func(task domain.OpenTask, proposal domain.OpenTaskProposal) (domain.AcceptanceOperation, error),
 ) (domain.AcceptanceOperation, domain.OpenTask, bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -383,7 +450,10 @@ func (s *Store) OpenAcceptanceOperation(
 			"an acceptance is already in progress for this open task", true)
 	}
 
-	task, err := scanOpenTask(tx.QueryRow(ctx, `SELECT `+openTaskColumns+` FROM open_tasks WHERE id=$1`, taskID))
+	if err := lockTransactionKey(ctx, tx, "open-task", taskID); err != nil {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, false, err
+	}
+	task, err := scanOpenTask(tx.QueryRow(ctx, `SELECT `+openTaskColumns+` FROM open_tasks WHERE id=$1 FOR UPDATE`, taskID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.AcceptanceOperation{}, domain.OpenTask{}, false, store.ErrNotFound
 	}
@@ -391,7 +461,18 @@ func (s *Store) OpenAcceptanceOperation(
 		return domain.AcceptanceOperation{}, domain.OpenTask{}, false, err
 	}
 
-	op, err := build(task)
+	if err := lockTransactionKey(ctx, tx, "open-task-proposal", proposalID); err != nil {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, false, err
+	}
+	proposal, err := scanProposal(tx.QueryRow(ctx, `SELECT `+proposalColumns+` FROM open_task_proposals WHERE id=$1 FOR UPDATE`, proposalID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, false, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, false, err
+	}
+
+	op, err := build(task, proposal)
 	if err != nil {
 		return domain.AcceptanceOperation{}, domain.OpenTask{}, false, err
 	}
@@ -537,4 +618,130 @@ func (s *Store) UpdateAcceptanceOperation(ctx context.Context, id string, fn fun
 		return domain.AcceptanceOperation{}, err
 	}
 	return next, nil
+}
+
+// CompleteAcceptance -- see the interface doc comment
+// (internal/store/store.go): the JobBound->Completed checkpoint write and
+// the OpenTask->Fulfilled projection happen in this ONE transaction, never
+// two separate commits.
+func (s *Store) CompleteAcceptance(ctx context.Context, opID string) (domain.AcceptanceOperation, domain.OpenTask, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err := lockTransactionKey(ctx, tx, "acceptance-operation-id", opID); err != nil {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+	}
+	op, err := scanAcceptance(tx.QueryRow(ctx, `SELECT `+acceptanceColumns+` FROM acceptance_operations WHERE id=$1 FOR UPDATE`, opID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+	}
+
+	if op.Checkpoint == domain.AcceptanceJobBound {
+		now := time.Now().UTC()
+		op.Checkpoint = domain.AcceptanceCompleted
+		op.UpdatedAt = now
+		op.CompletedAt = &now
+		if _, err := tx.Exec(ctx, upsertAcceptanceSQL, acceptanceWriteArgs(op)...); err != nil {
+			return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+		}
+	} else if op.Checkpoint != domain.AcceptanceCompleted {
+		// Caller bug (called from a checkpoint that isn't JobBound or
+		// already Completed) -- return the current state unchanged rather
+		// than silently completing from an unexpected checkpoint.
+		task, terr := scanOpenTask(tx.QueryRow(ctx, `SELECT `+openTaskColumns+` FROM open_tasks WHERE id=$1`, op.TaskID))
+		if terr != nil && !errors.Is(terr, pgx.ErrNoRows) {
+			return domain.AcceptanceOperation{}, domain.OpenTask{}, terr
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+		}
+		return op, task, nil
+	}
+
+	if err := lockTransactionKey(ctx, tx, "open-task", op.TaskID); err != nil {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+	}
+	task, err := scanOpenTask(tx.QueryRow(ctx, `SELECT `+openTaskColumns+` FROM open_tasks WHERE id=$1 FOR UPDATE`, op.TaskID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+	}
+	if task.Status == domain.OpenTaskAccepted {
+		task.BoundQuoteID = op.QuoteID
+		task.BoundJobID = op.JobID
+		task.Status = domain.OpenTaskFulfilled
+		task.UpdatedAt = time.Now().UTC()
+		if _, err := tx.Exec(ctx, upsertOpenTaskSQL, openTaskWriteArgs(task)...); err != nil {
+			return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+	}
+	return op, task, nil
+}
+
+// FailAcceptance -- see the interface doc comment
+// (internal/store/store.go): the non-terminal->Failed checkpoint write and
+// the OpenTask reopen happen in this ONE transaction, never two separate
+// commits.
+func (s *Store) FailAcceptance(ctx context.Context, opID, failureReason string) (domain.AcceptanceOperation, domain.OpenTask, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err := lockTransactionKey(ctx, tx, "acceptance-operation-id", opID); err != nil {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+	}
+	op, err := scanAcceptance(tx.QueryRow(ctx, `SELECT `+acceptanceColumns+` FROM acceptance_operations WHERE id=$1 FOR UPDATE`, opID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+	}
+
+	if !op.Checkpoint.Terminal() {
+		op.Checkpoint = domain.AcceptanceFailed
+		op.FailureReason = failureReason
+		op.UpdatedAt = time.Now().UTC()
+		if _, err := tx.Exec(ctx, upsertAcceptanceSQL, acceptanceWriteArgs(op)...); err != nil {
+			return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+		}
+	}
+
+	if err := lockTransactionKey(ctx, tx, "open-task", op.TaskID); err != nil {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+	}
+	task, err := scanOpenTask(tx.QueryRow(ctx, `SELECT `+openTaskColumns+` FROM open_tasks WHERE id=$1 FOR UPDATE`, op.TaskID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+	}
+	if op.Checkpoint == domain.AcceptanceFailed && task.Status == domain.OpenTaskAccepted && task.AcceptedProposalID == op.ProposalID {
+		task.Status = domain.OpenTaskOpen
+		task.AcceptedProposalID = ""
+		task.UpdatedAt = time.Now().UTC()
+		if _, err := tx.Exec(ctx, upsertOpenTaskSQL, openTaskWriteArgs(task)...); err != nil {
+			return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return domain.AcceptanceOperation{}, domain.OpenTask{}, err
+	}
+	return op, task, nil
 }
