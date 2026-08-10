@@ -1,0 +1,217 @@
+package service_test
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/tosnetwork/atos/internal/adapters/provideradapter"
+	"github.com/tosnetwork/atos/internal/adapters/provideradapter/httpadapter"
+	"github.com/tosnetwork/atos/internal/domain"
+	"github.com/tosnetwork/atos/internal/service"
+	"github.com/tosnetwork/atos/internal/store/memory"
+)
+
+func registerHTTPBoundCapability(t *testing.T, capabilities *service.CapabilityService, providerID, endpointRef string, requestedModes []domain.TrustMode) domain.Capability {
+	t.Helper()
+	cap, err := capabilities.Register(context.Background(), service.RegisterCapabilityInput{
+		ProviderID: providerID, Name: "HTTP Capability", Description: "third-party HTTP",
+		DeliveryMode: domain.DeliveryInstant,
+		InputSchema:  map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing:             domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
+		RequestedTrustModes: requestedModes,
+		Bindings: []domain.CapabilityBinding{
+			{Transport: domain.AdapterHTTP, EndpointRef: endpointRef, EligibleTrustModes: requestedModes},
+		},
+		IdempotencyKey: "register-" + providerID,
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	return cap
+}
+
+func TestHealthService_CheckCapability_RecordsHealthyResult(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer srv.Close()
+
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	resolver := provideradapter.NewResolver(httpadapter.New(httpadapter.Config{Client: srv.Client()}))
+	health := service.NewHealthService(st, capabilities, resolver)
+
+	cap := registerHTTPBoundCapability(t, capabilities, "agt_health_1", srv.URL, []domain.TrustMode{domain.TrustModeManaged})
+	checks, err := health.CheckCapability(ctx, cap.ID)
+	if err != nil {
+		t.Fatalf("CheckCapability: %v", err)
+	}
+	if len(checks) != 1 || checks[0].Status != domain.AdapterHealthHealthy {
+		t.Fatalf("checks = %+v", checks)
+	}
+
+	stored, found, err := st.HealthCheck(ctx, cap.ID, cap.Version, domain.AdapterHTTP)
+	if err != nil || !found {
+		t.Fatalf("HealthCheck: found=%v err=%v", found, err)
+	}
+	if stored.Status != domain.AdapterHealthHealthy {
+		t.Fatalf("stored status = %s", stored.Status)
+	}
+}
+
+func TestHealthService_CheckCapability_RecordsUnhealthyResult(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	resolver := provideradapter.NewResolver(httpadapter.New(httpadapter.Config{}))
+	health := service.NewHealthService(st, capabilities, resolver)
+
+	cap := registerHTTPBoundCapability(t, capabilities, "agt_health_2", "http://127.0.0.1:1/invoke", []domain.TrustMode{domain.TrustModeManaged})
+	checks, err := health.CheckCapability(ctx, cap.ID)
+	if err != nil {
+		t.Fatalf("CheckCapability: %v", err)
+	}
+	if len(checks) != 1 || checks[0].Status != domain.AdapterHealthUnhealthy {
+		t.Fatalf("checks = %+v", checks)
+	}
+}
+
+// TestHealthService_CheckCapability_NeverMutatesModeSupport is the
+// roadmap's explicit regression requirement: a health check success must
+// not directly activate Verified or Native, or change SupportedTrustModes
+// at all.
+func TestHealthService_CheckCapability_NeverMutatesModeSupport(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer srv.Close()
+
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	resolver := provideradapter.NewResolver(httpadapter.New(httpadapter.Config{Client: srv.Client()}))
+	health := service.NewHealthService(st, capabilities, resolver)
+
+	cap := registerHTTPBoundCapability(t, capabilities, "agt_health_3", srv.URL, []domain.TrustMode{domain.TrustModeManaged, domain.TrustModeVerified, domain.TrustModeNative})
+	before, err := capabilities.Get(ctx, cap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := health.CheckCapability(ctx, cap.ID); err != nil {
+		t.Fatalf("CheckCapability: %v", err)
+	}
+
+	after, err := capabilities.Get(ctx, cap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.SupportedTrustModes) != len(before.SupportedTrustModes) {
+		t.Fatalf("supported_trust_modes changed by a health check: %v -> %v", before.SupportedTrustModes, after.SupportedTrustModes)
+	}
+	for mode := range after.ModeSupport {
+		if after.ModeSupport[mode].Status != before.ModeSupport[mode].Status {
+			t.Fatalf("mode_support[%s] changed by a health check: %s -> %s", mode, before.ModeSupport[mode].Status, after.ModeSupport[mode].Status)
+		}
+	}
+	if after.ModeSupport.Active(domain.TrustModeVerified) {
+		t.Fatal("a healthy transport check must never independently activate Verified")
+	}
+	if after.ModeSupport.Active(domain.TrustModeNative) {
+		t.Fatal("a healthy transport check must never independently activate Native")
+	}
+}
+
+func TestHealthService_Availability_ReadyRequiresHealthyAndCertified(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer srv.Close()
+
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	resolver := provideradapter.NewResolver(httpadapter.New(httpadapter.Config{Client: srv.Client()}))
+	health := service.NewHealthService(st, capabilities, resolver)
+	certifications := service.NewCertificationService(st, capabilities, resolver)
+
+	// Verified is requested but -- as of Phase 3A -- can never be Active
+	// (that path is Phase 3B/4 only); it starts Pending. This is the mode
+	// that actually exercises "Ready=true must never imply Active=true",
+	// unlike Managed, which is unconditionally Active from registration by
+	// existing (pre-Phase-3A) design regardless of health/certification.
+	cap := registerHTTPBoundCapability(t, capabilities, "agt_avail_1", srv.URL, []domain.TrustMode{domain.TrustModeManaged, domain.TrustModeVerified})
+	var verified domain.ModeAvailability
+	findVerified := func(avail []domain.ModeAvailability) domain.ModeAvailability {
+		for _, a := range avail {
+			if a.Mode == domain.TrustModeVerified {
+				return a
+			}
+		}
+		t.Fatal("expected a ModeAvailability entry for verified")
+		return domain.ModeAvailability{}
+	}
+
+	// Before any health check or certification: not ready.
+	availBefore, err := health.Availability(ctx, cap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified = findVerified(availBefore)
+	if verified.Ready {
+		t.Fatalf("availability before health/certification = %+v, want not ready", verified)
+	}
+
+	if _, err := health.CheckCapability(ctx, cap.ID); err != nil {
+		t.Fatal(err)
+	}
+	availAfterHealth, err := health.Availability(ctx, cap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified = findVerified(availAfterHealth)
+	if !verified.TransportHealthy || verified.Ready {
+		t.Fatalf("availability after health only = %+v, want healthy but not ready (uncertified)", verified)
+	}
+
+	if _, err := certifications.Open(ctx, service.OpenCertificationInput{
+		ProviderID: "agt_avail_1", CapabilityID: cap.ID, Transport: domain.AdapterHTTP, IdempotencyKey: "cert-1",
+	}); err != nil {
+		t.Fatalf("certifications.Open: %v", err)
+	}
+	availAfterCert, err := health.Availability(ctx, cap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified = findVerified(availAfterCert)
+	if !verified.Ready {
+		t.Fatalf("availability after health+certification = %+v, want ready", verified)
+	}
+	if verified.Active {
+		t.Fatal("Ready=true must never imply Active=true -- activation is Phase 3B/4, not Phase 3A")
+	}
+}
+
+func TestHealthService_Availability_StaleHealthNotTreatedAsFresh(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	resolver := provideradapter.NewResolver(httpadapter.New(httpadapter.Config{}))
+	health := service.NewHealthService(st, capabilities, resolver)
+
+	cap := registerHTTPBoundCapability(t, capabilities, "agt_avail_stale", "https://provider.example.com", []domain.TrustMode{domain.TrustModeManaged})
+	// Directly write a stale-but-healthy check, simulating an old success
+	// that must not be treated as indefinitely fresh.
+	if err := st.PutHealthCheck(ctx, domain.AdapterHealthCheck{
+		CapabilityID: cap.ID, CapabilityVersion: cap.Version, Transport: domain.AdapterHTTP,
+		EndpointRef: "https://provider.example.com", Status: domain.AdapterHealthHealthy,
+		CheckedAt: time.Now().UTC().Add(-24 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	avail, err := health.Availability(ctx, cap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if avail[0].TransportHealthy {
+		t.Fatal("a stale health check must not be treated as currently healthy")
+	}
+}
