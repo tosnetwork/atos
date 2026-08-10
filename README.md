@@ -48,6 +48,7 @@ than a final TOS Network trust anchor.
 | `tos-core` / `tos-protocol` | Real typed ConnectRPC clients for Identity, Capability, Trust, Settlement, Proof and ExecutionGateway services; current Authority is Managed-only `tos-local` |
 | Device Authorization | Scoped in-memory Phase 0 implementation with immediate approval; production UI/consent remains to be wired |
 | Verified / Native | Contract implemented, runtime availability intentionally `unavailable` until real TOS integration |
+| Open Task Marketplace | Demand-side task publish/propose/accept over REST + MCP; accepted proposals bind through the same Quote/Job pipeline, never a parallel one — see `IMPLEMENTATION_STATUS.md`'s Phase 3C section |
 
 ## MCP surface
 

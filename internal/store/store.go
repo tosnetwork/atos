@@ -56,6 +56,12 @@ type Capabilities interface {
 type Quotes interface {
 	PutQuote(ctx context.Context, q domain.Quote) error
 	GetQuote(ctx context.Context, id string) (domain.Quote, error)
+	// QuoteByIdempotencyKey returns the Quote previously created under
+	// (principalID, key), the QuoteService.Create counterpart to
+	// JobByIdempotencyKey -- used to recover a durable idempotency-record
+	// commit that crashed before Finish ran, without minting a second
+	// Quote for the same caller-supplied idempotency key.
+	QuoteByIdempotencyKey(ctx context.Context, principalID, key string) (domain.Quote, error)
 }
 
 type Escrows interface {
@@ -484,6 +490,251 @@ type ExecutionSignerOperations interface {
 	UpdateSignerOperation(ctx context.Context, id string, fn func(op domain.ExecutionSignerOperation, exists bool) (domain.ExecutionSignerOperation, error)) (domain.ExecutionSignerOperation, error)
 }
 
+// OpenTasks is Phase 3C's store surface (atos-spec docs/IMPLEMENTATION_ROADMAP.md
+// §7.3). The AcceptanceOperation half of this interface mirrors
+// ExecutionSignerOperations deliberately: OpenAcceptanceOperation plays
+// exactly the role OpenSignerOperationForCapability plays for Phase 3B,
+// including the same two-invariant defense (an in-flight, non-terminal
+// operation lock scoped by TaskID, PLUS a caller-idempotency-key dedup
+// scoped by (PrincipalID, IdempotencyKey)) for the same reason: locking only
+// the read-then-open sequence is not sufficient to prevent two callers who
+// read "no winner yet" in quick succession from each independently claiming
+// a winner for the same task.
+type OpenTasks interface {
+	// PutOpenTask inserts a new OpenTask row. Insert-only (ON CONFLICT DO
+	// NOTHING on id, mirroring PutQuote) -- every subsequent mutation goes
+	// through UpdateOpenTask or OpenAcceptanceOperation's winner-claim step,
+	// never a second PutOpenTask.
+	PutOpenTask(ctx context.Context, t domain.OpenTask) error
+	GetOpenTask(ctx context.Context, id string) (domain.OpenTask, error)
+	// OpenTaskByIdempotencyKey recovers a Publish call that committed the
+	// OpenTask row but crashed before its idempotency record was marked
+	// Finished -- the OpenTask counterpart to JobByIdempotencyKey/
+	// QuoteByIdempotencyKey.
+	OpenTaskByIdempotencyKey(ctx context.Context, principalID, key string) (domain.OpenTask, error)
+	// OpenTasksByPrincipal returns every OpenTask owned by principalID
+	// (any status), newest first -- the owner's own "my tasks" view, which
+	// unlike the public listing includes Input and every other
+	// owner-visible field.
+	OpenTasksByPrincipal(ctx context.Context, principalID string) ([]domain.OpenTask, error)
+	// ListPublicOpenTasks returns up to limit OpenTasks with Status=Open
+	// that have not yet passed ExpiresAt as of now, newest first, for
+	// marketplace search/browse. Callers MUST still call
+	// domain.OpenTask.Public() on each result before returning it outside
+	// the service layer -- this query filters by status and expiry only,
+	// it does not redact fields. The expiry filter MUST be applied here,
+	// before limit, not by the caller after fetching: since expiry is lazy
+	// (no reconciler sweep flips Status away from Open), filtering
+	// client-side after the store already applied limit would let a run
+	// of newest-but-expired rows consume the whole limit window and hide
+	// older rows that are still genuinely open.
+	ListPublicOpenTasks(ctx context.Context, limit int, now time.Time) ([]domain.OpenTask, error)
+	// UpdateOpenTask atomically applies fn to the task's current stored
+	// state (or domain.OpenTask{} with exists=false if it isn't stored yet)
+	// and persists whatever fn returns -- the compare-and-swap primitive
+	// for Cancel and expiry-sweep transitions. Implementations MUST NOT
+	// use this method to claim a winner (set AcceptedProposalID) --
+	// OpenAcceptanceOperation is the only path that may do that, since only
+	// it also enforces the non-terminal-operation and idempotency-key
+	// invariants in the same atomic step.
+	UpdateOpenTask(ctx context.Context, id string, fn func(t domain.OpenTask, exists bool) (domain.OpenTask, error)) (domain.OpenTask, error)
+
+	// PutOpenTaskProposal inserts a new proposal row. Insert-only, like
+	// PutOpenTask. It performs no task-state validation of its own --
+	// CreateOpenTaskProposal is the path that must be used whenever the
+	// caller needs to guarantee the task was still open at insert time.
+	PutOpenTaskProposal(ctx context.Context, p domain.OpenTaskProposal) error
+	// CreateOpenTaskProposal atomically re-validates that taskID is
+	// currently Status=Open and not Expired(now), then calls build with
+	// the freshly locked task to construct the proposal to insert -- this
+	// closes the race where a plain "read task, check it's open, then
+	// PutOpenTaskProposal" sequence at the service layer cannot see a
+	// concurrent Accept/Cancel that commits in the gap between the check
+	// and the insert, letting a provider receive a successful proposal
+	// against a task that is, by the time the insert lands, already
+	// accepted or cancelled. Implementations MUST lock "open-task"+taskID
+	// (the same lock key OpenAcceptanceOperation/UpdateOpenTask/
+	// WithdrawOpenTaskProposal already use) before reading the task, so
+	// this participates in the same global lock-ordering discipline as
+	// every other task-mutating path. Returns domain.ErrNotFound if
+	// taskID does not exist, domain.ErrOpenTaskNotOpen (without calling
+	// build) if the task is not currently open for new proposals.
+	CreateOpenTaskProposal(ctx context.Context, taskID string, now time.Time, build func(task domain.OpenTask) (domain.OpenTaskProposal, error)) (domain.OpenTaskProposal, error)
+	GetOpenTaskProposal(ctx context.Context, id string) (domain.OpenTaskProposal, error)
+	// OpenTaskProposalByIdempotencyKey mirrors OpenTaskByIdempotencyKey,
+	// scoped by (providerID, key) instead of (principalID, key) -- a
+	// proposal's caller identity is the applying provider, not the task
+	// owner.
+	OpenTaskProposalByIdempotencyKey(ctx context.Context, providerID, key string) (domain.OpenTaskProposal, error)
+	// ProposalsByTask returns every proposal submitted against taskID
+	// (including withdrawn ones -- the service layer, not this query,
+	// decides what a given viewer may see), newest first.
+	ProposalsByTask(ctx context.Context, taskID string) ([]domain.OpenTaskProposal, error)
+	// UpdateOpenTaskProposal is Withdraw's CAS primitive, exactly like
+	// UpdateOpenTask is Cancel's. Implementations MUST NOT allow this
+	// method to change ID/TaskID/ProviderID/CapabilityID/CapabilityVersion/
+	// ProposalIdempotencyKey -- only WithdrawnAt/UpdatedAt may change
+	// through this method.
+	UpdateOpenTaskProposal(ctx context.Context, id string, fn func(p domain.OpenTaskProposal, exists bool) (domain.OpenTaskProposal, error)) (domain.OpenTaskProposal, error)
+	// WithdrawOpenTaskProposal atomically withdraws proposalID on behalf of
+	// providerID -- refused (domain.ErrPermissionDenied) if providerID does
+	// not own the proposal, and refused (domain.ErrOpenTaskNotOpen) if the
+	// proposal's own task currently has this exact proposal as its
+	// AcceptedProposalID. That second check MUST be performed under the
+	// SAME per-task lock/row-lock discipline OpenAcceptanceOperation uses
+	// (see its own doc comment) -- a plain "read the task, then update the
+	// proposal" sequence at the service layer cannot close the race
+	// against a concurrent Accept: whichever of the two transactions
+	// commits first must be the one that's authoritative, and the loser
+	// must observe that committed state from INSIDE its own transaction,
+	// not from a snapshot read before either transaction started.
+	//
+	// Implementations MUST acquire the task lock BEFORE the proposal lock
+	// -- the same order OpenAcceptanceOperation uses -- never the reverse.
+	// Two transactions taking the same pair of advisory locks in opposite
+	// orders is a textbook PostgreSQL deadlock (one holds task and waits
+	// on proposal while the other holds proposal and waits on task); an
+	// earlier version of the Postgres implementation did exactly that.
+	WithdrawOpenTaskProposal(ctx context.Context, proposalID, providerID string) (domain.OpenTaskProposal, error)
+
+	// OpenAcceptanceOperation is Accept's single atomic entry point. Under
+	// locks scoped to taskID AND proposalID (using the SAME lock/row-lock
+	// discipline as UpdateOpenTask, WithdrawOpenTaskProposal,
+	// CompleteAcceptance and FailAcceptance -- see their own doc comments;
+	// this is what makes Accept race-free against a concurrent Cancel or
+	// Withdraw, not merely against a concurrent Accept), it must:
+	//
+	//  1. Reject (domain.ErrOpenTaskAcceptanceInProgress, retryable) if a
+	//     non-terminal (checkpoint not in {completed,failed})
+	//     AcceptanceOperation already exists for taskID -- the same
+	//     "in-flight lock" hasNonTerminalSignerOperationTx enforces for
+	//     Phase 3B, and for the identical reason: reading "no winner yet"
+	//     and opening a new operation are not atomic with each other
+	//     unless something also forbids a second opener while the first
+	//     is still in flight.
+	//  2. Load the current OpenTask row under the SAME lock/row-lock
+	//     UpdateOpenTask/CompleteAcceptance/FailAcceptance use, so a
+	//     concurrent Cancel cannot commit a Cancelled status this method
+	//     never observes (or vice versa) -- whichever transaction commits
+	//     first is authoritative, the other sees it.
+	//  3. Load the current OpenTaskProposal row (by proposalID) under the
+	//     SAME lock/row-lock WithdrawOpenTaskProposal uses, for the
+	//     identical reason: a concurrent Withdraw of THIS proposal must
+	//     not be observably unordered with this method claiming it as
+	//     winner.
+	//  4. Call build(task, proposal) to construct the operation to open.
+	//     build MUST NOT call back into the store (a nested call would
+	//     deadlock the in-memory implementation's single non-reentrant
+	//     lock, and would read a separate, non-transactional snapshot
+	//     through the Postgres implementation's connection pool instead of
+	//     participating in the same transaction) -- every validation that
+	//     depends on something OTHER than these two snapshots (e.g.
+	//     Capability-still-active) must be done by the caller BEFORE
+	//     calling this method, using its own store calls; a narrower
+	//     staleness window there is acceptable because the later
+	//     QuoteService.Create call Accept drives towards independently
+	//     re-verifies the Capability version (see
+	//     CreateQuoteInput.ExpectedCapabilityVersion) and reopens the task
+	//     via FailAcceptance if it has drifted. build itself checks
+	//     task.Status==Open/not Expired and proposal.WithdrawnAt==nil
+	//     against the snapshots it was handed, and returns a definitive
+	//     (non-retryable) error to abort the whole sequence without
+	//     opening or claiming anything.
+	//  5. In the SAME transaction as the operation insert: claim the
+	//     winner by setting task.AcceptedProposalID=op.ProposalID and
+	//     task.Status=Accepted. This is what makes "exactly one accepted
+	//     proposal" a database guarantee rather than an in-process
+	//     check -- the claim and the operation's opening can never
+	//     observably happen without each other.
+	//
+	// Idempotency-key replay semantics (scoped by (op.PrincipalID,
+	// op.IdempotencyKey) as build returns them) mirror
+	// OpenSignerOperationForCapability's own openSignerOperationTx step
+	// exactly: same key + identical identity content -> the existing
+	// operation, created=false; same key + different content ->
+	// domain.ErrIdempotencyConflict. This check runs AFTER build(), not
+	// before -- see the implementation's doc comment for why a genuine
+	// SEQUENTIAL replay (the caller's original call already completed) must
+	// instead be caught by service.OpenTaskService.Accept calling
+	// AcceptanceOperationByIdempotencyKey BEFORE ever calling this method,
+	// exactly mirroring service.ExecutionSignerService.Authorize's
+	// resumeOrConflict-before-Open pattern -- build()'s own validation
+	// (task.Status==Open) is not safe to run against a task a prior,
+	// already-completed call to THIS SAME idempotency key already moved
+	// past Open.
+	OpenAcceptanceOperation(
+		ctx context.Context, taskID, proposalID string,
+		build func(task domain.OpenTask, proposal domain.OpenTaskProposal) (domain.AcceptanceOperation, error),
+	) (op domain.AcceptanceOperation, task domain.OpenTask, created bool, err error)
+	GetAcceptanceOperation(ctx context.Context, id string) (domain.AcceptanceOperation, error)
+	AcceptanceOperationByIdempotencyKey(ctx context.Context, principalID, key string) (domain.AcceptanceOperation, error)
+	// AcceptanceOperationByTask returns the most recently updated operation
+	// for taskID, if any -- including a non-terminal one still in flight.
+	// A task can have more than one operation across its lifetime only if
+	// an earlier one reached Failed and reopened the task (see
+	// domain.AcceptanceFailed's doc comment); this always returns the
+	// latest.
+	AcceptanceOperationByTask(ctx context.Context, taskID string) (domain.AcceptanceOperation, bool, error)
+	// StaleAcceptanceOperations returns up to limit non-terminal operations
+	// last updated before cutoff, oldest first -- the reconciler's sweep
+	// query, mirroring StaleSignerOperations exactly. Deliberately excludes
+	// completed/failed operations: those are handled synchronously and
+	// atomically by CompleteAcceptance/FailAcceptance, never left in a
+	// state the reconciler would need to revisit.
+	StaleAcceptanceOperations(ctx context.Context, cutoff time.Time, limit int) ([]domain.AcceptanceOperation, error)
+	// UpdateAcceptanceOperation atomically applies fn to the operation's
+	// current stored state, for every NON-terminal checkpoint transition
+	// (winner_claimed -> quote_binding_pending -> quote_bound ->
+	// job_binding_pending -> job_bound, and the ambiguous -> reconciling
+	// transition). Implementations MUST reject
+	// (domain.ErrIdempotencyConflict) a returned value whose ID or identity
+	// fields (TaskID/ProposalID/PrincipalID/ProviderID/CapabilityID/
+	// CapabilityVersion/IdempotencyKey) differ from the existing stored
+	// record -- only Checkpoint/QuoteID/JobID/FailureReason/CompletedAt/
+	// UpdatedAt may change through this method, mirroring
+	// UpdateSignerOperation's own immutability contract. Implementations
+	// MUST NOT allow this method to set Checkpoint to Completed or
+	// Failed -- see CompleteAcceptance/FailAcceptance below for why those
+	// two specific transitions cannot go through a plain CAS update.
+	UpdateAcceptanceOperation(ctx context.Context, id string, fn func(op domain.AcceptanceOperation, exists bool) (domain.AcceptanceOperation, error)) (domain.AcceptanceOperation, error)
+	// CompleteAcceptance atomically transitions the AcceptanceOperation
+	// identified by opID from JobBound to Completed AND projects its
+	// OpenTask to Fulfilled (BoundQuoteID/BoundJobID/Status) in the SAME
+	// database transaction. This is deliberately NOT expressed as
+	// UpdateAcceptanceOperation followed by a separate UpdateOpenTask
+	// call: Completed is terminal and therefore excluded from
+	// StaleAcceptanceOperations's sweep, so if those were two separate
+	// commits, a crash (or any error) between them would durably mark the
+	// operation Completed while leaving its OpenTask stuck at
+	// Status=Accepted forever, with no reconciler pass or retry ever
+	// revisiting it again -- there would be nothing left to trigger a
+	// third attempt. A call against an operation that is ALREADY Completed
+	// is a safe, idempotent no-op for the checkpoint itself, but still
+	// re-applies the OpenTask projection if the task is still Accepted
+	// (recovering from exactly the crash window this method exists to
+	// prevent, on an implementation that predates this fix, or from any
+	// other bug that left the two out of sync). Called only when
+	// op.Checkpoint is JobBound or already Completed; any other checkpoint
+	// is a caller bug (returns the operation/task unchanged, no error).
+	CompleteAcceptance(ctx context.Context, opID string) (domain.AcceptanceOperation, domain.OpenTask, error)
+	// FailAcceptance atomically transitions the AcceptanceOperation
+	// identified by opID from any non-terminal checkpoint to Failed with
+	// failureReason, AND reopens its OpenTask (AcceptedProposalID cleared,
+	// Status back to Open) if the task is still Accepted with THIS
+	// operation's own ProposalID claimed -- in the SAME database
+	// transaction, for the identical reason CompleteAcceptance's doc
+	// comment gives (Failed is also terminal and also excluded from the
+	// reconciler's sweep). A call against an operation that is ALREADY
+	// Failed is a safe, idempotent no-op for the checkpoint itself, but
+	// still re-applies the reopen if the task is still stuck Accepted.
+	// Never reopens (or otherwise mutates) the task if it reached Failed
+	// from Completed (a caller bug; Completed operations must never be
+	// failed) or if the task has already moved on through some other path
+	// (the CAS guard on AcceptedProposalID makes that a safe no-op, not a
+	// clobber of newer state).
+	FailAcceptance(ctx context.Context, opID, failureReason string) (domain.AcceptanceOperation, domain.OpenTask, error)
+}
+
 type Idempotency interface {
 	// Reserve atomically claims (principalID, key) in the InProgress state.
 	// If the key was already used it returns the prior record and ok=false
@@ -516,5 +767,6 @@ type Store interface {
 	ProviderHealth
 	Certifications
 	ExecutionSignerOperations
+	OpenTasks
 	Idempotency
 }

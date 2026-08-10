@@ -22,6 +22,7 @@ tags:
   - name: auth
   - name: capabilities
   - name: quotes
+  - name: open_tasks
   - name: invocations
   - name: jobs
   - name: account
@@ -376,6 +377,195 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Quote'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/open-tasks:
+    post:
+      tags: [open_tasks]
+      summary: Publish an Open Task Marketplace task
+      description: |
+        Requires `open_tasks:write`. Publishes a demand-side marketplace
+        listing -- NOT a Quote or Job. Accepting a proposal (see
+        `/v1/open-tasks/{task_id}/proposals/{proposal_id}/accept`) creates
+        those separately, through the exact same `QuoteService`/`JobService`
+        paths a direct Quote/Job request would use, with `principal_id` set
+        to this task's owner. Idempotent: retrying with the same
+        `idempotency_key` and identical body returns the original task; the
+        same key with a different body is `idempotency_conflict`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PublishOpenTaskRequest'}
+      responses:
+        '201':
+          description: OpenTask
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OpenTask'}
+        default: {$ref: '#/components/responses/Error'}
+    get:
+      tags: [open_tasks]
+      summary: Browse or search open marketplace tasks
+      description: |
+        Requires `open_tasks:read`. Without `mine=true`, returns only
+        currently `open`, non-expired tasks in the publicly safe shape
+        (`OpenTask.input` and every other owner-only field is never
+        included). With `mine=true`, returns the caller's own tasks in any
+        status with full detail instead.
+      parameters:
+        - name: mine
+          in: query
+          schema: {type: boolean, default: false}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 100, default: 50}
+      responses:
+        '200':
+          description: Open tasks
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [open_tasks]
+                properties:
+                  open_tasks: {type: array, items: {$ref: '#/components/schemas/OpenTask'}}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/open-tasks/{task_id}:
+    parameters:
+      - {$ref: '#/components/parameters/OpenTaskID'}
+    get:
+      tags: [open_tasks]
+      summary: Get an open task
+      description: |
+        Requires `open_tasks:read`. Full detail (including `input`) is
+        returned only to the task's own owner, or, once a winner has been
+        claimed, that proposal's provider. Every other caller receives the
+        redacted public shape.
+      responses:
+        '200':
+          description: OpenTask
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OpenTask'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/open-tasks/{task_id}/cancel:
+    parameters:
+      - {$ref: '#/components/parameters/OpenTaskID'}
+    post:
+      tags: [open_tasks]
+      summary: Cancel an open task
+      description: |
+        Requires `open_tasks:write`, and the caller must be the task's
+        owner. Refused once a proposal has been accepted (`status` is no
+        longer `open`) -- an accepted winner is never silently discarded by
+        a cancel.
+      responses:
+        '200':
+          description: Cancelled OpenTask
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OpenTask'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/open-tasks/{task_id}/proposals:
+    parameters:
+      - {$ref: '#/components/parameters/OpenTaskID'}
+    post:
+      tags: [open_tasks]
+      summary: Submit a proposal to fulfill an open task
+      description: |
+        Requires `open_task_proposals:write`. `provider_id` is always the
+        authenticated caller, never taken from the request body.
+        `capability_version` is never caller-supplied -- it is frozen from
+        the capability's current version at proposal time. `proposed_price`,
+        if supplied, is a non-authoritative hint only; the real price is
+        always computed by `QuoteService`'s own pricing rules at acceptance
+        time, never taken from this field.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProposeOpenTaskRequest'}
+      responses:
+        '201':
+          description: OpenTaskProposal
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OpenTaskProposal'}
+        default: {$ref: '#/components/responses/Error'}
+    get:
+      tags: [open_tasks]
+      summary: List proposals for an open task
+      description: |
+        Requires `open_tasks:read`. The task owner sees every proposal in
+        full, including `message`. A provider sees their own proposal in
+        full and every other proposal redacted. Anyone else sees only
+        redacted proposals.
+      responses:
+        '200':
+          description: Proposals
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [proposals]
+                properties:
+                  proposals: {type: array, items: {$ref: '#/components/schemas/OpenTaskProposalView'}}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/open-tasks/{task_id}/proposals/{proposal_id}/withdraw:
+    parameters:
+      - {$ref: '#/components/parameters/OpenTaskID'}
+      - {$ref: '#/components/parameters/OpenTaskProposalID'}
+    post:
+      tags: [open_tasks]
+      summary: Withdraw the calling provider's own proposal
+      description: |
+        Requires `open_task_proposals:write`, and the caller must be the
+        proposal's own submitting provider. Refused once that proposal has
+        already been accepted.
+      responses:
+        '200':
+          description: Withdrawn OpenTaskProposal
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OpenTaskProposal'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/open-tasks/{task_id}/proposals/{proposal_id}/accept:
+    parameters:
+      - {$ref: '#/components/parameters/OpenTaskID'}
+      - {$ref: '#/components/parameters/OpenTaskProposalID'}
+    post:
+      tags: [open_tasks]
+      summary: Accept a proposal as the task owner
+      description: |
+        Requires `open_tasks:write`, and the caller must be the task's
+        owner. Durably claims proposal_id as the winner (database-enforced:
+        at most one accepted proposal per task, at most one bound Job per
+        task) and drives the existing `QuoteService.Create` /
+        `JobService.CreateJob` pipeline forward using the task owner as
+        principal and the winning proposal's capability/version -- this
+        endpoint never computes price, trust mode or proof requirements
+        itself. A stale proposal (capability version changed, capability no
+        longer active, or already withdrawn) is refused outright, never
+        silently rebound. Idempotent: retrying with the same
+        `idempotency_key` resumes the same acceptance rather than creating a
+        second Quote/Job; a crash between steps is recovered by the
+        acceptance reconciler.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AcceptOpenTaskProposalRequest'}
+      responses:
+        '200':
+          description: Updated OpenTask and its AcceptanceOperation
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [open_task, acceptance]
+                properties:
+                  open_task: {$ref: '#/components/schemas/OpenTask'}
+                  acceptance: {$ref: '#/components/schemas/AcceptanceOperation'}
         default: {$ref: '#/components/responses/Error'}
   /v1/invocations:
     post:
@@ -882,6 +1072,16 @@ components:
       in: path
       required: true
       schema: {type: string, pattern: '^dispute_'}
+    OpenTaskID:
+      name: task_id
+      in: path
+      required: true
+      schema: {type: string, pattern: '^otask_'}
+    OpenTaskProposalID:
+      name: proposal_id
+      in: path
+      required: true
+      schema: {type: string, pattern: '^otprop_'}
   responses:
     Error:
       description: ATOS error envelope
@@ -1103,6 +1303,117 @@ components:
         created_at: {type: string, format: date-time}
         completed_at: {type: string, format: date-time}
         estimated_completion_at: {type: string, format: date-time}
+    PublishOpenTaskRequest:
+      type: object
+      additionalProperties: false
+      required: [title, expires_at, idempotency_key]
+      properties:
+        title: {type: string, minLength: 1}
+        description: {type: string}
+        input: {type: object, additionalProperties: true}
+        requested_trust_mode: {$ref: '#/components/schemas/RequestedTrustMode'}
+        proof_requirements: {$ref: '#/components/schemas/ProofRequirements'}
+        constraints:
+          type: object
+          additionalProperties: false
+          properties:
+            max_total: {$ref: '#/components/schemas/Money'}
+        expires_at: {type: string, format: date-time}
+        idempotency_key: {type: string, minLength: 1}
+    OpenTaskStatus:
+      type: string
+      enum: [open, accepted, fulfilled, cancelled, expired]
+    OpenTask:
+      type: object
+      required: [id, principal_id, title, status, expires_at, created_at, updated_at]
+      properties:
+        id: {type: string}
+        principal_id: {type: string}
+        title: {type: string}
+        description: {type: string}
+        input:
+          description: Present only for the task owner or, once accepted, the winning provider. Never present in the public listing/search view.
+          type: [object, 'null']
+          additionalProperties: true
+        requested_trust_mode: {$ref: '#/components/schemas/RequestedTrustMode'}
+        proof_requirements: {$ref: '#/components/schemas/ProofRequirements'}
+        max_total: {$ref: '#/components/schemas/Money'}
+        expires_at: {type: string, format: date-time}
+        status: {$ref: '#/components/schemas/OpenTaskStatus'}
+        accepted_proposal_id: {type: string}
+        bound_quote_id: {type: string}
+        bound_job_id: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    ProposeOpenTaskRequest:
+      type: object
+      additionalProperties: false
+      required: [capability_id, idempotency_key]
+      properties:
+        capability_id: {type: string}
+        message: {type: string}
+        proposed_price:
+          description: Non-authoritative hint only -- see the endpoint description.
+          allOf: [{$ref: '#/components/schemas/Money'}]
+        idempotency_key: {type: string, minLength: 1}
+    OpenTaskProposal:
+      type: object
+      required: [id, task_id, provider_id, capability_id, capability_version, created_at, updated_at]
+      properties:
+        id: {type: string}
+        task_id: {type: string}
+        provider_id: {type: string}
+        capability_id: {type: string}
+        capability_version: {type: string}
+        message:
+          description: Present only for the task owner or this proposal's own submitting provider.
+          type: string
+        proposed_price: {$ref: '#/components/schemas/Money'}
+        withdrawn_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    OpenTaskProposalView:
+      description: OpenTaskProposal with the derived (never stored) effective status.
+      allOf:
+        - {$ref: '#/components/schemas/OpenTaskProposal'}
+        - type: object
+          required: [status]
+          properties:
+            status: {type: string, enum: [submitted, withdrawn, accepted, rejected]}
+    AcceptOpenTaskProposalRequest:
+      type: object
+      additionalProperties: false
+      required: [idempotency_key]
+      properties:
+        idempotency_key: {type: string, minLength: 1}
+    AcceptanceCheckpoint:
+      type: string
+      enum: [intent_persisted, winner_claimed, quote_binding_pending, quote_bound, job_binding_pending, job_bound, completed, failed, reconciling]
+    AcceptanceOperation:
+      description: |
+        The durable winner-selection -> Quote -> Job binding journal for one
+        Accept call. `reconciling` means the last attempted step's remote
+        outcome is uncertain; a subsequent retry or the periodic reconciler
+        resolves it. `failed` is terminal but unsuccessful -- the task
+        reopens to `open` when this is reached.
+      type: object
+      required: [id, task_id, proposal_id, principal_id, provider_id, capability_id, capability_version, checkpoint, idempotency_key, created_at, updated_at]
+      properties:
+        id: {type: string}
+        task_id: {type: string}
+        proposal_id: {type: string}
+        principal_id: {type: string}
+        provider_id: {type: string}
+        capability_id: {type: string}
+        capability_version: {type: string}
+        checkpoint: {$ref: '#/components/schemas/AcceptanceCheckpoint'}
+        idempotency_key: {type: string}
+        quote_id: {type: string}
+        job_id: {type: string}
+        failure_reason: {type: string}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
     SubmitWorkRequest:
       type: object
       additionalProperties: false

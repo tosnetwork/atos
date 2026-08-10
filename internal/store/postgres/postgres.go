@@ -184,12 +184,43 @@ func (s *Store) PutQuote(ctx context.Context, q domain.Quote) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO quotes (
 			id, capability_id, capability_version, price, expires_at,
-			requires_confirmation, terms_hash, created_at, payload
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+			requires_confirmation, terms_hash, created_at, principal_id,
+			idempotency_key, payload
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		ON CONFLICT (id) DO NOTHING
 	`, q.ID, q.CapabilityID, q.CapabilityVersion, mustMarshal(q.Price),
-		q.ExpiresAt, q.RequiresConfirmation, q.TermsHash, q.CreatedAt, mustMarshal(q))
+		q.ExpiresAt, q.RequiresConfirmation, q.TermsHash, q.CreatedAt,
+		q.PrincipalID, q.IdempotencyKey, mustMarshal(q))
 	return err
+}
+
+// QuoteByIdempotencyKey returns the Quote previously committed under
+// (principalID, key), used by QuoteService.Create to recover from a crash
+// between committing the Quote row and marking the idempotency record
+// finished. Mirrors JobByIdempotencyKey below.
+func (s *Store) QuoteByIdempotencyKey(ctx context.Context, principalID, key string) (domain.Quote, error) {
+	var q domain.Quote
+	var price, payload []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, capability_id, capability_version, price, expires_at,
+		       requires_confirmation, terms_hash, created_at, payload
+		FROM quotes
+		WHERE principal_id=$1 AND idempotency_key=$2 AND idempotency_key <> ''
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, principalID, key).Scan(&q.ID, &q.CapabilityID, &q.CapabilityVersion, &price,
+		&q.ExpiresAt, &q.RequiresConfirmation, &q.TermsHash, &q.CreatedAt, &payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Quote{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.Quote{}, err
+	}
+	_ = json.Unmarshal(price, &q.Price)
+	if err := applyPayload(payload, &q); err != nil {
+		return domain.Quote{}, err
+	}
+	return q, nil
 }
 
 func (s *Store) GetQuote(ctx context.Context, id string) (domain.Quote, error) {

@@ -70,6 +70,28 @@ type Quote struct {
 	Binding      *CapabilityBinding `json:"binding,omitempty"`
 	InputSchema  map[string]any     `json:"input_schema,omitempty"`
 	OutputSchema map[string]any     `json:"output_schema,omitempty"`
+	// IdempotencyKey is the caller-supplied key this Quote was created
+	// under, if any (empty for the many pre-Phase-3C call sites that never
+	// set CreateQuoteInput.IdempotencyKey). Scoped by PrincipalID, exactly
+	// like domain.Job.IdempotencyKey -- see store.Quotes.QuoteByIdempotencyKey
+	// and QuoteService.Create's Reserve/Finish/Release wrapper. Internal
+	// bookkeeping only, never part of the public Quote contract.
+	IdempotencyKey string `json:"-"`
+	// IdempotencyRequestHash is QuoteService.Create's own requestHash
+	// digest, persisted on the Quote itself (unlike IdempotencyKey, this
+	// one is NOT tagged json:"-" -- it must actually round-trip through
+	// the Postgres store's jsonb payload column). This exists so the
+	// crash-recovery lookup path (QuoteByIdempotencyKey) can verify a
+	// resumed/replayed call's content still matches what was originally
+	// committed, rather than trusting the lookup blindly: the generic
+	// store.Idempotency record that would normally hold this comparison
+	// can be deleted out from under a genuinely-committed Quote if a
+	// PRIOR attempt's own Finish call failed after PutQuote succeeded
+	// (that attempt's deferred Release hard-deletes the idempotency
+	// record) -- without this field, a LATER call reusing the same key
+	// with genuinely different content would silently receive the old
+	// Quote back instead of being rejected as a conflicting reuse.
+	IdempotencyRequestHash string `json:"idempotency_request_hash,omitempty"`
 }
 
 func (q Quote) Expired(now time.Time) bool {
