@@ -140,14 +140,38 @@ func (s *JobService) submit(ctx context.Context, in SubmitInput, waitInline bool
 	if err := domain.ValidateCommittedTrust(quote.TrustMode, quote.ProofProfile); err != nil {
 		return SubmitResult{}, domain.NewError(domain.ErrQuoteModeMismatch, err.Error(), false)
 	}
+	if quote.InputSchema == nil {
+		// A Capability's InputSchema is required and non-nil at
+		// registration (validateCapabilitySchemas), and QuoteService.Create
+		// unconditionally freezes it onto every Quote it creates -- so a
+		// persisted Quote with a nil InputSchema unambiguously predates
+		// Binding/InputSchema/OutputSchema freezing, not "the Capability
+		// legitimately had no schema." Failing explicitly here (rather than
+		// silently falling back to whatever the live Capability currently
+		// has, or letting a nil Binding masquerade as "no third-party
+		// binding") is the deliberate choice: a legacy third-party Quote
+		// must never be silently reinterpreted as a native/no-binding one.
+		return SubmitResult{}, domain.NewError(domain.ErrQuoteMismatch, "quote predates binding/schema freezing; request a new quote", false)
+	}
 	capability, err := s.store.Get(ctx, in.CapabilityID)
 	if err != nil {
 		return SubmitResult{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability not found", false)
 	}
 	capability = normalizeCapability(capability)
-	if capability.Version != quote.CapabilityVersion || capability.ProviderID != quote.ProviderID {
+	if capability.ProviderID != quote.ProviderID {
 		return SubmitResult{}, domain.NewError(domain.ErrQuoteMismatch, "capability/provider changed after quote issuance", false)
 	}
+	// capability.Version deliberately is NOT compared against
+	// quote.CapabilityVersion here: an already-issued Quote MUST continue
+	// to use its own frozen version/binding/schema semantics even after a
+	// later Capability update (atos-spec docs/IMPLEMENTATION_ROADMAP.md
+	// §7.1.0's binding-freeze rule) -- see quote.Binding/InputSchema/
+	// OutputSchema below, frozen at Quote-creation time
+	// (internal/service/quote.go's Create), never re-derived from the
+	// live Capability here. Trust-mode ACTIVATION is a different,
+	// deliberately live concept (eligible_trust_modes is eligibility
+	// metadata, not activation authority) and is correctly still checked
+	// against the current Capability immediately below.
 	if !capability.Supports(quote.TrustMode) {
 		return SubmitResult{}, domain.NewError(domain.ErrTrustModeUnavailable, "quoted trust mode is no longer active", true)
 	}
@@ -166,24 +190,21 @@ func (s *JobService) submit(ctx context.Context, in SubmitInput, waitInline bool
 		proofStatus.Quote = domain.ProofPending
 	}
 	// Before outbound dispatch, request data must satisfy the frozen input
-	// schema -- checked once, here, against the schema current at Job
-	// creation (never re-checked against a later-updated Capability).
-	if err := validateAgainstSchema("input", capability.InputSchema, in.Input); err != nil {
+	// schema -- checked once, here, against the schema frozen onto the
+	// Quote at its own creation time (never re-checked against a
+	// later-updated Capability's current schema).
+	if err := validateAgainstSchema("input", quote.InputSchema, in.Input); err != nil {
 		return SubmitResult{}, domain.NewError(domain.ErrValidationFailed, err.Error(), false)
 	}
-	// The binding is selected and frozen onto the Job once, here, at
-	// creation time -- execution must never re-resolve it from the
-	// Capability's live (possibly later-updated) Bindings. See
-	// domain.Job.Binding's doc comment.
-	var frozenBinding *domain.CapabilityBinding
-	if binding, ok := domain.SelectBinding(capability.Bindings, quote.TrustMode); ok {
-		frozenBinding = &binding
-	}
+	// The binding, version and schemas are all sourced from the Quote's own
+	// frozen snapshot, not re-resolved from the Capability's live
+	// (possibly later-updated) state. See domain.Job.Binding's doc comment
+	// and domain.Quote.Binding's doc comment.
 	job := domain.Job{
-		ID: idPrefix + uuid.NewString(), CapabilityID: capability.ID,
-		CapabilityVersion: capability.Version, Binding: frozenBinding,
-		InputSchema: capability.InputSchema, OutputSchema: capability.OutputSchema,
-		ProviderID: capability.ProviderID,
+		ID: idPrefix + uuid.NewString(), CapabilityID: quote.CapabilityID,
+		CapabilityVersion: quote.CapabilityVersion, Binding: quote.Binding,
+		InputSchema: quote.InputSchema, OutputSchema: quote.OutputSchema,
+		ProviderID: quote.ProviderID,
 		QuoteID:    quote.ID, ServiceQuoteID: quote.ServiceQuoteID,
 		PrincipalID: in.PrincipalID, TrustMode: quote.TrustMode,
 		ProofProfile: quote.ProofProfile, ProofStatus: proofStatus,

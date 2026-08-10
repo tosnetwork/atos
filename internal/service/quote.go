@@ -169,6 +169,18 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 		executionDeadline = serviceQuote.ExecutionDeadline
 	}
 	disputePolicyHash := termsHash("atos-dispute-policy", "v0.2", "72h")
+	// Frozen here, at the same Capability snapshot ("cap") already used
+	// above for pricing/trust-mode resolution -- not re-derived from a
+	// possibly-later live Capability at Job-creation time. See
+	// domain.Quote.Binding's doc comment: an already-issued Quote/Job MUST
+	// continue to use its frozen version/binding semantics after a later
+	// Capability update (atos-spec docs/IMPLEMENTATION_ROADMAP.md §7.1.0).
+	// nil (not an error) when the Capability has no transport binding at
+	// all -- the ordinary tos-native/human path.
+	var frozenBinding *domain.CapabilityBinding
+	if binding, ok := domain.SelectBinding(cap.Bindings, mode); ok {
+		frozenBinding = &binding
+	}
 	q := domain.Quote{
 		ID:                 "q_" + uuid.NewString(),
 		CapabilityID:       cap.ID,
@@ -197,6 +209,9 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 		// pricing configuration.
 		MeteredRates: cap.Pricing.MeteredRates,
 		PricingModel: cap.Pricing.Model,
+		Binding:      frozenBinding,
+		InputSchema:  cap.InputSchema,
+		OutputSchema: cap.OutputSchema,
 	}
 	if serviceQuote.ID != "" {
 		q.ServiceQuoteID = serviceQuote.ID
@@ -223,6 +238,13 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 		q.ExpiresAt.Format(time.RFC3339Nano), q.ExecutionDeadline.Format(time.RFC3339Nano),
 		q.DisputePolicyHash, q.ServiceQuoteID, q.UnderlyingServiceQuoteRef,
 		q.InputSummaryCommitment,
+		// Binding/InputSchema/OutputSchema are the exact execution semantics
+		// Job creation later freezes from this Quote (see
+		// domain.Quote.Binding's doc comment) -- committed here for the same
+		// reason PricingModel/MeteredRates are: two Quotes must not share a
+		// TermsHash while differing in what a Job would actually execute
+		// against.
+		hashCommitment(q.Binding), hashCommitment(q.InputSchema), hashCommitment(q.OutputSchema),
 	)
 	if err := s.store.PutQuote(ctx, q); err != nil {
 		return domain.Quote{}, err

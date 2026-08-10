@@ -45,8 +45,82 @@ type Quote struct {
 	// trail -- so two Quotes cannot share a TermsHash while differing in
 	// how a Job would actually be charged.
 	PricingModel PricingModel `json:"pricing_model,omitempty"`
+	// Binding, InputSchema and OutputSchema are frozen from the Capability
+	// at Quote-creation time via SelectBinding, exactly like MeteredRates/
+	// PricingModel above. Job creation (internal/service/job.go's submit)
+	// MUST use these frozen values, never re-derive them from the
+	// Capability's live state -- an already-issued Quote/Job MUST continue
+	// to use its frozen version/binding semantics after a later Capability
+	// update (atos-spec docs/IMPLEMENTATION_ROADMAP.md §7.1.0's binding-
+	// freeze rule). Binding is nil when the Capability has no transport
+	// binding at all (the ordinary tos-native/human path), not as a signal
+	// that this Quote predates this field -- InputSchema/OutputSchema are
+	// unconditionally frozen for every Quote this package creates (a
+	// Capability's schemas are required, never nil), so a persisted Quote
+	// whose InputSchema is nil unambiguously predates this field instead
+	// (see QuoteService.Get's legacy-Quote handling).
+	//
+	// These three fields are ATOS's own internal execution snapshot, not
+	// part of the public Quote contract -- see PublicQuote's doc comment.
+	// They are tagged for JSON persistence (the durable store round-trips
+	// the whole struct through one JSON payload column) but a public
+	// REST/MCP/A2A response MUST go through Quote.Public() instead of
+	// serializing Quote directly, or they leak into a response
+	// atos-spec docs/API.md never defined them for.
+	Binding      *CapabilityBinding `json:"binding,omitempty"`
+	InputSchema  map[string]any     `json:"input_schema,omitempty"`
+	OutputSchema map[string]any     `json:"output_schema,omitempty"`
 }
 
 func (q Quote) Expired(now time.Time) bool {
 	return !now.Before(q.ExpiresAt)
+}
+
+// PublicQuote is the atos-spec-normative public representation of a Quote
+// (docs/API.md §3 "Quote Endpoints"). It deliberately omits
+// Quote.Binding/InputSchema/OutputSchema -- ATOS's own internal frozen
+// execution snapshot (see Quote.Binding's doc comment), never part of the
+// public contract. These can be arbitrarily large (a full JSON Schema
+// document) and returning them on every Quote response would be needless
+// token/network cost for a caller that never needs them: Job responses
+// already carry the same frozen values a Job actually executes against.
+type PublicQuote struct {
+	ID                        string               `json:"quote_id"`
+	CapabilityID              string               `json:"capability_id"`
+	CapabilityVersion         string               `json:"capability_version"`
+	ProviderID                string               `json:"provider_id"`
+	PrincipalID               string               `json:"principal_id,omitempty"`
+	RequestedTrustMode        RequestedTrustMode   `json:"requested_trust_mode"`
+	TrustMode                 TrustMode            `json:"trust_mode"`
+	ProofProfile              ProofProfile         `json:"proof_profile,omitempty"`
+	Price                     Price                `json:"price"`
+	Settlement                SettlementDescriptor `json:"settlement"`
+	Proof                     ProofDescriptor      `json:"proof"`
+	ExpiresAt                 time.Time            `json:"expires_at"`
+	RequiresConfirmation      bool                 `json:"requires_confirmation"`
+	TermsHash                 string               `json:"terms_hash"`
+	DisputePolicyHash         string               `json:"dispute_policy_hash,omitempty"`
+	ServiceQuoteID            string               `json:"service_quote_id,omitempty"`
+	UnderlyingServiceQuoteRef string               `json:"underlying_service_quote_ref,omitempty"`
+	InputSummaryCommitment    string               `json:"input_summary_commitment,omitempty"`
+	ExecutionDeadline         time.Time            `json:"execution_deadline,omitempty"`
+	MeteredRates              *MeteredRates        `json:"metered_rates,omitempty"`
+	PricingModel              PricingModel         `json:"pricing_model,omitempty"`
+}
+
+// Public returns q's atos-spec-normative public representation -- every
+// REST/MCP/A2A surface that returns a Quote to a caller MUST use this,
+// never serialize Quote directly. See PublicQuote's doc comment.
+func (q Quote) Public() PublicQuote {
+	return PublicQuote{
+		ID: q.ID, CapabilityID: q.CapabilityID, CapabilityVersion: q.CapabilityVersion,
+		ProviderID: q.ProviderID, PrincipalID: q.PrincipalID,
+		RequestedTrustMode: q.RequestedTrustMode, TrustMode: q.TrustMode, ProofProfile: q.ProofProfile,
+		Price: q.Price, Settlement: q.Settlement, Proof: q.Proof,
+		ExpiresAt: q.ExpiresAt, RequiresConfirmation: q.RequiresConfirmation,
+		TermsHash: q.TermsHash, DisputePolicyHash: q.DisputePolicyHash,
+		ServiceQuoteID: q.ServiceQuoteID, UnderlyingServiceQuoteRef: q.UnderlyingServiceQuoteRef,
+		InputSummaryCommitment: q.InputSummaryCommitment, ExecutionDeadline: q.ExecutionDeadline,
+		MeteredRates: q.MeteredRates, PricingModel: q.PricingModel,
+	}
 }

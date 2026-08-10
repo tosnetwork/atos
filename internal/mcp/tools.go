@@ -131,7 +131,11 @@ func (s *Server) toolQuote(ctx context.Context, principal auth.Principal, args m
 			}
 		}
 	}
-	return s.Quotes.Create(ctx, input)
+	quote, err := s.Quotes.Create(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return quote.Public(), nil
 }
 
 func (s *Server) toolInvoke(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {

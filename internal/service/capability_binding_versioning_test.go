@@ -2,10 +2,15 @@ package service_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/tosnetwork/atos/internal/adapters/provideradapter"
+	"github.com/tosnetwork/atos/internal/adapters/provideradapter/httpadapter"
 	"github.com/tosnetwork/atos/internal/adapters/tosai/dispatch"
 	tosaimock "github.com/tosnetwork/atos/internal/adapters/tosai/mock"
 	toscoremock "github.com/tosnetwork/atos/internal/adapters/toscore/mock"
@@ -190,5 +195,284 @@ func TestReconcileJob_ContinuesToResolveTheOldBindingAfterCapabilityUpdate(t *te
 		if endpoint != originalEndpoint {
 			t.Fatalf("call %d invoked endpoint %q, want the ORIGINAL frozen endpoint %q, never the capability's updated one %q", i, endpoint, originalEndpoint, updatedEndpoint)
 		}
+	}
+}
+
+// TestJobService_SubmitUsesQuoteFrozenBindingAfterCapabilityUpdate proves
+// atos-spec docs/IMPLEMENTATION_ROADMAP.md §7.1.0's binding-freeze
+// acceptance criterion at the point it was previously NOT satisfied: Job
+// creation (internal/service/job.go's submit), not just later
+// reconciliation of an already-created Job (already covered above by
+// TestReconcileJob_ContinuesToResolveTheOldBindingAfterCapabilityUpdate).
+//
+// Before this test's corresponding fix, submit() hard-rejected
+// (ErrQuoteMismatch) whenever capability.Version != quote.CapabilityVersion,
+// so a Capability update landing between QuoteService.Create and
+// JobService.Invoke made an otherwise still-valid, unexpired Quote
+// permanently unusable -- safe (no substitution), but not what the
+// roadmap's binding-freeze rule requires: "an already-issued Quote/Job
+// MUST continue to use its frozen version/binding semantics after a
+// Capability update." This test proves the Quote's own frozen
+// binding/version/schema (domain.Quote.Binding/InputSchema/OutputSchema,
+// set by QuoteService.Create) is what Job creation now uses instead.
+//
+// Uses real in-process HTTP servers for both the original and updated
+// bindings (not a mocked resolver interface), matching this repository's
+// atos-spec §3.6 real-protocol-tests convention -- the same pattern
+// TestJobInvoke_HTTPBoundCapability_EndToEnd already establishes.
+func TestJobService_SubmitUsesQuoteFrozenBindingAfterCapabilityUpdate(t *testing.T) {
+	ctx := context.Background()
+
+	var bindingBCalled bool
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bindingBCalled = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srvB.Close()
+
+	var gotJobID string
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			// dispatch.Provider.SubmitJob Querys by idempotency key before
+			// ever Invoking -- no record of this attempt exists yet.
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			return
+		}
+		gotJobID, _ = body["job_id"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "completed",
+			"output": map[string]any{"summary": "processed by the frozen binding A"},
+		})
+	}))
+	defer srvA.Close()
+
+	st := memory.New()
+	// A single httpadapter.Adapter dials whichever EndpointRef a given
+	// request carries (the local/dev dispatch model -- distinct from
+	// tos-ai's operator-curated remote allowlist), so one adapter instance
+	// can prove which of the two real servers actually received the call.
+	httpAdapter := httpadapter.New(httpadapter.Config{Client: srvA.Client()})
+	provider := dispatch.New(tosaimock.New(), provideradapter.NewResolver(httpAdapter))
+	core := toscoremock.New(st)
+	capabilities := service.NewCapabilityService(st)
+	quotes := service.NewQuoteService(st)
+	accounts := service.NewAccountService(st)
+	quotes.WithAccountService(accounts)
+	jobs := service.NewJobService(st, provider, core, accounts)
+
+	cap, err := capabilities.Register(ctx, service.RegisterCapabilityInput{
+		ProviderID: "agt_quote_continuity", Name: "Test Capability", Description: "for tests",
+		DeliveryMode: domain.DeliveryInstant,
+		InputSchema:  map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
+		Bindings: []domain.CapabilityBinding{
+			{Transport: domain.AdapterHTTP, EndpointRef: srvA.URL, EligibleTrustModes: []domain.TrustMode{domain.TrustModeManaged}},
+		},
+		IdempotencyKey: "register-quote-continuity",
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	originalVersion, originalManifest := cap.Version, cap.ManifestCommitment
+
+	quote, err := quotes.Create(ctx, service.CreateQuoteInput{CapabilityID: cap.ID})
+	if err != nil {
+		t.Fatalf("Create quote: %v", err)
+	}
+	if quote.CapabilityVersion != originalVersion {
+		t.Fatalf("quote.CapabilityVersion = %s, want %s", quote.CapabilityVersion, originalVersion)
+	}
+	if quote.Binding == nil || quote.Binding.EndpointRef != srvA.URL {
+		t.Fatalf("quote.Binding = %+v, want the frozen binding A (%s)", quote.Binding, srvA.URL)
+	}
+
+	// Update ONLY the binding -- A -> B.
+	updated, err := capabilities.Update(ctx, cap.ID, "agt_quote_continuity", map[string]any{
+		"bindings": []map[string]any{
+			{"transport": "http", "endpoint_ref": srvB.URL, "eligible_trust_modes": []string{"managed"}},
+		},
+	}, "update-quote-continuity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Version == originalVersion {
+		t.Fatal("test setup invalid: capability version must change after the binding update")
+	}
+	if updated.ManifestCommitment == originalManifest {
+		t.Fatal("test setup invalid: manifest commitment must change after the binding update")
+	}
+
+	// Submit a Job using the still-valid Quote AFTER the Capability moved
+	// on to a new version/binding.
+	result, err := jobs.Invoke(ctx, service.SubmitInput{
+		PrincipalID: "prn_quote_continuity", CapabilityID: cap.ID, QuoteID: quote.ID,
+		Input: map[string]any{"x": 1}, IdempotencyKey: "invoke-quote-continuity",
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v -- a still-valid Quote must continue to resolve its own frozen version/binding, not fail merely because the Capability moved to a new version", err)
+	}
+	if result.Job.State != domain.JobCompleted {
+		t.Fatalf("state = %s, want completed: %+v", result.Job.State, result.Job)
+	}
+	if bindingBCalled {
+		t.Fatal("binding B received a call -- a still-valid Quote must never dispatch against a binding it did not freeze")
+	}
+	if gotJobID != result.Job.ID {
+		t.Fatalf("binding A observed job_id %q, want %q -- execution must go to the frozen binding A", gotJobID, result.Job.ID)
+	}
+	if result.Job.CapabilityVersion != originalVersion {
+		t.Fatalf("job.CapabilityVersion = %s, want the Quote's frozen version %s (Capability is now at %s)", result.Job.CapabilityVersion, originalVersion, updated.Version)
+	}
+	if result.Job.Binding == nil || result.Job.Binding.EndpointRef != srvA.URL {
+		t.Fatalf("job.Binding = %+v, want the frozen binding A (%s)", result.Job.Binding, srvA.URL)
+	}
+	if !reflect.DeepEqual(result.Job.InputSchema, quote.InputSchema) {
+		t.Fatalf("job.InputSchema = %+v, want the Quote's frozen input schema %+v", result.Job.InputSchema, quote.InputSchema)
+	}
+	if !reflect.DeepEqual(result.Job.OutputSchema, quote.OutputSchema) {
+		t.Fatalf("job.OutputSchema = %+v, want the Quote's frozen output schema %+v", result.Job.OutputSchema, quote.OutputSchema)
+	}
+	if result.Job.ExecutionReceipt == nil {
+		t.Fatal("expected a synthesized execution receipt -- Receipt/settlement must remain the existing normal path")
+	}
+	if result.Job.EconomicState != domain.EconomicSettled {
+		t.Fatalf("economic state = %s, want settled", result.Job.EconomicState)
+	}
+
+	// A retry (idempotent replay) after the update must still resolve to
+	// the same already-committed Job, never reroute to binding B.
+	replay, err := jobs.Invoke(ctx, service.SubmitInput{
+		PrincipalID: "prn_quote_continuity", CapabilityID: cap.ID, QuoteID: quote.ID,
+		Input: map[string]any{"x": 1}, IdempotencyKey: "invoke-quote-continuity",
+	})
+	if err != nil {
+		t.Fatalf("replay Invoke: %v", err)
+	}
+	if replay.Job.ID != result.Job.ID {
+		t.Fatalf("replay produced a different job: %s vs %s", replay.Job.ID, result.Job.ID)
+	}
+	if bindingBCalled {
+		t.Fatal("binding B received a call on replay")
+	}
+}
+
+// TestQuoteService_NewQuoteAfterCapabilityUpdateUsesNewBinding is the
+// inverse of TestJobService_SubmitUsesQuoteFrozenBindingAfterCapabilityUpdate:
+// a NEW Quote created after the Capability update must resolve the
+// UPDATED binding/version, not the old one -- proving old committed
+// history (an already-issued Quote) and new live configuration are
+// cleanly separated, not that Quotes simply ignore Capability updates
+// altogether.
+func TestQuoteService_NewQuoteAfterCapabilityUpdateUsesNewBinding(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	quotes := service.NewQuoteService(st)
+
+	const bindingA = "https://provider-a.example.com"
+	const bindingB = "https://provider-b.example.com"
+
+	cap, err := capabilities.Register(ctx, service.RegisterCapabilityInput{
+		ProviderID: "agt_new_quote_binding", Name: "Test Capability", Description: "for tests",
+		DeliveryMode: domain.DeliveryInstant,
+		InputSchema:  map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
+		Bindings: []domain.CapabilityBinding{
+			{Transport: domain.AdapterHTTP, EndpointRef: bindingA, EligibleTrustModes: []domain.TrustMode{domain.TrustModeManaged}},
+		},
+		IdempotencyKey: "register-new-quote-binding",
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	updated, err := capabilities.Update(ctx, cap.ID, "agt_new_quote_binding", map[string]any{
+		"bindings": []map[string]any{
+			{"transport": "http", "endpoint_ref": bindingB, "eligible_trust_modes": []string{"managed"}},
+		},
+	}, "update-new-quote-binding")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	quote, err := quotes.Create(ctx, service.CreateQuoteInput{CapabilityID: cap.ID})
+	if err != nil {
+		t.Fatalf("Create quote: %v", err)
+	}
+	if quote.CapabilityVersion != updated.Version {
+		t.Fatalf("quote.CapabilityVersion = %s, want the current version %s", quote.CapabilityVersion, updated.Version)
+	}
+	if quote.Binding == nil || quote.Binding.EndpointRef != bindingB {
+		t.Fatalf("quote.Binding = %+v, want the UPDATED binding B (%s), not the old binding A", quote.Binding, bindingB)
+	}
+}
+
+// TestJobService_SubmitFailsClosedOnLegacyQuoteMissingFrozenSchema proves
+// JobService.submit's deployment-compatibility guard: a persisted Quote
+// whose InputSchema is nil (a real Capability's InputSchema is required
+// and non-nil at registration, and QuoteService.Create unconditionally
+// freezes it, so a nil InputSchema unambiguously means this Quote predates
+// Binding/InputSchema/OutputSchema freezing) must fail submission
+// explicitly, never silently fall back to treating a legacy third-party
+// Quote as a native/no-binding one -- which would otherwise route
+// execution to dispatch's native path instead of the third-party adapter
+// the Quote was actually issued against.
+func TestJobService_SubmitFailsClosedOnLegacyQuoteMissingFrozenSchema(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	adapter := &countingInvokeAdapter{transport: domain.AdapterHTTP}
+	provider := dispatch.New(tosaimock.New(), provideradapter.NewResolver(adapter))
+	core := toscoremock.New(st)
+	capabilities := service.NewCapabilityService(st)
+	quotes := service.NewQuoteService(st)
+	accounts := service.NewAccountService(st)
+	quotes.WithAccountService(accounts)
+	jobs := service.NewJobService(st, provider, core, accounts)
+
+	cap, err := capabilities.Register(ctx, service.RegisterCapabilityInput{
+		ProviderID: "agt_legacy_quote", Name: "Test Capability", Description: "for tests",
+		DeliveryMode: domain.DeliveryInstant,
+		InputSchema:  map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
+		Bindings: []domain.CapabilityBinding{
+			{Transport: domain.AdapterHTTP, EndpointRef: "https://provider.example.com", EligibleTrustModes: []domain.TrustMode{domain.TrustModeManaged}},
+		},
+		IdempotencyKey: "register-legacy-quote",
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	quote, err := quotes.Create(ctx, service.CreateQuoteInput{CapabilityID: cap.ID})
+	if err != nil {
+		t.Fatalf("Create quote: %v", err)
+	}
+	if quote.Binding == nil || quote.InputSchema == nil {
+		t.Fatal("test setup invalid: quote must have a real frozen binding/schema to strip")
+	}
+
+	// Simulate a Quote persisted before this field existed by stripping it
+	// and writing it directly back into the store, bypassing QuoteService
+	// entirely -- exactly what a real pre-upgrade row would look like.
+	legacy := quote
+	legacy.Binding, legacy.InputSchema, legacy.OutputSchema = nil, nil, nil
+	if err := st.PutQuote(ctx, legacy); err != nil {
+		t.Fatalf("PutQuote (simulate legacy row): %v", err)
+	}
+
+	_, err = jobs.Invoke(ctx, service.SubmitInput{
+		PrincipalID: "prn_legacy_quote", CapabilityID: cap.ID, QuoteID: quote.ID,
+		Input: map[string]any{"x": 1}, IdempotencyKey: "invoke-legacy-quote",
+	})
+	if err == nil {
+		t.Fatal("expected Invoke to fail closed on a legacy Quote missing its frozen schema, not silently succeed")
+	}
+	if adapter.invokeCalls != 0 {
+		t.Fatalf("adapter invoked %d times, want 0 -- a legacy Quote must never dispatch at all, whether to the native or third-party path", adapter.invokeCalls)
 	}
 }
