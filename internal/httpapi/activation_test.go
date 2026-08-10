@@ -79,12 +79,15 @@ func newActivationTestServer(t *testing.T, authority domain.ActivationAuthority)
 	return server, cap, token
 }
 
-func callEvaluateActivation(t *testing.T, server *Server, token, capabilityID, mode string) *httptest.ResponseRecorder {
+func callEvaluateActivation(t *testing.T, server *Server, token, capabilityID, mode, idempotencyKey string) *httptest.ResponseRecorder {
 	t.Helper()
 	body, _ := json.Marshal(map[string]any{"mode": mode})
 	req := httptest.NewRequest(http.MethodPost, "/v1/capabilities/"+capabilityID+"/activation/evaluate", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
 	recorder := httptest.NewRecorder()
 	server.Mux().ServeHTTP(recorder, req)
 	return recorder
@@ -92,7 +95,7 @@ func callEvaluateActivation(t *testing.T, server *Server, token, capabilityID, m
 
 func TestHandleEvaluateActivation_GrantedActivates(t *testing.T) {
 	server, cap, token := newActivationTestServer(t, grantingActivationAuthority{})
-	recorder := callEvaluateActivation(t, server, token, cap.ID, "verified")
+	recorder := callEvaluateActivation(t, server, token, cap.ID, "verified", "eval-rest-1")
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -114,7 +117,7 @@ func TestHandleEvaluateActivation_GrantedActivates(t *testing.T) {
 // exact behavior main.go's real wiring produces today.
 func TestHandleEvaluateActivation_FailClosedProductionAuthority(t *testing.T) {
 	server, cap, token := newActivationTestServer(t, service.FailClosedActivationAuthority{})
-	recorder := callEvaluateActivation(t, server, token, cap.ID, "verified")
+	recorder := callEvaluateActivation(t, server, token, cap.ID, "verified", "eval-rest-2")
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -137,7 +140,7 @@ func TestHandleEvaluateActivation_RejectsIllegalSourceState(t *testing.T) {
 	server, cap, token := newActivationTestServer(t, grantingActivationAuthority{})
 	// Managed is unconditionally active, never pending/suspended -- an
 	// illegal source state for this endpoint.
-	recorder := callEvaluateActivation(t, server, token, cap.ID, "managed")
+	recorder := callEvaluateActivation(t, server, token, cap.ID, "managed", "eval-rest-3")
 	if recorder.Code == http.StatusOK {
 		t.Fatalf("expected a validation error for mode=managed, got 200: %s", recorder.Body.String())
 	}
@@ -165,8 +168,36 @@ func TestHandleEvaluateActivation_RequiresScope(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 	server := &Server{Auth: authorization, Capabilities: capabilities, ActivationAuthority: grantingActivationAuthority{}}
-	recorder := callEvaluateActivation(t, server, token, cap.ID, "verified")
+	recorder := callEvaluateActivation(t, server, token, cap.ID, "verified", "eval-rest-4")
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestHandleEvaluateActivation_RequiresIdempotencyKey(t *testing.T) {
+	server, cap, token := newActivationTestServer(t, grantingActivationAuthority{})
+	recorder := callEvaluateActivation(t, server, token, cap.ID, "verified", "")
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a missing Idempotency-Key: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestHandleEvaluateActivation_RetryWithSameIdempotencyKeyReturnsIdenticalResponse
+// proves a genuine transport-level retry -- the same Idempotency-Key,
+// identical request body -- returns byte-identical granted/reason_code/
+// mode_support both times, the observable contract behind
+// CapabilityService.EvaluateActivation's idempotent-replay fix.
+func TestHandleEvaluateActivation_RetryWithSameIdempotencyKeyReturnsIdenticalResponse(t *testing.T) {
+	server, cap, token := newActivationTestServer(t, grantingActivationAuthority{})
+	first := callEvaluateActivation(t, server, token, cap.ID, "verified", "eval-rest-retry")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first call status = %d, body = %s", first.Code, first.Body.String())
+	}
+	retry := callEvaluateActivation(t, server, token, cap.ID, "verified", "eval-rest-retry")
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, body = %s", retry.Code, retry.Body.String())
+	}
+	if first.Body.String() != retry.Body.String() {
+		t.Fatalf("retry body diverged from original: first=%s retry=%s", first.Body.String(), retry.Body.String())
 	}
 }

@@ -158,7 +158,7 @@ func TestPhase3B_EndToEndProviderTrustReadinessAcceptance(t *testing.T) {
 	// Step 10: Verified remains NOT active because the Phase 4 activation
 	// authority is unavailable -- the production fail-closed authority is
 	// the ONLY one wired into any real deployment.
-	granted, reasonCode, err := capabilities.EvaluateActivation(ctx, service.FailClosedActivationAuthority{}, cap.ID, domain.TrustModeVerified)
+	granted, reasonCode, err := capabilities.EvaluateActivation(ctx, service.FailClosedActivationAuthority{}, "prn_e2e_admin", cap.ID, domain.TrustModeVerified, "eval-e2e-step10")
 	if err != nil {
 		t.Fatal(err)
 	}

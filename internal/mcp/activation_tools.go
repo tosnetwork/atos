@@ -21,8 +21,12 @@ func (s *Server) toolEvaluateActivation(ctx context.Context, principal auth.Prin
 	if mode != domain.TrustModeVerified && mode != domain.TrustModeNative {
 		return nil, domain.NewError(domain.ErrValidationFailed, "mode must be verified or native", false)
 	}
+	idempotencyKey := argString(args, "idempotency_key")
+	if idempotencyKey == "" {
+		return nil, domain.NewError(domain.ErrValidationFailed, "idempotency_key is required", false)
+	}
 	capabilityID := argString(args, "capability_id")
-	granted, reasonCode, err := s.Capabilities.EvaluateActivation(ctx, s.ActivationAuthority, capabilityID, mode)
+	granted, reasonCode, err := s.Capabilities.EvaluateActivation(ctx, s.ActivationAuthority, principal.ID, capabilityID, mode, idempotencyKey)
 	if err != nil {
 		return nil, err
 	}

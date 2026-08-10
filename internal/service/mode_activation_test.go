@@ -92,12 +92,12 @@ func TestEvaluateActivation_RejectsIllegalSourceStates(t *testing.T) {
 
 	authority := &grantingActivationAuthority{}
 	// Managed is already `active` -- not a legal source.
-	if _, _, err := capabilities.EvaluateActivation(ctx, authority, cap.ID, domain.TrustModeManaged); err == nil {
+	if _, _, err := capabilities.EvaluateActivation(ctx, authority, "prn_admin_ma_2", cap.ID, domain.TrustModeManaged, "eval-ma-2-managed"); err == nil {
 		t.Fatal("expected error evaluating activation for an already-active mode")
 	}
 	// Verified is freshly `requested`, not yet `pending` -- also not a
 	// legal source.
-	if _, _, err := capabilities.EvaluateActivation(ctx, authority, cap.ID, domain.TrustModeVerified); err == nil {
+	if _, _, err := capabilities.EvaluateActivation(ctx, authority, "prn_admin_ma_2", cap.ID, domain.TrustModeVerified, "eval-ma-2-verified"); err == nil {
 		t.Fatal("expected error evaluating activation for a merely-requested mode")
 	}
 	if authority.calls != 0 {
@@ -122,7 +122,7 @@ func TestEvaluateActivation_FailClosedAuthorityLeavesPending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	granted, reasonCode, err := capabilities.EvaluateActivation(ctx, service.FailClosedActivationAuthority{}, cap.ID, domain.TrustModeVerified)
+	granted, reasonCode, err := capabilities.EvaluateActivation(ctx, service.FailClosedActivationAuthority{}, "prn_admin_ma_3", cap.ID, domain.TrustModeVerified, "eval-ma-3")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestEvaluateActivation_GrantedActivatesAndDerivesSupportedModes(t *testing.
 	}
 
 	authority := &grantingActivationAuthority{}
-	granted, _, err := capabilities.EvaluateActivation(ctx, authority, cap.ID, domain.TrustModeVerified)
+	granted, _, err := capabilities.EvaluateActivation(ctx, authority, "prn_admin_ma_4", cap.ID, domain.TrustModeVerified, "eval-ma-4")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestHealthCheckFailure_SuspendsActiveMode_AndAuthorityReactivates(t *testin
 		t.Fatal(err)
 	}
 	authority := &grantingActivationAuthority{}
-	if granted, _, err := capabilities.EvaluateActivation(ctx, authority, cap.ID, domain.TrustModeVerified); err != nil || !granted {
+	if granted, _, err := capabilities.EvaluateActivation(ctx, authority, "prn_admin_ma_5", cap.ID, domain.TrustModeVerified, "eval-ma-5-first"); err != nil || !granted {
 		t.Fatalf("granted=%v err=%v, want granted", granted, err)
 	}
 	activeBefore, err := capabilities.Get(ctx, cap.ID)
@@ -255,7 +255,7 @@ func TestHealthCheckFailure_SuspendsActiveMode_AndAuthorityReactivates(t *testin
 
 	// Readiness restored (operator resolves the outage); the activation
 	// authority re-evaluates and grants -- suspended -> active.
-	granted, _, err := capabilities.EvaluateActivation(ctx, authority, cap.ID, domain.TrustModeVerified)
+	granted, _, err := capabilities.EvaluateActivation(ctx, authority, "prn_admin_ma_5", cap.ID, domain.TrustModeVerified, "eval-ma-5-second")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,5 +340,120 @@ func TestCertificationFailure_SuspendsActiveMode(t *testing.T) {
 	}
 	if got := after.ModeSupport.Entry(domain.TrustModeVerified).Status; got != domain.ModeSupportSuspended {
 		t.Fatalf("status after failed certification = %q, want suspended", got)
+	}
+}
+
+// TestEvaluateActivation_IdempotentReplayReturnsOriginalDecisionWithoutRecallingAuthority
+// is the regression test for the finding that a lost successful response
+// followed by a retry would either call the authority twice or -- once
+// the mode had already moved to active -- be rejected as an illegal
+// source state, instead of transparently returning the original decision
+// (atos-spec docs/API.md §2.2, docs/IMPLEMENTATION_ROADMAP.md §3.3's
+// universal idempotency rule).
+func TestEvaluateActivation_IdempotentReplayReturnsOriginalDecisionWithoutRecallingAuthority(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(certifiableHTTPHandler())
+	defer srv.Close()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	resolver := provideradapter.NewResolver(httpadapter.New(httpadapter.Config{Client: srv.Client()}))
+	health := service.NewHealthService(st, capabilities, resolver)
+
+	cap := registerHTTPBoundCapability(t, capabilities, "agt_ma_idem_1", srv.URL, []domain.TrustMode{domain.TrustModeVerified})
+	if _, err := health.CheckCapability(ctx, cap.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	authority := &grantingActivationAuthority{}
+	first, reasonFirst, err := capabilities.EvaluateActivation(ctx, authority, "prn_idem_admin", cap.ID, domain.TrustModeVerified, "idem-key-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first {
+		t.Fatal("expected first call to be granted")
+	}
+	if authority.calls != 1 {
+		t.Fatalf("authority calls after first attempt = %d, want 1", authority.calls)
+	}
+
+	replay, reasonReplay, err := capabilities.EvaluateActivation(ctx, authority, "prn_idem_admin", cap.ID, domain.TrustModeVerified, "idem-key-1")
+	if err != nil {
+		t.Fatalf("idempotent replay: %v", err)
+	}
+	if replay != first || reasonReplay != reasonFirst {
+		t.Fatalf("replay = (%v,%q), want same as original (%v,%q)", replay, reasonReplay, first, reasonFirst)
+	}
+	if authority.calls != 1 {
+		t.Fatalf("authority calls after replay = %d, want still 1 -- a replay must not call the authority again", authority.calls)
+	}
+}
+
+// TestEvaluateActivation_ReusedIdempotencyKeyWithDifferentRequestConflicts
+// proves the same idempotency key against a genuinely different request
+// (a different target capability) is rejected as a conflict, not silently
+// treated as a replay of the first request's decision.
+func TestEvaluateActivation_ReusedIdempotencyKeyWithDifferentRequestConflicts(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(certifiableHTTPHandler())
+	defer srv.Close()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	resolver := provideradapter.NewResolver(httpadapter.New(httpadapter.Config{Client: srv.Client()}))
+	health := service.NewHealthService(st, capabilities, resolver)
+
+	capA := registerHTTPBoundCapability(t, capabilities, "agt_ma_idem_2a", srv.URL, []domain.TrustMode{domain.TrustModeVerified})
+	if _, err := health.CheckCapability(ctx, capA.ID); err != nil {
+		t.Fatal(err)
+	}
+	capB := registerHTTPBoundCapability(t, capabilities, "agt_ma_idem_2b", srv.URL, []domain.TrustMode{domain.TrustModeVerified})
+	if _, err := health.CheckCapability(ctx, capB.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	authority := &grantingActivationAuthority{}
+	if _, _, err := capabilities.EvaluateActivation(ctx, authority, "prn_idem_admin", capA.ID, domain.TrustModeVerified, "idem-key-shared"); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := capabilities.EvaluateActivation(ctx, authority, "prn_idem_admin", capB.ID, domain.TrustModeVerified, "idem-key-shared")
+	if err == nil {
+		t.Fatal("expected an idempotency conflict for a reused key against a different capability")
+	}
+	derr, ok := err.(*domain.Error)
+	if !ok || derr.Code != domain.ErrIdempotencyConflict {
+		t.Fatalf("expected ErrIdempotencyConflict, got %v", err)
+	}
+}
+
+// TestEvaluateActivation_SameIdempotencyKeyDifferentPrincipalsDoNotConflict
+// proves the idempotency namespace is scoped by the calling admin's own
+// principal ID -- two different admins independently using the identical
+// literal idempotency key string must not collide with each other.
+func TestEvaluateActivation_SameIdempotencyKeyDifferentPrincipalsDoNotConflict(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(certifiableHTTPHandler())
+	defer srv.Close()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	resolver := provideradapter.NewResolver(httpadapter.New(httpadapter.Config{Client: srv.Client()}))
+	health := service.NewHealthService(st, capabilities, resolver)
+
+	capA := registerHTTPBoundCapability(t, capabilities, "agt_ma_idem_3a", srv.URL, []domain.TrustMode{domain.TrustModeVerified})
+	if _, err := health.CheckCapability(ctx, capA.ID); err != nil {
+		t.Fatal(err)
+	}
+	capB := registerHTTPBoundCapability(t, capabilities, "agt_ma_idem_3b", srv.URL, []domain.TrustMode{domain.TrustModeVerified})
+	if _, err := health.CheckCapability(ctx, capB.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	authority := &grantingActivationAuthority{}
+	if _, _, err := capabilities.EvaluateActivation(ctx, authority, "prn_idem_admin_a", capA.ID, domain.TrustModeVerified, "idem-key-common"); err != nil {
+		t.Fatalf("admin A: %v", err)
+	}
+	if _, _, err := capabilities.EvaluateActivation(ctx, authority, "prn_idem_admin_b", capB.ID, domain.TrustModeVerified, "idem-key-common"); err != nil {
+		t.Fatalf("admin B: %v", err)
+	}
+	if authority.calls != 2 {
+		t.Fatalf("authority calls = %d, want 2 -- two different admins' identical key strings must not collide", authority.calls)
 	}
 }

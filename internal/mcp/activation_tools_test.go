@@ -69,7 +69,7 @@ func newActivationToolTestServer(t *testing.T, authority domain.ActivationAuthor
 func TestToolEvaluateActivation_GrantedActivates(t *testing.T) {
 	server, cap, token := newActivationToolTestServer(t, grantingActivationAuthority{}, auth.ScopeActivationEvaluate)
 	resp := callTool(t, server, token, "atos_evaluate_activation", map[string]any{
-		"capability_id": cap.ID, "mode": "verified",
+		"capability_id": cap.ID, "mode": "verified", "idempotency_key": "eval-mcp-1",
 	})
 	if toolCallFailed(t, resp) {
 		t.Fatalf("tool call failed: %+v", resp)
@@ -90,7 +90,7 @@ func TestToolEvaluateActivation_GrantedActivates(t *testing.T) {
 func TestToolEvaluateActivation_FailClosedProductionAuthority(t *testing.T) {
 	server, cap, token := newActivationToolTestServer(t, service.FailClosedActivationAuthority{}, auth.ScopeActivationEvaluate)
 	resp := callTool(t, server, token, "atos_evaluate_activation", map[string]any{
-		"capability_id": cap.ID, "mode": "verified",
+		"capability_id": cap.ID, "mode": "verified", "idempotency_key": "eval-mcp-2",
 	})
 	if toolCallFailed(t, resp) {
 		t.Fatalf("expected a normal (isError:false) result for a fail-closed denial, got: %+v", resp)

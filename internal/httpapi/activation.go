@@ -34,8 +34,13 @@ func (s *Server) handleEvaluateActivation(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "mode must be verified or native", false)
 		return
 	}
+	idempotencyKey := idempotencyKeyFrom(r)
+	if idempotencyKey == "" {
+		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "Idempotency-Key header is required", false)
+		return
+	}
 	capabilityID := r.PathValue("id")
-	granted, reasonCode, err := s.Capabilities.EvaluateActivation(r.Context(), s.ActivationAuthority, capabilityID, req.Mode)
+	granted, reasonCode, err := s.Capabilities.EvaluateActivation(r.Context(), s.ActivationAuthority, principalFrom(r), capabilityID, req.Mode, idempotencyKey)
 	if err != nil {
 		writeDomainErr(w, err)
 		return
