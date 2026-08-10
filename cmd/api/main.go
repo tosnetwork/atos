@@ -198,6 +198,13 @@ func main() {
 	artifacts := service.NewArtifactService(st, blobStorage)
 	disputes := service.NewDisputeService(st, jobs, earnings, accounts, artifacts)
 	executionSigners := service.NewExecutionSignerService(st, core, capabilities)
+	// FailClosedActivationAuthority is the only domain.ActivationAuthority
+	// implementation that exists today -- see its own doc comment and
+	// atos-spec docs/IMPLEMENTATION_ROADMAP.md §7.2.1. A config-driven
+	// selector is deliberately not introduced here: there is nothing else
+	// to select between yet, and Phase 3B intentionally does not implement
+	// a fake on-chain authority just to make the interface non-trivial.
+	activationAuthority := service.FailClosedActivationAuthority{}
 
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
 	defer reconcileCancel()
@@ -223,13 +230,15 @@ func main() {
 	}
 
 	restServer := &httpapi.Server{
-		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners, Quotes: quotes,
+		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,
+		ActivationAuthority: activationAuthority, Quotes: quotes,
 		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts,
 		Earnings: earnings, Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 		ApprovalToken: cfg.Auth.ApprovalToken,
 	}
 	mcpServer := &mcp.Server{
-		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners, Quotes: quotes,
+		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,
+		ActivationAuthority: activationAuthority, Quotes: quotes,
 		Jobs: jobs, Accounts: accounts, Receipts: receipts, Earnings: earnings,
 		Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}

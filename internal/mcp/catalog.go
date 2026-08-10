@@ -35,6 +35,7 @@ var orderedToolSpecs = []toolSpec{
 	{Definition: rotateExecutionSignerTool(), RequiredScopes: []auth.Scope{auth.ScopeExecutionSignersWrite}},
 	{Definition: revokeExecutionSignerTool(), RequiredScopes: []auth.Scope{auth.ScopeExecutionSignersWrite}},
 	{Definition: getExecutionSignerStatusTool(), RequiredScopes: []auth.Scope{auth.ScopeExecutionSignersRead}},
+	{Definition: evaluateActivationTool(), RequiredScopes: []auth.Scope{auth.ScopeActivationEvaluate}},
 }
 
 func toolName(spec toolSpec) string {
@@ -400,6 +401,18 @@ func getExecutionSignerStatusTool() map[string]any {
 		"description": "Read-only: the current execution signer and any in-progress authorize/rotate/revoke operation's durable checkpoint for a Capability owned by the authenticated provider. current_execution_signer_id remains the old signer until a rotation's checkpoint reaches new_authorized.",
 		"inputSchema": objectSchema([]string{"capability_id"}, map[string]any{
 			"capability_id": map[string]any{"type": "string", "minLength": 1},
+		}),
+		"outputSchema": map[string]any{"type": "object"},
+	}
+}
+
+func evaluateActivationTool() map[string]any {
+	return map[string]any{
+		"name":        "atos_evaluate_activation",
+		"description": "Admin-triggered entry point for the activation authority's pending/suspended -> active decision (docs/IMPLEMENTATION_ROADMAP.md §7.2.1). Deliberately not capability-owner-scoped -- this is an activation-authority-side operation, not a provider one. granted:false is a normal outcome, not an error: production has no ActivationAuthority implementation that ever grants until Phase 4 supplies a real one.",
+		"inputSchema": objectSchema([]string{"capability_id", "mode"}, map[string]any{
+			"capability_id": map[string]any{"type": "string", "minLength": 1},
+			"mode":          map[string]any{"type": "string", "enum": []string{"verified", "native"}},
 		}),
 		"outputSchema": map[string]any{"type": "object"},
 	}

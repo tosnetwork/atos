@@ -56,6 +56,16 @@ const (
 	// consumer scope.
 	ScopeExecutionSignersRead  Scope = "execution_signers:read"
 	ScopeExecutionSignersWrite Scope = "execution_signers:write"
+	// ScopeActivationEvaluate authorizes the admin-triggered entry point
+	// for domain.ActivationAuthority.Evaluate (atos-spec
+	// docs/IMPLEMENTATION_ROADMAP.md §7.2.1, docs/API.md §2.2).
+	// Deliberately a separate scope from ScopeExecutionSignersWrite and
+	// every other provider scope: this is an activation-authority-side
+	// operation, not a provider one, so it carries no ownership
+	// precondition at all (unlike every other Capability mutation
+	// scope) -- explicit-grant-only like ScopeDisputesReview, never a
+	// default consumer scope.
+	ScopeActivationEvaluate Scope = "activation:evaluate"
 )
 
 var allowedScopes = map[Scope]struct{}{
@@ -65,6 +75,7 @@ var allowedScopes = map[Scope]struct{}{
 	ScopeEarningsRead: {}, ScopeSettlementRead: {}, ScopeSettlementWrite: {}, ScopeProofsRead: {}, ScopeNetworkRead: {},
 	ScopeDisputesOpen: {}, ScopeDisputesRead: {}, ScopeDisputesReview: {},
 	ScopeExecutionSignersRead: {}, ScopeExecutionSignersWrite: {},
+	ScopeActivationEvaluate: {},
 }
 
 var defaultConsumerScopes = []Scope{

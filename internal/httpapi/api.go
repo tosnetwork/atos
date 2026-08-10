@@ -53,17 +53,22 @@ type Server struct {
 	// service.CapabilityReadiness's doc comment).
 	Health           *service.HealthService
 	ExecutionSigners *service.ExecutionSignerService
-	Quotes           *service.QuoteService
-	Jobs             *service.JobService
-	Streams          *service.StreamService
-	Accounts         *service.AccountService
-	Receipts         *service.ReceiptService
-	Earnings         *service.EarningsService
-	Disputes         *service.DisputeService
-	Artifacts        *service.ArtifactService
-	Logger           *slog.Logger
-	PublicBaseURL    string
-	ApprovalToken    string
+	// ActivationAuthority backs POST /capabilities/{id}/activation/evaluate
+	// (atos-spec docs/API.md §2.2) -- unlike Health, this is not optional:
+	// production wiring MUST always set it (service.FailClosedActivationAuthority
+	// today), since domain.ActivationAuthority has no nil-safe default.
+	ActivationAuthority domain.ActivationAuthority
+	Quotes              *service.QuoteService
+	Jobs                *service.JobService
+	Streams             *service.StreamService
+	Accounts            *service.AccountService
+	Receipts            *service.ReceiptService
+	Earnings            *service.EarningsService
+	Disputes            *service.DisputeService
+	Artifacts           *service.ArtifactService
+	Logger              *slog.Logger
+	PublicBaseURL       string
+	ApprovalToken       string
 }
 
 func (s *Server) Mux() *http.ServeMux {
@@ -95,6 +100,8 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("POST /v1/capabilities/{id}/execution-signer/rotate", s.withScopes(s.handleRotateExecutionSigner, auth.ScopeExecutionSignersWrite))
 	mux.HandleFunc("POST /v1/capabilities/{id}/execution-signer/revoke", s.withScopes(s.handleRevokeExecutionSigner, auth.ScopeExecutionSignersWrite))
 	mux.HandleFunc("GET /v1/capabilities/{id}/execution-signer", s.withScopes(s.handleGetExecutionSignerStatus, auth.ScopeExecutionSignersRead))
+
+	mux.HandleFunc("POST /v1/capabilities/{id}/activation/evaluate", s.withScopes(s.handleEvaluateActivation, auth.ScopeActivationEvaluate))
 
 	mux.HandleFunc("POST /v1/quotes", s.withScopes(s.handleCreateQuote, auth.ScopeQuotesRead))
 	mux.HandleFunc("GET /v1/quotes/{id}", s.withScopes(s.handleGetQuote, auth.ScopeQuotesRead))
