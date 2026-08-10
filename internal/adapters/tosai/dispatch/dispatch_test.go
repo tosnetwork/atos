@@ -82,10 +82,8 @@ func httpBindingReq() tosai.SubmitJobRequest {
 	return tosai.SubmitJobRequest{
 		JobID: "job_1", CapabilityID: "cap_1", CapabilityVersion: "1.0.0", ProviderID: "prov_1",
 		QuoteID: "q_1", EscrowID: "esc_1", PrincipalID: "prn_1", TrustMode: domain.TrustModeManaged,
-		Input: map[string]any{"x": 1},
-		Bindings: []domain.CapabilityBinding{
-			{Transport: domain.AdapterHTTP, EndpointRef: "https://provider.example.com/invoke", EligibleTrustModes: []domain.TrustMode{domain.TrustModeManaged}},
-		},
+		Input:   map[string]any{"x": 1},
+		Binding: &domain.CapabilityBinding{Transport: domain.AdapterHTTP, EndpointRef: "https://provider.example.com/invoke", EligibleTrustModes: []domain.TrustMode{domain.TrustModeManaged}},
 	}
 }
 
@@ -106,7 +104,7 @@ func TestSubmitJob_TOSNativeBindingDelegatesToNative(t *testing.T) {
 	native := &stubNative{submitRes: tosai.SubmitJobResult{State: domain.JobCompleted}}
 	p := New(native, provideradapter.NewResolver())
 	req := nativeBindingReq()
-	req.Bindings = []domain.CapabilityBinding{{Transport: domain.AdapterTOSNative, EndpointRef: "internal:mock"}}
+	req.Binding = &domain.CapabilityBinding{Transport: domain.AdapterTOSNative, EndpointRef: "internal:mock"}
 
 	if _, err := p.SubmitJob(context.Background(), req); err != nil {
 		t.Fatal(err)
@@ -302,29 +300,23 @@ func TestFetchResult_And_FetchReceipt_RouteThroughGetJob(t *testing.T) {
 	}
 }
 
-func TestDispatchableBinding_PrefersEligibleTrustMode(t *testing.T) {
-	bindings := []domain.CapabilityBinding{
-		{Transport: domain.AdapterHTTP, EndpointRef: "http://a", EligibleTrustModes: []domain.TrustMode{domain.TrustModeVerified}},
-		{Transport: domain.AdapterMCP, EndpointRef: "http://b#tool", EligibleTrustModes: []domain.TrustMode{domain.TrustModeManaged}},
-	}
-	chosen, ok := dispatchableBinding(bindings, domain.TrustModeManaged)
-	if !ok || chosen.Transport != domain.AdapterMCP {
-		t.Fatalf("chosen = %+v, want the MCP binding (eligible for managed)", chosen)
-	}
-}
+// Binding selection itself (domain.SelectBinding) is now tested directly
+// in internal/domain, since it moved there to be shared with
+// JobService.submit's Job-creation-time freeze -- see
+// domain.TestSelectBinding_* for that coverage. Nothing in this package
+// selects a binding anymore; SubmitJob only ever dispatches the Job's own
+// already-frozen req.Binding.
+func TestSubmitJob_NilBindingDelegatesToNative(t *testing.T) {
+	native := &stubNative{submitRes: tosai.SubmitJobResult{State: domain.JobCompleted}}
+	p := New(native, provideradapter.NewResolver())
+	req := nativeBindingReq()
+	req.Binding = nil
 
-func TestDispatchableBinding_FallsBackToFirstWhenNoneEligible(t *testing.T) {
-	bindings := []domain.CapabilityBinding{{Transport: domain.AdapterHTTP, EndpointRef: "http://a"}}
-	chosen, ok := dispatchableBinding(bindings, domain.TrustModeManaged)
-	if !ok || chosen.Transport != domain.AdapterHTTP {
-		t.Fatalf("chosen = %+v", chosen)
+	if _, err := p.SubmitJob(context.Background(), req); err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestDispatchableBinding_EmptyBindingsNotOK(t *testing.T) {
-	_, ok := dispatchableBinding(nil, domain.TrustModeManaged)
-	if ok {
-		t.Fatal("expected ok=false for no bindings at all")
+	if len(native.submitted) != 1 {
+		t.Fatalf("native.SubmitJob called %d times, want 1", len(native.submitted))
 	}
 }
 

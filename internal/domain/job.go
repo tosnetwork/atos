@@ -73,10 +73,19 @@ type Artifact struct {
 }
 
 type Job struct {
-	ID                     string             `json:"job_id"`
-	InvocationID           string             `json:"invocation_id,omitempty"`
-	CapabilityID           string             `json:"capability_id"`
-	CapabilityVersion      string             `json:"capability_version"`
+	ID                string `json:"job_id"`
+	InvocationID      string `json:"invocation_id,omitempty"`
+	CapabilityID      string `json:"capability_id"`
+	CapabilityVersion string `json:"capability_version"`
+	// Binding is the transport binding this Job's execution is frozen to,
+	// selected once at creation time (see domain.SelectBinding) and never
+	// re-resolved from the Capability's current, possibly-since-updated
+	// bindings. This is what makes "an already-issued Quote/Job continues
+	// to use its frozen binding semantics after a Capability update" hold:
+	// execution always dispatches through this frozen value, never a live
+	// Capability.Bindings lookup. Nil for a Capability with no bindings at
+	// all (falls back to native/tos-protocol execution).
+	Binding                *CapabilityBinding `json:"binding,omitempty"`
 	ProviderID             string             `json:"provider_id"`
 	QuoteID                string             `json:"quote_id"`
 	ServiceQuoteID         string             `json:"service_quote_id,omitempty"`

@@ -2,8 +2,8 @@ package service_test
 
 import (
 	"context"
+	"errors"
 	"testing"
-	"time"
 
 	"github.com/tosnetwork/atos/internal/adapters/provideradapter"
 	"github.com/tosnetwork/atos/internal/adapters/tosai/dispatch"
@@ -59,16 +59,27 @@ func TestCapabilityUpdate_ChangedBindingBumpsVersionAndManifest(t *testing.T) {
 	}
 }
 
-// countingInvokeAdapter counts Invoke calls, for proving an adapter is
-// NEVER reached in a scenario that must fail closed before dispatch.
+// countingInvokeAdapter counts Invoke calls and records which endpoint each
+// one targeted, for proving both "an adapter is never reached against the
+// wrong binding" and "an adapter IS reached against the correct, frozen
+// binding." failFirst, if set, makes the first call return an error
+// (simulating a submission attempt that never reached the provider,
+// leaving the Job durably stuck pre-admission for reconciliation to retry)
+// while every subsequent call succeeds.
 type countingInvokeAdapter struct {
-	transport   domain.EndpointAdapterType
-	invokeCalls int
+	transport        domain.EndpointAdapterType
+	failFirst        bool
+	invokeCalls      int
+	invokedEndpoints []string
 }
 
 func (a *countingInvokeAdapter) Transport() domain.EndpointAdapterType { return a.transport }
 func (a *countingInvokeAdapter) Invoke(ctx context.Context, req provideradapter.InvokeRequest) (provideradapter.InvokeResult, error) {
 	a.invokeCalls++
+	a.invokedEndpoints = append(a.invokedEndpoints, req.EndpointRef)
+	if a.failFirst && a.invokeCalls == 1 {
+		return provideradapter.InvokeResult{}, errors.New("simulated submission failure -- provider never admitted this attempt")
+	}
 	return provideradapter.InvokeResult{Status: provideradapter.InvokeCompleted}, nil
 }
 func (a *countingInvokeAdapter) Query(ctx context.Context, endpointRef, idempotencyKey string) (provideradapter.InvokeResult, bool, error) {
@@ -81,21 +92,27 @@ func (a *countingInvokeAdapter) Health(ctx context.Context, endpointRef string) 
 	return domain.AdapterHealthCheck{Transport: a.transport, Status: domain.AdapterHealthHealthy}
 }
 
-// TestReconcileJob_CapabilityVersionChangedAfterQuoteFrozen_NeverExecutes
-// proves the roadmap's explicit invariant: "a previously issued Quote/Job
-// must never silently execute against a semantically different provider
-// binding" / "do not live-switch an already-committed Job to a new
-// provider endpoint merely because the Capability was later updated." A
-// Job is placed directly into the exact durable state a crash/reconcile-
-// before-first-submission window would produce (EconomicEscrowReserved,
-// JobWorking, CapabilityVersion frozen at the ORIGINAL capability
-// version), the capability is then updated (bumping its version and
-// changing its binding), and ReconcileJob must fail closed -- the
-// adapter for the NEW binding must never be invoked at all.
-func TestReconcileJob_CapabilityVersionChangedAfterQuoteFrozen_NeverExecutes(t *testing.T) {
+// TestReconcileJob_ContinuesToResolveTheOldBindingAfterCapabilityUpdate
+// proves the roadmap's explicit 3A-S acceptance criterion verbatim: "a
+// test changes only the provider binding on a Capability and proves a new
+// version/manifest is produced while an older Quote/Job continues to
+// resolve the old binding." A Job is placed directly into the exact
+// durable state a crash/reconcile-before-first-submission window would
+// produce, with its Binding frozen to the ORIGINAL endpoint exactly as
+// JobService.submit itself would have set it; the Capability is then
+// updated to a DIFFERENT endpoint (bumping its version); ReconcileJob must
+// still dispatch to the OLD, frozen endpoint -- proving execution never
+// re-resolves Capability.Bindings live, only ever the Job's own frozen
+// domain.Job.Binding (see its doc comment).
+func TestReconcileJob_ContinuesToResolveTheOldBindingAfterCapabilityUpdate(t *testing.T) {
 	ctx := context.Background()
 	st := memory.New()
-	adapter := &countingInvokeAdapter{transport: domain.AdapterHTTP}
+	// The first Invoke attempt fails (simulating a submission that never
+	// reached the provider -- e.g. a transient network error), leaving the
+	// Job durably parked pre-admission with its Binding already frozen by
+	// the real submit() path; the second call (via ReconcileJob, after the
+	// Capability has been updated) succeeds.
+	adapter := &countingInvokeAdapter{transport: domain.AdapterHTTP, failFirst: true}
 	provider := dispatch.New(tosaimock.New(), provideradapter.NewResolver(adapter))
 	core := toscoremock.New(st)
 	capabilities := service.NewCapabilityService(st)
@@ -104,13 +121,16 @@ func TestReconcileJob_CapabilityVersionChangedAfterQuoteFrozen_NeverExecutes(t *
 	quotes.WithAccountService(accounts)
 	jobs := service.NewJobService(st, provider, core, accounts)
 
+	const originalEndpoint = "https://provider-original.example.com"
+	const updatedEndpoint = "https://provider-updated.example.com"
+
 	cap, err := capabilities.Register(ctx, service.RegisterCapabilityInput{
 		ProviderID: "agt_stale_binding", Name: "Test Capability", Description: "for tests",
 		DeliveryMode: domain.DeliveryInstant,
 		InputSchema:  map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
 		Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
 		Bindings: []domain.CapabilityBinding{
-			{Transport: domain.AdapterHTTP, EndpointRef: "https://provider-original.example.com", EligibleTrustModes: []domain.TrustMode{domain.TrustModeManaged}},
+			{Transport: domain.AdapterHTTP, EndpointRef: originalEndpoint, EligibleTrustModes: []domain.TrustMode{domain.TrustModeManaged}},
 		},
 		IdempotencyKey: "register-stale-binding",
 	})
@@ -122,30 +142,31 @@ func TestReconcileJob_CapabilityVersionChangedAfterQuoteFrozen_NeverExecutes(t *
 		t.Fatalf("Create quote: %v", err)
 	}
 
-	// Directly construct the Job in the exact state a crash between
-	// escrow reservation and the first SubmitJob attempt would leave it
-	// in -- bypassing JobService.Invoke's own goroutine entirely so there
-	// is no execution race to control; CapabilityVersion is frozen at the
-	// capability's CURRENT (pre-update) version, exactly as submit()
-	// itself would have set it.
-	now := time.Now().UTC()
-	job := domain.Job{
-		ID: "job_stale_binding_test", CapabilityID: cap.ID, CapabilityVersion: cap.Version,
-		QuoteID: quote.ID, PrincipalID: "prn_stale_binding", ProviderID: cap.ProviderID,
-		TrustMode: domain.TrustModeManaged, State: domain.JobWorking, EconomicState: domain.EconomicEscrowReserved,
-		Input: map[string]any{}, Artifacts: []domain.Artifact{}, CreatedAt: now, UpdatedAt: now,
-		ExecutionDeadline: now.Add(time.Hour),
+	// Real end-to-end submission through JobService.Invoke -- this is what
+	// actually freezes job.Binding to the ORIGINAL endpoint (via
+	// domain.SelectBinding at creation time). The adapter's first call
+	// fails, so the Job ends up durably parked (JobWorking,
+	// EconomicEscrowReserved, not yet admitted by the provider) rather
+	// than completed.
+	submitted, err := jobs.Invoke(ctx, service.SubmitInput{
+		PrincipalID: "prn_stale_binding", CapabilityID: cap.ID, QuoteID: quote.ID,
+		Input: map[string]any{"x": 1}, IdempotencyKey: "invoke-stale-binding",
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
 	}
-	if err := st.PutJob(ctx, job); err != nil {
-		t.Fatal(err)
+	if submitted.Job.State == domain.JobCompleted {
+		t.Fatal("test setup invalid: job completed on the first (meant-to-fail) attempt")
+	}
+	if adapter.invokeCalls != 1 {
+		t.Fatalf("test setup invalid: expected exactly 1 failed attempt so far, got %d", adapter.invokeCalls)
 	}
 
-	// Now the capability is updated -- its binding changes (to a
-	// different, still-HTTP endpoint the counting adapter WOULD serve)
-	// and its version bumps.
+	// Now the capability is updated -- its binding changes to a
+	// different endpoint and its version bumps.
 	updated, err := capabilities.Update(ctx, cap.ID, "agt_stale_binding", map[string]any{
 		"bindings": []map[string]any{
-			{"transport": "http", "endpoint_ref": "https://provider-updated.example.com", "eligible_trust_modes": []string{"managed"}},
+			{"transport": "http", "endpoint_ref": updatedEndpoint, "eligible_trust_modes": []string{"managed"}},
 		},
 	}, "update-stale-binding")
 	if err != nil {
@@ -155,25 +176,19 @@ func TestReconcileJob_CapabilityVersionChangedAfterQuoteFrozen_NeverExecutes(t *
 		t.Fatal("test setup invalid: capability version must change after the binding update")
 	}
 
-	_, reconcileErr := jobs.ReconcileJob(ctx, job.ID)
-	if reconcileErr == nil {
-		t.Fatal("expected ReconcileJob to fail closed for a version-mismatched job")
+	final, reconcileErr := jobs.ReconcileJob(ctx, submitted.Job.ID)
+	if reconcileErr != nil {
+		t.Fatalf("ReconcileJob: %v -- an older Job must continue to resolve its frozen binding, not fail merely because the Capability was updated", reconcileErr)
 	}
-	if adapter.invokeCalls != 0 {
-		t.Fatalf("adapter.Invoke called %d times -- the job must NEVER execute against a binding that changed after its quote was frozen", adapter.invokeCalls)
+	if final.State != domain.JobCompleted {
+		t.Fatalf("state = %s, want completed (execution against the frozen binding must still succeed)", final.State)
 	}
-
-	// Read directly from the store rather than through JobService.Get,
-	// which itself retries reconciliation (and would return the same
-	// deferred error again) for a JobReconciling job -- the reconcileErr
-	// assertion above already proves the fail-closed behavior; this only
-	// needs to confirm the job's durable state was never advanced to
-	// Completed.
-	final, err := st.GetJob(ctx, job.ID)
-	if err != nil {
-		t.Fatal(err)
+	if adapter.invokeCalls != 2 {
+		t.Fatalf("adapter.Invoke called %d times, want exactly 2 (1 failed + 1 succeeded)", adapter.invokeCalls)
 	}
-	if final.State == domain.JobCompleted {
-		t.Fatal("job must not reach Completed against a mismatched binding")
+	for i, endpoint := range adapter.invokedEndpoints {
+		if endpoint != originalEndpoint {
+			t.Fatalf("call %d invoked endpoint %q, want the ORIGINAL frozen endpoint %q, never the capability's updated one %q", i, endpoint, originalEndpoint, updatedEndpoint)
+		}
 	}
 }

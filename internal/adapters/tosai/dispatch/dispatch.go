@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 	"sync"
 	"time"
 
@@ -37,12 +36,13 @@ type Provider struct {
 	// routes is an in-memory fast-path cache from JobID to the binding a
 	// prior SubmitJob call resolved, so a same-process GetJob/CancelJob/
 	// FetchResult/FetchReceipt call doesn't need the caller to re-supply
-	// Bindings. Losing this cache (process restart) is always safe: the
-	// next recoverProviderExecution call re-fetches the Capability (and
-	// therefore Bindings) from the store and calls SubmitJob again, which
-	// itself always Querys the third-party endpoint by the SAME stable
-	// idempotency key before ever Invoking -- so a "lost" route recovers
-	// the prior result rather than duplicating the side effect. See
+	// Binding. Losing this cache (process restart) is always safe: the
+	// next recoverProviderExecution call re-reads the Job's own durably
+	// frozen Binding (never the Capability's current one) and calls
+	// SubmitJob again, which itself always Querys the third-party endpoint
+	// by the SAME stable idempotency key before ever Invoking -- so a
+	// "lost" route recovers the prior result rather than duplicating the
+	// side effect. See
 	// InvocationIdentity's doc comment.
 	routes map[string]jobRoute
 }
@@ -89,24 +89,6 @@ func InvocationIdentity(jobID string) string {
 	return "job:" + jobID + ":v1"
 }
 
-// dispatchableBinding picks the Capability binding SubmitJob should use:
-// the first binding whose EligibleTrustModes includes the resolved
-// TrustMode, falling back to the first binding at all if none declare
-// eligibility explicitly (matching normalizeBindings' own default of
-// treating an empty EligibleTrustModes list permissively at
-// registration time). ok is false only when bindings is empty.
-func dispatchableBinding(bindings []domain.CapabilityBinding, mode domain.TrustMode) (domain.CapabilityBinding, bool) {
-	for _, b := range bindings {
-		if slices.Contains(b.EligibleTrustModes, mode) {
-			return b, true
-		}
-	}
-	if len(bindings) > 0 {
-		return bindings[0], true
-	}
-	return domain.CapabilityBinding{}, false
-}
-
 // isThirdParty reports whether transport routes through a
 // provideradapter.ProviderAdapter rather than the wrapped native
 // tosai.Provider.
@@ -120,10 +102,10 @@ func isThirdParty(transport domain.EndpointAdapterType) bool {
 }
 
 func (p *Provider) SubmitJob(ctx context.Context, req tosai.SubmitJobRequest) (tosai.SubmitJobResult, error) {
-	binding, ok := dispatchableBinding(req.Bindings, req.TrustMode)
-	if !ok || !isThirdParty(binding.Transport) {
+	if req.Binding == nil || !isThirdParty(req.Binding.Transport) {
 		return p.native.SubmitJob(ctx, req)
 	}
+	binding := *req.Binding
 	adapter, ok := p.resolver.For(binding.Transport)
 	if !ok {
 		return tosai.SubmitJobResult{}, fmt.Errorf("dispatch: no provider adapter registered for transport %q", binding.Transport)

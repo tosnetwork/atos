@@ -327,3 +327,41 @@ func TestJobsByProvider_FiltersOnJSONBPayload(t *testing.T) {
 		t.Fatalf("JobsByProvider(%s) = %+v, want exactly job B", providerB, gotB)
 	}
 }
+
+// TestPutJob_RoundTripsFrozenBinding proves domain.Job.Binding survives a
+// real Postgres round trip via the jobs.payload JSONB column -- this is
+// the field that makes "an already-issued Quote/Job continues to use its
+// frozen binding semantics after a Capability update" hold at all, so a
+// silent JSON-marshaling gap here would defeat the whole fix.
+func TestPutJob_RoundTripsFrozenBinding(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	now := time.Now().UTC()
+	binding := domain.CapabilityBinding{
+		Transport: domain.AdapterHTTP, EndpointRef: "https://provider.example.com/invoke",
+		EligibleTrustModes: []domain.TrustMode{domain.TrustModeManaged},
+	}
+	job := domain.Job{
+		ID: "job_binding_roundtrip_" + suffix, CapabilityID: "cap_" + suffix, CapabilityVersion: "1.0.0",
+		Binding: &binding, QuoteID: "q_" + suffix, PrincipalID: "prn_" + suffix, ProviderID: "agt_" + suffix,
+		State: domain.JobWorking, Input: map[string]any{}, Artifacts: []domain.Artifact{},
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.PutJob(ctx, job); err != nil {
+		t.Fatalf("PutJob: %v", err)
+	}
+	got, err := s.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if got.Binding == nil {
+		t.Fatal("binding did not survive the round trip -- got nil")
+	}
+	if got.Binding.Transport != binding.Transport || got.Binding.EndpointRef != binding.EndpointRef {
+		t.Fatalf("binding = %+v, want %+v", got.Binding, binding)
+	}
+	if len(got.Binding.EligibleTrustModes) != 1 || got.Binding.EligibleTrustModes[0] != domain.TrustModeManaged {
+		t.Fatalf("eligible_trust_modes = %+v", got.Binding.EligibleTrustModes)
+	}
+}

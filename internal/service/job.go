@@ -165,9 +165,17 @@ func (s *JobService) submit(ctx context.Context, in SubmitInput, waitInline bool
 	if quote.TrustMode != domain.TrustModeManaged {
 		proofStatus.Quote = domain.ProofPending
 	}
+	// The binding is selected and frozen onto the Job once, here, at
+	// creation time -- execution must never re-resolve it from the
+	// Capability's live (possibly later-updated) Bindings. See
+	// domain.Job.Binding's doc comment.
+	var frozenBinding *domain.CapabilityBinding
+	if binding, ok := domain.SelectBinding(capability.Bindings, quote.TrustMode); ok {
+		frozenBinding = &binding
+	}
 	job := domain.Job{
 		ID: idPrefix + uuid.NewString(), CapabilityID: capability.ID,
-		CapabilityVersion: capability.Version, ProviderID: capability.ProviderID,
+		CapabilityVersion: capability.Version, Binding: frozenBinding, ProviderID: capability.ProviderID,
 		QuoteID: quote.ID, ServiceQuoteID: quote.ServiceQuoteID,
 		PrincipalID: in.PrincipalID, TrustMode: quote.TrustMode,
 		ProofProfile: quote.ProofProfile, ProofStatus: proofStatus,

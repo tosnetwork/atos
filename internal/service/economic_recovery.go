@@ -526,11 +526,6 @@ func (s *JobService) recoverProviderExecution(ctx context.Context, jobID string,
 		result := tosai.SubmitJobResult{State: domain.JobCompleted, Output: cloneMap(job.Output), Artifacts: append([]domain.Artifact(nil), job.Artifacts...), Receipt: job.ExecutionReceipt}
 		return s.settleProviderResultUnderLock(ctx, job, result), nil
 	}
-	capability, err := s.store.Get(ctx, job.CapabilityID)
-	if err != nil {
-		return job, err
-	}
-	capability = normalizeCapability(capability)
 	result, getErr := s.provider.GetJob(ctx, job.ID)
 	if getErr != nil {
 		if !domainErrorIs(getErr, domain.ErrNotFound) {
@@ -544,19 +539,12 @@ func (s *JobService) recoverProviderExecution(ctx context.Context, jobID string,
 			released, releaseErr := s.releaseForTerminalUnderLock(ctx, job, domain.JobFailed, domain.ErrProviderFailed, "execution was never admitted before its deadline")
 			return released, releaseErr
 		}
-		// capability storage is not versioned (one mutable record per ID,
-		// Version is just a bumped string field) -- a live capability
-		// update between Quote-freeze and this submission attempt must
-		// never silently redirect an already-committed Job to a
-		// semantically different provider binding (or pricing/schema).
-		// Fail closed into reconciliation rather than guessing: this Job
-		// remains JobWorking, retried on the next reconciliation pass,
-		// until an operator resolves the mismatch.
-		if capability.Version != job.CapabilityVersion {
-			pending := s.markEconomicReconciliationUnderLock(ctx, job.ID, job.EconomicState, domain.JobWorking, domain.ErrProviderFailed,
-				fmt.Sprintf("capability was updated (now version %s) after this job froze version %s; submission deferred pending reconciliation", capability.Version, job.CapabilityVersion))
-			return pending, domain.NewError(domain.ErrProviderFailed, "capability version changed since this job's quote was frozen", true)
-		}
+		// job.Binding was frozen once, at creation time (domain.SelectBinding),
+		// and is passed through unchanged here -- execution never re-fetches
+		// or re-resolves the Capability's current bindings, so a live
+		// Capability update (a semantically different provider binding,
+		// possibly a version bump) can never silently redirect an
+		// already-committed Job. See domain.Job.Binding's doc comment.
 		result, getErr = s.provider.SubmitJob(ctx, tosai.SubmitJobRequest{
 			JobID: job.ID, InvocationID: job.InvocationID,
 			QuoteID: job.QuoteID, ServiceQuoteID: job.ServiceQuoteID,
@@ -565,7 +553,7 @@ func (s *JobService) recoverProviderExecution(ctx context.Context, jobID string,
 			ProviderID: job.ProviderID, TrustMode: job.TrustMode, ProofProfile: job.ProofProfile,
 			Input: job.Input, InputCommitment: hashCommitment(job.Input),
 			ExecutionDeadline: job.ExecutionDeadline, RetainUntil: time.Now().UTC().Add(executionRetention),
-			Bindings: capability.Bindings,
+			Binding: job.Binding,
 		})
 		if getErr != nil {
 			pending := s.markEconomicReconciliationUnderLock(ctx, job.ID, job.EconomicState, domain.JobWorking, domain.ErrProviderFailed, "provider submission outcome requires recovery: "+getErr.Error())
