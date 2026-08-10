@@ -149,6 +149,50 @@ func TestSubmitJob_HTTPBindingRoutesToAdapterAndSynthesizesReceipt(t *testing.T)
 	}
 }
 
+// TestSubmitJob_RemoteThirdPartyExecutionRoutesThroughNative proves
+// WithRemoteThirdPartyExecution's contract: an http/mcp/a2a-bound Job goes
+// straight to native.SubmitJob (carrying req.Binding unchanged for
+// tosprotocol.Client to thread onto the wire), and the local
+// provideradapter is never touched at all -- not even Queried.
+func TestSubmitJob_RemoteThirdPartyExecutionRoutesThroughNative(t *testing.T) {
+	adapter := &stubAdapter{transport: domain.AdapterHTTP}
+	native := &stubNative{submitRes: tosai.SubmitJobResult{State: domain.JobCompleted, Output: map[string]any{"ok": true}}}
+	p := New(native, provideradapter.NewResolver(adapter), WithRemoteThirdPartyExecution(true))
+
+	req := httpBindingReq()
+	result, err := p.SubmitJob(context.Background(), req)
+	if err != nil {
+		t.Fatalf("SubmitJob: %v", err)
+	}
+	if len(native.submitted) != 1 {
+		t.Fatalf("native.SubmitJob called %d times, want exactly 1", len(native.submitted))
+	}
+	if native.submitted[0].Binding != req.Binding {
+		t.Fatal("native.SubmitJob must receive the exact same Binding, never a re-resolved one")
+	}
+	if adapter.invokeCalls != 0 || adapter.queryCalls != 0 {
+		t.Fatalf("local adapter was touched (invoke=%d query=%d) despite remote third-party execution being enabled",
+			adapter.invokeCalls, adapter.queryCalls)
+	}
+	if result.State != domain.JobCompleted {
+		t.Fatalf("state = %s, want completed", result.State)
+	}
+
+	// GetJob/CancelJob/FetchResult/FetchReceipt must also fall through to
+	// native -- SubmitJob never populated a local route to recall, exactly
+	// as when native handles a tos-native Job.
+	native.getRes = tosai.SubmitJobResult{State: domain.JobCompleted, Output: map[string]any{"ok": true}}
+	if _, err := p.GetJob(context.Background(), req.JobID); err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if err := p.CancelJob(context.Background(), req.JobID, "test"); err != nil {
+		t.Fatalf("CancelJob: %v", err)
+	}
+	if len(native.canceled) != 1 || native.canceled[0] != req.JobID {
+		t.Fatalf("native.CancelJob was not called for a remotely-dispatched job: %+v", native.canceled)
+	}
+}
+
 func TestSubmitJob_QueriesBeforeInvoking(t *testing.T) {
 	adapter := &stubAdapter{
 		transport:  domain.AdapterHTTP,

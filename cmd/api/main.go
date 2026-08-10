@@ -126,7 +126,7 @@ func main() {
 		httpadapter.New(httpadapter.Config{}),
 		mcpadapter.New(mcpadapter.Config{}),
 		a2aadapter.New(a2aadapter.Config{}),
-	))
+	), dispatch.WithRemoteThirdPartyExecution(cfg.RemoteThirdPartyExecution))
 
 	capabilities := service.NewCapabilityService(st)
 	var quotes *service.QuoteService

@@ -53,6 +53,59 @@ func registerHTTPBoundCapability(t *testing.T, capabilities *service.CapabilityS
 	return cap
 }
 
+// fakeThirdPartyHealthProber is an in-memory stand-in for
+// tosprotocol.Client.ProbeThirdPartyHealth, used to prove
+// HealthService/CertificationService route through
+// service.ThirdPartyHealthProber when configured, without a real
+// tos-protocol/tos-ai deployment.
+type fakeThirdPartyHealthProber struct {
+	calls  int
+	result domain.AdapterHealthCheck
+	err    error
+}
+
+func (f *fakeThirdPartyHealthProber) ProbeThirdPartyHealth(_ context.Context, providerID, capabilityID, capabilityVersion string, binding domain.CapabilityBinding) (domain.AdapterHealthCheck, error) {
+	f.calls++
+	if f.err != nil {
+		return domain.AdapterHealthCheck{}, f.err
+	}
+	check := f.result
+	check.CapabilityID, check.CapabilityVersion = capabilityID, capabilityVersion
+	check.Transport, check.EndpointRef = binding.Transport, binding.EndpointRef
+	return check, nil
+}
+
+// TestHealthService_CheckCapability_UsesRemoteProberWhenConfigured proves
+// that once WithRemoteProber is set, CheckCapability never dials
+// binding.EndpointRef from this process (the resolver's HTTP client would
+// fail loudly against a nonexistent server if it were still consulted)
+// and instead records exactly the remote prober's evidence, including
+// deep_probe -- see atos-spec docs/THIRD_PARTY_EXECUTION_PLANE.md §3.1.
+func TestHealthService_CheckCapability_UsesRemoteProberWhenConfigured(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	// A resolver with no adapters registered -- if CheckCapability fell
+	// back to it despite the remote prober being set, resolver.For would
+	// return !ok and the binding would be silently skipped (0 checks
+	// recorded), which the assertion below catches.
+	resolver := provideradapter.NewResolver()
+	prober := &fakeThirdPartyHealthProber{result: domain.AdapterHealthCheck{Status: domain.AdapterHealthHealthy, LatencyMS: 42, DeepProbe: true}}
+	health := service.NewHealthService(st, capabilities, resolver).WithRemoteProber(prober)
+
+	cap := registerHTTPBoundCapability(t, capabilities, "agt_health_remote", "https://provider.example.com/nonexistent", []domain.TrustMode{domain.TrustModeManaged})
+	checks, err := health.CheckCapability(ctx, cap.ID)
+	if err != nil {
+		t.Fatalf("CheckCapability: %v", err)
+	}
+	if prober.calls != 1 {
+		t.Fatalf("remote prober called %d times, want 1", prober.calls)
+	}
+	if len(checks) != 1 || checks[0].Status != domain.AdapterHealthHealthy || checks[0].LatencyMS != 42 || !checks[0].DeepProbe {
+		t.Fatalf("checks = %+v, want a single healthy/deep_probe=true result from the remote prober", checks)
+	}
+}
+
 func TestHealthService_CheckCapability_RecordsHealthyResult(t *testing.T) {
 	ctx := context.Background()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))

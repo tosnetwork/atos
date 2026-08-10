@@ -31,6 +31,11 @@ import (
 type Provider struct {
 	native   tosai.Provider
 	resolver *provideradapter.Resolver
+	// remoteThirdParty, when true, routes third-party (http/mcp/a2a) Job
+	// execution through the wrapped native tosai.Provider instead of
+	// dialing the endpoint from this process via resolver -- see
+	// WithRemoteThirdPartyExecution's doc comment.
+	remoteThirdParty bool
 
 	mu sync.Mutex
 	// routes is an in-memory fast-path cache from JobID to the binding a
@@ -67,9 +72,44 @@ type jobRoute struct {
 // selects (mock or the tos-protocol RPC client). resolver supplies the
 // third-party transport adapters (http/mcp/a2a); a nil resolver is valid
 // and simply means every Job falls back to native (e.g. in tests that
-// never register third-party bindings).
-func New(native tosai.Provider, resolver *provideradapter.Resolver) *Provider {
-	return &Provider{native: native, resolver: resolver, routes: make(map[string]jobRoute)}
+// never register third-party bindings), unless
+// WithRemoteThirdPartyExecution is also set, in which case resolver is
+// never consulted at all.
+func New(native tosai.Provider, resolver *provideradapter.Resolver, opts ...Option) *Provider {
+	p := &Provider{native: native, resolver: resolver, routes: make(map[string]jobRoute)}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
+// Option configures a dispatching Provider.
+type Option func(*Provider)
+
+// WithRemoteThirdPartyExecution routes third-party (http/mcp/a2a) Job
+// execution through the wrapped native tosai.Provider -- which must itself
+// carry domain.Job.Binding through to a ThirdPartyBinding on the wire (see
+// tosprotocol.Client.SubmitJob/QuoteExecution) -- instead of this process
+// dialing the provider endpoint directly via resolver.
+//
+// This is the §7.1.1-compliant path per atos-spec
+// docs/THIRD_PARTY_EXECUTION_PLANE.md: ATOS's Job/economic service does
+// not perform the provider HTTP/MCP/A2A call itself; tos-protocol routes
+// it to tos-ai's operator-allowlisted ThirdPartyExecutionService. It
+// requires that stack actually deployed and configured with an approved
+// binding -- until then, local dispatch (this Option unset, the default)
+// remains the only backend that works, since the wrapped native provider
+// may be tosaimock.Provider (which does not understand a third-party
+// binding at all) or a tos-protocol deployment with no ThirdPartyWorker
+// configured.
+//
+// GetJob/CancelJob/FetchResult/FetchReceipt/StreamJobEvents need no
+// corresponding change: they already fall back to the native provider
+// whenever SubmitJob did not remember a local route for a Job (see
+// Provider.routes's doc comment), which is exactly what happens here --
+// remote dispatch never populates that cache.
+func WithRemoteThirdPartyExecution(enabled bool) Option {
+	return func(p *Provider) { p.remoteThirdParty = enabled }
 }
 
 func (p *Provider) RegisterProvider(ctx context.Context, providerID string, capability domain.Capability) error {
@@ -102,7 +142,7 @@ func isThirdParty(transport domain.EndpointAdapterType) bool {
 }
 
 func (p *Provider) SubmitJob(ctx context.Context, req tosai.SubmitJobRequest) (tosai.SubmitJobResult, error) {
-	if req.Binding == nil || !isThirdParty(req.Binding.Transport) {
+	if req.Binding == nil || !isThirdParty(req.Binding.Transport) || p.remoteThirdParty {
 		return p.native.SubmitJob(ctx, req)
 	}
 	binding := *req.Binding

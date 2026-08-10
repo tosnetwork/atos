@@ -1,7 +1,9 @@
 package toprotocol
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -128,6 +130,49 @@ func domainProofProfile(profile atostosv1.ProofProfile) domain.ProofProfile {
 	default:
 		return domain.ProofProfileNone
 	}
+}
+
+// thirdPartyTransport maps domain.EndpointAdapterType to the tos-protocol
+// wire enum. ok is false for a native/human binding (or an empty one),
+// which is not a third-party transport at all -- see
+// thirdPartyBindingProto's doc comment.
+func thirdPartyTransport(t domain.EndpointAdapterType) (atostosv1.EndpointAdapterType, bool) {
+	switch t {
+	case domain.AdapterHTTP:
+		return atostosv1.EndpointAdapterType_ENDPOINT_ADAPTER_TYPE_HTTP, true
+	case domain.AdapterMCP:
+		return atostosv1.EndpointAdapterType_ENDPOINT_ADAPTER_TYPE_MCP, true
+	case domain.AdapterA2A:
+		return atostosv1.EndpointAdapterType_ENDPOINT_ADAPTER_TYPE_A2A, true
+	default:
+		return atostosv1.EndpointAdapterType_ENDPOINT_ADAPTER_TYPE_UNSPECIFIED, false
+	}
+}
+
+// thirdPartyBindingProto maps a domain.CapabilityBinding onto
+// atos-spec's ThirdPartyBinding wire message (see atos-spec
+// docs/THIRD_PARTY_EXECUTION_PLANE.md), or returns (nil, nil) for a
+// tos-native/human binding -- an ordinary Job, not a third-party one.
+// binding_commitment is a content digest over the binding itself (not a
+// pre-existing string commitment the way InputCommitment is), so it is
+// computed here rather than parsed.
+func thirdPartyBindingProto(binding *domain.CapabilityBinding) (*atostosv1.ThirdPartyBinding, error) {
+	if binding == nil {
+		return nil, nil
+	}
+	transport, ok := thirdPartyTransport(binding.Transport)
+	if !ok {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(binding)
+	if err != nil {
+		return nil, domain.NewError(domain.ErrValidationFailed, "capability binding is not serializable", false)
+	}
+	sum := sha256.Sum256(encoded)
+	return &atostosv1.ThirdPartyBinding{
+		Transport: transport, EndpointRef: binding.EndpointRef,
+		BindingCommitment: &atostosv1.Digest{Algorithm: "sha256", Value: sum[:]},
+	}, nil
 }
 
 func digest(value string) (*atostosv1.Digest, error) {

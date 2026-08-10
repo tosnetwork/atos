@@ -65,6 +65,52 @@ func TestCertificationOpen_SuccessfulMCPCertification(t *testing.T) {
 	}
 }
 
+// TestCertificationOpen_UsesRemoteProberWhenConfigured proves that once
+// WithRemoteProber is set, Open never dials binding.EndpointRef from this
+// process (the resolver has no adapters registered, so a fallback to it
+// would fail closed instead of passing) and instead records the remote
+// prober's own deep_probe evidence directly, without a separate local
+// provideradapter.CertificationProbe step -- see atos-spec
+// docs/THIRD_PARTY_EXECUTION_PLANE.md §3.1.
+func TestCertificationOpen_UsesRemoteProberWhenConfigured(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	resolver := provideradapter.NewResolver()
+	prober := &fakeThirdPartyHealthProber{result: domain.AdapterHealthCheck{Status: domain.AdapterHealthHealthy, LatencyMS: 7, DeepProbe: true}}
+	certifications := service.NewCertificationService(st, capabilities, resolver).WithRemoteProber(prober)
+
+	cap, err := capabilities.Register(ctx, service.RegisterCapabilityInput{
+		ProviderID: "agt_cert_remote", Name: "HTTP Capability", Description: "for tests",
+		DeliveryMode: domain.DeliveryInstant,
+		InputSchema:  map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing:             domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
+		RequestedTrustModes: []domain.TrustMode{domain.TrustModeVerified},
+		Bindings: []domain.CapabilityBinding{
+			{Transport: domain.AdapterHTTP, EndpointRef: "https://provider.example.com/nonexistent", EligibleTrustModes: []domain.TrustMode{domain.TrustModeVerified}},
+		},
+		IdempotencyKey: "register-cert-remote",
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	cert, err := certifications.Open(ctx, service.OpenCertificationInput{
+		ProviderID: "agt_cert_remote", CapabilityID: cap.ID, Transport: domain.AdapterHTTP, IdempotencyKey: "cert-remote-1",
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if prober.calls != 1 {
+		t.Fatalf("remote prober called %d times, want 1", prober.calls)
+	}
+	if cert.Status != domain.CertificationPassed {
+		t.Fatalf("status = %s, want passed", cert.Status)
+	}
+	if deep, _ := cert.Evidence["deep_probe"].(bool); !deep {
+		t.Fatalf("evidence[deep_probe] = %v, want true from the remote prober", cert.Evidence["deep_probe"])
+	}
+}
+
 func TestCertificationOpen_SuccessfulA2ACertification(t *testing.T) {
 	ctx := context.Background()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

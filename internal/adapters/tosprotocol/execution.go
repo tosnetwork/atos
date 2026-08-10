@@ -40,6 +40,15 @@ func (c *Client) SubmitJob(ctx context.Context, req tosai.SubmitJobRequest) (tos
 	if !retainUntil.After(req.ExecutionDeadline) {
 		return tosai.SubmitJobResult{}, domain.NewError(domain.ErrQuoteMismatch, "retain_until must be after the execution deadline", false)
 	}
+	// Binding is the Job's own frozen transport (see
+	// tosai.SubmitJobRequest.Binding's doc comment) -- it is threaded
+	// through unconditionally, never re-selected here, so tos-protocol
+	// executes exactly the binding this Job already committed to, per
+	// atos-spec docs/THIRD_PARTY_EXECUTION_PLANE.md.
+	thirdPartyBinding, err := thirdPartyBindingProto(req.Binding)
+	if err != nil {
+		return tosai.SubmitJobResult{}, err
+	}
 	callCtx, cancel := c.callContext(ctx, req.ExecutionDeadline)
 	defer cancel()
 	request := connect.NewRequest(&atostosv1.SubmitJobRequest{
@@ -52,6 +61,7 @@ func (c *Client) SubmitJob(ctx context.Context, req tosai.SubmitJobRequest) (tos
 		Input: input, InputCommitment: inputDigest, MaxOutputBytes: maxOutput,
 		ExecutionDeadlineUnixMillis: req.ExecutionDeadline.UnixMilli(),
 		RetainUntilUnixMillis:       retainUntil.UnixMilli(),
+		ThirdPartyBinding:           thirdPartyBinding,
 	})
 	decorateRequest(c, ctx, request)
 	response, err := c.execution.SubmitJob(callCtx, request)
