@@ -197,6 +197,7 @@ func main() {
 	}
 	artifacts := service.NewArtifactService(st, blobStorage)
 	disputes := service.NewDisputeService(st, jobs, earnings, accounts, artifacts)
+	executionSigners := service.NewExecutionSignerService(st, core, capabilities)
 
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
 	defer reconcileCancel()
@@ -208,6 +209,12 @@ func main() {
 	})
 	go disputes.RunReconciler(reconcileCtx, 20*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("dispute economic reconciliation pending", "error", reconcileErr)
+	})
+	go health.RunReconciler(reconcileCtx, 5*time.Minute, 200, func(reconcileErr error) {
+		logger.Error("provider health sweep pending", "error", reconcileErr)
+	})
+	go executionSigners.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
+		logger.Error("execution-signer operation reconciliation pending", "error", reconcileErr)
 	})
 
 	if err := seedDemoCapability(capabilities, cfg.TOSBackend); err != nil {
