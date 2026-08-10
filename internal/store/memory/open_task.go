@@ -356,6 +356,18 @@ func (s *Store) UpdateAcceptanceOperation(ctx context.Context, id string, fn fun
 			return domain.AcceptanceOperation{}, domain.NewError(domain.ErrIdempotencyConflict, "acceptance operation update must not change identity fields", false)
 		}
 	}
+	// Completed/Failed MUST only ever be reached through
+	// CompleteAcceptance/FailAcceptance, which atomically pair the
+	// checkpoint transition with the OpenTask projection/reopen -- a plain
+	// UpdateAcceptanceOperation call reaching either terminal checkpoint
+	// would recreate exactly the split-commit crash window those two
+	// methods exist to close. Enforced here, not just documented on the
+	// interface, so a future caller mistake fails loudly instead of
+	// silently reintroducing the bug.
+	if next.Checkpoint == domain.AcceptanceCompleted || next.Checkpoint == domain.AcceptanceFailed {
+		return domain.AcceptanceOperation{}, domain.NewError(domain.ErrIdempotencyConflict,
+			"UpdateAcceptanceOperation must not set a terminal checkpoint; use CompleteAcceptance/FailAcceptance", false)
+	}
 	s.acceptanceOperations[id] = next
 	return next, nil
 }

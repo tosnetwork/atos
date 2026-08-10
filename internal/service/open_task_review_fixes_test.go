@@ -191,6 +191,19 @@ func TestOpenTaskProposeRejectsSelfDealing(t *testing.T) {
 	}
 }
 
+// TestOpenTaskAcceptRejectsSelfDealing proves Accept's OWN self-dealing
+// guard fires, not merely the pre-existing "not the task owner" check.
+// This requires task owner == proposal provider == the Accept caller, all
+// the SAME identity -- but Propose() itself already refuses to create a
+// self-dealing proposal in the first place, so the only way to construct
+// one to test Accept's independent, defense-in-depth check is to insert it
+// directly through the store, bypassing Propose entirely (simulating a
+// proposal that predates the guard, or some other bypass). An earlier
+// version of this test used a DIFFERENT identity for the Accept call than
+// the task's actual owner, which meant it only ever exercised the
+// pre-existing ownership check (ErrPermissionDenied for the wrong reason)
+// and would still have passed even if Accept's self-dealing guard were
+// deleted entirely.
 func TestOpenTaskAcceptRejectsSelfDealing(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness()
@@ -198,24 +211,24 @@ func TestOpenTaskAcceptRejectsSelfDealing(t *testing.T) {
 
 	cap := registerCapability(t, h, "agt_self_deal_2", "1.00")
 	task, err := openTasks.Publish(ctx, service.PublishOpenTaskInput{
-		PrincipalID: "prn_self_deal_2", Title: "task", ExpiresAt: time.Now().UTC().Add(time.Hour),
+		PrincipalID: "agt_self_deal_2", Title: "task", ExpiresAt: time.Now().UTC().Add(time.Hour),
 		IdempotencyKey: "publish-self-deal-2",
 	})
 	if err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
-	p, err := openTasks.Propose(ctx, service.ProposeInput{
-		ProviderID: "agt_self_deal_2", TaskID: task.ID, CapabilityID: cap.ID, IdempotencyKey: "propose-self-deal-2",
-	})
-	if err != nil {
-		t.Fatalf("Propose: %v", err)
+	now := time.Now().UTC()
+	proposal := domain.OpenTaskProposal{
+		ID: "otprop_self_deal_bypass", TaskID: task.ID, ProviderID: "agt_self_deal_2",
+		CapabilityID: cap.ID, CapabilityVersion: cap.Version,
+		CreatedAt: now, UpdatedAt: now,
 	}
-	// Simulate the owner also controlling the proposing identity (Propose
-	// already refuses this at submission time; Accept must independently
-	// refuse it too, as defense in depth for a self-referential
-	// operation, in case a proposal predating that check ever exists).
+	if err := h.store().PutOpenTaskProposal(ctx, proposal); err != nil {
+		t.Fatalf("PutOpenTaskProposal: %v", err)
+	}
+
 	_, _, err = openTasks.Accept(ctx, service.AcceptProposalInput{
-		PrincipalID: "agt_self_deal_2", TaskID: task.ID, ProposalID: p.ID, IdempotencyKey: "accept-self-deal-2",
+		PrincipalID: "agt_self_deal_2", TaskID: task.ID, ProposalID: proposal.ID, IdempotencyKey: "accept-self-deal-2",
 	})
 	if err == nil {
 		t.Fatal("expected accepting your own proposal to fail")
@@ -223,6 +236,12 @@ func TestOpenTaskAcceptRejectsSelfDealing(t *testing.T) {
 	derr, ok := err.(*domain.Error)
 	if !ok || derr.Code != domain.ErrPermissionDenied {
 		t.Fatalf("expected ErrPermissionDenied, got %v", err)
+	}
+
+	if _, found, err := h.store().AcceptanceOperationByTask(ctx, task.ID); err != nil {
+		t.Fatalf("AcceptanceOperationByTask: %v", err)
+	} else if found {
+		t.Fatal("an AcceptanceOperation was created despite the self-dealing rejection")
 	}
 }
 

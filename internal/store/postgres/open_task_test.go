@@ -202,6 +202,24 @@ func TestOpenAcceptanceOperation_RejectsSecondAttemptWhileFirstInFlight(t *testi
 	if resumed.ID != first.ID {
 		t.Fatalf("resumed operation ID = %q, want %q", resumed.ID, first.ID)
 	}
+
+	// UpdateAcceptanceOperation must refuse to set a terminal checkpoint --
+	// only CompleteAcceptance/FailAcceptance may, since those atomically
+	// pair the transition with the OpenTask projection/reopen. See the
+	// interface doc comment in internal/store/store.go.
+	for _, terminal := range []domain.AcceptanceCheckpoint{domain.AcceptanceCompleted, domain.AcceptanceFailed} {
+		_, err := s.UpdateAcceptanceOperation(ctx, first.ID, func(op domain.AcceptanceOperation, exists bool) (domain.AcceptanceOperation, error) {
+			op.Checkpoint = terminal
+			return op, nil
+		})
+		if err == nil {
+			t.Fatalf("expected UpdateAcceptanceOperation to refuse setting checkpoint=%s", terminal)
+		}
+		derr, ok := err.(*domain.Error)
+		if !ok || derr.Code != domain.ErrIdempotencyConflict {
+			t.Fatalf("expected ErrIdempotencyConflict for checkpoint=%s, got %v", terminal, err)
+		}
+	}
 }
 
 // TestOpenAcceptanceOperation_ConcurrentWithCancelConverges is the real-

@@ -482,3 +482,43 @@ correctness at the exact boundary between two store calls that are not
 themselves atomic. Every fix in both rounds either makes that boundary
 genuinely atomic (one transaction) or makes the recovery path re-verify
 content instead of trusting position alone.
+
+### Third review round
+
+A third review (against commit `38d1ed1`, one commit before the lock-order
+and digest fixes above were pushed) re-reported the same lock-ordering
+deadlock and digest-validation gaps, this time backed by running the
+Withdraw/Accept concurrency test 30x against real PostgreSQL and grepping
+the *server's own log* for `deadlock detected` (not just trusting the Go
+test's pass/fail) -- a stronger verification method than the previous
+round used. Both findings were already fixed by the commit this round
+predated; re-verified at current `HEAD` using the same stronger method
+(50 iterations, `deadlock_timeout=200ms`, `log_lock_waits=on`, grepping
+the container's actual log output): zero deadlocks, zero errors of any
+kind logged by PostgreSQL across all 50 runs.
+
+The same round also found two genuinely new, smaller issues in the
+fixes' own test coverage and store contract, both fixed:
+
+- **P2: the self-dealing regression test didn't actually exercise
+  Accept's new guard.** `TestOpenTaskAcceptRejectsSelfDealing` called
+  Accept with a DIFFERENT `PrincipalID` than the task's actual owner, so
+  the pre-existing "not the task owner" check fired first and the test
+  would still have passed even if Accept's self-dealing guard were
+  deleted entirely. Since `Propose` already refuses to create a
+  self-dealing proposal in the first place, the fixed test inserts one
+  directly through the store (bypassing `Propose`, simulating a proposal
+  that predates the guard) and calls Accept AS the task's real owner, so
+  the ownership check passes and the self-dealing check is what actually
+  fires -- plus asserts no `AcceptanceOperation` was created at all.
+- **P2: `UpdateAcceptanceOperation`'s documented contract ("MUST NOT set
+  a terminal checkpoint") was not actually enforced by either store
+  implementation.** Nothing in the current call graph violates this
+  (`advanceAcceptance` never targets `Completed`/`Failed`;
+  `CompleteAcceptance`/`FailAcceptance` are the only paths that reach
+  them), but an unenforced contract is one accidental future call away
+  from silently reintroducing the exact split-commit bug those two
+  methods exist to close. Both `memory` and `postgres` now reject a
+  `Completed`/`Failed` target checkpoint from `UpdateAcceptanceOperation`
+  with `ErrIdempotencyConflict`, with a conformance-style assertion added
+  to both stores' existing tests.
