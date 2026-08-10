@@ -247,7 +247,7 @@ func TestInvoke_ProviderMetadataCannotClaimStrongerTrustMode(t *testing.T) {
 
 func TestQuery_AlwaysReportsNotFound(t *testing.T) {
 	a := New(Config{})
-	_, found, err := a.Query(context.Background(), "any-key")
+	_, found, err := a.Query(context.Background(), "http://example.invalid#analyze", "any-key")
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestQuery_AlwaysReportsNotFound(t *testing.T) {
 
 func TestCancel_ReturnsUnsupported(t *testing.T) {
 	a := New(Config{})
-	if err := a.Cancel(context.Background(), "k1", "no longer needed"); err != provideradapter.ErrCancelUnsupported {
+	if err := a.Cancel(context.Background(), "http://example.invalid#analyze", "k1", "no longer needed"); err != provideradapter.ErrCancelUnsupported {
 		t.Fatalf("got %v, want ErrCancelUnsupported", err)
 	}
 }

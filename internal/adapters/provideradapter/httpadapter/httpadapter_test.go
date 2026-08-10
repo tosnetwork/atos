@@ -201,7 +201,7 @@ func TestQueryAt_NotFoundIsNotAnError(t *testing.T) {
 	defer srv.Close()
 
 	a := testAdapter(t, srv)
-	result, found, err := a.QueryAt(context.Background(), srv.URL, "k1")
+	result, found, err := a.Query(context.Background(), srv.URL, "k1")
 	if err != nil {
 		t.Fatalf("QueryAt: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestQueryAt_RecoversPriorResultWithoutNewSideEffect(t *testing.T) {
 	defer srv.Close()
 
 	a := testAdapter(t, srv)
-	result, found, err := a.QueryAt(context.Background(), srv.URL, "k1")
+	result, found, err := a.Query(context.Background(), srv.URL, "k1")
 	if err != nil || !found {
 		t.Fatalf("QueryAt: found=%v err=%v", found, err)
 	}
@@ -239,7 +239,7 @@ func TestQueryAt_RecoversPriorResultWithoutNewSideEffect(t *testing.T) {
 
 func TestCancel_ReturnsUnsupported(t *testing.T) {
 	a := New(Config{})
-	err := a.Cancel(context.Background(), "k1", "no longer needed")
+	err := a.Cancel(context.Background(), "http://example.invalid", "k1", "no longer needed")
 	if err != provideradapter.ErrCancelUnsupported {
 		t.Fatalf("got %v, want ErrCancelUnsupported", err)
 	}

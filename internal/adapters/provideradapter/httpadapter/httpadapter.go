@@ -207,20 +207,10 @@ func isJSONContentType(ct string) bool {
 	return strings.EqualFold(mediaType, "application/json")
 }
 
-func (a *Adapter) Query(ctx context.Context, idempotencyKey string) (provideradapter.InvokeResult, bool, error) {
-	return provideradapter.InvokeResult{}, false, errQueryRequiresEndpoint
-}
-
-// QueryAt looks up a previously attempted invocation's outcome at
-// endpointRef by idempotencyKey. The plain provideradapter.ProviderAdapter
-// interface's Query(ctx, key) has no endpoint parameter (mirroring
-// payout.Adapter's single-rail assumption), but this adapter serves many
-// distinct third-party endpoints, so internal/adapters/tosai/dispatch calls
-// this method directly (it holds the concrete *Adapter type, not just the
-// interface) rather than the interface method, which exists only to
-// satisfy provideradapter.ProviderAdapter and always returns
-// errQueryRequiresEndpoint.
-func (a *Adapter) QueryAt(ctx context.Context, endpointRef, idempotencyKey string) (provideradapter.InvokeResult, bool, error) {
+// Query looks up a previously attempted invocation's outcome at
+// endpointRef by idempotencyKey via a GET request carrying the same
+// idempotency identity.
+func (a *Adapter) Query(ctx context.Context, endpointRef, idempotencyKey string) (provideradapter.InvokeResult, bool, error) {
 	if endpointRef == "" || idempotencyKey == "" {
 		return provideradapter.InvokeResult{}, false, errors.New("httpadapter: endpoint_ref and idempotency_key are required")
 	}
@@ -253,9 +243,7 @@ func (a *Adapter) QueryAt(ctx context.Context, endpointRef, idempotencyKey strin
 	return result, true, nil
 }
 
-var errQueryRequiresEndpoint = errors.New("httpadapter: Query requires an endpoint; call QueryAt directly")
-
-func (a *Adapter) Cancel(ctx context.Context, idempotencyKey, reason string) error {
+func (a *Adapter) Cancel(ctx context.Context, endpointRef, idempotencyKey, reason string) error {
 	return provideradapter.ErrCancelUnsupported
 }
 

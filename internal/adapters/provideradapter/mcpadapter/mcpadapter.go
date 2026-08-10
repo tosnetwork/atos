@@ -225,11 +225,11 @@ func decodeStatus(raw string) (provideradapter.InvokeStatus, error) {
 // "no record" -- see provideradapter.ProviderAdapter.Query's doc comment,
 // which explicitly allows this for stateless request/response-only
 // protocols.
-func (a *Adapter) Query(ctx context.Context, idempotencyKey string) (provideradapter.InvokeResult, bool, error) {
+func (a *Adapter) Query(ctx context.Context, endpointRef, idempotencyKey string) (provideradapter.InvokeResult, bool, error) {
 	return provideradapter.InvokeResult{}, false, nil
 }
 
-func (a *Adapter) Cancel(ctx context.Context, idempotencyKey, reason string) error {
+func (a *Adapter) Cancel(ctx context.Context, endpointRef, idempotencyKey, reason string) error {
 	return provideradapter.ErrCancelUnsupported
 }
 

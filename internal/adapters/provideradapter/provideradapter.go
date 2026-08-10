@@ -76,19 +76,22 @@ type ProviderAdapter interface {
 	// Invoke attempts, or on retry replays, one execution attempt for req.
 	// It is the only method that may cause a new external side effect.
 	Invoke(ctx context.Context, req InvokeRequest) (InvokeResult, error)
-	// Query looks up the outcome of a previously attempted invocation by
-	// its idempotency key, without causing any new side effect. found is
-	// false when the adapter has no record of ever attempting this key --
-	// a safe signal that Invoke was never called, or never reached the
-	// provider, for it. Adapters that talk to a stateless
-	// request/response-only protocol (no server-side lookup-by-id) MAY
-	// legitimately always report found=false; callers must not treat that
-	// as an error.
-	Query(ctx context.Context, idempotencyKey string) (result InvokeResult, found bool, err error)
-	// Cancel is a best-effort request to stop an in-flight attempt.
-	// Adapters that cannot support cancellation for their protocol return
-	// ErrCancelUnsupported rather than a fabricated success.
-	Cancel(ctx context.Context, idempotencyKey, reason string) error
+	// Query looks up the outcome of a previously attempted invocation at
+	// endpointRef by its idempotency key, without causing any new side
+	// effect. found is false when the adapter has no record of ever
+	// attempting this key -- a safe signal that Invoke was never called,
+	// or never reached the provider, for it. Adapters that talk to a
+	// stateless request/response-only protocol (no server-side
+	// lookup-by-id) MAY legitimately always report found=false; callers
+	// must not treat that as an error. endpointRef is required (not
+	// implied by adapter state) because one Adapter instance serves many
+	// distinct third-party endpoints, one per Capability binding.
+	Query(ctx context.Context, endpointRef, idempotencyKey string) (result InvokeResult, found bool, err error)
+	// Cancel is a best-effort request to stop an in-flight attempt at
+	// endpointRef. Adapters that cannot support cancellation for their
+	// protocol return ErrCancelUnsupported rather than a fabricated
+	// success.
+	Cancel(ctx context.Context, endpointRef, idempotencyKey, reason string) error
 	// Health performs a lightweight, bounded reachability probe against
 	// endpointRef. This is readiness evidence only -- see
 	// domain.AdapterHealthCheck's doc comment -- and MUST NEVER be treated

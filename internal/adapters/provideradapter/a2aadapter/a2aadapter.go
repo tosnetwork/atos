@@ -194,21 +194,12 @@ type taskIDParams struct {
 	ID string `json:"id"`
 }
 
-// Query calls tasks/get(id: idempotencyKey) -- recovering a lost message/
-// send response via the same durable identity Invoke set as the task's
-// TaskID, exactly as A2A's own task-tracking model intends. A provider
-// reporting "task not found" is a legitimate found=false, not an error.
-func (a *Adapter) Query(ctx context.Context, idempotencyKey string) (provideradapter.InvokeResult, bool, error) {
-	return provideradapter.InvokeResult{}, false, errQueryRequiresEndpoint
-}
-
-var errQueryRequiresEndpoint = errors.New("a2aadapter: Query requires an endpoint; call QueryAt directly")
-
-// QueryAt is the endpoint-carrying counterpart to Query -- see
-// httpadapter.Adapter.QueryAt's doc comment for why this adapter needs one
-// (it serves many distinct third-party endpoints, unlike payout.Adapter's
-// single-rail assumption the bare interface method mirrors).
-func (a *Adapter) QueryAt(ctx context.Context, endpointRef, idempotencyKey string) (provideradapter.InvokeResult, bool, error) {
+// Query calls tasks/get(id: idempotencyKey) at endpointRef -- recovering a
+// lost message/send response via the same durable identity Invoke set as
+// the task's TaskID, exactly as A2A's own task-tracking model intends. A
+// provider reporting "task not found" is a legitimate found=false, not an
+// error.
+func (a *Adapter) Query(ctx context.Context, endpointRef, idempotencyKey string) (provideradapter.InvokeResult, bool, error) {
 	if endpointRef == "" || idempotencyKey == "" {
 		return provideradapter.InvokeResult{}, false, errors.New("a2aadapter: endpoint_ref and idempotency_key are required")
 	}
@@ -231,19 +222,10 @@ func (a *Adapter) QueryAt(ctx context.Context, endpointRef, idempotencyKey strin
 	return result, true, nil
 }
 
-// Cancel calls tasks/cancel(id: idempotencyKey) -- unlike HTTP/MCP, A2A has
-// a defined cancellation operation, so this adapter implements it rather
-// than reporting ErrCancelUnsupported.
-func (a *Adapter) Cancel(ctx context.Context, idempotencyKey, reason string) error {
-	if idempotencyKey == "" {
-		return errors.New("a2aadapter: idempotency_key is required")
-	}
-	return errCancelRequiresEndpoint
-}
-
-var errCancelRequiresEndpoint = errors.New("a2aadapter: Cancel requires an endpoint; call CancelAt directly")
-
-func (a *Adapter) CancelAt(ctx context.Context, endpointRef, idempotencyKey, reason string) error {
+// Cancel calls tasks/cancel(id: idempotencyKey) at endpointRef -- unlike
+// HTTP/MCP, A2A has a defined cancellation operation, so this adapter
+// implements it rather than reporting ErrCancelUnsupported.
+func (a *Adapter) Cancel(ctx context.Context, endpointRef, idempotencyKey, reason string) error {
 	if endpointRef == "" || idempotencyKey == "" {
 		return errors.New("a2aadapter: endpoint_ref and idempotency_key are required")
 	}

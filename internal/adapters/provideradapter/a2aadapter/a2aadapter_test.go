@@ -194,12 +194,12 @@ func TestInvoke_DuplicateResultConverges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A caller that instead recovers via QueryAt (the intended lost-
+	// A caller that instead recovers via Query (the intended lost-
 	// response-recovery path) must see the SAME task, without triggering
 	// a second message/send.
-	recovered, found, err := a.QueryAt(context.Background(), srv.URL, "k1")
+	recovered, found, err := a.Query(context.Background(), srv.URL, "k1")
 	if err != nil || !found {
-		t.Fatalf("QueryAt: found=%v err=%v", found, err)
+		t.Fatalf("Query: found=%v err=%v", found, err)
 	}
 	if recovered.Output["call"] != first.Output["call"] {
 		t.Fatalf("recovered a different result: %+v vs %+v", recovered.Output, first.Output)
@@ -209,30 +209,29 @@ func TestInvoke_DuplicateResultConverges(t *testing.T) {
 	}
 }
 
-func TestQueryAt_UnknownTaskIsNotFoundNotError(t *testing.T) {
+func TestQuery_UnknownTaskIsNotFoundNotError(t *testing.T) {
 	srv := newTestA2AServer(t, func(msg a2a.Message) a2a.Task { return a2a.Task{} })
 	defer srv.Close()
 
 	a := New(Config{Client: srv.Client()})
-	_, found, err := a.QueryAt(context.Background(), srv.URL, "never-sent")
+	_, found, err := a.Query(context.Background(), srv.URL, "never-sent")
 	if err != nil {
-		t.Fatalf("QueryAt: %v", err)
+		t.Fatalf("Query: %v", err)
 	}
 	if found {
 		t.Fatal("expected found=false for an unknown task id")
 	}
 }
 
-func TestQuery_RequiresQueryAt(t *testing.T) {
+func TestQuery_RequiresEndpoint(t *testing.T) {
 	a := New(Config{})
-	_, found, err := a.Query(context.Background(), "k1")
+	_, found, err := a.Query(context.Background(), "", "k1")
 	if found || err == nil {
-		t.Fatal("bare Query (no endpoint) must error, directing callers to QueryAt")
+		t.Fatal("Query with an empty endpoint must error")
 	}
 }
 
-func TestCancelAt_Success(t *testing.T) {
-	var canceled string
+func TestCancel_Success(t *testing.T) {
 	srv := newTestA2AServer(t, func(msg a2a.Message) a2a.Task {
 		return a2a.Task{Status: a2a.TaskStatus{State: a2a.TaskWorking}}
 	})
@@ -241,17 +240,16 @@ func TestCancelAt_Success(t *testing.T) {
 	if _, err := a.Invoke(context.Background(), provideradapter.InvokeRequest{JobID: "job_1", EndpointRef: srv.URL, IdempotencyKey: "k1"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.CancelAt(context.Background(), srv.URL, "k1", "no longer needed"); err != nil {
-		t.Fatalf("CancelAt: %v", err)
+	if err := a.Cancel(context.Background(), srv.URL, "k1", "no longer needed"); err != nil {
+		t.Fatalf("Cancel: %v", err)
 	}
-	result, found, err := a.QueryAt(context.Background(), srv.URL, "k1")
+	result, found, err := a.Query(context.Background(), srv.URL, "k1")
 	if err != nil || !found {
-		t.Fatalf("QueryAt after cancel: found=%v err=%v", found, err)
+		t.Fatalf("Query after cancel: found=%v err=%v", found, err)
 	}
 	if result.Status != provideradapter.InvokeFailed {
 		t.Fatalf("status after cancel = %s, want failed (canceled maps to failed)", result.Status)
 	}
-	_ = canceled
 }
 
 func TestHealth_ReachableAgent(t *testing.T) {
