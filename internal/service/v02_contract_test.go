@@ -37,11 +37,14 @@ func TestCapabilityModeActivationSeparatesRequestedFromSupported(t *testing.T) {
 	if len(cap.SupportedTrustModes) != 1 || cap.SupportedTrustModes[0] != domain.TrustModeManaged {
 		t.Fatalf("supported modes = %v, want managed only", cap.SupportedTrustModes)
 	}
-	if cap.ModeSupport.Entry(domain.TrustModeVerified).Status != domain.ModeSupportPending {
-		t.Fatalf("verified status = %q, want pending", cap.ModeSupport.Entry(domain.TrustModeVerified).Status)
+	// A freshly requested stronger mode starts at `requested` (no readiness
+	// evidence recorded yet), not `pending` -- see atos-spec
+	// docs/IMPLEMENTATION_ROADMAP.md §7.2.0's frozen transition matrix.
+	if cap.ModeSupport.Entry(domain.TrustModeVerified).Status != domain.ModeSupportRequested {
+		t.Fatalf("verified status = %q, want requested", cap.ModeSupport.Entry(domain.TrustModeVerified).Status)
 	}
-	if cap.ModeSupport.Entry(domain.TrustModeNative).Status != domain.ModeSupportPending {
-		t.Fatalf("native status = %q, want pending", cap.ModeSupport.Entry(domain.TrustModeNative).Status)
+	if cap.ModeSupport.Entry(domain.TrustModeNative).Status != domain.ModeSupportRequested {
+		t.Fatalf("native status = %q, want requested", cap.ModeSupport.Entry(domain.TrustModeNative).Status)
 	}
 }
 

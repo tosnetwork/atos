@@ -134,6 +134,57 @@ func (m ModeSupport) ActiveModes() []TrustMode {
 	return out
 }
 
+// AdvanceToPending applies the `requested -> pending` transition from
+// atos-spec docs/IMPLEMENTATION_ROADMAP.md §7.2.0's frozen matrix, whose
+// sole authority is the readiness pipeline recording a first evidence
+// cycle (health check or certification attempt) for the Capability's
+// current version. A no-op (not an error) for any other current status --
+// only `requested` legally becomes `pending` this way. Safe to call on a
+// nil ModeSupport (Entry already treats it as all-unsupported, so the
+// status check fails closed before any write is attempted).
+func (m ModeSupport) AdvanceToPending(mode TrustMode) ModeSupport {
+	entry := m.Entry(mode)
+	if entry.Status != ModeSupportRequested {
+		return m
+	}
+	entry.Status = ModeSupportPending
+	entry.Reason = "readiness evidence recorded, awaiting activation authority"
+	m[mode] = entry
+	return m
+}
+
+// Suspend applies the `active -> suspended` transition from §7.2.0, whose
+// sole authority is the readiness pipeline observing that evidence this
+// activation depended on is no longer valid for the Capability's current
+// version. A no-op for any other current status. reason is stored as
+// ModeSupportEntry.Reason for operator visibility.
+func (m ModeSupport) Suspend(mode TrustMode, reason string) ModeSupport {
+	entry := m.Entry(mode)
+	if entry.Status != ModeSupportActive {
+		return m
+	}
+	entry.Status = ModeSupportSuspended
+	entry.Reason = reason
+	m[mode] = entry
+	return m
+}
+
+// Activate applies the `pending -> active` or `suspended -> active`
+// transitions from §7.2.0, whose sole authority is an ActivationAuthority
+// grant (see ActivationAuthority.Evaluate). A no-op for any other current
+// status -- callers MUST NOT invoke this without a prior granted=true
+// result; it performs no evaluation of its own.
+func (m ModeSupport) Activate(mode TrustMode) ModeSupport {
+	entry := m.Entry(mode)
+	if entry.Status != ModeSupportPending && entry.Status != ModeSupportSuspended {
+		return m
+	}
+	entry.Status = ModeSupportActive
+	entry.Reason = ""
+	m[mode] = entry
+	return m
+}
+
 type ProofRequirements struct {
 	NetworkVerifiableReceipt bool `json:"network_verifiable_receipt,omitempty"`
 	TOSSettlement            bool `json:"tos_settlement,omitempty"`

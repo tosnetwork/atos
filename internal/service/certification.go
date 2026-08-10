@@ -104,6 +104,14 @@ func (s *CertificationService) Open(ctx context.Context, in OpenCertificationInp
 	if err != nil {
 		return domain.SandboxCertification{}, err
 	}
+	if created {
+		// A newly opened certification attempt is itself the §7.2.0
+		// `requested -> pending` readiness-evidence trigger, regardless of
+		// whether the probe below ultimately passes or fails.
+		if err := s.capabilities.RecordReadinessEvidence(ctx, cap.ID, binding.Transport); err != nil {
+			return domain.SandboxCertification{}, err
+		}
+	}
 	if !created && stored.Status != domain.CertificationPending {
 		// Already reached a terminal outcome -- idempotent no-op replay.
 		return stored, nil
@@ -112,23 +120,23 @@ func (s *CertificationService) Open(ctx context.Context, in OpenCertificationInp
 	if s.remoteProber != nil {
 		check, err := s.remoteProber.ProbeThirdPartyHealth(ctx, in.ProviderID, cap.ID, cap.Version, binding)
 		if err != nil {
-			return s.completeCertification(ctx, stored.ID, domain.CertificationFailed, err.Error(), nil)
+			return s.failCertification(ctx, cap.ID, binding.Transport, stored.ID, err.Error(), nil)
 		}
 		evidence := map[string]any{"health_status": string(check.Status), "latency_ms": check.LatencyMS, "deep_probe": check.DeepProbe}
 		if check.Status != domain.AdapterHealthHealthy {
-			return s.completeCertification(ctx, stored.ID, domain.CertificationFailed, check.FailureReason, evidence)
+			return s.failCertification(ctx, cap.ID, binding.Transport, stored.ID, check.FailureReason, evidence)
 		}
 		return s.completeCertification(ctx, stored.ID, domain.CertificationPassed, "", evidence)
 	}
 
 	adapter, ok := s.resolver.For(binding.Transport)
 	if !ok {
-		return s.completeCertification(ctx, stored.ID, domain.CertificationFailed, "no provider adapter registered for this transport", nil)
+		return s.failCertification(ctx, cap.ID, binding.Transport, stored.ID, "no provider adapter registered for this transport", nil)
 	}
 	check := adapter.Health(ctx, binding.EndpointRef)
 	evidence := map[string]any{"health_status": string(check.Status), "latency_ms": check.LatencyMS}
 	if check.Status != domain.AdapterHealthHealthy {
-		return s.completeCertification(ctx, stored.ID, domain.CertificationFailed, check.FailureReason, evidence)
+		return s.failCertification(ctx, cap.ID, binding.Transport, stored.ID, check.FailureReason, evidence)
 	}
 
 	prober, deepProbeSupported := adapter.(provideradapter.CertificationProbe)
@@ -139,9 +147,24 @@ func (s *CertificationService) Open(ctx context.Context, in OpenCertificationInp
 	probeEvidence, err := prober.ProbeCertification(ctx, binding.EndpointRef, cap.InputSchema, cap.OutputSchema)
 	maps.Copy(evidence, probeEvidence)
 	if err != nil {
-		return s.completeCertification(ctx, stored.ID, domain.CertificationFailed, err.Error(), evidence)
+		return s.failCertification(ctx, cap.ID, binding.Transport, stored.ID, err.Error(), evidence)
 	}
 	return s.completeCertification(ctx, stored.ID, domain.CertificationPassed, "", evidence)
+}
+
+// failCertification completes a certification as Failed and, per §7.2.0,
+// applies the `active -> suspended` transition to any mode this transport
+// binding was activated for -- a failed certification is readiness
+// evidence that an activation depended on becoming invalid.
+func (s *CertificationService) failCertification(ctx context.Context, capabilityID string, transport domain.EndpointAdapterType, certID, failureReason string, evidence map[string]any) (domain.SandboxCertification, error) {
+	result, err := s.completeCertification(ctx, certID, domain.CertificationFailed, failureReason, evidence)
+	if err != nil {
+		return domain.SandboxCertification{}, err
+	}
+	if err := s.capabilities.SuspendModeIfActive(ctx, capabilityID, transport, "certification failed: "+failureReason); err != nil {
+		return domain.SandboxCertification{}, err
+	}
+	return result, nil
 }
 
 func (s *CertificationService) completeCertification(ctx context.Context, id string, status domain.CertificationStatus, failureReason string, evidence map[string]any) (domain.SandboxCertification, error) {

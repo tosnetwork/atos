@@ -26,6 +26,13 @@ type Core struct {
 	quotes    map[string]domain.Quote
 	modes     map[domain.TrustMode]bool
 	simulated bool
+	// signers is keyed by AuthorizationID, mirroring tos-protocol's own
+	// idempotency key for AuthorizeExecutionSigner/RevokeExecutionSigner --
+	// a real stateful registry (not the old always-authorized stub) so
+	// Phase 3B's signer lifecycle/crash-recovery tests can exercise
+	// meaningful authorize/revoke/idempotency-conflict behavior against
+	// this mock without needing the real tos-protocol RPC server.
+	signers map[string]toscore.ExecutionSignerAuthorization
 }
 
 func New(s store.Store) *Core {
@@ -47,6 +54,7 @@ func newCore(s store.Store, simulated bool, modes ...domain.TrustMode) *Core {
 	return &Core{
 		store: s, verified: make(map[string]domain.ExecutionReceipt),
 		quotes: make(map[string]domain.Quote), modes: allowed, simulated: simulated,
+		signers: make(map[string]toscore.ExecutionSignerAuthorization),
 	}
 }
 
@@ -102,6 +110,12 @@ func (c *Core) CommitQuote(ctx context.Context, quote domain.Quote) (string, err
 	return "", nil
 }
 
+// ResolveExecutionSignerAuthorization scans the real, mutable signer
+// registry populated by AuthorizeExecutionSigner/RevokeExecutionSigner --
+// not a hardcoded always-authorized stub -- so a resolve genuinely reflects
+// whether the signer was ever authorized, has since been revoked, and is
+// within its validity window, exactly like tos-protocol's real
+// implementation.
 func (c *Core) ResolveExecutionSignerAuthorization(
 	ctx context.Context,
 	providerID, capabilityID, capabilityVersion, signerID string,
@@ -110,24 +124,75 @@ func (c *Core) ResolveExecutionSignerAuthorization(
 	if signerID == "" {
 		return toscore.ExecutionSignerAuthorization{}, false, nil
 	}
-	if !c.supports(domain.TrustModeManaged) && !c.simulated {
-		return toscore.ExecutionSignerAuthorization{}, false, nil
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, auth := range c.signers {
+		if auth.ProviderID != providerID || auth.CapabilityID != capabilityID ||
+			auth.CapabilityVersion != capabilityVersion || auth.ExecutionSignerID != signerID {
+			continue
+		}
+		if auth.Revoked || at.Before(auth.ValidFrom) || !at.Before(auth.ValidUntil) {
+			return toscore.ExecutionSignerAuthorization{}, false, nil
+		}
+		return auth, true, nil
 	}
-	authorizationRef := "atos:managed:signer:" + signerID
+	return toscore.ExecutionSignerAuthorization{}, false, nil
+}
+
+// AuthorizeExecutionSigner mirrors tos-protocol's own idempotency
+// contract: a replay of the same AuthorizationID with identical fields
+// returns the existing record (created=false); a replay with the same
+// AuthorizationID but a different field is an idempotency conflict.
+func (c *Core) AuthorizeExecutionSigner(ctx context.Context, req toscore.AuthorizeExecutionSignerRequest) (toscore.ExecutionSignerAuthorization, bool, error) {
+	if req.AuthorizationID == "" {
+		return toscore.ExecutionSignerAuthorization{}, false, domain.NewError(domain.ErrValidationFailed, "authorization_id is required", false)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if existing, ok := c.signers[req.AuthorizationID]; ok {
+		if existing.ProviderID != req.ProviderID || existing.CapabilityID != req.CapabilityID ||
+			existing.CapabilityVersion != req.CapabilityVersion || existing.ExecutionSignerID != req.ExecutionSignerID ||
+			!existing.ValidFrom.Equal(req.ValidFrom) || !existing.ValidUntil.Equal(req.ValidUntil) {
+			return toscore.ExecutionSignerAuthorization{}, false, domain.NewError(domain.ErrIdempotencyConflict, "authorization_id reused with a different execution signer request", false)
+		}
+		return existing, false, nil
+	}
+	authorizationRef := "atos:mock:signer-auth:" + req.AuthorizationID
 	if c.simulated {
-		authorizationRef = simulatedRef("signer", domain.TrustModeVerified, "auth_mock_"+capabilityID)
+		authorizationRef = simulatedRef("signer-auth", domain.TrustModeVerified, req.AuthorizationID)
 	}
 	auth := toscore.ExecutionSignerAuthorization{
-		AuthorizationID:   "auth_mock_" + capabilityID,
-		ProviderID:        providerID,
-		CapabilityID:      capabilityID,
-		CapabilityVersion: capabilityVersion,
-		ExecutionSignerID: signerID,
-		ValidFrom:         at.Add(-24 * time.Hour),
-		ValidUntil:        at.Add(24 * time.Hour),
-		AuthorizationRef:  authorizationRef,
+		AuthorizationID: req.AuthorizationID, ProviderID: req.ProviderID,
+		CapabilityID: req.CapabilityID, CapabilityVersion: req.CapabilityVersion,
+		ExecutionSignerID: req.ExecutionSignerID,
+		ValidFrom:         req.ValidFrom, ValidUntil: req.ValidUntil,
+		AuthorizationRef: authorizationRef,
 	}
+	c.signers[req.AuthorizationID] = auth
 	return auth, true, nil
+}
+
+// RevokeExecutionSigner marks the record identified by req.AuthorizationID
+// revoked. Idempotent: revoking an already-revoked record returns the
+// existing (already-revoked) record with revoked=false, mirroring
+// tos-protocol's own "true only on first application" contract.
+func (c *Core) RevokeExecutionSigner(ctx context.Context, req toscore.RevokeExecutionSignerRequest) (toscore.ExecutionSignerAuthorization, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	existing, ok := c.signers[req.AuthorizationID]
+	if !ok {
+		return toscore.ExecutionSignerAuthorization{}, false, domain.NewError(domain.ErrNotFound, "execution signer authorization not found", false)
+	}
+	if existing.Revoked {
+		return existing, false, nil
+	}
+	existing.Revoked = true
+	existing.RevocationRef = "atos:mock:signer-revocation:" + req.AuthorizationID
+	if c.simulated {
+		existing.RevocationRef = simulatedRef("signer-revocation", domain.TrustModeVerified, req.AuthorizationID)
+	}
+	c.signers[req.AuthorizationID] = existing
+	return existing, true, nil
 }
 
 func (c *Core) CreateEscrow(ctx context.Context, req toscore.CreateEscrowRequest) (domain.Escrow, error) {
@@ -270,18 +335,28 @@ func (c *Core) VerifyExecutionReceipt(ctx context.Context, escrowID string, rece
 	if receipt.Result != "" && receipt.Result != domain.ExecutionSuccess {
 		return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: "receipt is not successful"}, nil
 	}
-	auth, authorized, err := c.ResolveExecutionSignerAuthorization(
-		ctx, receipt.ProviderID, receipt.CapabilityID, receipt.CapabilityVersion,
-		receipt.ExecutionSignerID, receipt.CompletedAt,
-	)
-	if err != nil {
-		return toscore.VerifyExecutionReceiptResult{}, err
-	}
-	if !authorized {
-		return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: "execution signer is not authorized"}, nil
-	}
-	if receipt.SignerAuthorizationID != "" && receipt.SignerAuthorizationID != auth.AuthorizationID {
-		return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: "signer authorization mismatch"}, nil
+	// Managed never requires TOS-backed execution-signer authorization --
+	// its receipts use an ATOS-self-signed synthetic signer identity (see
+	// internal/service/job.go's synthesizeDeliveredReceipt and
+	// internal/adapters/tosai/dispatch's synthesizeReceipt), never a
+	// signer this registry (or the real tos-protocol TrustService) was
+	// ever asked to authorize. Only Verified/Native require a real,
+	// resolvable authorization (atos-spec docs/IMPLEMENTATION_ROADMAP.md
+	// §7.2's Managed-stability rule).
+	if receipt.TrustMode != domain.TrustModeManaged {
+		auth, authorized, err := c.ResolveExecutionSignerAuthorization(
+			ctx, receipt.ProviderID, receipt.CapabilityID, receipt.CapabilityVersion,
+			receipt.ExecutionSignerID, receipt.CompletedAt,
+		)
+		if err != nil {
+			return toscore.VerifyExecutionReceiptResult{}, err
+		}
+		if !authorized {
+			return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: "execution signer is not authorized"}, nil
+		}
+		if receipt.SignerAuthorizationID != "" && receipt.SignerAuthorizationID != auth.AuthorizationID {
+			return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: "signer authorization mismatch"}, nil
+		}
 	}
 
 	c.mu.Lock()

@@ -102,6 +102,18 @@ func (s *HealthService) CheckCapability(ctx context.Context, capabilityID string
 		if err := s.store.PutHealthCheck(ctx, check); err != nil {
 			return nil, err
 		}
+		// A recorded health check -- healthy or not -- is itself the
+		// §7.2.0 `requested -> pending` readiness-evidence trigger; an
+		// unhealthy result additionally invalidates any currently active
+		// mode this binding was activated for (`active -> suspended`).
+		if err := s.capabilities.RecordReadinessEvidence(ctx, cap.ID, binding.Transport); err != nil {
+			return nil, err
+		}
+		if check.Status != domain.AdapterHealthHealthy {
+			if err := s.capabilities.SuspendModeIfActive(ctx, cap.ID, binding.Transport, "health check failed: "+check.FailureReason); err != nil {
+				return nil, err
+			}
+		}
 		out = append(out, check)
 	}
 	return out, nil
