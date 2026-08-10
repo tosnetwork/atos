@@ -28,8 +28,11 @@ type CapabilityReadiness struct {
 // GetCapabilityWithReadiness is the sole builder of CapabilityReadiness.
 // health may be nil (readiness omitted entirely) for callers that have
 // not wired a HealthService -- see CapabilityReadiness.Readiness's doc
-// comment.
-func GetCapabilityWithReadiness(ctx context.Context, capabilities *CapabilityService, health *HealthService, id string) (CapabilityReadiness, error) {
+// comment. signers may independently be nil (SignerAuthorized then keeps
+// HealthService.Availability's own default -- see its doc comment: true
+// for Managed only, false for Verified/Native, since without an
+// ExecutionSignerService there is no way to check real signer state).
+func GetCapabilityWithReadiness(ctx context.Context, capabilities *CapabilityService, health *HealthService, signers *ExecutionSignerService, id string) (CapabilityReadiness, error) {
 	cap, err := capabilities.Get(ctx, id)
 	if err != nil {
 		return CapabilityReadiness{}, err
@@ -41,10 +44,27 @@ func GetCapabilityWithReadiness(ctx context.Context, capabilities *CapabilitySer
 	if err != nil {
 		return CapabilityReadiness{}, err
 	}
+	// One execution signer authorizes intent to execute a Capability
+	// regardless of which stronger trust mode it's serving (the signer
+	// journal is capability-scoped, not per-mode -- see
+	// ExecutionSignerOperation's doc comment), so this is resolved once
+	// and applied to every non-Managed mode entry below.
+	signerAuthorized := false
+	if signers != nil {
+		_, _, found, err := signers.CurrentSigner(ctx, id)
+		if err != nil {
+			return CapabilityReadiness{}, err
+		}
+		signerAuthorized = found
+	}
 	readiness := make(map[domain.TrustMode]domain.ModeAvailability, len(availability))
 	for _, mode := range availability {
 		if mode.Mode == domain.TrustModeManaged {
 			continue
+		}
+		if signers != nil {
+			mode.SignerAuthorized = signerAuthorized
+			mode.ReasonCode = domain.ReadinessReasonCode(mode.Status, mode.TransportHealthy, mode.HealthFresh, mode.Certified, mode.SignerAuthorized, mode.ActivationAuthoritySatisfied)
 		}
 		readiness[mode.Mode] = mode
 	}

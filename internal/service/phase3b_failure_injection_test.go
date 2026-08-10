@@ -60,14 +60,19 @@ func TestFailClosed_AllReadinessEvidenceGreenStillDoesNotActivate(t *testing.T) 
 
 	// Confirm the test actually assembled every green signal it claims to
 	// -- a false pass here (evidence not really green) would make the
-	// assertion below meaningless.
-	view, err := service.GetCapabilityWithReadiness(ctx, capabilities, health, cap.ID)
+	// assertion below meaningless. Pass signers (not nil) so the public
+	// projection reflects the REAL signer authorization just performed,
+	// not the nil-signers default.
+	view, err := service.GetCapabilityWithReadiness(ctx, capabilities, health, signers, cap.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	verified := view.Readiness[domain.TrustModeVerified]
-	if !verified.TransportHealthy || !verified.HealthFresh || !verified.Certified {
-		t.Fatalf("test setup invalid: health/certification not actually green: %+v", verified)
+	if !verified.TransportHealthy || !verified.HealthFresh || !verified.Certified || !verified.SignerAuthorized {
+		t.Fatalf("test setup invalid: health/certification/signer not actually all green: %+v", verified)
+	}
+	if verified.ReasonCode != domain.ActivationAuthorityUnavailable {
+		t.Fatalf("with every readiness dimension green, reason_code should already point at the real remaining blocker (the activation authority), got %q", verified.ReasonCode)
 	}
 	_, _, signerFound, err := signers.CurrentSigner(ctx, cap.ID)
 	if err != nil {

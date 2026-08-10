@@ -111,7 +111,7 @@ func (s *Server) toolSearch(ctx context.Context, principal auth.Principal, args 
 }
 
 func (s *Server) toolGetCapability(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
-	return service.GetCapabilityWithReadiness(ctx, s.Capabilities, s.Health, argString(args, "capability_id"))
+	return service.GetCapabilityWithReadiness(ctx, s.Capabilities, s.Health, s.ExecutionSigners, argString(args, "capability_id"))
 }
 
 func (s *Server) toolQuote(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
