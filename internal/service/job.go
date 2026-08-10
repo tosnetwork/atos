@@ -140,6 +140,19 @@ func (s *JobService) submit(ctx context.Context, in SubmitInput, waitInline bool
 	if err := domain.ValidateCommittedTrust(quote.TrustMode, quote.ProofProfile); err != nil {
 		return SubmitResult{}, domain.NewError(domain.ErrQuoteModeMismatch, err.Error(), false)
 	}
+	if quote.InputSchema == nil {
+		// A Capability's InputSchema is required and non-nil at
+		// registration (validateCapabilitySchemas), and QuoteService.Create
+		// unconditionally freezes it onto every Quote it creates -- so a
+		// persisted Quote with a nil InputSchema unambiguously predates
+		// Binding/InputSchema/OutputSchema freezing, not "the Capability
+		// legitimately had no schema." Failing explicitly here (rather than
+		// silently falling back to whatever the live Capability currently
+		// has, or letting a nil Binding masquerade as "no third-party
+		// binding") is the deliberate choice: a legacy third-party Quote
+		// must never be silently reinterpreted as a native/no-binding one.
+		return SubmitResult{}, domain.NewError(domain.ErrQuoteMismatch, "quote predates binding/schema freezing; request a new quote", false)
+	}
 	capability, err := s.store.Get(ctx, in.CapabilityID)
 	if err != nil {
 		return SubmitResult{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability not found", false)

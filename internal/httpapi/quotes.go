@@ -40,7 +40,7 @@ func (s *Server) handleCreateQuote(w http.ResponseWriter, r *http.Request) {
 		writeDomainErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, q)
+	writeJSON(w, http.StatusCreated, q.Public())
 }
 
 func (s *Server) handleGetQuote(w http.ResponseWriter, r *http.Request) {
@@ -53,5 +53,5 @@ func (s *Server) handleGetQuote(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, domain.ErrPermissionDenied, "not the Quote's owning principal", false)
 		return
 	}
-	writeJSON(w, http.StatusOK, q)
+	writeJSON(w, http.StatusOK, q.Public())
 }

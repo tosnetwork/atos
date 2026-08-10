@@ -412,3 +412,67 @@ func TestQuoteService_NewQuoteAfterCapabilityUpdateUsesNewBinding(t *testing.T) 
 		t.Fatalf("quote.Binding = %+v, want the UPDATED binding B (%s), not the old binding A", quote.Binding, bindingB)
 	}
 }
+
+// TestJobService_SubmitFailsClosedOnLegacyQuoteMissingFrozenSchema proves
+// JobService.submit's deployment-compatibility guard: a persisted Quote
+// whose InputSchema is nil (a real Capability's InputSchema is required
+// and non-nil at registration, and QuoteService.Create unconditionally
+// freezes it, so a nil InputSchema unambiguously means this Quote predates
+// Binding/InputSchema/OutputSchema freezing) must fail submission
+// explicitly, never silently fall back to treating a legacy third-party
+// Quote as a native/no-binding one -- which would otherwise route
+// execution to dispatch's native path instead of the third-party adapter
+// the Quote was actually issued against.
+func TestJobService_SubmitFailsClosedOnLegacyQuoteMissingFrozenSchema(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	adapter := &countingInvokeAdapter{transport: domain.AdapterHTTP}
+	provider := dispatch.New(tosaimock.New(), provideradapter.NewResolver(adapter))
+	core := toscoremock.New(st)
+	capabilities := service.NewCapabilityService(st)
+	quotes := service.NewQuoteService(st)
+	accounts := service.NewAccountService(st)
+	quotes.WithAccountService(accounts)
+	jobs := service.NewJobService(st, provider, core, accounts)
+
+	cap, err := capabilities.Register(ctx, service.RegisterCapabilityInput{
+		ProviderID: "agt_legacy_quote", Name: "Test Capability", Description: "for tests",
+		DeliveryMode: domain.DeliveryInstant,
+		InputSchema:  map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
+		Bindings: []domain.CapabilityBinding{
+			{Transport: domain.AdapterHTTP, EndpointRef: "https://provider.example.com", EligibleTrustModes: []domain.TrustMode{domain.TrustModeManaged}},
+		},
+		IdempotencyKey: "register-legacy-quote",
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	quote, err := quotes.Create(ctx, service.CreateQuoteInput{CapabilityID: cap.ID})
+	if err != nil {
+		t.Fatalf("Create quote: %v", err)
+	}
+	if quote.Binding == nil || quote.InputSchema == nil {
+		t.Fatal("test setup invalid: quote must have a real frozen binding/schema to strip")
+	}
+
+	// Simulate a Quote persisted before this field existed by stripping it
+	// and writing it directly back into the store, bypassing QuoteService
+	// entirely -- exactly what a real pre-upgrade row would look like.
+	legacy := quote
+	legacy.Binding, legacy.InputSchema, legacy.OutputSchema = nil, nil, nil
+	if err := st.PutQuote(ctx, legacy); err != nil {
+		t.Fatalf("PutQuote (simulate legacy row): %v", err)
+	}
+
+	_, err = jobs.Invoke(ctx, service.SubmitInput{
+		PrincipalID: "prn_legacy_quote", CapabilityID: cap.ID, QuoteID: quote.ID,
+		Input: map[string]any{"x": 1}, IdempotencyKey: "invoke-legacy-quote",
+	})
+	if err == nil {
+		t.Fatal("expected Invoke to fail closed on a legacy Quote missing its frozen schema, not silently succeed")
+	}
+	if adapter.invokeCalls != 0 {
+		t.Fatalf("adapter invoked %d times, want 0 -- a legacy Quote must never dispatch at all, whether to the native or third-party path", adapter.invokeCalls)
+	}
+}
