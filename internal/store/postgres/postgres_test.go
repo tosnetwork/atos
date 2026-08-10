@@ -261,6 +261,22 @@ func formatWholeDollars(n int) string {
 var suffixCounter int
 var suffixMu sync.Mutex
 
+// suffixEpoch is captured once, at first use, from a nanosecond-resolution
+// clock -- NOT os.Getpid(), which this used to be keyed on. PIDs get
+// recycled by the OS, so two separate `go test` process invocations
+// against the same long-lived Postgres database (a real scenario: CI
+// without a fresh-database-per-run policy, or rapid local iteration) can
+// end up with the identical PID and therefore emit the identical suffix
+// sequence, silently colliding on job_id/settlement_id primary/unique
+// keys. This was not theoretical: it caused a real, reproducible
+// TestOpenDisputeRacesPayoutTransitionExactlyOneOutcome failure --
+// CreateEarning's `ON CONFLICT (settlement_id) DO NOTHING` silently
+// no-opped against a leftover row from an earlier run sharing the exact
+// same recycled-PID suffix, so the test's own goroutines operated on a
+// nonexistent fresh row while `EarningByJob` (keyed on the also-collided
+// job_id) returned the OLD row's already-terminal status.
+var suffixEpoch = time.Now().UnixNano()
+
 // randSuffix keeps test rows unique across repeated `go test` runs against
 // the same persistent database (unlike the in-memory store, Postgres data
 // outlives the test process).
@@ -268,7 +284,7 @@ func randSuffix() string {
 	suffixMu.Lock()
 	defer suffixMu.Unlock()
 	suffixCounter++
-	return formatWholeDollars(os.Getpid()) + "_" + formatWholeDollars(suffixCounter)
+	return formatWholeDollars(int(suffixEpoch)) + "_" + formatWholeDollars(suffixCounter)
 }
 
 // TestUpdateJobConcurrentCreateHasSingleWinner proves the atomic mutation
