@@ -237,6 +237,34 @@ func TestRequestSettlementTool_HiddenWithoutScope(t *testing.T) {
 	}
 }
 
+// TestRequestSettlementTool_ReadOnlyScopeInsufficientForWrite proves the
+// newly-defined settlement:write scope is enforced as a genuinely separate
+// mutation scope: holding only settlement:read (an existing, pre-Phase-3A
+// read-only scope) must not authorize atos_request_settlement -- the
+// specific risk the roadmap flagged by name ("do not overload a read-only
+// scope to authorize a money-changing operation").
+func TestRequestSettlementTool_ReadOnlyScopeInsufficientForWrite(t *testing.T) {
+	h := newProviderToolsHarness(t)
+	token := accessToken(t, h.auth, auth.ScopeSettlementRead)
+	resp := callTool(t, h.server(), token, "atos_request_settlement", map[string]any{"job_id": "job_x", "idempotency_key": "k1"})
+	if resp.Error == nil || resp.Error.Code != codeMethodNotFound {
+		t.Fatalf("got %+v, want method-not-found: settlement:read alone must not authorize atos_request_settlement", resp.Error)
+	}
+}
+
+func TestDeliverJobTool_WrongProviderDenied(t *testing.T) {
+	h := newProviderToolsHarness(t)
+	tokenA := accessToken(t, h.auth, auth.ScopeProviderJobsDeliver)
+	job := h.completedJob(t, "agt_deliver_owner", "prn_deliver_wrong")
+
+	resp := callTool(t, h.server(), tokenA, "atos_deliver_job", map[string]any{
+		"job_id": job.ID, "output": map[string]any{"ok": true}, "idempotency_key": "deliver-wrong-1",
+	})
+	if !toolCallFailed(t, resp) {
+		t.Fatal("expected delivery from a non-owning provider to be rejected")
+	}
+}
+
 func TestRequestSettlementTool_AlreadySettledJobIsIdempotent(t *testing.T) {
 	h := newProviderToolsHarness(t)
 	tokenA := accessToken(t, h.auth, auth.ScopeSettlementWrite)

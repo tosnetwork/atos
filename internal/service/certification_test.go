@@ -8,12 +8,101 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"encoding/json"
+
 	"github.com/tosnetwork/atos/internal/adapters/provideradapter"
+	"github.com/tosnetwork/atos/internal/adapters/provideradapter/a2aadapter"
 	"github.com/tosnetwork/atos/internal/adapters/provideradapter/httpadapter"
+	"github.com/tosnetwork/atos/internal/adapters/provideradapter/mcpadapter"
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/service"
 	"github.com/tosnetwork/atos/internal/store/memory"
 )
+
+// TestCertificationOpen_SuccessfulMCPCertification and
+// TestCertificationOpen_SuccessfulA2ACertification prove
+// CertificationService is genuinely transport-agnostic (dispatches
+// through the Resolver, not coincidentally only exercised via HTTP) --
+// the roadmap's explicit "successful MCP certification"/"successful A2A
+// certification" matrix entries.
+func TestCertificationOpen_SuccessfulMCPCertification(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "result": map[string]any{"tools": []any{}}})
+	}))
+	defer srv.Close()
+
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	resolver := provideradapter.NewResolver(mcpadapter.New(mcpadapter.Config{Client: srv.Client()}))
+	certifications := service.NewCertificationService(st, capabilities, resolver)
+
+	cap, err := capabilities.Register(ctx, service.RegisterCapabilityInput{
+		ProviderID: "agt_cert_mcp", Name: "MCP Capability", Description: "for tests",
+		DeliveryMode: domain.DeliveryInstant,
+		InputSchema:  map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing:             domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
+		RequestedTrustModes: []domain.TrustMode{domain.TrustModeVerified},
+		Bindings: []domain.CapabilityBinding{
+			{Transport: domain.AdapterMCP, EndpointRef: srv.URL + "#analyze", EligibleTrustModes: []domain.TrustMode{domain.TrustModeVerified}},
+		},
+		IdempotencyKey: "register-cert-mcp",
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	cert, err := certifications.Open(ctx, service.OpenCertificationInput{
+		ProviderID: "agt_cert_mcp", CapabilityID: cap.ID, Transport: domain.AdapterMCP, IdempotencyKey: "cert-mcp-1",
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if cert.Status != domain.CertificationPassed {
+		t.Fatalf("status = %s, want passed", cert.Status)
+	}
+}
+
+func TestCertificationOpen_SuccessfulA2ACertification(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "error": map[string]any{"code": -32001, "message": "task not found"}})
+	}))
+	defer srv.Close()
+
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	resolver := provideradapter.NewResolver(a2aadapter.New(a2aadapter.Config{Client: srv.Client()}))
+	certifications := service.NewCertificationService(st, capabilities, resolver)
+
+	cap, err := capabilities.Register(ctx, service.RegisterCapabilityInput{
+		ProviderID: "agt_cert_a2a", Name: "A2A Capability", Description: "for tests",
+		DeliveryMode: domain.DeliveryInstant,
+		InputSchema:  map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing:             domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
+		RequestedTrustModes: []domain.TrustMode{domain.TrustModeVerified},
+		Bindings: []domain.CapabilityBinding{
+			{Transport: domain.AdapterA2A, EndpointRef: srv.URL, EligibleTrustModes: []domain.TrustMode{domain.TrustModeVerified}},
+		},
+		IdempotencyKey: "register-cert-a2a",
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	cert, err := certifications.Open(ctx, service.OpenCertificationInput{
+		ProviderID: "agt_cert_a2a", CapabilityID: cap.ID, Transport: domain.AdapterA2A, IdempotencyKey: "cert-a2a-1",
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	// A "task not found" JSON-RPC error still proves the tasks/get method
+	// itself is implemented and reachable -- Health()'s own documented
+	// pure-reachability contract (see a2aadapter.Health's doc comment).
+	if cert.Status != domain.CertificationPassed {
+		t.Fatalf("status = %s, want passed (task-not-found still proves reachability)", cert.Status)
+	}
+}
 
 func TestCertificationOpen_SuccessfulHTTPCertification(t *testing.T) {
 	ctx := context.Background()

@@ -9,6 +9,7 @@ import (
 
 	"github.com/tosnetwork/atos/internal/adapters/provideradapter"
 	"github.com/tosnetwork/atos/internal/adapters/provideradapter/httpadapter"
+	"github.com/tosnetwork/atos/internal/adapters/provideradapter/mcpadapter"
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/service"
 	"github.com/tosnetwork/atos/internal/store/memory"
@@ -187,6 +188,64 @@ func TestHealthService_Availability_ReadyRequiresHealthyAndCertified(t *testing.
 	}
 	if verified.Active {
 		t.Fatal("Ready=true must never imply Active=true -- activation is Phase 3B/4, not Phase 3A")
+	}
+}
+
+// TestHealthService_CheckCapability_OneUnhealthyBindingDoesNotAffectOthers
+// proves that when a Capability has multiple distinct transport bindings
+// for different trust modes, one being unhealthy does not incorrectly mark
+// every mode unavailable -- health is tracked per (capability, version,
+// transport), not collapsed into one capability-wide boolean.
+func TestHealthService_CheckCapability_OneUnhealthyBindingDoesNotAffectOthers(t *testing.T) {
+	ctx := context.Background()
+	healthySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer healthySrv.Close()
+
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	resolver := provideradapter.NewResolver(
+		httpadapter.New(httpadapter.Config{Client: healthySrv.Client()}),
+		mcpadapter.New(mcpadapter.Config{Timeout: 200 * time.Millisecond}),
+	)
+	health := service.NewHealthService(st, capabilities, resolver)
+
+	cap, err := capabilities.Register(ctx, service.RegisterCapabilityInput{
+		ProviderID: "agt_mixed_bindings", Name: "Mixed Bindings", Description: "two transports",
+		DeliveryMode: domain.DeliveryInstant,
+		InputSchema:  map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing:             domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
+		RequestedTrustModes: []domain.TrustMode{domain.TrustModeManaged, domain.TrustModeVerified},
+		Bindings: []domain.CapabilityBinding{
+			{Transport: domain.AdapterHTTP, EndpointRef: healthySrv.URL, EligibleTrustModes: []domain.TrustMode{domain.TrustModeManaged}},
+			{Transport: domain.AdapterMCP, EndpointRef: "http://127.0.0.1:1#unreachable", EligibleTrustModes: []domain.TrustMode{domain.TrustModeVerified}},
+		},
+		IdempotencyKey: "register-mixed-bindings",
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if _, err := health.CheckCapability(ctx, cap.ID); err != nil {
+		t.Fatal(err)
+	}
+	avail, err := health.Availability(ctx, cap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var managed, verified domain.ModeAvailability
+	for _, a := range avail {
+		switch a.Mode {
+		case domain.TrustModeManaged:
+			managed = a
+		case domain.TrustModeVerified:
+			verified = a
+		}
+	}
+	if !managed.TransportHealthy {
+		t.Fatalf("managed (healthy HTTP binding) = %+v, want transport_healthy", managed)
+	}
+	if verified.TransportHealthy {
+		t.Fatalf("verified (unreachable MCP binding) = %+v, want NOT transport_healthy -- one bad binding must not be masked by the other's health", verified)
 	}
 }
 

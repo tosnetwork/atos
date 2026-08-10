@@ -148,6 +148,23 @@ func TestInvoke_MalformedStructuredContent(t *testing.T) {
 	}
 }
 
+func TestInvoke_TimeoutSurfacesAsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	a := New(Config{Timeout: 20 * time.Millisecond, Client: &http.Client{Timeout: 20 * time.Millisecond, Transport: srv.Client().Transport}})
+	_, err := a.Invoke(context.Background(), provideradapter.InvokeRequest{
+		JobID: "job_1", EndpointRef: srv.URL + "#analyze", IdempotencyKey: "k1",
+	})
+	if err == nil {
+		t.Fatal("expected a timeout error, not a fabricated result")
+	}
+}
+
 func TestInvoke_PendingStatusHonored(t *testing.T) {
 	srv := newTestMCPServer(t, "analyze", func(args map[string]any) toolCallResult {
 		return toolCallResult{IsError: false, StructuredContent: map[string]any{"status": "pending"}}
