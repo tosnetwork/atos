@@ -69,6 +69,12 @@ type Server struct {
 	Logger              *slog.Logger
 	PublicBaseURL       string
 	ApprovalToken       string
+	// AdminApprovalToken additionally gates approval of a Device
+	// Authorization grant requesting an admin scope (see
+	// auth.RequiresAdminApproval) -- required on top of ApprovalToken, not
+	// instead of it. Empty means admin-scoped grants can never be
+	// approved, matching secureEqual's own empty-vs-nonempty rejection.
+	AdminApprovalToken string
 }
 
 func (s *Server) Mux() *http.ServeMux {

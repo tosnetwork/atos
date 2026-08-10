@@ -190,6 +190,24 @@ func (m ModeSupport) Suspend(mode TrustMode, reason string) ModeSupport {
 	return m.with(mode, entry)
 }
 
+// DenyActivation records reasonCode on mode's entry without changing
+// Status, whose sole authority is an ActivationAuthority granted=false
+// result (see ActivationAuthority.Evaluate). A no-op for any other current
+// status than pending/suspended -- callers MUST NOT invoke this without
+// first confirming the mode is in a legal source state. Uses the same
+// copy-on-write .with() every other mutator here uses -- a direct
+// `m[mode] = entry` write would mutate a caller's aliased map in place
+// (e.g. the memory store's Get returns a Capability whose ModeSupport
+// field still aliases the store's own live map).
+func (m ModeSupport) DenyActivation(mode TrustMode, reasonCode string) ModeSupport {
+	entry := m.Entry(mode)
+	if entry.Status != ModeSupportPending && entry.Status != ModeSupportSuspended {
+		return m
+	}
+	entry.Reason = reasonCode
+	return m.with(mode, entry)
+}
+
 // Activate applies the `pending -> active` or `suspended -> active`
 // transitions from §7.2.0, whose sole authority is an ActivationAuthority
 // grant (see ActivationAuthority.Evaluate). A no-op for any other current

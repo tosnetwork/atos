@@ -51,6 +51,15 @@ type Capabilities interface {
 	Get(ctx context.Context, id string) (domain.Capability, error)
 	Search(ctx context.Context, query string, limit int) ([]domain.Capability, error)
 	ByProvider(ctx context.Context, providerID string) ([]domain.Capability, error)
+	// UpdateCapability atomically applies fn to the capability's current
+	// stored state (or domain.Capability{} with exists=false if it isn't
+	// stored yet) and persists whatever fn returns -- the compare-and-swap
+	// primitive every CapabilityService mutation (Update,
+	// RecordReadinessEvidence, SuspendModeIfActive, EvaluateActivation)
+	// MUST use instead of a plain Get-then-Put pair, so a concurrent
+	// mutation (the health/certification reconciler, another admin
+	// request, a provider PATCH) can never be silently clobbered.
+	UpdateCapability(ctx context.Context, id string, fn func(c domain.Capability, exists bool) (domain.Capability, error)) (domain.Capability, error)
 }
 
 type Quotes interface {

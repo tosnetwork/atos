@@ -91,6 +91,18 @@ func (s *Store) Get(ctx context.Context, id string) (domain.Capability, error) {
 	return c, nil
 }
 
+func (s *Store) UpdateCapability(ctx context.Context, id string, fn func(c domain.Capability, exists bool) (domain.Capability, error)) (domain.Capability, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, exists := s.capabilities[id]
+	next, err := fn(current, exists)
+	if err != nil {
+		return domain.Capability{}, err
+	}
+	s.capabilities[id] = next
+	return next, nil
+}
+
 // Search does a naive substring match over name/description/tags. It is a
 // Phase 0 stand-in for the semantic search described in
 // docs/CAPABILITIES.md — good enough to exercise the full contract, not

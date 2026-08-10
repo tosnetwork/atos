@@ -57,9 +57,17 @@ type AuthConfig struct {
 	AutoApprove   bool
 	StatePath     string
 	ApprovalToken string
-	TokenTTL      time.Duration
-	DeviceTTL     time.Duration
-	PollInterval  time.Duration
+	// AdminApprovalToken gates approval of a Device Authorization grant
+	// requesting any scope in auth.RequiresAdminApproval's set, in
+	// addition to (not instead of) ApprovalToken -- see
+	// internal/httpapi/auth.go's DecideDevice callers. Deliberately no
+	// startup-validation requirement like ApprovalToken's: leaving it
+	// unset means admin-scoped grants can simply never be approved (a
+	// safe fail-closed default), not a broken service.
+	AdminApprovalToken string
+	TokenTTL           time.Duration
+	DeviceTTL          time.Duration
+	PollInterval       time.Duration
 }
 
 type ManagedAccountConfig struct {
@@ -134,10 +142,11 @@ func Load() (Config, error) {
 		BlobDir:       envOr("ATOS_BLOB_DIR", "./data/blobs"),
 		PublicBaseURL: envOr("ATOS_PUBLIC_BASE_URL", "http://localhost:8080"),
 		Auth: AuthConfig{
-			AutoApprove:   autoApprove,
-			StatePath:     strings.TrimSpace(os.Getenv("ATOS_AUTH_STATE_PATH")),
-			ApprovalToken: strings.TrimSpace(os.Getenv("ATOS_APPROVAL_TOKEN")),
-			TokenTTL:      tokenTTL, DeviceTTL: deviceTTL, PollInterval: pollInterval,
+			AutoApprove:        autoApprove,
+			StatePath:          strings.TrimSpace(os.Getenv("ATOS_AUTH_STATE_PATH")),
+			ApprovalToken:      strings.TrimSpace(os.Getenv("ATOS_APPROVAL_TOKEN")),
+			AdminApprovalToken: strings.TrimSpace(os.Getenv("ATOS_ADMIN_APPROVAL_TOKEN")),
+			TokenTTL:           tokenTTL, DeviceTTL: deviceTTL, PollInterval: pollInterval,
 		},
 		ManagedAccount: ManagedAccountConfig{
 			Currency:       strings.ToUpper(envOr("ATOS_MANAGED_CURRENCY", "USD")),
