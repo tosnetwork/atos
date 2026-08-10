@@ -205,6 +205,7 @@ func main() {
 	// to select between yet, and Phase 3B intentionally does not implement
 	// a fake on-chain authority just to make the interface non-trivial.
 	activationAuthority := service.FailClosedActivationAuthority{}
+	openTasks := service.NewOpenTaskService(st, quotes, jobs)
 
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
 	defer reconcileCancel()
@@ -223,6 +224,9 @@ func main() {
 	go executionSigners.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("execution-signer operation reconciliation pending", "error", reconcileErr)
 	})
+	go openTasks.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
+		logger.Error("open task acceptance reconciliation pending", "error", reconcileErr)
+	})
 
 	if err := seedDemoCapability(capabilities, cfg.TOSBackend); err != nil {
 		logger.Error("failed to seed demo capability", "error", err)
@@ -231,14 +235,14 @@ func main() {
 
 	restServer := &httpapi.Server{
 		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,
-		ActivationAuthority: activationAuthority, Quotes: quotes,
+		ActivationAuthority: activationAuthority, OpenTasks: openTasks, Quotes: quotes,
 		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts,
 		Earnings: earnings, Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 		ApprovalToken: cfg.Auth.ApprovalToken, AdminApprovalToken: cfg.Auth.AdminApprovalToken,
 	}
 	mcpServer := &mcp.Server{
 		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,
-		ActivationAuthority: activationAuthority, Quotes: quotes,
+		ActivationAuthority: activationAuthority, OpenTasks: openTasks, Quotes: quotes,
 		Jobs: jobs, Accounts: accounts, Receipts: receipts, Earnings: earnings,
 		Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}

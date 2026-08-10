@@ -36,6 +36,14 @@ var orderedToolSpecs = []toolSpec{
 	{Definition: revokeExecutionSignerTool(), RequiredScopes: []auth.Scope{auth.ScopeExecutionSignersWrite}},
 	{Definition: getExecutionSignerStatusTool(), RequiredScopes: []auth.Scope{auth.ScopeExecutionSignersRead}},
 	{Definition: evaluateActivationTool(), RequiredScopes: []auth.Scope{auth.ScopeActivationEvaluate}},
+	{Definition: publishOpenTaskTool(), RequiredScopes: []auth.Scope{auth.ScopeOpenTasksWrite}},
+	{Definition: searchOpenTasksTool(), RequiredScopes: []auth.Scope{auth.ScopeOpenTasksRead}},
+	{Definition: getOpenTaskTool(), RequiredScopes: []auth.Scope{auth.ScopeOpenTasksRead}},
+	{Definition: applyToOpenTaskTool(), RequiredScopes: []auth.Scope{auth.ScopeOpenTaskProposalsWrite}},
+	{Definition: listOpenTaskProposalsTool(), RequiredScopes: []auth.Scope{auth.ScopeOpenTasksRead}},
+	{Definition: withdrawOpenTaskProposalTool(), RequiredScopes: []auth.Scope{auth.ScopeOpenTaskProposalsWrite}},
+	{Definition: acceptOpenTaskProposalTool(), RequiredScopes: []auth.Scope{auth.ScopeOpenTasksWrite}},
+	{Definition: cancelOpenTaskTool(), RequiredScopes: []auth.Scope{auth.ScopeOpenTasksWrite}},
 }
 
 func toolName(spec toolSpec) string {

@@ -26,6 +26,7 @@ type Server struct {
 	// this is not optional: production wiring MUST always set it (see
 	// httpapi.Server.ActivationAuthority's identical doc comment).
 	ActivationAuthority domain.ActivationAuthority
+	OpenTasks           *service.OpenTaskService
 	Quotes              *service.QuoteService
 	Jobs                *service.JobService
 	Accounts            *service.AccountService

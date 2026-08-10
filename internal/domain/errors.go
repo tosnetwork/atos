@@ -49,6 +49,27 @@ const (
 	// in-flight operation to reach a terminal checkpoint and retry, not
 	// treat this as a permanent rejection.
 	ErrSignerOperationInProgress ErrorCode = "signer_operation_in_progress"
+	// ErrOpenTaskNotOpen means Propose/Accept/Cancel was attempted against
+	// an OpenTask whose Status is not Open (already Accepted, Fulfilled,
+	// Cancelled or Expired) -- not retryable, the task's lifecycle has
+	// moved on.
+	ErrOpenTaskNotOpen ErrorCode = "open_task_not_open"
+	// ErrOpenTaskAcceptanceInProgress means a non-terminal
+	// AcceptanceOperation already exists for this OpenTask -- see
+	// store.OpenTasks.OpenAcceptanceOperation's doc comment. Retryable:
+	// the caller should wait for the in-flight acceptance to reach a
+	// terminal checkpoint (Completed or Failed, the latter reopening the
+	// task) and retry.
+	ErrOpenTaskAcceptanceInProgress ErrorCode = "open_task_acceptance_in_progress"
+	// ErrOpenTaskProposalStale means the proposal's bound Capability
+	// version is no longer the provider's current version, or the
+	// Capability is no longer active/owned by that provider -- Accept
+	// refuses to silently rebind to a different version (atos-spec
+	// §7.3); the provider must submit a fresh proposal. Not retryable.
+	ErrOpenTaskProposalStale ErrorCode = "open_task_proposal_stale"
+	// ErrOpenTaskProposalWithdrawn means Accept targeted a proposal the
+	// provider has since withdrawn. Not retryable.
+	ErrOpenTaskProposalWithdrawn ErrorCode = "open_task_proposal_withdrawn"
 )
 
 type Error struct {
