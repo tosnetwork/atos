@@ -280,3 +280,50 @@ func TestCertificationsByCapability_ReturnsAllForCapability(t *testing.T) {
 		t.Fatalf("found %d certifications, want 2", len(all))
 	}
 }
+
+// TestJobsByProvider_FiltersOnJSONBPayload proves JobsByProvider correctly
+// filters on the jobs.payload JSONB field against real Postgres -- jobs has
+// no dedicated provider_id column (ProviderID lives only inside payload,
+// like trust_mode), so this is a genuine regression test for that query
+// shape, not just a schema/migration smoke check.
+func TestJobsByProvider_FiltersOnJSONBPayload(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	providerA := "agt_jbp_a_" + suffix
+	providerB := "agt_jbp_b_" + suffix
+	now := time.Now().UTC()
+
+	jobA := domain.Job{
+		ID: "job_jbp_a_" + suffix, CapabilityID: "cap_" + suffix, QuoteID: "q_a_" + suffix,
+		PrincipalID: "prn_a_" + suffix, ProviderID: providerA, State: domain.JobCompleted,
+		Input: map[string]any{}, Artifacts: []domain.Artifact{}, CreatedAt: now, UpdatedAt: now,
+	}
+	jobB := domain.Job{
+		ID: "job_jbp_b_" + suffix, CapabilityID: "cap_" + suffix, QuoteID: "q_b_" + suffix,
+		PrincipalID: "prn_b_" + suffix, ProviderID: providerB, State: domain.JobCompleted,
+		Input: map[string]any{}, Artifacts: []domain.Artifact{}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.PutJob(ctx, jobA); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutJob(ctx, jobB); err != nil {
+		t.Fatal(err)
+	}
+
+	gotA, err := s.JobsByProvider(ctx, providerA)
+	if err != nil {
+		t.Fatalf("JobsByProvider: %v", err)
+	}
+	if len(gotA) != 1 || gotA[0].ID != jobA.ID {
+		t.Fatalf("JobsByProvider(%s) = %+v, want exactly job A", providerA, gotA)
+	}
+
+	gotB, err := s.JobsByProvider(ctx, providerB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotB) != 1 || gotB[0].ID != jobB.ID {
+		t.Fatalf("JobsByProvider(%s) = %+v, want exactly job B", providerB, gotB)
+	}
+}

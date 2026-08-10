@@ -247,6 +247,18 @@ func (s *Store) JobsByPrincipal(ctx context.Context, principalID string) ([]doma
 	return out, nil
 }
 
+func (s *Store) JobsByProvider(ctx context.Context, providerID string) ([]domain.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []domain.Job
+	for _, j := range s.jobs {
+		if j.ProviderID == providerID {
+			out = append(out, j)
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) JobsForRecovery(ctx context.Context, updatedBefore time.Time, limit int) ([]domain.Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

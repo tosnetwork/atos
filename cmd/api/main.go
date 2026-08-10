@@ -205,7 +205,7 @@ func main() {
 	mcpServer := &mcp.Server{
 		Auth: authorization, Capabilities: capabilities, Quotes: quotes,
 		Jobs: jobs, Accounts: accounts, Receipts: receipts, Earnings: earnings,
-		Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
+		Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}
 	a2aServer := &a2a.Server{
 		Auth: authorization, Quotes: quotes, Jobs: jobs,

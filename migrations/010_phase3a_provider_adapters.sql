@@ -57,3 +57,10 @@ CREATE TABLE IF NOT EXISTS sandbox_certifications (
 
 CREATE INDEX IF NOT EXISTS idx_sandbox_certifications_capability
     ON sandbox_certifications (capability_id, created_at DESC, id ASC);
+
+-- jobs has no dedicated provider_id column -- ProviderID lives only inside
+-- the payload JSONB blob, exactly like trust_mode (see
+-- jobs_trust_mode_idx below). atos_provider_jobs needs an efficient
+-- provider-side lookup, so this adds a matching expression index rather
+-- than a plain column index.
+CREATE INDEX IF NOT EXISTS idx_jobs_provider_id ON jobs ((payload ->> 'provider_id'));

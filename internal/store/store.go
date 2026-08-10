@@ -75,6 +75,10 @@ type Jobs interface {
 	PutJob(ctx context.Context, j domain.Job) error
 	GetJob(ctx context.Context, id string) (domain.Job, error)
 	JobsByPrincipal(ctx context.Context, principalID string) ([]domain.Job, error)
+	// JobsByProvider returns every Job whose ProviderID matches providerID,
+	// newest first -- the provider-side counterpart to JobsByPrincipal, for
+	// atos_provider_jobs.
+	JobsByProvider(ctx context.Context, providerID string) ([]domain.Job, error)
 	JobsForRecovery(ctx context.Context, updatedBefore time.Time, limit int) ([]domain.Job, error)
 	JobByConfirmationCode(ctx context.Context, userCode string) (domain.Job, error)
 	JobByIdempotencyKey(ctx context.Context, principalID, key string) (domain.Job, error)
