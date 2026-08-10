@@ -544,6 +544,19 @@ func (s *JobService) recoverProviderExecution(ctx context.Context, jobID string,
 			released, releaseErr := s.releaseForTerminalUnderLock(ctx, job, domain.JobFailed, domain.ErrProviderFailed, "execution was never admitted before its deadline")
 			return released, releaseErr
 		}
+		// capability storage is not versioned (one mutable record per ID,
+		// Version is just a bumped string field) -- a live capability
+		// update between Quote-freeze and this submission attempt must
+		// never silently redirect an already-committed Job to a
+		// semantically different provider binding (or pricing/schema).
+		// Fail closed into reconciliation rather than guessing: this Job
+		// remains JobWorking, retried on the next reconciliation pass,
+		// until an operator resolves the mismatch.
+		if capability.Version != job.CapabilityVersion {
+			pending := s.markEconomicReconciliationUnderLock(ctx, job.ID, job.EconomicState, domain.JobWorking, domain.ErrProviderFailed,
+				fmt.Sprintf("capability was updated (now version %s) after this job froze version %s; submission deferred pending reconciliation", capability.Version, job.CapabilityVersion))
+			return pending, domain.NewError(domain.ErrProviderFailed, "capability version changed since this job's quote was frozen", true)
+		}
 		result, getErr = s.provider.SubmitJob(ctx, tosai.SubmitJobRequest{
 			JobID: job.ID, InvocationID: job.InvocationID,
 			QuoteID: job.QuoteID, ServiceQuoteID: job.ServiceQuoteID,
