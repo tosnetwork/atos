@@ -359,6 +359,57 @@ type Certifications interface {
 	UpdateCertification(ctx context.Context, id string, fn func(c domain.SandboxCertification, exists bool) (domain.SandboxCertification, error)) (domain.SandboxCertification, error)
 }
 
+// ExecutionSignerOperations stores the durable execution-signer
+// authorize/rotate/revoke journal (atos-spec
+// docs/IMPLEMENTATION_ROADMAP.md §7.2.2) -- see
+// domain.ExecutionSignerOperation's doc comment for the full checkpoint
+// sequence this exists to make crash-recoverable.
+type ExecutionSignerOperations interface {
+	// OpenSignerOperation idempotently creates an operation record keyed
+	// by (providerID, idempotencyKey), mirroring OpenCertification's
+	// contract exactly: first call creates op (created=true); a replay
+	// with the SAME key and identical identity content returns the
+	// existing record unchanged (created=false, nil error); a replay with
+	// the SAME key but DIFFERENT identity content returns
+	// domain.ErrIdempotencyConflict.
+	OpenSignerOperation(ctx context.Context, providerID string, op domain.ExecutionSignerOperation) (domain.ExecutionSignerOperation, bool, error)
+	GetSignerOperation(ctx context.Context, id string) (domain.ExecutionSignerOperation, error)
+	SignerOperationByIdempotencyKey(ctx context.Context, providerID, key string) (domain.ExecutionSignerOperation, error)
+	// LatestSignerOperationByCapability returns the most recently updated
+	// operation for capabilityID, if any -- including a non-terminal one
+	// still in flight or reconciling. This is the status-query view (so a
+	// caller can see "a rotation is in progress"), NOT the basis for
+	// "what is the current execution signer" -- see
+	// LatestCompletedSignerOperationByCapability for that, which a
+	// non-terminal latest operation must never override (§7.2.2: the old
+	// signer remains authoritative until a rotation's new signer is
+	// durably new_authorized, and MUST NOT appear to have no signer at
+	// all just because a later operation is stuck).
+	LatestSignerOperationByCapability(ctx context.Context, capabilityID string) (domain.ExecutionSignerOperation, bool, error)
+	// LatestCompletedSignerOperationByCapability returns the most
+	// recently updated COMPLETED operation for capabilityID, if any --
+	// the sole basis for "what is the current execution signer" (the most
+	// recent completed authorize/rotate's NewExecutionSignerID, or none
+	// if the most recent completed operation is a revoke). A newer
+	// non-terminal operation (in flight or reconciling) never changes
+	// this answer until it too reaches Completed.
+	LatestCompletedSignerOperationByCapability(ctx context.Context, capabilityID string) (domain.ExecutionSignerOperation, bool, error)
+	// StaleSignerOperations returns up to limit non-terminal operations
+	// (checkpoint != completed) last updated before cutoff, oldest first
+	// -- the reconciler's sweep query.
+	StaleSignerOperations(ctx context.Context, cutoff time.Time, limit int) ([]domain.ExecutionSignerOperation, error)
+	// UpdateSignerOperation atomically applies fn to the operation's
+	// current stored state. Implementations MUST reject
+	// (domain.ErrIdempotencyConflict) a returned value whose ID or
+	// identity fields (ProviderID/CapabilityID/CapabilityVersion/Type/
+	// IdempotencyKey/new-signer identity/old-authorization identity)
+	// differ from the existing stored record -- only Checkpoint/
+	// NewAuthorizationRef/RevocationReasonCode/FailureReason/CompletedAt/
+	// UpdatedAt may change through this method, exactly mirroring
+	// UpdateCertification's own immutability contract.
+	UpdateSignerOperation(ctx context.Context, id string, fn func(op domain.ExecutionSignerOperation, exists bool) (domain.ExecutionSignerOperation, error)) (domain.ExecutionSignerOperation, error)
+}
+
 type Idempotency interface {
 	// Reserve atomically claims (principalID, key) in the InProgress state.
 	// If the key was already used it returns the prior record and ok=false
@@ -390,5 +441,6 @@ type Store interface {
 	Artifacts
 	ProviderHealth
 	Certifications
+	ExecutionSignerOperations
 	Idempotency
 }

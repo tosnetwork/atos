@@ -33,10 +33,12 @@ type Store struct {
 	disputes             map[string]domain.Dispute         // disputeID -> dispute
 	disputesByJob        map[string]string                 // jobID -> disputeID
 	artifacts            map[string]domain.StoredArtifact
-	healthChecks         map[string]domain.AdapterHealthCheck   // capabilityID+":"+capabilityVersion+":"+transport -> check
-	certifications       map[string]domain.SandboxCertification // certID -> certification
-	certByIdempotencyKey map[string]string                      // providerID+":"+key -> certID
-	idempotency          map[string]store.IdempotencyRecord     // principalID+":"+key
+	healthChecks         map[string]domain.AdapterHealthCheck       // capabilityID+":"+capabilityVersion+":"+transport -> check
+	certifications       map[string]domain.SandboxCertification     // certID -> certification
+	certByIdempotencyKey map[string]string                          // providerID+":"+key -> certID
+	signerOperations     map[string]domain.ExecutionSignerOperation // opID -> operation
+	signerOpByIdemKey    map[string]string                          // providerID+":"+key -> opID
+	idempotency          map[string]store.IdempotencyRecord         // principalID+":"+key
 }
 
 func New() *Store {
@@ -62,6 +64,8 @@ func New() *Store {
 		healthChecks:         make(map[string]domain.AdapterHealthCheck),
 		certifications:       make(map[string]domain.SandboxCertification),
 		certByIdempotencyKey: make(map[string]string),
+		signerOperations:     make(map[string]domain.ExecutionSignerOperation),
+		signerOpByIdemKey:    make(map[string]string),
 		idempotency:          make(map[string]store.IdempotencyRecord),
 	}
 }
