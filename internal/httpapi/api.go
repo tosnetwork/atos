@@ -46,8 +46,12 @@ func decodeRequestJSON(r *http.Request, dst any) error {
 }
 
 type Server struct {
-	Auth          *auth.Service
-	Capabilities  *service.CapabilityService
+	Auth         *auth.Service
+	Capabilities *service.CapabilityService
+	// Health is optional: nil omits the readiness projection from
+	// GET /capabilities/{id} entirely rather than erroring (see
+	// service.CapabilityReadiness's doc comment).
+	Health        *service.HealthService
 	Quotes        *service.QuoteService
 	Jobs          *service.JobService
 	Streams       *service.StreamService

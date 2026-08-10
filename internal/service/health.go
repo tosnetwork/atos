@@ -144,32 +144,49 @@ func (s *HealthService) Availability(ctx context.Context, capabilityID string) (
 	now := time.Now().UTC()
 	out := make([]domain.ModeAvailability, 0, len(cap.RequestedTrustModes))
 	for _, mode := range cap.RequestedTrustModes {
-		healthy, certified := false, false
+		healthy, fresh, certified := false, false, false
 		for _, binding := range cap.Bindings {
 			if !slices.Contains(binding.EligibleTrustModes, mode) {
 				continue
 			}
 			if !isThirdPartyTransport(binding.Transport) {
 				// tos-native/human bindings have no external endpoint to
-				// probe -- treated as inherently reachable.
-				healthy = true
+				// probe -- treated as inherently reachable and always fresh.
+				healthy, fresh = true, true
 				continue
 			}
 			check, found, err := s.store.HealthCheck(ctx, cap.ID, cap.Version, binding.Transport)
 			if err != nil {
 				return nil, err
 			}
-			if found && !check.Stale(now, maxHealthAge) && check.Status == domain.AdapterHealthHealthy {
-				healthy = true
+			if found {
+				// TransportHealthy and HealthFresh are deliberately
+				// independent dimensions -- a stale-but-formerly-healthy
+				// check reports healthy:true, fresh:false, so a caller can
+				// tell "last known good" apart from "checked recently".
+				if check.Status == domain.AdapterHealthHealthy {
+					healthy = true
+				}
+				if !check.Stale(now, maxHealthAge) {
+					fresh = true
+				}
 			}
 			if certifiedTransports[binding.Transport] {
 				certified = true
 			}
 		}
+		status := cap.ModeSupport.Entry(mode).Status
+		active := status == domain.ModeSupportActive
+		// Managed has no execution-signer concept at all (docs/API.md
+		// §2/§7.2.3), so it trivially reports satisfied rather than
+		// blocked on a dimension that will never apply to it.
+		signerAuthorized := mode == domain.TrustModeManaged
 		out = append(out, domain.ModeAvailability{
-			Mode: mode, Requested: true, Active: cap.ModeSupport.Active(mode),
-			TransportHealthy: healthy, Certified: certified,
-			Ready: healthy && certified,
+			Mode: mode, Requested: true, Active: active, Status: status,
+			TransportHealthy: healthy, HealthFresh: fresh, Certified: certified,
+			SignerAuthorized: signerAuthorized, ActivationAuthoritySatisfied: active,
+			ReasonCode: domain.ReadinessReasonCode(status, healthy, fresh, certified, signerAuthorized, active),
+			Ready:      healthy && certified,
 		})
 	}
 	return out, nil

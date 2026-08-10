@@ -446,7 +446,15 @@ func TestHealthService_Availability_StaleHealthNotTreatedAsFresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if avail[0].TransportHealthy {
-		t.Fatal("a stale health check must not be treated as currently healthy")
+	// TransportHealthy and HealthFresh are independent dimensions (see
+	// domain.ModeAvailability's doc comment): the stale check's last
+	// known status was genuinely Healthy, so TransportHealthy correctly
+	// stays true -- staleness is HealthFresh's job to flag, not
+	// TransportHealthy's.
+	if !avail[0].TransportHealthy {
+		t.Fatal("a stale-but-formerly-healthy check should still report the last known status as healthy")
+	}
+	if avail[0].HealthFresh {
+		t.Fatal("a stale health check must not be treated as currently fresh")
 	}
 }

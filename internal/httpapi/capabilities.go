@@ -76,7 +76,7 @@ func optionalBool(raw string) (bool, error) {
 }
 
 func (s *Server) handleGetCapability(w http.ResponseWriter, r *http.Request) {
-	cap, err := s.Capabilities.Get(r.Context(), r.PathValue("id"))
+	cap, err := service.GetCapabilityWithReadiness(r.Context(), s.Capabilities, s.Health, r.PathValue("id"))
 	if err != nil {
 		writeDomainErr(w, err)
 		return
