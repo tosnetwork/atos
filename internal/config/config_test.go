@@ -44,9 +44,32 @@ func TestProductionRejectsMockPayoutBackend(t *testing.T) {
 	t.Setenv("ATOS_TOS_BACKEND", "rpc")
 	t.Setenv("ATOS_TOS_RPC_URL", "https://tos-protocol.internal")
 	t.Setenv("ATOS_TOS_RPC_TOKEN", "integration-token")
+	t.Setenv("ATOS_REMOTE_THIRD_PARTY_EXECUTION", "true")
 	t.Setenv("ATOS_PAYOUT_BACKEND", "mock")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "never moves real funds") {
 		t.Fatalf("Load() error = %v, want mock-payout-in-production rejection", err)
+	}
+}
+
+// TestProductionRequiresRemoteThirdPartyExecution proves production
+// configuration fails closed rather than silently allowing this Gateway
+// process to dial a third-party HTTP/MCP/A2A provider endpoint itself --
+// see atos-spec docs/THIRD_PARTY_EXECUTION_PLANE.md §7.1.1's placement
+// rule, which ATOS_REMOTE_THIRD_PARTY_EXECUTION defaulting to false would
+// otherwise silently violate in production.
+func TestProductionRequiresRemoteThirdPartyExecution(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ATOS_ENV", "production")
+	t.Setenv("ATOS_DATABASE_URL", "postgres://atos@example/atos")
+	t.Setenv("ATOS_PUBLIC_BASE_URL", "https://api.atos.example")
+	t.Setenv("ATOS_AUTH_AUTO_APPROVE", "false")
+	t.Setenv("ATOS_APPROVAL_TOKEN", strings.Repeat("a", 32))
+	t.Setenv("ATOS_AUTH_STATE_PATH", "/var/lib/atos/auth.db")
+	t.Setenv("ATOS_TOS_BACKEND", "rpc")
+	t.Setenv("ATOS_TOS_RPC_URL", "https://tos-protocol.internal")
+	t.Setenv("ATOS_TOS_RPC_TOKEN", "integration-token")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "ATOS_REMOTE_THIRD_PARTY_EXECUTION=true is required in production") {
+		t.Fatalf("Load() error = %v, want remote-third-party-execution-required-in-production rejection", err)
 	}
 }
 
@@ -102,11 +125,12 @@ func TestProductionAcceptsCompleteManagedConfiguration(t *testing.T) {
 	t.Setenv("ATOS_TOS_BACKEND", "rpc")
 	t.Setenv("ATOS_TOS_RPC_URL", "https://tos-protocol.internal")
 	t.Setenv("ATOS_TOS_RPC_TOKEN", "integration-token")
+	t.Setenv("ATOS_REMOTE_THIRD_PARTY_EXECUTION", "true")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Environment != EnvironmentProduction || cfg.Auth.AutoApprove || cfg.TOSBackend != TOSBackendRPC {
+	if cfg.Environment != EnvironmentProduction || cfg.Auth.AutoApprove || cfg.TOSBackend != TOSBackendRPC || !cfg.RemoteThirdPartyExecution {
 		t.Fatalf("unexpected production config: %#v", cfg)
 	}
 }

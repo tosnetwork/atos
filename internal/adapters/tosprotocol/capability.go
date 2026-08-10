@@ -158,7 +158,7 @@ func (c *Client) ProbeThirdPartyHealth(ctx context.Context, providerID, capabili
 	defer cancel()
 	request := connect.NewRequest(&atostosv1.GetProviderStatusRequest{
 		Context: c.requestContext(ctx, providerID, "", time.Time{}), ProviderId: providerID,
-		CapabilityId: capabilityID, ThirdPartyBinding: thirdPartyBinding,
+		CapabilityId: capabilityID, CapabilityVersion: capabilityVersion, ThirdPartyBinding: thirdPartyBinding,
 	})
 	decorateRequest(c, ctx, request)
 	response, err := c.execution.GetProviderStatus(callCtx, request)

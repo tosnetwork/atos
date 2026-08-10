@@ -83,10 +83,10 @@ type Config struct {
 	// RemoteThirdPartyExecution routes http/mcp/a2a Job execution through
 	// tos-protocol/tos-ai (see internal/adapters/tosai/dispatch.
 	// WithRemoteThirdPartyExecution's doc comment) instead of this process
-	// dialing the provider endpoint directly. Defaults to false: that
-	// stack must actually be deployed with an operator-approved binding
-	// allowlist configured, which is not yet the case for every
-	// TOSBackendRPC deployment.
+	// dialing the provider endpoint directly. Defaults to false so
+	// development/test can run without that stack deployed, but
+	// Validate() requires it to be true in production -- see atos-spec
+	// docs/THIRD_PARTY_EXECUTION_PLANE.md §7.1.1's placement rule.
 	RemoteThirdPartyExecution bool
 }
 
@@ -232,6 +232,11 @@ func (c Config) Validate() error {
 		}
 		if c.TOSBackend != TOSBackendRPC {
 			return errors.New("ATOS_TOS_BACKEND=rpc is required in production")
+		}
+		if !c.RemoteThirdPartyExecution {
+			return errors.New("ATOS_REMOTE_THIRD_PARTY_EXECUTION=true is required in production " +
+				"(see atos-spec docs/THIRD_PARTY_EXECUTION_PLANE.md §7.1.1: production must not let this " +
+				"Gateway process dial a third-party HTTP/MCP/A2A provider endpoint itself)")
 		}
 		if c.PayoutBackend == PayoutBackendMock {
 			return errors.New("ATOS_PAYOUT_BACKEND=mock never moves real funds and must not be used in production")

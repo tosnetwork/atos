@@ -34,11 +34,15 @@ import (
 // end-to-end, not re-verifying tos-ai's actual outbound dial logic.
 type fakeThirdPartyWorker struct {
 	invokeCalls int
+	healthFunc  func(*edgev1.ThirdPartyHealthRequest) *edgev1.ThirdPartyHealthResponse
 }
 
 func (w *fakeThirdPartyWorker) Health(
-	context.Context, *connect.Request[edgev1.ThirdPartyHealthRequest],
+	_ context.Context, req *connect.Request[edgev1.ThirdPartyHealthRequest],
 ) (*connect.Response[edgev1.ThirdPartyHealthResponse], error) {
+	if w.healthFunc != nil {
+		return connect.NewResponse(w.healthFunc(req.Msg)), nil
+	}
 	return connect.NewResponse(&edgev1.ThirdPartyHealthResponse{Healthy: true}), nil
 }
 
@@ -219,5 +223,68 @@ func TestATOSConnectRPCThirdPartyManagedLifecycle(t *testing.T) {
 	}
 	if replay.Job.ID != result.Job.ID {
 		t.Fatalf("replay produced a different job: %s vs %s", replay.Job.ID, result.Job.ID)
+	}
+}
+
+// TestATOSConnectRPCProbeThirdPartyHealth_ForwardsCapabilityVersion proves
+// tosprotocol.Client.ProbeThirdPartyHealth's capabilityVersion argument
+// actually reaches the private Worker's ThirdPartyHealthRequest.Binding.
+// CapabilityVersion over a real ConnectRPC round trip through
+// atosrpc.Server, not just within a single process's function call --
+// closing the gap where GetProviderStatusRequest had no capability_version
+// field at all and tos-protocol substituted a literal "".
+func TestATOSConnectRPCProbeThirdPartyHealth_ForwardsCapabilityVersion(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+
+	worker := &fakeThirdPartyWorker{
+		healthFunc: func(req *edgev1.ThirdPartyHealthRequest) *edgev1.ThirdPartyHealthResponse {
+			if req.Binding.CapabilityVersion != "1.2.3" {
+				return &edgev1.ThirdPartyHealthResponse{Healthy: false, FailureReason: "VERSION_MISMATCH"}
+			}
+			return &edgev1.ThirdPartyHealthResponse{Healthy: true}
+		},
+	}
+	thirdPartySocket, stopThirdParty := startThirdPartyWorker(t, worker)
+	defer stopThirdParty()
+	thirdPartyWorker, err := localrpc.NewThirdPartyWorkerClient(localrpc.DefaultThirdPartyWorkerClientConfig(thirdPartySocket))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	protocolServer, err := atosrpc.Open(atosrpc.Config{
+		StatePath:   filepath.Join(t.TempDir(), "atos-rpc.db"),
+		BearerToken: "integration-secret", ThirdPartyWorker: thirdPartyWorker,
+		Authority: atosrpc.NewLocalAuthority("tos-local"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer protocolServer.Close()
+	httpServer := httptest.NewServer(protocolServer.Handler())
+	defer httpServer.Close()
+
+	client, err := toprotocol.New(toprotocol.Config{
+		BaseURL: httpServer.URL, BearerToken: "integration-secret",
+		Insecure: true, Timeout: 20 * time.Second, Store: st,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.CheckReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	binding := domain.CapabilityBinding{Transport: domain.AdapterHTTP, EndpointRef: "https://third-party-provider.example.com/invoke"}
+	check, err := client.ProbeThirdPartyHealth(ctx, "agt_probe_version_1", "cap_probe_version_1", "1.2.3", binding)
+	if err != nil {
+		t.Fatalf("ProbeThirdPartyHealth: %v", err)
+	}
+	if check.FailureReason == "VERSION_MISMATCH" {
+		t.Fatal("capability_version was dropped somewhere on the atos -> tos-protocol -> tos-ai wire path")
+	}
+	if check.Status != domain.AdapterHealthHealthy {
+		t.Fatalf("status = %s, want healthy", check.Status)
 	}
 }
