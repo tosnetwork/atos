@@ -426,3 +426,59 @@ reproduced/closed with new tests (`go test -race` against real PostgreSQL
 All of the above are covered by tests that fail on the pre-fix code and
 pass after -- see `internal/store/postgres/open_task_test.go` and
 `internal/service/open_task_review_fixes_test.go`.
+
+### Second review round (independent Codex review of the fix commit)
+
+A second, independent review (OpenAI Codex, run against the fix commit
+above) found two further real issues in the fixes themselves:
+
+- **P1: `OpenAcceptanceOperation` and `WithdrawOpenTaskProposal` acquired
+  the shared `"open-task"`/`"open-task-proposal"` advisory locks in
+  OPPOSITE orders** (task-then-proposal vs proposal-then-task) --
+  textbook conditions for a PostgreSQL deadlock (one transaction holds
+  task and waits on proposal while the other holds proposal and waits on
+  task), which Postgres resolves by aborting one side with a raw,
+  unclassified `40P01` error rather than a clean domain rejection. The
+  existing concurrency regression tests didn't catch it because they
+  discarded every error from the racing goroutines. Fixed:
+  `WithdrawOpenTaskProposal` now does a lock-free preview read of the
+  proposal (safe -- `TaskID` is one of the identity fields
+  `UpdateOpenTaskProposal` already protects as immutable) purely to learn
+  which task lock to acquire FIRST, then locks task before proposal,
+  matching `OpenAcceptanceOperation`'s order exactly. Both concurrency
+  tests were also strengthened to assert every observed error is an
+  expected, classified `*domain.Error` rather than silently discarding
+  errors -- the assertion that would have caught the deadlock directly.
+- **P1: the idempotency crash-recovery lookup path in `Publish`,
+  `Propose`, and `QuoteService.Create` trusted an already-committed
+  object as a valid replay without comparing its content against the
+  current request.** The gap: if a prior attempt's `PutOpenTask`/
+  `PutOpenTaskProposal`/`PutQuote` succeeded but that SAME attempt's own
+  `Finish` call then failed for any reason short of the process dying,
+  the deferred `Release` hard-deletes the `idempotency_records` row
+  entirely (not just marks it stale) -- a LATER call reusing the same key
+  with genuinely different content would find no reservation at all,
+  reserve fresh, hit the crash-recovery lookup, and silently receive the
+  OLD object back instead of `ErrIdempotencyConflict`. Fixed by comparing
+  a content digest before trusting the lookup: `Publish`/`Propose`
+  recompute `hashRequest(...)` from the existing object's own
+  already-stored fields (no schema change needed, since `OpenTask`/
+  `OpenTaskProposal` losslessly retain every field the digest covers);
+  `QuoteService.Create` persists the digest directly on a new
+  `domain.Quote.IdempotencyRequestHash` field instead, since `Quote`'s
+  stored representation does not losslessly preserve every raw input
+  (e.g. `InputSummary` is only kept as a commitment). Regression tests
+  reproduce the exact end state by calling the real creation path once
+  and then calling `store.Idempotency.Release` directly -- the same
+  primitive the abandoned attempt's own cleanup would have called --
+  rather than hand-constructing a fake row:
+  `TestOpenTaskPublishContentValidatedAfterAbandonedReservation`,
+  `TestOpenTaskProposeContentValidatedAfterAbandonedReservation`,
+  `TestQuoteCreateContentValidatedAfterAbandonedReservation` (each also
+  asserts the identical-content case still replays correctly).
+
+This is the same class of finding both review rounds kept surfacing:
+correctness at the exact boundary between two store calls that are not
+themselves atomic. Every fix in both rounds either makes that boundary
+genuinely atomic (one transaction) or makes the recovery path re-verify
+content instead of trusting position alone.

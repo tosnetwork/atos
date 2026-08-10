@@ -141,6 +141,22 @@ func (s *OpenTaskService) Publish(ctx context.Context, in PublishOpenTaskInput) 
 	}()
 
 	if existing, lookupErr := s.store.OpenTaskByIdempotencyKey(ctx, in.PrincipalID, in.IdempotencyKey); lookupErr == nil {
+		// Re-derive the digest from the ALREADY-COMMITTED object's own
+		// fields and compare against this call's freshly computed
+		// requestHash before trusting it as a replay -- required, not
+		// redundant with the Reserve-time hash check above: if the PREVIOUS
+		// attempt committed this row via PutOpenTask but then failed before
+		// (or during) its own Finish call, that attempt's deferred Release
+		// hard-deletes the idempotency_records row entirely. A LATER call
+		// reusing the same key -- even with genuinely different content --
+		// then sees no existing reservation at all, reserves fresh, and
+		// would otherwise land here and silently receive the OLD task
+		// instead of being rejected as a conflicting reuse of the key.
+		existingHash := hashRequest("atos-open-task-publish-v1", existing.Title, existing.Description, existing.Input,
+			string(existing.RequestedTrustMode), existing.ProofRequirements, existing.MaxTotal, existing.ExpiresAt)
+		if existingHash != requestHash {
+			return domain.OpenTask{}, domain.NewError(domain.ErrIdempotencyConflict, "idempotency_key reused with a different request", false)
+		}
 		if err := s.store.Finish(ctx, in.PrincipalID, in.IdempotencyKey, existing.ID); err != nil {
 			return domain.OpenTask{}, err
 		}
@@ -361,6 +377,16 @@ func (s *OpenTaskService) Propose(ctx context.Context, in ProposeInput) (domain.
 	}()
 
 	if existing, lookupErr := s.store.OpenTaskProposalByIdempotencyKey(ctx, in.ProviderID, in.IdempotencyKey); lookupErr == nil {
+		// See Publish's identical guard for why this comparison is
+		// required: a prior attempt's row can be durably committed while
+		// its idempotency_records reservation was subsequently deleted by
+		// its own failed-Finish cleanup, so a later, genuinely different
+		// request under the same key must not silently receive the old
+		// proposal back.
+		existingHash := hashRequest("atos-open-task-propose-v1", existing.TaskID, existing.CapabilityID, existing.Message, existing.ProposedPrice)
+		if existingHash != requestHash {
+			return domain.OpenTaskProposal{}, domain.NewError(domain.ErrIdempotencyConflict, "idempotency_key reused with a different request", false)
+		}
 		if err := s.store.Finish(ctx, in.ProviderID, in.IdempotencyKey, existing.ID); err != nil {
 			return domain.OpenTaskProposal{}, err
 		}

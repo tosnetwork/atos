@@ -269,3 +269,145 @@ func TestOpenTaskListPublicDefaultLimitParityAgainstPostgres(t *testing.T) {
 		t.Fatal("ListPublic(0) returned zero tasks against Postgres -- the exact P1 bug this test targets")
 	}
 }
+
+// TestOpenTaskPublishContentValidatedAfterAbandonedReservation is the
+// regression test for the finding that Publish's crash-recovery lookup
+// (OpenTaskByIdempotencyKey) trusted an already-committed row as a valid
+// replay without comparing its content against the current request. The
+// gap: if a PRIOR attempt's PutOpenTask succeeded but that attempt's own
+// Finish call then failed (for any reason short of the process dying), its
+// deferred Release hard-deletes the store.Idempotency record entirely --
+// store.Release is exactly the primitive that cleanup path calls, so
+// calling it directly here reproduces the identical end state ("the task
+// row is committed, but no reservation exists for its key") without
+// needing to inject a real Finish failure. A later call reusing the same
+// key with genuinely different content must now be rejected; the exact
+// same content must still replay successfully.
+func TestOpenTaskPublishContentValidatedAfterAbandonedReservation(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness()
+	openTasks := service.NewOpenTaskService(h.store(), h.quotes, h.jobs)
+
+	original := service.PublishOpenTaskInput{
+		PrincipalID: "prn_abandoned", Title: "original title",
+		ExpiresAt: time.Now().UTC().Add(time.Hour), IdempotencyKey: "publish-abandoned",
+	}
+	first, err := openTasks.Publish(ctx, original)
+	if err != nil {
+		t.Fatalf("first Publish: %v", err)
+	}
+	if err := h.store().Release(ctx, original.PrincipalID, original.IdempotencyKey); err != nil {
+		t.Fatalf("Release (simulating a Finish failure's cleanup): %v", err)
+	}
+
+	// Same key, genuinely different content -- must be rejected even
+	// though no reservation exists to catch it at the Reserve layer.
+	changed := original
+	changed.Title = "a completely different title"
+	_, err = openTasks.Publish(ctx, changed)
+	if err == nil {
+		t.Fatal("expected a content mismatch against an abandoned-reservation row to fail")
+	}
+	derr, ok := err.(*domain.Error)
+	if !ok || derr.Code != domain.ErrIdempotencyConflict {
+		t.Fatalf("expected ErrIdempotencyConflict, got %v", err)
+	}
+
+	// Same key, IDENTICAL content -- must still replay successfully.
+	replay, err := openTasks.Publish(ctx, original)
+	if err != nil {
+		t.Fatalf("replay Publish after abandoned reservation: %v", err)
+	}
+	if replay.ID != first.ID {
+		t.Fatalf("replay minted a different task: %q vs %q", replay.ID, first.ID)
+	}
+}
+
+// TestOpenTaskProposeContentValidatedAfterAbandonedReservation is Propose's
+// counterpart to TestOpenTaskPublishContentValidatedAfterAbandonedReservation.
+func TestOpenTaskProposeContentValidatedAfterAbandonedReservation(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness()
+	openTasks := service.NewOpenTaskService(h.store(), h.quotes, h.jobs)
+
+	cap := registerCapability(t, h, "agt_propose_abandoned", "1.00")
+	task, err := openTasks.Publish(ctx, service.PublishOpenTaskInput{
+		PrincipalID: "prn_propose_abandoned", Title: "task", ExpiresAt: time.Now().UTC().Add(time.Hour),
+		IdempotencyKey: "publish-propose-abandoned",
+	})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	original := service.ProposeInput{
+		ProviderID: "agt_propose_abandoned", TaskID: task.ID, CapabilityID: cap.ID,
+		Message: "original message", IdempotencyKey: "propose-abandoned",
+	}
+	first, err := openTasks.Propose(ctx, original)
+	if err != nil {
+		t.Fatalf("first Propose: %v", err)
+	}
+	if err := h.store().Release(ctx, original.ProviderID, original.IdempotencyKey); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	changed := original
+	changed.Message = "a completely different message"
+	_, err = openTasks.Propose(ctx, changed)
+	if err == nil {
+		t.Fatal("expected a content mismatch against an abandoned-reservation row to fail")
+	}
+	derr, ok := err.(*domain.Error)
+	if !ok || derr.Code != domain.ErrIdempotencyConflict {
+		t.Fatalf("expected ErrIdempotencyConflict, got %v", err)
+	}
+
+	replay, err := openTasks.Propose(ctx, original)
+	if err != nil {
+		t.Fatalf("replay Propose after abandoned reservation: %v", err)
+	}
+	if replay.ID != first.ID {
+		t.Fatalf("replay minted a different proposal: %q vs %q", replay.ID, first.ID)
+	}
+}
+
+// TestQuoteCreateContentValidatedAfterAbandonedReservation is
+// QuoteService.Create's counterpart, verifying domain.Quote.IdempotencyRequestHash
+// closes the same gap for the idempotent Quote-creation path Phase 3C
+// added.
+func TestQuoteCreateContentValidatedAfterAbandonedReservation(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness()
+	cap := registerCapability(t, h, "agt_quote_abandoned", "1.00")
+
+	original := service.CreateQuoteInput{
+		PrincipalID: "prn_quote_abandoned", CapabilityID: cap.ID,
+		InputSummary: map[string]any{"x": 1}, IdempotencyKey: "quote-abandoned",
+	}
+	first, err := h.quotes.Create(ctx, original)
+	if err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	if err := h.store().Release(ctx, original.PrincipalID, original.IdempotencyKey); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	changed := original
+	changed.InputSummary = map[string]any{"x": 2}
+	_, err = h.quotes.Create(ctx, changed)
+	if err == nil {
+		t.Fatal("expected a content mismatch against an abandoned-reservation row to fail")
+	}
+	derr, ok := err.(*domain.Error)
+	if !ok || derr.Code != domain.ErrIdempotencyConflict {
+		t.Fatalf("expected ErrIdempotencyConflict, got %v", err)
+	}
+
+	replay, err := h.quotes.Create(ctx, original)
+	if err != nil {
+		t.Fatalf("replay Create after abandoned reservation: %v", err)
+	}
+	if replay.ID != first.ID {
+		t.Fatalf("replay minted a different quote: %q vs %q", replay.ID, first.ID)
+	}
+}

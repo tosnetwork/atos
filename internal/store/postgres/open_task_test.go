@@ -238,13 +238,17 @@ func TestOpenAcceptanceOperation_ConcurrentWithCancelConverges(t *testing.T) {
 
 	const attempts = 12
 	var wg sync.WaitGroup
-	results := make(chan bool, attempts)
+	type outcome struct {
+		created bool
+		err     error
+	}
+	results := make(chan outcome, attempts)
 	for i := 0; i < attempts; i++ {
 		wg.Add(1)
 		if i%2 == 0 {
 			go func(i int) {
 				defer wg.Done()
-				_, _, created, _ := s.OpenAcceptanceOperation(ctx, taskID, propID, func(task domain.OpenTask, proposal domain.OpenTaskProposal) (domain.AcceptanceOperation, error) {
+				_, _, created, err := s.OpenAcceptanceOperation(ctx, taskID, propID, func(task domain.OpenTask, proposal domain.OpenTaskProposal) (domain.AcceptanceOperation, error) {
 					if task.Status != domain.OpenTaskOpen {
 						return domain.AcceptanceOperation{}, domain.NewError(domain.ErrOpenTaskNotOpen, "not open", false)
 					}
@@ -257,12 +261,12 @@ func TestOpenAcceptanceOperation_ConcurrentWithCancelConverges(t *testing.T) {
 						CreatedAt: n, UpdatedAt: n,
 					}, nil
 				})
-				results <- created
+				results <- outcome{created, err}
 			}(i)
 		} else {
 			go func() {
 				defer wg.Done()
-				_, _ = s.UpdateOpenTask(ctx, taskID, func(t domain.OpenTask, exists bool) (domain.OpenTask, error) {
+				_, err := s.UpdateOpenTask(ctx, taskID, func(t domain.OpenTask, exists bool) (domain.OpenTask, error) {
 					if !exists {
 						return t, domain.NewError(domain.ErrNotFound, "not found", false)
 					}
@@ -273,7 +277,7 @@ func TestOpenAcceptanceOperation_ConcurrentWithCancelConverges(t *testing.T) {
 					t.UpdatedAt = time.Now().UTC()
 					return t, nil
 				})
-				results <- false
+				results <- outcome{false, err}
 			}()
 		}
 	}
@@ -281,9 +285,20 @@ func TestOpenAcceptanceOperation_ConcurrentWithCancelConverges(t *testing.T) {
 	close(results)
 
 	acceptedCount := 0
-	for created := range results {
-		if created {
+	for r := range results {
+		if r.created {
 			acceptedCount++
+			continue
+		}
+		if r.err == nil {
+			continue
+		}
+		derr, ok := r.err.(*domain.Error)
+		if !ok {
+			t.Fatalf("unexpected non-domain error: %v", r.err)
+		}
+		if derr.Code != domain.ErrOpenTaskNotOpen && derr.Code != domain.ErrOpenTaskAcceptanceInProgress {
+			t.Fatalf("unexpected domain error code: %v", derr)
 		}
 	}
 	if acceptedCount > 1 {
@@ -355,13 +370,17 @@ func TestWithdrawOpenTaskProposal_ConcurrentWithAcceptConverges(t *testing.T) {
 
 	const attempts = 12
 	var wg sync.WaitGroup
-	results := make(chan bool, attempts)
+	type outcome struct {
+		created bool
+		err     error
+	}
+	results := make(chan outcome, attempts)
 	for i := 0; i < attempts; i++ {
 		wg.Add(1)
 		if i%2 == 0 {
 			go func(i int) {
 				defer wg.Done()
-				_, _, created, _ := s.OpenAcceptanceOperation(ctx, taskID, propID, func(task domain.OpenTask, proposal domain.OpenTaskProposal) (domain.AcceptanceOperation, error) {
+				_, _, created, err := s.OpenAcceptanceOperation(ctx, taskID, propID, func(task domain.OpenTask, proposal domain.OpenTaskProposal) (domain.AcceptanceOperation, error) {
 					if task.Status != domain.OpenTaskOpen {
 						return domain.AcceptanceOperation{}, domain.NewError(domain.ErrOpenTaskNotOpen, "not open", false)
 					}
@@ -377,23 +396,46 @@ func TestWithdrawOpenTaskProposal_ConcurrentWithAcceptConverges(t *testing.T) {
 						CreatedAt: n, UpdatedAt: n,
 					}, nil
 				})
-				results <- created
+				results <- outcome{created, err}
 			}(i)
 		} else {
 			go func() {
 				defer wg.Done()
-				_, _ = s.WithdrawOpenTaskProposal(ctx, propID, providerID)
-				results <- false
+				_, err := s.WithdrawOpenTaskProposal(ctx, propID, providerID)
+				results <- outcome{false, err}
 			}()
 		}
 	}
 	wg.Wait()
 	close(results)
 
+	// Every error observed during the race must be one of the expected,
+	// classified domain errors -- never a raw/unclassified error. This is
+	// the assertion that actually catches the lock-ordering deadlock this
+	// test targets: two transactions taking the "open-task" and
+	// "open-task-proposal" advisory locks in opposite orders can deadlock,
+	// and PostgreSQL surfaces that as a raw driver error (SQLSTATE
+	// 40P01), not a *domain.Error -- a prior version of this test
+	// discarded every error and would have silently passed through a
+	// deadlock as just another "lost the race" outcome.
 	acceptedCount := 0
-	for created := range results {
-		if created {
+	for r := range results {
+		if r.created {
 			acceptedCount++
+			continue
+		}
+		if r.err == nil {
+			continue // Withdraw succeeding (or a no-op re-withdraw) is a valid outcome.
+		}
+		derr, ok := r.err.(*domain.Error)
+		if !ok {
+			t.Fatalf("unexpected non-domain error (possible lock-ordering deadlock): %v", r.err)
+		}
+		switch derr.Code {
+		case domain.ErrOpenTaskNotOpen, domain.ErrOpenTaskProposalWithdrawn, domain.ErrOpenTaskAcceptanceInProgress:
+			// expected: the losing side of the race.
+		default:
+			t.Fatalf("unexpected domain error code: %v", derr)
 		}
 	}
 	if acceptedCount > 1 {

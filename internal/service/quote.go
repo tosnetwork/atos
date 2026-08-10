@@ -129,7 +129,21 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 
 	// Recover a process crash after the Quote commit but before Finish. The
 	// unique (principal_id,idempotency_key) index makes this unambiguous.
+	//
+	// The IdempotencyRequestHash comparison is required, not redundant with
+	// the Reserve-time hash check above: if a PRIOR attempt's PutQuote
+	// succeeded but that attempt's own Finish call then failed, its
+	// deferred Release hard-deletes the idempotency_records row entirely
+	// -- a LATER call reusing the same key, even with genuinely different
+	// content, would see no existing reservation, reserve fresh, and
+	// land here. Without comparing against what was actually committed,
+	// it would silently receive the OLD Quote instead of being rejected
+	// as a conflicting reuse of the key. See domain.Quote.IdempotencyRequestHash's
+	// doc comment.
 	if existing, lookupErr := s.store.QuoteByIdempotencyKey(ctx, in.PrincipalID, in.IdempotencyKey); lookupErr == nil {
+		if existing.IdempotencyRequestHash != requestHash {
+			return domain.Quote{}, domain.NewError(domain.ErrIdempotencyConflict, "idempotency_key reused with a different request", false)
+		}
 		if err := s.store.Finish(ctx, in.PrincipalID, in.IdempotencyKey, existing.ID); err != nil {
 			return domain.Quote{}, err
 		}
@@ -143,6 +157,7 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 	if err != nil {
 		return domain.Quote{}, err
 	}
+	q.IdempotencyRequestHash = requestHash
 	q.IdempotencyKey = in.IdempotencyKey
 	if err := s.store.PutQuote(ctx, q); err != nil {
 		return domain.Quote{}, err

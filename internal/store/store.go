@@ -567,6 +567,13 @@ type OpenTasks interface {
 	// commits first must be the one that's authoritative, and the loser
 	// must observe that committed state from INSIDE its own transaction,
 	// not from a snapshot read before either transaction started.
+	//
+	// Implementations MUST acquire the task lock BEFORE the proposal lock
+	// -- the same order OpenAcceptanceOperation uses -- never the reverse.
+	// Two transactions taking the same pair of advisory locks in opposite
+	// orders is a textbook PostgreSQL deadlock (one holds task and waits
+	// on proposal while the other holds proposal and waits on task); an
+	// earlier version of the Postgres implementation did exactly that.
 	WithdrawOpenTaskProposal(ctx context.Context, proposalID, providerID string) (domain.OpenTaskProposal, error)
 
 	// OpenAcceptanceOperation is Accept's single atomic entry point. Under

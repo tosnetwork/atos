@@ -283,16 +283,18 @@ func (s *Store) UpdateOpenTaskProposal(ctx context.Context, id string, fn func(d
 }
 
 // WithdrawOpenTaskProposal -- see the interface doc comment
-// (internal/store/store.go). Locks "open-task-proposal"+proposalID (the
-// same lock/row UpdateOpenTaskProposal and OpenAcceptanceOperation's
-// proposal read both use) for the whole transaction, then additionally
-// locks "open-task"+task_id (the same lock/row UpdateOpenTask/
-// OpenAcceptanceOperation/CompleteAcceptance/FailAcceptance all use)
-// before checking whether the task's AcceptedProposalID already names this
-// proposal -- whichever of a concurrent Accept/Withdraw pair commits first
-// is authoritative, and the other observes that committed state from
-// inside its own transaction, never a snapshot read before either
-// transaction began.
+// (internal/store/store.go). Locks "open-task"+task_id BEFORE
+// "open-task-proposal"+proposalID -- the SAME global lock order
+// OpenAcceptanceOperation uses (task, then proposal), deliberately, not
+// the reverse: two transactions that each acquire the same two advisory
+// locks in opposite orders can deadlock each other in PostgreSQL (A holds
+// task and waits on proposal while B holds proposal and waits on task),
+// which an earlier version of this method did. task_id itself is not
+// known until the proposal row is read, so an initial, LOCK-FREE preview
+// read establishes it first -- safe because TaskID is one of the identity
+// fields UpdateOpenTaskProposal enforces as immutable once a proposal
+// exists, so it cannot change out from under this preview between the
+// unlocked read and the locked one below.
 func (s *Store) WithdrawOpenTaskProposal(ctx context.Context, proposalID, providerID string) (domain.OpenTaskProposal, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -300,9 +302,21 @@ func (s *Store) WithdrawOpenTaskProposal(ctx context.Context, proposalID, provid
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	preview, err := scanProposal(tx.QueryRow(ctx, `SELECT `+proposalColumns+` FROM open_task_proposals WHERE id=$1`, proposalID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.OpenTaskProposal{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.OpenTaskProposal{}, err
+	}
+
+	if err := lockTransactionKey(ctx, tx, "open-task", preview.TaskID); err != nil {
+		return domain.OpenTaskProposal{}, err
+	}
 	if err := lockTransactionKey(ctx, tx, "open-task-proposal", proposalID); err != nil {
 		return domain.OpenTaskProposal{}, err
 	}
+
 	p, err := scanProposal(tx.QueryRow(ctx, `SELECT `+proposalColumns+` FROM open_task_proposals WHERE id=$1 FOR UPDATE`, proposalID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.OpenTaskProposal{}, store.ErrNotFound
@@ -320,9 +334,6 @@ func (s *Store) WithdrawOpenTaskProposal(ctx context.Context, proposalID, provid
 		return p, nil
 	}
 
-	if err := lockTransactionKey(ctx, tx, "open-task", p.TaskID); err != nil {
-		return domain.OpenTaskProposal{}, err
-	}
 	task, err := scanOpenTask(tx.QueryRow(ctx, `SELECT `+openTaskColumns+` FROM open_tasks WHERE id=$1 FOR UPDATE`, p.TaskID))
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return domain.OpenTaskProposal{}, err
