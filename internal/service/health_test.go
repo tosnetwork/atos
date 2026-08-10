@@ -210,6 +210,110 @@ func TestHealthService_Availability_ReadyRequiresHealthyAndCertified(t *testing.
 	}
 }
 
+// TestHealthService_Availability_CertificationDoesNotCarryAcrossCapabilityVersionBump
+// is atos-spec IMPLEMENTATION_ROADMAP.md §7.1.3's explicit acceptance
+// scenario: "stale results do not certify a new Capability version."
+// AdapterHealthCheck and SandboxCertification are both stored keyed by
+// (capability_id, capability_version, transport); this test proves that
+// keying is actually load-bearing in HealthService.Availability's
+// projection, not just present on the struct -- a certification passed
+// against version N must stop counting toward Certified/Ready the moment
+// the Capability is updated to version N+1, even though nothing about the
+// binding's reachability changed and even after health is re-checked
+// against the new version.
+func TestHealthService_Availability_CertificationDoesNotCarryAcrossCapabilityVersionBump(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(certifiableHTTPHandler())
+	defer srv.Close()
+
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	resolver := provideradapter.NewResolver(httpadapter.New(httpadapter.Config{Client: srv.Client()}))
+	health := service.NewHealthService(st, capabilities, resolver)
+	certifications := service.NewCertificationService(st, capabilities, resolver)
+
+	cap := registerHTTPBoundCapability(t, capabilities, "agt_avail_stale", srv.URL, []domain.TrustMode{domain.TrustModeVerified})
+	findVerified := func(avail []domain.ModeAvailability) domain.ModeAvailability {
+		for _, a := range avail {
+			if a.Mode == domain.TrustModeVerified {
+				return a
+			}
+		}
+		t.Fatal("expected a ModeAvailability entry for verified")
+		return domain.ModeAvailability{}
+	}
+
+	if _, err := health.CheckCapability(ctx, cap.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := certifications.Open(ctx, service.OpenCertificationInput{
+		ProviderID: "agt_avail_stale", CapabilityID: cap.ID, Transport: domain.AdapterHTTP, IdempotencyKey: "cert-stale-v1",
+	}); err != nil {
+		t.Fatalf("certifications.Open (version 1): %v", err)
+	}
+	beforeBump, err := health.Availability(ctx, cap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := findVerified(beforeBump); !v.Ready {
+		t.Fatalf("test setup invalid: availability before the version bump = %+v, want ready", v)
+	}
+
+	// Bump the Capability's version via an unrelated field (price) --
+	// deliberately NOT changing the binding's endpoint_ref, to isolate
+	// "certification is version-scoped" from "certification is
+	// endpoint-scoped" (already covered by the binding-freeze tests).
+	updated, err := capabilities.Update(ctx, cap.ID, "agt_avail_stale", map[string]any{
+		"pricing": map[string]any{
+			"model":      "fixed",
+			"price_hint": map[string]any{"amount": "2.00", "currency": "USD"},
+		},
+	}, "update-avail-stale-price")
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if updated.Version == cap.Version {
+		t.Fatal("test setup invalid: capability version must change after the price update")
+	}
+
+	// Re-check health against the NEW version -- transport reachability is
+	// genuinely fresh -- but do NOT re-certify. If certification were
+	// (incorrectly) capability-scoped rather than version-scoped, Ready
+	// would stay true here; it must not.
+	if _, err := health.CheckCapability(ctx, cap.ID); err != nil {
+		t.Fatal(err)
+	}
+	afterBump, err := health.Availability(ctx, cap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifiedAfterBump := findVerified(afterBump)
+	if !verifiedAfterBump.TransportHealthy {
+		t.Fatalf("availability after version bump = %+v, want transport_healthy (freshly re-checked against the new version)", verifiedAfterBump)
+	}
+	if verifiedAfterBump.Certified {
+		t.Fatalf("availability after version bump = %+v, want NOT certified -- the version-1 certification must not carry over to version %s", verifiedAfterBump, updated.Version)
+	}
+	if verifiedAfterBump.Ready {
+		t.Fatalf("availability after version bump = %+v, want NOT ready -- a stale certification must never make a new version ready", verifiedAfterBump)
+	}
+
+	// Re-certifying against the new (current) version must resolve it --
+	// this isn't a permanently broken state, only a correctly-scoped one.
+	if _, err := certifications.Open(ctx, service.OpenCertificationInput{
+		ProviderID: "agt_avail_stale", CapabilityID: cap.ID, Transport: domain.AdapterHTTP, IdempotencyKey: "cert-stale-v2",
+	}); err != nil {
+		t.Fatalf("certifications.Open (version 2): %v", err)
+	}
+	afterRecert, err := health.Availability(ctx, cap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := findVerified(afterRecert); !v.Ready {
+		t.Fatalf("availability after re-certifying against the current version = %+v, want ready", v)
+	}
+}
+
 // TestHealthService_CheckCapability_OneUnhealthyBindingDoesNotAffectOthers
 // proves that when a Capability has multiple distinct transport bindings
 // for different trust modes, one being unhealthy does not incorrectly mark
