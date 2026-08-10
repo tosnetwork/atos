@@ -70,6 +70,13 @@ type Quote struct {
 	Binding      *CapabilityBinding `json:"binding,omitempty"`
 	InputSchema  map[string]any     `json:"input_schema,omitempty"`
 	OutputSchema map[string]any     `json:"output_schema,omitempty"`
+	// IdempotencyKey is the caller-supplied key this Quote was created
+	// under, if any (empty for the many pre-Phase-3C call sites that never
+	// set CreateQuoteInput.IdempotencyKey). Scoped by PrincipalID, exactly
+	// like domain.Job.IdempotencyKey -- see store.Quotes.QuoteByIdempotencyKey
+	// and QuoteService.Create's Reserve/Finish/Release wrapper. Internal
+	// bookkeeping only, never part of the public Quote contract.
+	IdempotencyKey string `json:"-"`
 }
 
 func (q Quote) Expired(now time.Time) bool {

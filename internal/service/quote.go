@@ -58,9 +58,97 @@ type CreateQuoteInput struct {
 	RequestedTrustMode domain.RequestedTrustMode
 	ProofRequirements  domain.ProofRequirements
 	MaxTotal           *domain.Money
+	// IdempotencyKey is optional and backward-compatible: the many existing
+	// callers (handleCreateQuote, toolQuote) that never set it keep the
+	// original always-mint-a-fresh-Quote behavior unchanged. Phase 3C's
+	// OpenTask acceptance flow is the first caller that sets it, since
+	// acceptance must be able to retry/resume after a crash without minting
+	// a second Quote for the same accepted proposal -- see Create's
+	// Reserve/Finish/Release wrapper below, which mirrors JobService.submit.
+	IdempotencyKey string
 }
 
+// Create resolves trust mode, computes pricing and freezes a new Quote from
+// the Capability's current state. When in.IdempotencyKey is empty this is
+// exactly the original, always-fresh behavior. When it is set, Create
+// becomes genuinely idempotent: the same (PrincipalID, IdempotencyKey) with
+// the same business inputs always returns the same Quote (replay), the same
+// key with different inputs is rejected as domain.ErrIdempotencyConflict,
+// and a crash between committing the Quote row and marking the idempotency
+// record Finished is recovered via QuoteByIdempotencyKey rather than
+// minting a duplicate.
 func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.Quote, error) {
+	if in.IdempotencyKey == "" {
+		q, err := s.buildQuote(ctx, in)
+		if err != nil {
+			return domain.Quote{}, err
+		}
+		if err := s.store.PutQuote(ctx, q); err != nil {
+			return domain.Quote{}, err
+		}
+		return q, nil
+	}
+	if in.PrincipalID == "" {
+		return domain.Quote{}, domain.NewError(domain.ErrAuthenticationRequired, "principal is required when idempotency_key is set", false)
+	}
+
+	requestHash := hashRequest("atos-quote-v1", in.CapabilityID, in.InputSummary,
+		string(in.RequestedTrustMode), in.ProofRequirements, in.MaxTotal)
+	now := time.Now().UTC()
+	rec, reserved, err := s.store.Reserve(ctx, in.PrincipalID, in.IdempotencyKey, requestHash, now.Add(idempotencyLease))
+	if err != nil {
+		return domain.Quote{}, err
+	}
+	if !reserved {
+		if rec.RequestHash != requestHash {
+			return domain.Quote{}, domain.NewError(domain.ErrIdempotencyConflict, "idempotency_key reused with a different request", false)
+		}
+		if rec.Status != store.IdempotencyCompleted {
+			return domain.Quote{}, domain.NewError(domain.ErrIdempotencyConflict, "a request with this idempotency_key is still in progress; retry shortly", true)
+		}
+		return s.store.GetQuote(ctx, rec.ResponseKey)
+	}
+
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.store.Release(context.Background(), in.PrincipalID, in.IdempotencyKey)
+		}
+	}()
+
+	// Recover a process crash after the Quote commit but before Finish. The
+	// unique (principal_id,idempotency_key) index makes this unambiguous.
+	if existing, lookupErr := s.store.QuoteByIdempotencyKey(ctx, in.PrincipalID, in.IdempotencyKey); lookupErr == nil {
+		if err := s.store.Finish(ctx, in.PrincipalID, in.IdempotencyKey, existing.ID); err != nil {
+			return domain.Quote{}, err
+		}
+		committed = true
+		return existing, nil
+	} else if lookupErr != store.ErrNotFound {
+		return domain.Quote{}, lookupErr
+	}
+
+	q, err := s.buildQuote(ctx, in)
+	if err != nil {
+		return domain.Quote{}, err
+	}
+	q.IdempotencyKey = in.IdempotencyKey
+	if err := s.store.PutQuote(ctx, q); err != nil {
+		return domain.Quote{}, err
+	}
+	if err := s.store.Finish(ctx, in.PrincipalID, in.IdempotencyKey, q.ID); err != nil {
+		return domain.Quote{}, err
+	}
+	committed = true
+	return q, nil
+}
+
+// buildQuote performs every validation/pricing/freezing step and returns a
+// Quote ready to persist, without touching the store's idempotency records
+// or calling PutQuote -- shared by both the plain and idempotent paths of
+// Create above so the pricing/trust-mode/freezing algorithm exists in
+// exactly one place.
+func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (domain.Quote, error) {
 	if s.quoter != nil && in.PrincipalID == "" {
 		return domain.Quote{}, domain.NewError(domain.ErrAuthenticationRequired, "principal is required for an RPC-backed Quote", false)
 	}
@@ -246,9 +334,6 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 		// against.
 		hashCommitment(q.Binding), hashCommitment(q.InputSchema), hashCommitment(q.OutputSchema),
 	)
-	if err := s.store.PutQuote(ctx, q); err != nil {
-		return domain.Quote{}, err
-	}
 	return q, nil
 }
 

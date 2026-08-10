@@ -56,6 +56,22 @@ const (
 	// consumer scope.
 	ScopeExecutionSignersRead  Scope = "execution_signers:read"
 	ScopeExecutionSignersWrite Scope = "execution_signers:write"
+	// ScopeOpenTasksRead/Write authorize Phase 3C's Open Task Marketplace
+	// (atos-spec docs/IMPLEMENTATION_ROADMAP.md §7.3) from the task
+	// OWNER's side: browsing/publishing/cancelling/accepting a proposal
+	// for one's own OpenTask. Default consumer scopes, mirroring
+	// ScopeJobsCreate/Read/Cancel -- publishing a task and accepting a
+	// proposal are ordinary consumer actions, not a distinct role.
+	ScopeOpenTasksRead  Scope = "open_tasks:read"
+	ScopeOpenTasksWrite Scope = "open_tasks:write"
+	// ScopeOpenTaskProposalsWrite authorizes the PROVIDER side: submitting
+	// or withdrawing a proposal against someone else's OpenTask.
+	// Deliberately NOT a default consumer scope and NOT implied by
+	// ScopeOpenTasksWrite -- mirrors ScopeProviderJobsDeliver's
+	// explicit-grant-only, provider-role pattern: applying to fulfill
+	// other principals' tasks is a distinct trust-side effect class from
+	// managing one's own tasks.
+	ScopeOpenTaskProposalsWrite Scope = "open_task_proposals:write"
 )
 
 var allowedScopes = map[Scope]struct{}{
@@ -65,6 +81,7 @@ var allowedScopes = map[Scope]struct{}{
 	ScopeEarningsRead: {}, ScopeSettlementRead: {}, ScopeSettlementWrite: {}, ScopeProofsRead: {}, ScopeNetworkRead: {},
 	ScopeDisputesOpen: {}, ScopeDisputesRead: {}, ScopeDisputesReview: {},
 	ScopeExecutionSignersRead: {}, ScopeExecutionSignersWrite: {},
+	ScopeOpenTasksRead: {}, ScopeOpenTasksWrite: {}, ScopeOpenTaskProposalsWrite: {},
 }
 
 var defaultConsumerScopes = []Scope{
@@ -82,6 +99,12 @@ var defaultConsumerScopes = []Scope{
 	// consumer.
 	ScopeDisputesOpen,
 	ScopeDisputesRead,
+	// Publishing an OpenTask and accepting/cancelling one's own is an
+	// ordinary consumer action -- see ScopeOpenTasksRead/Write's doc
+	// comment. ScopeOpenTaskProposalsWrite (the provider side) is
+	// deliberately NOT included here.
+	ScopeOpenTasksRead,
+	ScopeOpenTasksWrite,
 }
 
 type Principal struct {

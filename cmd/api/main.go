@@ -198,6 +198,7 @@ func main() {
 	artifacts := service.NewArtifactService(st, blobStorage)
 	disputes := service.NewDisputeService(st, jobs, earnings, accounts, artifacts)
 	executionSigners := service.NewExecutionSignerService(st, core, capabilities)
+	openTasks := service.NewOpenTaskService(st, quotes, jobs)
 
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
 	defer reconcileCancel()
@@ -216,6 +217,9 @@ func main() {
 	go executionSigners.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("execution-signer operation reconciliation pending", "error", reconcileErr)
 	})
+	go openTasks.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
+		logger.Error("open task acceptance reconciliation pending", "error", reconcileErr)
+	})
 
 	if err := seedDemoCapability(capabilities, cfg.TOSBackend); err != nil {
 		logger.Error("failed to seed demo capability", "error", err)
@@ -223,13 +227,13 @@ func main() {
 	}
 
 	restServer := &httpapi.Server{
-		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners, Quotes: quotes,
+		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners, OpenTasks: openTasks, Quotes: quotes,
 		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts,
 		Earnings: earnings, Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 		ApprovalToken: cfg.Auth.ApprovalToken,
 	}
 	mcpServer := &mcp.Server{
-		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners, Quotes: quotes,
+		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners, OpenTasks: openTasks, Quotes: quotes,
 		Jobs: jobs, Accounts: accounts, Receipts: receipts, Earnings: earnings,
 		Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}

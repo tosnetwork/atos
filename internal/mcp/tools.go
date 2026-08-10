@@ -37,6 +37,14 @@ func (s *Server) dispatch() map[string]toolHandler {
 		"atos_rotate_execution_signer":     s.toolRotateExecutionSigner,
 		"atos_revoke_execution_signer":     s.toolRevokeExecutionSigner,
 		"atos_get_execution_signer_status": s.toolGetExecutionSignerStatus,
+		"atos_publish_open_task":           s.toolPublishOpenTask,
+		"atos_search_open_tasks":           s.toolSearchOpenTasks,
+		"atos_get_open_task":               s.toolGetOpenTask,
+		"atos_apply_to_open_task":          s.toolApplyToOpenTask,
+		"atos_list_open_task_proposals":    s.toolListOpenTaskProposals,
+		"atos_withdraw_open_task_proposal": s.toolWithdrawOpenTaskProposal,
+		"atos_accept_open_task_proposal":   s.toolAcceptOpenTaskProposal,
+		"atos_cancel_open_task":            s.toolCancelOpenTask,
 	}
 }
 

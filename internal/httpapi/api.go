@@ -53,6 +53,7 @@ type Server struct {
 	// service.CapabilityReadiness's doc comment).
 	Health           *service.HealthService
 	ExecutionSigners *service.ExecutionSignerService
+	OpenTasks        *service.OpenTaskService
 	Quotes           *service.QuoteService
 	Jobs             *service.JobService
 	Streams          *service.StreamService
@@ -98,6 +99,23 @@ func (s *Server) Mux() *http.ServeMux {
 
 	mux.HandleFunc("POST /v1/quotes", s.withScopes(s.handleCreateQuote, auth.ScopeQuotesRead))
 	mux.HandleFunc("GET /v1/quotes/{id}", s.withScopes(s.handleGetQuote, auth.ScopeQuotesRead))
+
+	// Phase 3C: Open Task Marketplace (atos-spec docs/IMPLEMENTATION_ROADMAP.md
+	// §7.3). GET /v1/open-tasks and GET .../proposals are readable with
+	// ScopeOpenTasksRead alone -- sensitive-field redaction happens inside
+	// OpenTaskService, not by gating the route itself, since "public
+	// browse" and "owner's own detail" are the SAME endpoint
+	// distinguished only by response shape (see handleListOpenTasks).
+	// Submitting/withdrawing a proposal is the provider-role action and
+	// requires the separate, explicit-grant-only ScopeOpenTaskProposalsWrite.
+	mux.HandleFunc("POST /v1/open-tasks", s.withScopes(s.handlePublishOpenTask, auth.ScopeOpenTasksWrite))
+	mux.HandleFunc("GET /v1/open-tasks", s.withScopes(s.handleListOpenTasks, auth.ScopeOpenTasksRead))
+	mux.HandleFunc("GET /v1/open-tasks/{task_id}", s.withScopes(s.handleGetOpenTask, auth.ScopeOpenTasksRead))
+	mux.HandleFunc("POST /v1/open-tasks/{task_id}/cancel", s.withScopes(s.handleCancelOpenTask, auth.ScopeOpenTasksWrite))
+	mux.HandleFunc("POST /v1/open-tasks/{task_id}/proposals", s.withScopes(s.handleProposeOpenTask, auth.ScopeOpenTaskProposalsWrite))
+	mux.HandleFunc("GET /v1/open-tasks/{task_id}/proposals", s.withScopes(s.handleListOpenTaskProposals, auth.ScopeOpenTasksRead))
+	mux.HandleFunc("POST /v1/open-tasks/{task_id}/proposals/{proposal_id}/withdraw", s.withScopes(s.handleWithdrawOpenTaskProposal, auth.ScopeOpenTaskProposalsWrite))
+	mux.HandleFunc("POST /v1/open-tasks/{task_id}/proposals/{proposal_id}/accept", s.withScopes(s.handleAcceptOpenTaskProposal, auth.ScopeOpenTasksWrite))
 
 	mux.HandleFunc("POST /v1/invocations", s.withScopes(s.handleInvoke, auth.ScopeInvocationsCreate))
 	mux.HandleFunc("GET /v1/invocations/{id}", s.withScopes(s.handleGetJob, auth.ScopeJobsRead))
@@ -239,7 +257,9 @@ func statusForCode(code domain.ErrorCode) int {
 		domain.ErrIdempotencyConflict, domain.ErrJobNotCancelable,
 		domain.ErrSpendConfirmationRequired, domain.ErrSpendConfirmationDenied,
 		domain.ErrSpendConfirmationExpired, domain.ErrStreamSequenceConflict,
-		domain.ErrStreamTerminal, domain.ErrDisputeWindowExpired, domain.ErrDisputeInvalidTransition:
+		domain.ErrStreamTerminal, domain.ErrDisputeWindowExpired, domain.ErrDisputeInvalidTransition,
+		domain.ErrOpenTaskNotOpen, domain.ErrOpenTaskAcceptanceInProgress,
+		domain.ErrOpenTaskProposalStale, domain.ErrOpenTaskProposalWithdrawn:
 		return http.StatusConflict
 	case domain.ErrSpendLimitExceeded, domain.ErrInsufficientBalance:
 		return http.StatusPaymentRequired

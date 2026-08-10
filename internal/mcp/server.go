@@ -22,6 +22,7 @@ type Server struct {
 	// service.CapabilityReadiness's doc comment).
 	Health           *service.HealthService
 	ExecutionSigners *service.ExecutionSignerService
+	OpenTasks        *service.OpenTaskService
 	Quotes           *service.QuoteService
 	Jobs             *service.JobService
 	Accounts         *service.AccountService

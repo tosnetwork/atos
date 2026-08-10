@@ -38,6 +38,10 @@ type Store struct {
 	certByIdempotencyKey map[string]string                          // providerID+":"+key -> certID
 	signerOperations     map[string]domain.ExecutionSignerOperation // opID -> operation
 	signerOpByIdemKey    map[string]string                          // providerID+":"+key -> opID
+	openTasks            map[string]domain.OpenTask                 // taskID -> task
+	openTaskProposals    map[string]domain.OpenTaskProposal         // proposalID -> proposal
+	acceptanceOperations map[string]domain.AcceptanceOperation      // opID -> operation
+	acceptanceOpByIdem   map[string]string                          // principalID+":"+key -> opID
 	idempotency          map[string]store.IdempotencyRecord         // principalID+":"+key
 }
 
@@ -66,6 +70,10 @@ func New() *Store {
 		certByIdempotencyKey: make(map[string]string),
 		signerOperations:     make(map[string]domain.ExecutionSignerOperation),
 		signerOpByIdemKey:    make(map[string]string),
+		openTasks:            make(map[string]domain.OpenTask),
+		openTaskProposals:    make(map[string]domain.OpenTaskProposal),
+		acceptanceOperations: make(map[string]domain.AcceptanceOperation),
+		acceptanceOpByIdem:   make(map[string]string),
 		idempotency:          make(map[string]store.IdempotencyRecord),
 	}
 }
@@ -152,6 +160,17 @@ func (s *Store) GetQuote(ctx context.Context, id string) (domain.Quote, error) {
 		return domain.Quote{}, store.ErrNotFound
 	}
 	return q, nil
+}
+
+func (s *Store) QuoteByIdempotencyKey(ctx context.Context, principalID, key string) (domain.Quote, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, q := range s.quotes {
+		if q.PrincipalID == principalID && q.IdempotencyKey == key {
+			return q, nil
+		}
+	}
+	return domain.Quote{}, store.ErrNotFound
 }
 
 func (s *Store) PutEscrow(ctx context.Context, e domain.Escrow) error {
