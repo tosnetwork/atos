@@ -167,95 +167,97 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 		}
 	}()
 
-	c, err := s.Get(ctx, id)
-	if err != nil {
-		return domain.Capability{}, err
-	}
-	if c.ProviderID != requestingProviderID {
-		return domain.Capability{}, domain.NewError(domain.ErrPermissionDenied, "not the owning provider", false)
-	}
-	for _, immutable := range []string{"provider_id", "supported_trust_modes", "mode_support", "manifest_commitment", "canonical_uri"} {
-		if _, attempted := patch[immutable]; attempted {
-			return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, immutable+" cannot be set through a generic update", false)
+	c, err := s.store.UpdateCapability(ctx, id, func(current domain.Capability, exists bool) (domain.Capability, error) {
+		if !exists {
+			return domain.Capability{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability not found", false)
 		}
-	}
+		c := normalizeCapability(current)
+		if c.ProviderID != requestingProviderID {
+			return domain.Capability{}, domain.NewError(domain.ErrPermissionDenied, "not the owning provider", false)
+		}
+		for _, immutable := range []string{"provider_id", "supported_trust_modes", "mode_support", "manifest_commitment", "canonical_uri"} {
+			if _, attempted := patch[immutable]; attempted {
+				return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, immutable+" cannot be set through a generic update", false)
+			}
+		}
 
-	if name, ok := patch["name"].(string); ok && name != "" {
-		c.Name = name
-	}
-	if desc, ok := patch["description"].(string); ok && desc != "" {
-		c.Description = desc
-	}
-	if status, ok := patch["status"].(string); ok {
-		switch domain.CapabilityStatus(status) {
-		case domain.CapabilityActive, domain.CapabilityPaused:
-			c.Status = domain.CapabilityStatus(status)
-		default:
-			return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, fmt.Sprintf("invalid status %q", status), false)
+		if name, ok := patch["name"].(string); ok && name != "" {
+			c.Name = name
 		}
-	}
+		if desc, ok := patch["description"].(string); ok && desc != "" {
+			c.Description = desc
+		}
+		if status, ok := patch["status"].(string); ok {
+			switch domain.CapabilityStatus(status) {
+			case domain.CapabilityActive, domain.CapabilityPaused:
+				c.Status = domain.CapabilityStatus(status)
+			default:
+				return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, fmt.Sprintf("invalid status %q", status), false)
+			}
+		}
 
-	termsChanged := false
-	if pricing, ok := patch["pricing"]; ok {
-		var p domain.Pricing
-		b, _ := json.Marshal(pricing)
-		if err := json.Unmarshal(b, &p); err != nil {
-			return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "invalid pricing", false)
+		termsChanged := false
+		if pricing, ok := patch["pricing"]; ok {
+			var p domain.Pricing
+			b, _ := json.Marshal(pricing)
+			if err := json.Unmarshal(b, &p); err != nil {
+				return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "invalid pricing", false)
+			}
+			if err := validatePricing(p); err != nil {
+				return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "invalid pricing: "+err.Error(), false)
+			}
+			if !samePricing(c.Pricing, p) {
+				c.Pricing = p
+				termsChanged = true
+			}
 		}
-		if err := validatePricing(p); err != nil {
-			return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "invalid pricing: "+err.Error(), false)
-		}
-		if !samePricing(c.Pricing, p) {
-			c.Pricing = p
+		if inputSchema, ok := patch["input_schema"].(map[string]any); ok {
+			c.InputSchema = inputSchema
 			termsChanged = true
 		}
-	}
-	if inputSchema, ok := patch["input_schema"].(map[string]any); ok {
-		c.InputSchema = inputSchema
-		termsChanged = true
-	}
-	if outputSchema, ok := patch["output_schema"].(map[string]any); ok {
-		c.OutputSchema = outputSchema
-		termsChanged = true
-	}
-	if raw, ok := patch["requested_trust_modes"]; ok {
-		modes, err := decodeTrustModes(raw)
-		if err != nil {
+		if outputSchema, ok := patch["output_schema"].(map[string]any); ok {
+			c.OutputSchema = outputSchema
+			termsChanged = true
+		}
+		if raw, ok := patch["requested_trust_modes"]; ok {
+			modes, err := decodeTrustModes(raw)
+			if err != nil {
+				return domain.Capability{}, err
+			}
+			c.RequestedTrustModes = modes
+			c.ModeSupport = reconcileModeSupport(c.ModeSupport, modes)
+		}
+		if raw, ok := patch["bindings"]; ok {
+			bindings, err := decodeBindings(raw, c.RequestedTrustModes)
+			if err != nil {
+				return domain.Capability{}, err
+			}
+			c.Bindings = bindings
+			c.AdapterType = bindings[0].Transport
+			termsChanged = true
+		}
+		if termsChanged {
+			c.Version = bumpMinorVersion(c.Version)
+		}
+
+		// Validated against the fully-built candidate, after every patched
+		// field has been applied but before anything is persisted -- a
+		// schema-invalid patch must leave the stored Capability's version,
+		// manifest commitment, schemas, and every other field byte-for-byte
+		// unchanged, never a partial update.
+		if err := validateCapabilitySchemas(c.InputSchema, c.OutputSchema); err != nil {
 			return domain.Capability{}, err
 		}
-		c.RequestedTrustModes = modes
-		c.ModeSupport = reconcileModeSupport(c.ModeSupport, modes)
-	}
-	if raw, ok := patch["bindings"]; ok {
-		bindings, err := decodeBindings(raw, c.RequestedTrustModes)
-		if err != nil {
-			return domain.Capability{}, err
-		}
-		c.Bindings = bindings
-		c.AdapterType = bindings[0].Transport
-		termsChanged = true
-	}
-	if termsChanged {
-		c.Version = bumpMinorVersion(c.Version)
-	}
 
-	// Validated against the fully-built candidate, after every patched
-	// field has been applied but before anything is persisted -- a
-	// schema-invalid patch must leave the stored Capability's version,
-	// manifest commitment, schemas, and every other field byte-for-byte
-	// unchanged, never a partial update.
-	if err := validateCapabilitySchemas(c.InputSchema, c.OutputSchema); err != nil {
-		return domain.Capability{}, err
-	}
-
-	c.ArtifactInputFields = artifactFields(c.InputSchema)
-	c.ArtifactOutputFields = artifactFields(c.OutputSchema)
-	c.RequiresArtifactTransfer = len(c.ArtifactInputFields)+len(c.ArtifactOutputFields) > 0
-	c.SupportedTrustModes = c.ModeSupport.ActiveModes()
-	c.UpdatedAt = time.Now().UTC()
-	c.ManifestCommitment = capabilityManifestCommitment(c)
-
-	if err := s.store.Put(ctx, c); err != nil {
+		c.ArtifactInputFields = artifactFields(c.InputSchema)
+		c.ArtifactOutputFields = artifactFields(c.OutputSchema)
+		c.RequiresArtifactTransfer = len(c.ArtifactInputFields)+len(c.ArtifactOutputFields) > 0
+		c.SupportedTrustModes = c.ModeSupport.ActiveModes()
+		c.UpdatedAt = time.Now().UTC()
+		c.ManifestCommitment = capabilityManifestCommitment(c)
+		return c, nil
+	})
+	if err != nil {
 		return domain.Capability{}, err
 	}
 	if err := s.store.Finish(ctx, requestingProviderID, idempotencyKey, c.ID); err != nil {
@@ -274,29 +276,32 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 // every health check or certification attempt without checking prior
 // state themselves.
 func (s *CapabilityService) RecordReadinessEvidence(ctx context.Context, capabilityID string, transport domain.EndpointAdapterType) error {
-	cap, err := s.Get(ctx, capabilityID)
-	if err != nil {
-		return err
-	}
-	changed := false
-	for _, binding := range cap.Bindings {
-		if binding.Transport != transport {
-			continue
+	_, err := s.store.UpdateCapability(ctx, capabilityID, func(current domain.Capability, exists bool) (domain.Capability, error) {
+		if !exists {
+			return domain.Capability{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability not found", false)
 		}
-		for _, mode := range binding.EligibleTrustModes {
-			before := cap.ModeSupport.Entry(mode).Status
-			cap.ModeSupport = cap.ModeSupport.AdvanceToPending(mode)
-			if cap.ModeSupport.Entry(mode).Status != before {
-				changed = true
+		cap := normalizeCapability(current)
+		changed := false
+		for _, binding := range cap.Bindings {
+			if binding.Transport != transport {
+				continue
+			}
+			for _, mode := range binding.EligibleTrustModes {
+				before := cap.ModeSupport.Entry(mode).Status
+				cap.ModeSupport = cap.ModeSupport.AdvanceToPending(mode)
+				if cap.ModeSupport.Entry(mode).Status != before {
+					changed = true
+				}
 			}
 		}
-	}
-	if !changed {
-		return nil
-	}
-	cap.SupportedTrustModes = cap.ModeSupport.ActiveModes()
-	cap.UpdatedAt = time.Now().UTC()
-	return s.store.Put(ctx, cap)
+		if !changed {
+			return current, nil
+		}
+		cap.SupportedTrustModes = cap.ModeSupport.ActiveModes()
+		cap.UpdatedAt = time.Now().UTC()
+		return cap, nil
+	})
+	return err
 }
 
 // SuspendModeIfActive applies the §7.2.0 `active -> suspended` transition
@@ -306,29 +311,57 @@ func (s *CapabilityService) RecordReadinessEvidence(ctx context.Context, capabil
 // version. reason is stored as the mode's ModeSupportEntry.Reason. A no-op
 // for a mode that isn't currently active.
 func (s *CapabilityService) SuspendModeIfActive(ctx context.Context, capabilityID string, transport domain.EndpointAdapterType, reason string) error {
-	cap, err := s.Get(ctx, capabilityID)
-	if err != nil {
-		return err
-	}
-	changed := false
-	for _, binding := range cap.Bindings {
-		if binding.Transport != transport {
-			continue
+	_, err := s.store.UpdateCapability(ctx, capabilityID, func(current domain.Capability, exists bool) (domain.Capability, error) {
+		if !exists {
+			return domain.Capability{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability not found", false)
 		}
-		for _, mode := range binding.EligibleTrustModes {
-			before := cap.ModeSupport.Entry(mode).Status
-			cap.ModeSupport = cap.ModeSupport.Suspend(mode, reason)
-			if cap.ModeSupport.Entry(mode).Status != before {
-				changed = true
+		cap := normalizeCapability(current)
+		changed := false
+		for _, binding := range cap.Bindings {
+			if binding.Transport != transport {
+				continue
+			}
+			for _, mode := range binding.EligibleTrustModes {
+				before := cap.ModeSupport.Entry(mode).Status
+				cap.ModeSupport = cap.ModeSupport.Suspend(mode, reason)
+				if cap.ModeSupport.Entry(mode).Status != before {
+					changed = true
+				}
 			}
 		}
+		if !changed {
+			return current, nil
+		}
+		cap.SupportedTrustModes = cap.ModeSupport.ActiveModes()
+		cap.UpdatedAt = time.Now().UTC()
+		return cap, nil
+	})
+	return err
+}
+
+// activationDecision encodes (granted, reasonCode) into the opaque
+// ResponseKey string store.IdempotencyRecord already carries -- EvaluateActivation
+// has no other resource to store.Finish against (unlike Register/Update,
+// whose ResponseKey is a Capability ID a replay re-fetches). Re-deriving
+// granted/reasonCode from the capability's CURRENT ModeSupport entry on
+// replay would be wrong: a later, independent evaluation (a different
+// idempotency key) can legitimately change that entry before a stale
+// retry of THIS key is replayed, which must still see what THIS call
+// originally decided, not whatever is current now.
+func encodeActivationDecision(granted bool, reasonCode string) string {
+	return strconv.FormatBool(granted) + "|" + reasonCode
+}
+
+func decodeActivationDecision(encoded string) (granted bool, reasonCode string, err error) {
+	parts := strings.SplitN(encoded, "|", 2)
+	if len(parts) != 2 {
+		return false, "", domain.NewError(domain.ErrIdempotencyConflict, "corrupt activation decision replay record", false)
 	}
-	if !changed {
-		return nil
+	granted, parseErr := strconv.ParseBool(parts[0])
+	if parseErr != nil {
+		return false, "", domain.NewError(domain.ErrIdempotencyConflict, "corrupt activation decision replay record", false)
 	}
-	cap.SupportedTrustModes = cap.ModeSupport.ActiveModes()
-	cap.UpdatedAt = time.Now().UTC()
-	return s.store.Put(ctx, cap)
+	return granted, parts[1], nil
 }
 
 // EvaluateActivation is the activation authority's sole entry point for
@@ -338,7 +371,43 @@ func (s *CapabilityService) SuspendModeIfActive(ctx context.Context, capabilityI
 // since those are the only two legal source states. A granted=false
 // result from authority is not an error: it records reasonCode on the
 // mode's entry for operator visibility and leaves Status unchanged.
-func (s *CapabilityService) EvaluateActivation(ctx context.Context, authority domain.ActivationAuthority, capabilityID string, mode domain.TrustMode) (granted bool, reasonCode string, err error) {
+//
+// requestingPrincipalID scopes idempotencyKey's namespace -- the calling
+// admin's own identity (atos-spec docs/API.md §2.2's caller, not the
+// target Capability's owner, since this operation is deliberately not
+// ownership-scoped) -- exactly like DisputeService.Review's reviewerID.
+// A retry with the same requestingPrincipalID+idempotencyKey and
+// identical capabilityID/mode replays the ORIGINAL decision this call
+// made, even if the live ModeSupport state has since moved on for
+// unrelated reasons (see docs/IMPLEMENTATION_ROADMAP.md §3.3's universal
+// idempotency rule: a lost response must not turn into either a repeated
+// authority call or a confusing "mode is already active" validation
+// error on retry).
+func (s *CapabilityService) EvaluateActivation(ctx context.Context, authority domain.ActivationAuthority, requestingPrincipalID, capabilityID string, mode domain.TrustMode, idempotencyKey string) (granted bool, reasonCode string, err error) {
+	if idempotencyKey == "" {
+		return false, "", domain.NewError(domain.ErrValidationFailed, "idempotency_key is required", false)
+	}
+	requestHash := hashRequest("evaluate-activation", capabilityID, mode)
+	record, reserved, err := s.store.Reserve(ctx, requestingPrincipalID, idempotencyKey, requestHash, time.Now().UTC().Add(idempotencyLease))
+	if err != nil {
+		return false, "", err
+	}
+	if !reserved {
+		if record.RequestHash != requestHash {
+			return false, "", domain.NewError(domain.ErrIdempotencyConflict, "idempotency_key reused with a different evaluation request", false)
+		}
+		if record.Status != store.IdempotencyCompleted {
+			return false, "", domain.NewError(domain.ErrIdempotencyConflict, "activation evaluation is still in progress", true)
+		}
+		return decodeActivationDecision(record.ResponseKey)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.store.Release(ctx, requestingPrincipalID, idempotencyKey)
+		}
+	}()
+
 	cap, err := s.Get(ctx, capabilityID)
 	if err != nil {
 		return false, "", err
@@ -347,26 +416,56 @@ func (s *CapabilityService) EvaluateActivation(ctx context.Context, authority do
 	if status != domain.ModeSupportPending && status != domain.ModeSupportSuspended {
 		return false, "", domain.NewError(domain.ErrValidationFailed, fmt.Sprintf("mode %q is %q, not pending or suspended", mode, status), false)
 	}
-	granted, reasonCode, err = authority.Evaluate(ctx, cap.ProviderID, cap.ID, cap.Version, mode)
+	// authority.Evaluate deliberately runs OUTSIDE any store lock -- Phase
+	// 4's real authority may be a network call, and holding the memory
+	// store's whole-store mutex (or a Postgres row lock) for its duration
+	// would block every other capability operation, or every other
+	// operation on THIS capability, for as long as that call takes. The
+	// version/status this decision was evaluated against is instead
+	// re-checked fresh, under lock, in the atomic write below -- a
+	// concurrent Update/Suspend/EvaluateActivation landing in between
+	// makes this decision stale, and a stale decision must never be
+	// silently applied (the same "never reinterpret a decision made
+	// against state that has since moved on" discipline this codebase
+	// already applies to Quote/Job binding freezing). If that happens,
+	// this attempt fails (retryable) and the deferred Release above lets
+	// a retry under the same idempotency key genuinely re-evaluate against
+	// current state -- this is a failed attempt needing resubmission, not
+	// a completed decision to replay.
+	evaluatedVersion := cap.Version
+	granted, reasonCode, err = authority.Evaluate(ctx, cap.ProviderID, cap.ID, evaluatedVersion, mode)
 	if err != nil {
 		return false, "", err
 	}
-	if !granted {
-		entry := cap.ModeSupport.Entry(mode)
-		entry.Reason = reasonCode
-		cap.ModeSupport[mode] = entry
-		if err := s.store.Put(ctx, cap); err != nil {
-			return false, "", err
+	_, err = s.store.UpdateCapability(ctx, capabilityID, func(current domain.Capability, exists bool) (domain.Capability, error) {
+		if !exists {
+			return domain.Capability{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability not found", false)
 		}
-		return false, reasonCode, nil
-	}
-	cap.ModeSupport = cap.ModeSupport.Activate(mode)
-	cap.SupportedTrustModes = cap.ModeSupport.ActiveModes()
-	cap.UpdatedAt = time.Now().UTC()
-	if err := s.store.Put(ctx, cap); err != nil {
+		cur := normalizeCapability(current)
+		if cur.Version != evaluatedVersion {
+			return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, "capability version changed during activation evaluation; retry", true)
+		}
+		currentStatus := cur.ModeSupport.Entry(mode).Status
+		if currentStatus != domain.ModeSupportPending && currentStatus != domain.ModeSupportSuspended {
+			return domain.Capability{}, domain.NewError(domain.ErrValidationFailed, fmt.Sprintf("mode %q became %q during activation evaluation; retry", mode, currentStatus), true)
+		}
+		if !granted {
+			cur.ModeSupport = cur.ModeSupport.DenyActivation(mode, reasonCode)
+			return cur, nil
+		}
+		cur.ModeSupport = cur.ModeSupport.Activate(mode)
+		cur.SupportedTrustModes = cur.ModeSupport.ActiveModes()
+		cur.UpdatedAt = time.Now().UTC()
+		return cur, nil
+	})
+	if err != nil {
 		return false, "", err
 	}
-	return true, reasonCode, nil
+	if err := s.store.Finish(ctx, requestingPrincipalID, idempotencyKey, encodeActivationDecision(granted, reasonCode)); err != nil {
+		return false, "", err
+	}
+	committed = true
+	return granted, reasonCode, nil
 }
 
 func (s *CapabilityService) ListByProvider(ctx context.Context, providerID string) ([]domain.Capability, error) {

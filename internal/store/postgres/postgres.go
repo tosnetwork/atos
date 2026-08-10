@@ -86,22 +86,30 @@ func lockTransactionKey(ctx context.Context, tx pgx.Tx, namespace string, parts 
 
 const capabilityColumns = `id, provider_id, name, description, version, tags, modalities, delivery_mode, input_schema, output_schema, pricing, sla, trust, status, updated_at, payload`
 
-func (s *Store) Put(ctx context.Context, c domain.Capability) error {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO capabilities (
-			id, provider_id, name, description, version, tags, modalities,
-			delivery_mode, input_schema, output_schema, pricing, sla, trust,
-			status, updated_at, payload
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-		ON CONFLICT (id) DO UPDATE SET
-			name=$3, description=$4, version=$5, tags=$6, modalities=$7,
-			delivery_mode=$8, input_schema=$9, output_schema=$10, pricing=$11,
-			sla=$12, trust=$13, status=$14, updated_at=$15, payload=$16
-	`, c.ID, c.ProviderID, c.Name, c.Description, c.Version,
+const upsertCapabilitySQL = `
+	INSERT INTO capabilities (
+		id, provider_id, name, description, version, tags, modalities,
+		delivery_mode, input_schema, output_schema, pricing, sla, trust,
+		status, updated_at, payload
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+	ON CONFLICT (id) DO UPDATE SET
+		name=$3, description=$4, version=$5, tags=$6, modalities=$7,
+		delivery_mode=$8, input_schema=$9, output_schema=$10, pricing=$11,
+		sla=$12, trust=$13, status=$14, updated_at=$15, payload=$16
+`
+
+func capabilityWriteArgs(c domain.Capability) []any {
+	return []any{
+		c.ID, c.ProviderID, c.Name, c.Description, c.Version,
 		mustMarshal(c.Tags), mustMarshal(c.Modalities), string(c.DeliveryMode),
 		mustMarshal(c.InputSchema), mustMarshal(c.OutputSchema), mustMarshal(c.Pricing),
 		mustMarshal(c.SLA), mustMarshal(c.Trust), string(c.Status), c.UpdatedAt,
-		mustMarshal(c))
+		mustMarshal(c),
+	}
+}
+
+func (s *Store) Put(ctx context.Context, c domain.Capability) error {
+	_, err := s.pool.Exec(ctx, upsertCapabilitySQL, capabilityWriteArgs(c)...)
 	return err
 }
 
@@ -137,6 +145,39 @@ func (s *Store) Get(ctx context.Context, id string) (domain.Capability, error) {
 		return domain.Capability{}, store.ErrNotFound
 	}
 	return c, err
+}
+
+func (s *Store) UpdateCapability(ctx context.Context, id string, fn func(domain.Capability, bool) (domain.Capability, error)) (domain.Capability, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Capability{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := lockTransactionKey(ctx, tx, "capability", id); err != nil {
+		return domain.Capability{}, err
+	}
+
+	current, err := scanCapability(tx.QueryRow(ctx, `SELECT `+capabilityColumns+` FROM capabilities WHERE id=$1 FOR UPDATE`, id))
+	exists := true
+	if errors.Is(err, pgx.ErrNoRows) {
+		current = domain.Capability{}
+		exists = false
+		err = nil
+	}
+	if err != nil {
+		return domain.Capability{}, err
+	}
+	next, err := fn(current, exists)
+	if err != nil {
+		return domain.Capability{}, err
+	}
+	if _, err := tx.Exec(ctx, upsertCapabilitySQL, capabilityWriteArgs(next)...); err != nil {
+		return domain.Capability{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Capability{}, err
+	}
+	return next, nil
 }
 
 func (s *Store) Search(ctx context.Context, query string, limit int) ([]domain.Capability, error) {

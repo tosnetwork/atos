@@ -108,6 +108,12 @@ func (s *Server) handleAuthDeviceDecision(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "decision must be approve or deny", false)
 		return
 	}
+	if approve {
+		if err := s.requireAdminApprovalIfNeeded(r, req.UserCode); err != nil {
+			writeDomainErr(w, err)
+			return
+		}
+	}
 	grant, err := s.Auth.DecideDevice(req.UserCode, principalID, approve)
 	if err != nil {
 		writeError(w, http.StatusConflict, domain.ErrValidationFailed, err.Error(), false)
@@ -121,6 +127,30 @@ func (s *Server) handleAuthDeviceDecision(w http.ResponseWriter, r *http.Request
 		"scopes":      grant.Scopes,
 		"expires_at":  grant.ExpiresAt,
 	})
+}
+
+// requireAdminApprovalIfNeeded additionally requires
+// X-ATOS-Admin-Approval-Token, on top of the X-ATOS-Approval-Token every
+// decision already requires, whenever userCode's pending grant requests a
+// scope in auth.RequiresAdminApproval's set -- the self-service Device
+// Authorization consent flow otherwise treats an admin scope exactly like
+// any ordinary one. Scopes are fixed at StartDevice time and never mutated
+// afterward, so this lookup and the DecideDevice call it precedes cannot
+// race on what's being approved. A no-op (nil) for a grant that doesn't
+// exist or has no admin scope -- DecideDevice's own lookup surfaces a
+// not-found/already-decided error identically either way.
+func (s *Server) requireAdminApprovalIfNeeded(r *http.Request, userCode string) error {
+	grant, err := s.Auth.GrantByUserCode(userCode)
+	if err != nil {
+		return nil
+	}
+	if !auth.RequiresAdminApproval(grant.Scopes) {
+		return nil
+	}
+	if !secureEqual(r.Header.Get("X-ATOS-Admin-Approval-Token"), s.AdminApprovalToken) {
+		return domain.NewError(domain.ErrAuthenticationRequired, "admin approval authorization is required for the requested scopes", false)
+	}
+	return nil
 }
 
 func (s *Server) handleActivationPage(w http.ResponseWriter, r *http.Request) {
@@ -189,6 +219,12 @@ func (s *Server) handleActivationDecisionPage(w http.ResponseWriter, r *http.Req
 	if !secureEqual(r.Form.Get("csrf_token"), s.consentCSRF(principalID, code)) {
 		writeError(w, http.StatusForbidden, domain.ErrPermissionDenied, "invalid consent form token", false)
 		return
+	}
+	if approve {
+		if err := s.requireAdminApprovalIfNeeded(r, code); err != nil {
+			writeDomainErr(w, err)
+			return
+		}
 	}
 	if _, err := s.Auth.DecideDevice(code, principalID, approve); err != nil {
 		writeError(w, http.StatusConflict, domain.ErrValidationFailed, err.Error(), false)

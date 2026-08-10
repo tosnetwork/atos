@@ -53,18 +53,29 @@ type Server struct {
 	// service.CapabilityReadiness's doc comment).
 	Health           *service.HealthService
 	ExecutionSigners *service.ExecutionSignerService
-	OpenTasks        *service.OpenTaskService
-	Quotes           *service.QuoteService
-	Jobs             *service.JobService
-	Streams          *service.StreamService
-	Accounts         *service.AccountService
-	Receipts         *service.ReceiptService
-	Earnings         *service.EarningsService
-	Disputes         *service.DisputeService
-	Artifacts        *service.ArtifactService
-	Logger           *slog.Logger
-	PublicBaseURL    string
-	ApprovalToken    string
+	// ActivationAuthority backs POST /capabilities/{id}/activation/evaluate
+	// (atos-spec docs/API.md §2.2) -- unlike Health, this is not optional:
+	// production wiring MUST always set it (service.FailClosedActivationAuthority
+	// today), since domain.ActivationAuthority has no nil-safe default.
+	ActivationAuthority domain.ActivationAuthority
+	OpenTasks           *service.OpenTaskService
+	Quotes              *service.QuoteService
+	Jobs                *service.JobService
+	Streams             *service.StreamService
+	Accounts            *service.AccountService
+	Receipts            *service.ReceiptService
+	Earnings            *service.EarningsService
+	Disputes            *service.DisputeService
+	Artifacts           *service.ArtifactService
+	Logger              *slog.Logger
+	PublicBaseURL       string
+	ApprovalToken       string
+	// AdminApprovalToken additionally gates approval of a Device
+	// Authorization grant requesting an admin scope (see
+	// auth.RequiresAdminApproval) -- required on top of ApprovalToken, not
+	// instead of it. Empty means admin-scoped grants can never be
+	// approved, matching secureEqual's own empty-vs-nonempty rejection.
+	AdminApprovalToken string
 }
 
 func (s *Server) Mux() *http.ServeMux {
@@ -96,6 +107,8 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("POST /v1/capabilities/{id}/execution-signer/rotate", s.withScopes(s.handleRotateExecutionSigner, auth.ScopeExecutionSignersWrite))
 	mux.HandleFunc("POST /v1/capabilities/{id}/execution-signer/revoke", s.withScopes(s.handleRevokeExecutionSigner, auth.ScopeExecutionSignersWrite))
 	mux.HandleFunc("GET /v1/capabilities/{id}/execution-signer", s.withScopes(s.handleGetExecutionSignerStatus, auth.ScopeExecutionSignersRead))
+
+	mux.HandleFunc("POST /v1/capabilities/{id}/activation/evaluate", s.withScopes(s.handleEvaluateActivation, auth.ScopeActivationEvaluate))
 
 	mux.HandleFunc("POST /v1/quotes", s.withScopes(s.handleCreateQuote, auth.ScopeQuotesRead))
 	mux.HandleFunc("GET /v1/quotes/{id}", s.withScopes(s.handleGetQuote, auth.ScopeQuotesRead))

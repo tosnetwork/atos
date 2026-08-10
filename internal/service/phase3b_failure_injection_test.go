@@ -97,7 +97,7 @@ func TestFailClosed_AllReadinessEvidenceGreenStillDoesNotActivate(t *testing.T) 
 
 	// Now explicitly evaluate against the production fail-closed
 	// authority -- the one and only authority any real deployment uses.
-	granted, reasonCode, err := capabilities.EvaluateActivation(ctx, service.FailClosedActivationAuthority{}, cap.ID, domain.TrustModeVerified)
+	granted, reasonCode, err := capabilities.EvaluateActivation(ctx, service.FailClosedActivationAuthority{}, "prn_failure_injection_admin", cap.ID, domain.TrustModeVerified, "eval-failure-injection")
 	if err != nil {
 		t.Fatal(err)
 	}

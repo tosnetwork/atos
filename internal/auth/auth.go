@@ -56,6 +56,16 @@ const (
 	// consumer scope.
 	ScopeExecutionSignersRead  Scope = "execution_signers:read"
 	ScopeExecutionSignersWrite Scope = "execution_signers:write"
+	// ScopeActivationEvaluate authorizes the admin-triggered entry point
+	// for domain.ActivationAuthority.Evaluate (atos-spec
+	// docs/IMPLEMENTATION_ROADMAP.md §7.2.1, docs/API.md §2.2).
+	// Deliberately a separate scope from ScopeExecutionSignersWrite and
+	// every other provider scope: this is an activation-authority-side
+	// operation, not a provider one, so it carries no ownership
+	// precondition at all (unlike every other Capability mutation
+	// scope) -- explicit-grant-only like ScopeDisputesReview, never a
+	// default consumer scope.
+	ScopeActivationEvaluate Scope = "activation:evaluate"
 	// ScopeOpenTasksRead/Write authorize Phase 3C's Open Task Marketplace
 	// (atos-spec docs/IMPLEMENTATION_ROADMAP.md §7.3) from the task
 	// OWNER's side: browsing/publishing/cancelling/accepting a proposal
@@ -81,7 +91,8 @@ var allowedScopes = map[Scope]struct{}{
 	ScopeEarningsRead: {}, ScopeSettlementRead: {}, ScopeSettlementWrite: {}, ScopeProofsRead: {}, ScopeNetworkRead: {},
 	ScopeDisputesOpen: {}, ScopeDisputesRead: {}, ScopeDisputesReview: {},
 	ScopeExecutionSignersRead: {}, ScopeExecutionSignersWrite: {},
-	ScopeOpenTasksRead: {}, ScopeOpenTasksWrite: {}, ScopeOpenTaskProposalsWrite: {},
+	ScopeActivationEvaluate: {},
+	ScopeOpenTasksRead:      {}, ScopeOpenTasksWrite: {}, ScopeOpenTaskProposalsWrite: {},
 }
 
 var defaultConsumerScopes = []Scope{
@@ -105,6 +116,37 @@ var defaultConsumerScopes = []Scope{
 	// deliberately NOT included here.
 	ScopeOpenTasksRead,
 	ScopeOpenTasksWrite,
+}
+
+// adminScopes carries system-wide, ownership-independent trust-side power
+// -- a holder acts on ANY provider's ANY capability, not just their own.
+// Explicit-grant-only scopes (ScopeExecutionSignersWrite, ScopeSettlementWrite,
+// ScopeDisputesReview) are already never issued by default, but that alone
+// only gates issuance behind the same self-service Device Authorization
+// consent flow every ordinary scope uses -- nothing distinguishes "an
+// authenticated user approved their own device's request" from "an
+// administrator approved it." Scopes in this set additionally require
+// RequiresAdminApproval's stronger operator-secret gate at approval time
+// (see internal/httpapi/auth.go's DecideDevice callers) before a pending
+// grant can ever be approved. Currently just ScopeActivationEvaluate --
+// the only scope with zero ownership scoping at all -- not
+// ScopeSettlementWrite/ScopeDisputesReview, which is a deliberate,
+// separate decision this set makes easy to revisit later, not an oversight.
+var adminScopes = map[Scope]struct{}{
+	ScopeActivationEvaluate: {},
+}
+
+// RequiresAdminApproval reports whether scopes contains any scope in
+// adminScopes -- callers deciding a pending Device Authorization grant
+// MUST additionally require the stronger admin-approval gate before
+// approving when this returns true.
+func RequiresAdminApproval(scopes []Scope) bool {
+	for _, scope := range scopes {
+		if _, admin := adminScopes[scope]; admin {
+			return true
+		}
+	}
+	return false
 }
 
 type Principal struct {

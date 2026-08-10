@@ -22,16 +22,20 @@ type Server struct {
 	// service.CapabilityReadiness's doc comment).
 	Health           *service.HealthService
 	ExecutionSigners *service.ExecutionSignerService
-	OpenTasks        *service.OpenTaskService
-	Quotes           *service.QuoteService
-	Jobs             *service.JobService
-	Accounts         *service.AccountService
-	Receipts         *service.ReceiptService
-	Earnings         *service.EarningsService
-	Disputes         *service.DisputeService
-	Artifacts        *service.ArtifactService
-	Logger           *slog.Logger
-	PublicBaseURL    string
+	// ActivationAuthority backs atos_evaluate_activation -- unlike Health,
+	// this is not optional: production wiring MUST always set it (see
+	// httpapi.Server.ActivationAuthority's identical doc comment).
+	ActivationAuthority domain.ActivationAuthority
+	OpenTasks           *service.OpenTaskService
+	Quotes              *service.QuoteService
+	Jobs                *service.JobService
+	Accounts            *service.AccountService
+	Receipts            *service.ReceiptService
+	Earnings            *service.EarningsService
+	Disputes            *service.DisputeService
+	Artifacts           *service.ArtifactService
+	Logger              *slog.Logger
+	PublicBaseURL       string
 }
 
 type rpcRequest struct {

@@ -95,3 +95,44 @@ func TestValidateCommittedTrustAcceptsOnlyNormativePairs(t *testing.T) {
 		})
 	}
 }
+
+func TestModeSupportDenyActivation_NoOpOnIllegalSourceStatus(t *testing.T) {
+	for _, status := range []ModeSupportStatus{ModeSupportRequested, ModeSupportActive, ModeSupportUnsupported} {
+		m := ModeSupport{TrustModeVerified: {Status: status}}
+		got := m.DenyActivation(TrustModeVerified, "SOME_REASON")
+		if got.Entry(TrustModeVerified).Reason != "" {
+			t.Fatalf("DenyActivation from status=%q set a reason, want no-op: %+v", status, got.Entry(TrustModeVerified))
+		}
+	}
+}
+
+func TestModeSupportDenyActivation_RecordsReasonWithoutChangingStatus(t *testing.T) {
+	for _, status := range []ModeSupportStatus{ModeSupportPending, ModeSupportSuspended} {
+		m := ModeSupport{TrustModeVerified: {Status: status}}
+		got := m.DenyActivation(TrustModeVerified, "ACTIVATION_AUTHORITY_UNAVAILABLE")
+		entry := got.Entry(TrustModeVerified)
+		if entry.Status != status {
+			t.Fatalf("DenyActivation from status=%q changed status to %q", status, entry.Status)
+		}
+		if entry.Reason != "ACTIVATION_AUTHORITY_UNAVAILABLE" {
+			t.Fatalf("DenyActivation from status=%q reason = %q, want ACTIVATION_AUTHORITY_UNAVAILABLE", status, entry.Reason)
+		}
+	}
+}
+
+// TestModeSupportDenyActivation_CopyOnWrite proves DenyActivation never
+// mutates the receiver's underlying map -- the exact bug class already
+// found and fixed for AdvanceToPending/Suspend/Activate (a direct
+// `m[mode] = entry` write would corrupt a caller's aliased map, e.g. the
+// memory store's Get returning a Capability whose ModeSupport field still
+// aliases the store's own live map).
+func TestModeSupportDenyActivation_CopyOnWrite(t *testing.T) {
+	original := ModeSupport{TrustModeVerified: {Status: ModeSupportPending}}
+	updated := original.DenyActivation(TrustModeVerified, "SOME_REASON")
+	if original.Entry(TrustModeVerified).Reason != "" {
+		t.Fatalf("DenyActivation mutated the original map in place: %+v", original.Entry(TrustModeVerified))
+	}
+	if updated.Entry(TrustModeVerified).Reason != "SOME_REASON" {
+		t.Fatalf("returned map missing the recorded reason: %+v", updated.Entry(TrustModeVerified))
+	}
+}
