@@ -41,6 +41,14 @@ const (
 	ErrDisputeWindowExpired         ErrorCode = "dispute_window_expired"
 	ErrDisputeNotEligible           ErrorCode = "dispute_not_eligible"
 	ErrDisputeInvalidTransition     ErrorCode = "dispute_invalid_transition"
+	// ErrSignerOperationInProgress means a non-terminal execution-signer
+	// operation (authorize/rotate/revoke) already exists for this
+	// capability version -- at most one may be in flight at a time (see
+	// store.ExecutionSignerOperations.OpenSignerOperationForCapability's
+	// doc comment for why). Retryable: the caller should wait for the
+	// in-flight operation to reach a terminal checkpoint and retry, not
+	// treat this as a permanent rejection.
+	ErrSignerOperationInProgress ErrorCode = "signer_operation_in_progress"
 )
 
 type Error struct {

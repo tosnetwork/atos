@@ -46,6 +46,16 @@ const (
 	ScopeDisputesOpen    Scope = "disputes:open"
 	ScopeDisputesRead    Scope = "disputes:read"
 	ScopeDisputesReview  Scope = "disputes:review"
+	// ScopeExecutionSignersRead/Write authorize the Phase 3B
+	// execution-signer authorize/rotate/revoke/status surface
+	// (atos-spec docs/IMPLEMENTATION_ROADMAP.md §7.2.3). Deliberately a
+	// separate scope pair from ScopeCapabilitiesRead/Write, never
+	// implied by them: signer mutation is a distinct trust-side effect
+	// class from ordinary Capability metadata, explicit-grant-only like
+	// ScopeSettlementWrite/ScopeDisputesReview, never a default
+	// consumer scope.
+	ScopeExecutionSignersRead  Scope = "execution_signers:read"
+	ScopeExecutionSignersWrite Scope = "execution_signers:write"
 )
 
 var allowedScopes = map[Scope]struct{}{
@@ -54,6 +64,7 @@ var allowedScopes = map[Scope]struct{}{
 	ScopeAccountRead: {}, ScopeProviderJobsRead: {}, ScopeProviderJobsDeliver: {},
 	ScopeEarningsRead: {}, ScopeSettlementRead: {}, ScopeSettlementWrite: {}, ScopeProofsRead: {}, ScopeNetworkRead: {},
 	ScopeDisputesOpen: {}, ScopeDisputesRead: {}, ScopeDisputesReview: {},
+	ScopeExecutionSignersRead: {}, ScopeExecutionSignersWrite: {},
 }
 
 var defaultConsumerScopes = []Scope{

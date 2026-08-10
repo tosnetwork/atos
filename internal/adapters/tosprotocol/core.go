@@ -210,6 +210,78 @@ func (c *Client) ResolveExecutionSignerAuthorization(
 	}, true, nil
 }
 
+func toExecutionSignerAuthorization(msg *atostosv1.ExecutionSignerAuthorization) toscore.ExecutionSignerAuthorization {
+	if msg == nil || msg.Value == nil {
+		return toscore.ExecutionSignerAuthorization{}
+	}
+	value := msg.Value
+	return toscore.ExecutionSignerAuthorization{
+		AuthorizationID: value.AuthorizationId, ProviderID: value.ProviderId,
+		CapabilityID: value.CapabilityId, CapabilityVersion: value.CapabilityVersion,
+		ExecutionSignerID: value.ExecutionSignerId,
+		ValidFrom:         time.UnixMilli(value.ValidFromUnixMillis).UTC(),
+		ValidUntil:        time.UnixMilli(value.ValidUntilUnixMillis).UTC(),
+		AuthorizationRef:  reference(msg.AuthorizationRef),
+		Revoked:           msg.Revoked,
+		RevocationRef:     reference(msg.RevocationRef),
+	}
+}
+
+// AuthorizeExecutionSigner calls tos-protocol's TrustService RPC of the same
+// name unchanged (atos-spec docs/IMPLEMENTATION_ROADMAP.md §7.2.2 --
+// reused, not replaced). req.AuthorizationID is the caller's durably
+// persisted idempotency identity; tos-protocol's own atomicMutation
+// machinery makes a retry with the same AuthorizationID and identical
+// fields return the same result, and a changed field return
+// IDEMPOTENCY_CONFLICT (surfaced here as domain.ErrIdempotencyConflict via
+// rpcError).
+func (c *Client) AuthorizeExecutionSigner(ctx context.Context, req toscore.AuthorizeExecutionSignerRequest) (toscore.ExecutionSignerAuthorization, bool, error) {
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	request := connect.NewRequest(&atostosv1.AuthorizeExecutionSignerRequest{
+		Context: c.requestContext(ctx, req.ProviderID, req.AuthorizationID, time.Time{}),
+		Authorization: &atostosv1.ExecutionSignerAuthorizationInput{
+			AuthorizationId: req.AuthorizationID, ProviderId: req.ProviderID,
+			CapabilityId: req.CapabilityID, CapabilityVersion: req.CapabilityVersion,
+			ExecutionSignerId: req.ExecutionSignerID, SignerPublicKey: req.SignerPublicKey,
+			SignatureAlgorithm:  req.SignatureAlgorithm,
+			ValidFromUnixMillis: req.ValidFrom.UnixMilli(), ValidUntilUnixMillis: req.ValidUntil.UnixMilli(),
+		},
+	})
+	decorateRequest(c, ctx, request)
+	response, err := c.trust.AuthorizeExecutionSigner(callCtx, request)
+	if err != nil {
+		return toscore.ExecutionSignerAuthorization{}, false, rpcError(err)
+	}
+	if response.Msg == nil || response.Msg.Authorization == nil {
+		return toscore.ExecutionSignerAuthorization{}, false, domain.NewError(domain.ErrNetworkUnavailable, "tos-protocol returned an empty execution signer authorization", true)
+	}
+	return toExecutionSignerAuthorization(response.Msg.Authorization), response.Msg.Created, nil
+}
+
+// RevokeExecutionSigner calls tos-protocol's TrustService RPC of the same
+// name unchanged. req.AuthorizationID identifies the existing authorization
+// to revoke (not a new idempotency key of its own -- the underlying RPC's
+// own idempotency is keyed by the request's canonical digest, matching
+// AuthorizeExecutionSigner).
+func (c *Client) RevokeExecutionSigner(ctx context.Context, req toscore.RevokeExecutionSignerRequest) (toscore.ExecutionSignerAuthorization, bool, error) {
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	request := connect.NewRequest(&atostosv1.RevokeExecutionSignerRequest{
+		Context:         c.requestContext(ctx, req.ProviderID, req.AuthorizationID, time.Time{}),
+		AuthorizationId: req.AuthorizationID, ReasonCode: req.ReasonCode,
+	})
+	decorateRequest(c, ctx, request)
+	response, err := c.trust.RevokeExecutionSigner(callCtx, request)
+	if err != nil {
+		return toscore.ExecutionSignerAuthorization{}, false, rpcError(err)
+	}
+	if response.Msg == nil || response.Msg.Authorization == nil {
+		return toscore.ExecutionSignerAuthorization{}, false, domain.NewError(domain.ErrNetworkUnavailable, "tos-protocol returned an empty execution signer authorization", true)
+	}
+	return toExecutionSignerAuthorization(response.Msg.Authorization), response.Msg.Revoked, nil
+}
+
 func (c *Client) CreateEscrow(ctx context.Context, req toscore.CreateEscrowRequest) (domain.Escrow, error) {
 	if existing, err := c.store.EscrowByJob(ctx, req.JobID); err == nil {
 		if existing.QuoteID != req.QuoteID || existing.PrincipalID != req.PrincipalID ||

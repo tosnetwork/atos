@@ -15,24 +15,28 @@ type toolHandler func(ctx context.Context, principal auth.Principal, args map[st
 
 func (s *Server) dispatch() map[string]toolHandler {
 	return map[string]toolHandler{
-		"atos_search":               s.toolSearch,
-		"atos_get_capability":       s.toolGetCapability,
-		"atos_quote":                s.toolQuote,
-		"atos_invoke":               s.toolInvoke,
-		"atos_create_job":           s.toolCreateJob,
-		"atos_get_job":              s.toolGetJob,
-		"atos_cancel_job":           s.toolCancelJob,
-		"atos_account":              s.toolAccount,
-		"atos_artifact":             s.toolArtifact,
-		"atos_register_capability":  s.toolRegisterCapability,
-		"atos_update_capability":    s.toolUpdateCapability,
-		"atos_list_my_capabilities": s.toolListMyCapabilities,
-		"atos_pause_capability":     s.toolPauseCapability,
-		"atos_provider_earnings":    s.toolProviderEarnings,
-		"atos_provider_jobs":        s.toolProviderJobs,
-		"atos_deliver_job":          s.toolDeliverJob,
-		"atos_request_settlement":   s.toolRequestSettlement,
-		"atos_dispute_job":          s.toolDisputeJob,
+		"atos_search":                      s.toolSearch,
+		"atos_get_capability":              s.toolGetCapability,
+		"atos_quote":                       s.toolQuote,
+		"atos_invoke":                      s.toolInvoke,
+		"atos_create_job":                  s.toolCreateJob,
+		"atos_get_job":                     s.toolGetJob,
+		"atos_cancel_job":                  s.toolCancelJob,
+		"atos_account":                     s.toolAccount,
+		"atos_artifact":                    s.toolArtifact,
+		"atos_register_capability":         s.toolRegisterCapability,
+		"atos_update_capability":           s.toolUpdateCapability,
+		"atos_list_my_capabilities":        s.toolListMyCapabilities,
+		"atos_pause_capability":            s.toolPauseCapability,
+		"atos_provider_earnings":           s.toolProviderEarnings,
+		"atos_provider_jobs":               s.toolProviderJobs,
+		"atos_deliver_job":                 s.toolDeliverJob,
+		"atos_request_settlement":          s.toolRequestSettlement,
+		"atos_dispute_job":                 s.toolDisputeJob,
+		"atos_authorize_execution_signer":  s.toolAuthorizeExecutionSigner,
+		"atos_rotate_execution_signer":     s.toolRotateExecutionSigner,
+		"atos_revoke_execution_signer":     s.toolRevokeExecutionSigner,
+		"atos_get_execution_signer_status": s.toolGetExecutionSignerStatus,
 	}
 }
 
@@ -107,7 +111,7 @@ func (s *Server) toolSearch(ctx context.Context, principal auth.Principal, args 
 }
 
 func (s *Server) toolGetCapability(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
-	return s.Capabilities.Get(ctx, argString(args, "capability_id"))
+	return service.GetCapabilityWithReadiness(ctx, s.Capabilities, s.Health, s.ExecutionSigners, argString(args, "capability_id"))
 }
 
 func (s *Server) toolQuote(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {

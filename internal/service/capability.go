@@ -265,6 +265,110 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 	return c, nil
 }
 
+// RecordReadinessEvidence applies the §7.2.0 `requested -> pending`
+// transition for every trust mode eligible on transport's binding of
+// capabilityID, triggered by the readiness pipeline (HealthService or
+// CertificationService) recording a first evidence cycle for the
+// Capability's CURRENT version. It is a no-op for a mode that has already
+// moved past `requested`, so callers may invoke it unconditionally on
+// every health check or certification attempt without checking prior
+// state themselves.
+func (s *CapabilityService) RecordReadinessEvidence(ctx context.Context, capabilityID string, transport domain.EndpointAdapterType) error {
+	cap, err := s.Get(ctx, capabilityID)
+	if err != nil {
+		return err
+	}
+	changed := false
+	for _, binding := range cap.Bindings {
+		if binding.Transport != transport {
+			continue
+		}
+		for _, mode := range binding.EligibleTrustModes {
+			before := cap.ModeSupport.Entry(mode).Status
+			cap.ModeSupport = cap.ModeSupport.AdvanceToPending(mode)
+			if cap.ModeSupport.Entry(mode).Status != before {
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return nil
+	}
+	cap.SupportedTrustModes = cap.ModeSupport.ActiveModes()
+	cap.UpdatedAt = time.Now().UTC()
+	return s.store.Put(ctx, cap)
+}
+
+// SuspendModeIfActive applies the §7.2.0 `active -> suspended` transition
+// for every trust mode eligible on transport's binding of capabilityID,
+// triggered by the readiness pipeline observing that evidence this
+// activation depended on is no longer valid for the Capability's CURRENT
+// version. reason is stored as the mode's ModeSupportEntry.Reason. A no-op
+// for a mode that isn't currently active.
+func (s *CapabilityService) SuspendModeIfActive(ctx context.Context, capabilityID string, transport domain.EndpointAdapterType, reason string) error {
+	cap, err := s.Get(ctx, capabilityID)
+	if err != nil {
+		return err
+	}
+	changed := false
+	for _, binding := range cap.Bindings {
+		if binding.Transport != transport {
+			continue
+		}
+		for _, mode := range binding.EligibleTrustModes {
+			before := cap.ModeSupport.Entry(mode).Status
+			cap.ModeSupport = cap.ModeSupport.Suspend(mode, reason)
+			if cap.ModeSupport.Entry(mode).Status != before {
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return nil
+	}
+	cap.SupportedTrustModes = cap.ModeSupport.ActiveModes()
+	cap.UpdatedAt = time.Now().UTC()
+	return s.store.Put(ctx, cap)
+}
+
+// EvaluateActivation is the activation authority's sole entry point for
+// the §7.2.0 `pending -> active` and `suspended -> active` transitions.
+// mode must currently be pending or suspended -- any other current status
+// returns domain.ErrValidationFailed without calling authority at all,
+// since those are the only two legal source states. A granted=false
+// result from authority is not an error: it records reasonCode on the
+// mode's entry for operator visibility and leaves Status unchanged.
+func (s *CapabilityService) EvaluateActivation(ctx context.Context, authority domain.ActivationAuthority, capabilityID string, mode domain.TrustMode) (granted bool, reasonCode string, err error) {
+	cap, err := s.Get(ctx, capabilityID)
+	if err != nil {
+		return false, "", err
+	}
+	status := cap.ModeSupport.Entry(mode).Status
+	if status != domain.ModeSupportPending && status != domain.ModeSupportSuspended {
+		return false, "", domain.NewError(domain.ErrValidationFailed, fmt.Sprintf("mode %q is %q, not pending or suspended", mode, status), false)
+	}
+	granted, reasonCode, err = authority.Evaluate(ctx, cap.ProviderID, cap.ID, cap.Version, mode)
+	if err != nil {
+		return false, "", err
+	}
+	if !granted {
+		entry := cap.ModeSupport.Entry(mode)
+		entry.Reason = reasonCode
+		cap.ModeSupport[mode] = entry
+		if err := s.store.Put(ctx, cap); err != nil {
+			return false, "", err
+		}
+		return false, reasonCode, nil
+	}
+	cap.ModeSupport = cap.ModeSupport.Activate(mode)
+	cap.SupportedTrustModes = cap.ModeSupport.ActiveModes()
+	cap.UpdatedAt = time.Now().UTC()
+	if err := s.store.Put(ctx, cap); err != nil {
+		return false, "", err
+	}
+	return true, reasonCode, nil
+}
+
 func (s *CapabilityService) ListByProvider(ctx context.Context, providerID string) ([]domain.Capability, error) {
 	caps, err := s.store.ByProvider(ctx, providerID)
 	if err != nil {
@@ -335,6 +439,16 @@ func trustModeOrder(mode domain.TrustMode) int {
 	}
 }
 
+// initialModeSupport applies atos-spec docs/IMPLEMENTATION_ROADMAP.md
+// §7.2.0's frozen transition matrix at Capability registration:
+// unsupported -> requested is the Provider's own authority (this function
+// is only ever invoked as a direct consequence of the provider's own
+// RequestedTrustModes), never unsupported -> pending or -> active for a
+// stronger mode -- those require the readiness pipeline and the
+// activation authority respectively, neither of which has run yet for a
+// Capability that doesn't exist until this call returns. Managed is the
+// sole exception: it has no readiness/activation concept and is
+// unconditionally active the moment it's requested.
 func initialModeSupport(requested []domain.TrustMode) domain.ModeSupport {
 	out := domain.ModeSupport{
 		domain.TrustModeManaged:  {Status: domain.ModeSupportUnsupported},
@@ -346,14 +460,23 @@ func initialModeSupport(requested []domain.TrustMode) domain.ModeSupport {
 		if mode == domain.TrustModeManaged {
 			entry.Status = domain.ModeSupportActive
 		} else {
-			entry.Status = domain.ModeSupportPending
-			entry.Reason = "awaiting identity, ownership, signer, proof and settlement readiness"
+			entry.Status = domain.ModeSupportRequested
+			entry.Reason = "no readiness evidence recorded yet"
 		}
 		out[mode] = entry
 	}
 	return out
 }
 
+// reconcileModeSupport applies the same §7.2.0 transition matrix on a
+// Capability update: only the Provider-authority edges
+// (unsupported<->requested for a stronger mode, and any status ->
+// unsupported when the provider stops requesting a mode) belong here.
+// requested -> pending (readiness pipeline), pending/suspended -> active
+// (activation authority), and active -> suspended (readiness pipeline)
+// are driven elsewhere by whichever service actually observed the
+// triggering event -- this function must never perform them itself,
+// since a generic metadata PATCH is not evidence of any of those.
 func reconcileModeSupport(current domain.ModeSupport, requested []domain.TrustMode) domain.ModeSupport {
 	if current == nil {
 		return initialModeSupport(requested)
@@ -372,9 +495,9 @@ func reconcileModeSupport(current domain.ModeSupport, requested []domain.TrustMo
 				entry.Status = domain.ModeSupportActive
 				entry.Reason = ""
 			} else {
-				entry.Status = domain.ModeSupportPending
+				entry.Status = domain.ModeSupportRequested
 				entry.ProofProfile = domain.StandardProofProfile(mode)
-				entry.Reason = "awaiting certification"
+				entry.Reason = "no readiness evidence recorded yet"
 			}
 		}
 		current[mode] = entry

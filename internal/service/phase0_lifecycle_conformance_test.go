@@ -4,8 +4,10 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	tosaimock "github.com/tosnetwork/atos/internal/adapters/tosai/mock"
+	"github.com/tosnetwork/atos/internal/adapters/toscore"
 	toscoremock "github.com/tosnetwork/atos/internal/adapters/toscore/mock"
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/service"
@@ -40,7 +42,23 @@ func TestPhase0OneAPIRunsEveryConcreteMode(t *testing.T) {
 
 	accounts := service.NewAccountService(st)
 	quotes := service.NewQuoteService(st).WithAccountService(accounts)
-	jobs := service.NewJobService(st, tosaimock.NewContractFixture(), toscoremock.NewContractFixture(st), accounts)
+	core := toscoremock.NewContractFixture(st)
+	// Verified/Native execution receipts require a genuinely resolvable
+	// execution-signer authorization (Managed does not -- see
+	// toscore/mock.Core.VerifyExecutionReceipt's doc comment); pre-authorize
+	// the fixed signer identity tosaimock.NewContractFixture's synthesized
+	// receipts always use ("sig_mock_tos_ai"), mirroring what a real
+	// Phase 3B signer-authorize call would have durably recorded before
+	// this Job ever ran.
+	if _, _, err := core.AuthorizeExecutionSigner(ctx, toscore.AuthorizeExecutionSignerRequest{
+		AuthorizationID: "auth_mock_" + capability.ID, ProviderID: capability.ProviderID,
+		CapabilityID: capability.ID, CapabilityVersion: capability.Version,
+		ExecutionSignerID: "sig_mock_tos_ai",
+		ValidFrom:         time.Now().UTC().Add(-24 * time.Hour), ValidUntil: time.Now().UTC().Add(24 * time.Hour),
+	}); err != nil {
+		t.Fatalf("pre-authorize execution signer: %v", err)
+	}
+	jobs := service.NewJobService(st, tosaimock.NewContractFixture(), core, accounts)
 	tests := []struct {
 		requested domain.RequestedTrustMode
 		mode      domain.TrustMode

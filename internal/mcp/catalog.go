@@ -31,6 +31,10 @@ var orderedToolSpecs = []toolSpec{
 	{Definition: deliverJobTool(), RequiredScopes: []auth.Scope{auth.ScopeProviderJobsDeliver}},
 	{Definition: requestSettlementTool(), RequiredScopes: []auth.Scope{auth.ScopeSettlementWrite}},
 	{Definition: disputeJobTool(), RequiredScopes: []auth.Scope{auth.ScopeDisputesReview}},
+	{Definition: authorizeExecutionSignerTool(), RequiredScopes: []auth.Scope{auth.ScopeExecutionSignersWrite}},
+	{Definition: rotateExecutionSignerTool(), RequiredScopes: []auth.Scope{auth.ScopeExecutionSignersWrite}},
+	{Definition: revokeExecutionSignerTool(), RequiredScopes: []auth.Scope{auth.ScopeExecutionSignersWrite}},
+	{Definition: getExecutionSignerStatusTool(), RequiredScopes: []auth.Scope{auth.ScopeExecutionSignersRead}},
 }
 
 func toolName(spec toolSpec) string {
@@ -334,6 +338,68 @@ func disputeJobTool() map[string]any {
 			"dispute_id":      map[string]any{"type": "string", "minLength": 1},
 			"outcome":         map[string]any{"type": "string", "enum": []string{"principal", "provider", "rejected"}, "description": "Required when operation=resolve."},
 			"reason_rejected": map[string]any{"type": "string", "description": "Optional detail when outcome=rejected."},
+		}),
+		"outputSchema": map[string]any{"type": "object"},
+	}
+}
+
+func authorizeExecutionSignerTool() map[string]any {
+	return map[string]any{
+		"name":        "atos_authorize_execution_signer",
+		"description": "Authorize the (first) execution signer for a Capability owned by the authenticated provider. Accepts only a signer public key and signer ID -- never a private key.",
+		"inputSchema": objectSchema([]string{"capability_id", "execution_signer_id", "signer_public_key", "signature_algorithm", "idempotency_key"}, map[string]any{
+			"capability_id":       map[string]any{"type": "string", "minLength": 1},
+			"capability_version":  map[string]any{"type": "string", "description": "Optional: if set, must match the capability's current version."},
+			"execution_signer_id": map[string]any{"type": "string", "minLength": 1},
+			"signer_public_key":   map[string]any{"type": "string", "description": "Base64-encoded, optionally \"base64:\"-prefixed public key."},
+			"signature_algorithm": map[string]any{"type": "string", "enum": []string{"ed25519"}},
+			"valid_from":          map[string]any{"type": "string", "description": "RFC3339. Defaults to now."},
+			"valid_until":         map[string]any{"type": "string", "description": "RFC3339. Defaults to one year after valid_from."},
+			"idempotency_key":     map[string]any{"type": "string", "minLength": 1},
+		}),
+		"outputSchema": map[string]any{"type": "object"},
+	}
+}
+
+func rotateExecutionSignerTool() map[string]any {
+	return map[string]any{
+		"name":        "atos_rotate_execution_signer",
+		"description": "Durably orchestrated rotation (authorize-then-revoke, never the reverse) of a Capability's execution signer, owned by the authenticated provider. Never implemented as two independent tool calls -- see docs/IMPLEMENTATION_ROADMAP.md §7.2.2's checkpoint sequence.",
+		"inputSchema": objectSchema([]string{"capability_id", "execution_signer_id", "signer_public_key", "signature_algorithm", "idempotency_key"}, map[string]any{
+			"capability_id":       map[string]any{"type": "string", "minLength": 1},
+			"capability_version":  map[string]any{"type": "string", "description": "Optional: if set, must match the capability's current version."},
+			"execution_signer_id": map[string]any{"type": "string", "minLength": 1, "description": "The NEW signer's ID."},
+			"signer_public_key":   map[string]any{"type": "string", "description": "The NEW signer's base64-encoded, optionally \"base64:\"-prefixed public key."},
+			"signature_algorithm": map[string]any{"type": "string", "enum": []string{"ed25519"}},
+			"valid_from":          map[string]any{"type": "string", "description": "RFC3339. Defaults to now."},
+			"valid_until":         map[string]any{"type": "string", "description": "RFC3339. Defaults to one year after valid_from."},
+			"reason_code":         map[string]any{"type": "string", "description": "Optional reason recorded for the old signer's revocation."},
+			"idempotency_key":     map[string]any{"type": "string", "minLength": 1},
+		}),
+		"outputSchema": map[string]any{"type": "object"},
+	}
+}
+
+func revokeExecutionSignerTool() map[string]any {
+	return map[string]any{
+		"name":        "atos_revoke_execution_signer",
+		"description": "Revoke a Capability's currently authorized execution signer, owned by the authenticated provider. Refused while doing so would leave an active stronger trust mode with no authorized signer -- use rotate instead.",
+		"inputSchema": objectSchema([]string{"capability_id", "idempotency_key"}, map[string]any{
+			"capability_id":      map[string]any{"type": "string", "minLength": 1},
+			"capability_version": map[string]any{"type": "string", "description": "Optional: if set, must match the capability's current version."},
+			"reason_code":        map[string]any{"type": "string"},
+			"idempotency_key":    map[string]any{"type": "string", "minLength": 1},
+		}),
+		"outputSchema": map[string]any{"type": "object"},
+	}
+}
+
+func getExecutionSignerStatusTool() map[string]any {
+	return map[string]any{
+		"name":        "atos_get_execution_signer_status",
+		"description": "Read-only: the current execution signer and any in-progress authorize/rotate/revoke operation's durable checkpoint for a Capability owned by the authenticated provider. current_execution_signer_id remains the old signer until a rotation's checkpoint reaches new_authorized.",
+		"inputSchema": objectSchema([]string{"capability_id"}, map[string]any{
+			"capability_id": map[string]any{"type": "string", "minLength": 1},
 		}),
 		"outputSchema": map[string]any{"type": "object"},
 	}

@@ -359,6 +359,131 @@ type Certifications interface {
 	UpdateCertification(ctx context.Context, id string, fn func(c domain.SandboxCertification, exists bool) (domain.SandboxCertification, error)) (domain.SandboxCertification, error)
 }
 
+// ExecutionSignerOperations stores the durable execution-signer
+// authorize/rotate/revoke journal (atos-spec
+// docs/IMPLEMENTATION_ROADMAP.md §7.2.2) -- see
+// domain.ExecutionSignerOperation's doc comment for the full checkpoint
+// sequence this exists to make crash-recoverable.
+type ExecutionSignerOperations interface {
+	// OpenSignerOperation idempotently creates an operation record keyed
+	// by (providerID, idempotencyKey), mirroring OpenCertification's
+	// contract exactly: first call creates op (created=true); a replay
+	// with the SAME key and identical identity content returns the
+	// existing record unchanged (created=false, nil error); a replay with
+	// the SAME key but DIFFERENT identity content returns
+	// domain.ErrIdempotencyConflict.
+	OpenSignerOperation(ctx context.Context, providerID string, op domain.ExecutionSignerOperation) (domain.ExecutionSignerOperation, bool, error)
+	// OpenSignerOperationForCapability combines two steps
+	// Authorize/Revoke/Rotate each need when opening a genuinely NEW
+	// operation (never for resuming an idempotency-key replay -- see
+	// service.ExecutionSignerService.resumeOrConflict) into one atomic
+	// sequence under a single lock scoped to (capabilityID,
+	// capabilityVersion):
+	//
+	//  1. Determine the current execution signer -- exactly what
+	//     LatestCompletedSignerOperationByCapability plus the
+	//     authorize/rotate-vs-revoke derivation in
+	//     service.ExecutionSignerService.CurrentSigner would report --
+	//     at a single consistent snapshot.
+	//  2. Call build with that snapshot to obtain the operation to open,
+	//     then open it exactly as OpenSignerOperation would (same
+	//     idempotency semantics: created=true on first open,
+	//     created=false and the existing record on a same-content
+	//     replay, domain.ErrIdempotencyConflict on a same-key
+	//     different-content replay).
+	//
+	// This exists to close a real race: without a lock spanning BOTH
+	// steps, two concurrent callers using DIFFERENT idempotency keys
+	// (e.g. two independent Rotate calls) can each read the same current
+	// signer before either has persisted an operation that would change
+	// it, then each independently authorize and complete a DIFFERENT new
+	// signer -- both genuinely valid at the remote authority, but only
+	// one ever visible as "current" through this store, leaving the
+	// other an orphaned authorization no caller can name or revoke.
+	// Reading the current signer and opening the operation as two
+	// separate store calls (as an earlier version of this codebase did)
+	// cannot close this race no matter how each individual call is
+	// locked internally, because the race is in the GAP between the two
+	// calls, not within either one.
+	//
+	// Locking the read-then-open sequence alone is ALSO not sufficient:
+	// it prevents two concurrent callers from reading current-signer at
+	// the exact same instant, but not two callers that read it in quick
+	// SUCCESSION, before the first one's operation reaches Completed --
+	// the second would still see the same stale current signer and open
+	// a second, independently-completable operation against it.
+	// Implementations MUST additionally reject a new open with
+	// domain.ErrSignerOperationInProgress (retryable) while ANY
+	// non-terminal operation already exists for (capabilityID,
+	// capabilityVersion), which is what actually closes that window: the
+	// second caller is forced to fail and retry after the first either
+	// completes (and it will then correctly see the new signer as
+	// current) or is itself recovered by the reconciler.
+	//
+	// build returning an error aborts the whole sequence without opening
+	// anything (e.g. "no current signer to rotate").
+	OpenSignerOperationForCapability(
+		ctx context.Context, providerID, capabilityID, capabilityVersion string,
+		build func(currentAuthorizationID, currentExecutionSignerID string, found bool) (domain.ExecutionSignerOperation, error),
+	) (op domain.ExecutionSignerOperation, created bool, err error)
+	GetSignerOperation(ctx context.Context, id string) (domain.ExecutionSignerOperation, error)
+	SignerOperationByIdempotencyKey(ctx context.Context, providerID, key string) (domain.ExecutionSignerOperation, error)
+	// LatestSignerOperationByCapability returns the most recently updated
+	// operation for capabilityID, if any -- including a non-terminal one
+	// still in flight or reconciling. This is the status-query view (so a
+	// caller can see "a rotation is in progress"), NOT the basis for
+	// "what is the current execution signer" -- see
+	// LatestCompletedSignerOperationByCapability for that, which a
+	// non-terminal latest operation must never override (§7.2.2: the old
+	// signer remains authoritative until a rotation's new signer is
+	// durably new_authorized, and MUST NOT appear to have no signer at
+	// all just because a later operation is stuck).
+	LatestSignerOperationByCapability(ctx context.Context, capabilityID string) (domain.ExecutionSignerOperation, bool, error)
+	// LatestCompletedSignerOperationByCapability returns the most
+	// recently updated COMPLETED operation for (capabilityID,
+	// capabilityVersion), if any -- the sole basis for "what is the
+	// current execution signer" (the most recent completed
+	// authorize/rotate's NewExecutionSignerID, or none if the most recent
+	// completed operation is a revoke). A newer non-terminal operation (in
+	// flight or reconciling) never changes this answer until it too
+	// reaches Completed.
+	//
+	// capabilityVersion MUST be filtered in the query itself, not applied
+	// afterward by the caller: signer authorization currency is
+	// version-scoped (a capability version bump resets it), and a
+	// completed operation for a SUPERSEDED version can still have a more
+	// recent updated_at than the current version's own completed
+	// operation -- e.g. a stuck v1 rotation that a reconciler only
+	// finishes recovering after a v2 signer was already authorized and
+	// completed. Selecting "most recently updated, completed, ANY
+	// version" and rejecting it in Go after the fact (an earlier version
+	// of this method did exactly that) answers "no current signer" in
+	// that case even though a real, current v2 signer exists -- it never
+	// looks past the wrong version's row to find it.
+	LatestCompletedSignerOperationByCapability(ctx context.Context, capabilityID, capabilityVersion string) (domain.ExecutionSignerOperation, bool, error)
+	// StaleSignerOperations returns up to limit non-terminal operations
+	// (checkpoint != completed) last updated before cutoff, oldest first
+	// -- the reconciler's sweep query.
+	StaleSignerOperations(ctx context.Context, cutoff time.Time, limit int) ([]domain.ExecutionSignerOperation, error)
+	// UpdateSignerOperation atomically applies fn to the operation's
+	// current stored state. Implementations MUST reject
+	// (domain.ErrIdempotencyConflict) a returned value whose ID or
+	// identity fields (ProviderID/CapabilityID/CapabilityVersion/Type/
+	// IdempotencyKey/new-signer identity/old-authorization identity/
+	// RevocationReasonCode) differ from the existing stored record -- only
+	// Checkpoint/NewAuthorizationRef/FailureReason/CompletedAt/UpdatedAt
+	// may change through this method, exactly mirroring
+	// UpdateCertification's own immutability contract. RevocationReasonCode
+	// moved into the identity set alongside the fields it was always meant
+	// to travel with: it is caller-supplied content for Revoke/Rotate that
+	// feeds tos-protocol's own commitment digest, so a replay that
+	// supplies a different reason is a different logical request, exactly
+	// like a different new-signer identity would be -- advance() (the sole
+	// production caller) never touches it, so this tightening changes no
+	// existing behavior.
+	UpdateSignerOperation(ctx context.Context, id string, fn func(op domain.ExecutionSignerOperation, exists bool) (domain.ExecutionSignerOperation, error)) (domain.ExecutionSignerOperation, error)
+}
+
 type Idempotency interface {
 	// Reserve atomically claims (principalID, key) in the InProgress state.
 	// If the key was already used it returns the prior record and ok=false
@@ -390,5 +515,6 @@ type Store interface {
 	Artifacts
 	ProviderHealth
 	Certifications
+	ExecutionSignerOperations
 	Idempotency
 }

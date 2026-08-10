@@ -49,6 +49,34 @@ type ExecutionSignerAuthorization struct {
 	ValidUntil        time.Time
 	AuthorizationRef  string
 	Revoked           bool
+	RevocationRef     string
+}
+
+// AuthorizeExecutionSignerRequest mirrors
+// atos.tos.v1.ExecutionSignerAuthorizationInput (already normative and
+// version-bound in atos-spec's trust.proto). AuthorizationID is the stable
+// idempotency identity ATOS generates once and durably persists before ever
+// calling this method -- a retry with the same AuthorizationID and
+// identical fields MUST return the same result (tos-protocol's own
+// AuthorizeExecutionSigner is already idempotent on this key via its
+// shared atomicMutation machinery); a retry with the same AuthorizationID
+// and DIFFERENT fields is a semantic conflict.
+type AuthorizeExecutionSignerRequest struct {
+	AuthorizationID    string
+	ProviderID         string
+	CapabilityID       string
+	CapabilityVersion  string
+	ExecutionSignerID  string
+	SignerPublicKey    []byte
+	SignatureAlgorithm string
+	ValidFrom          time.Time
+	ValidUntil         time.Time
+}
+
+type RevokeExecutionSignerRequest struct {
+	AuthorizationID string
+	ProviderID      string
+	ReasonCode      string
 }
 
 type Core interface {
@@ -62,6 +90,15 @@ type Core interface {
 	// Quote and execution-signer trust.
 	CommitQuote(ctx context.Context, quote domain.Quote) (proofRef string, err error)
 	ResolveExecutionSignerAuthorization(ctx context.Context, providerID, capabilityID, capabilityVersion, signerID string, at time.Time) (ExecutionSignerAuthorization, bool, error)
+	// AuthorizeExecutionSigner and RevokeExecutionSigner are the only path
+	// permitted to mutate trust-side signer state -- ordinary ATOS provider
+	// business logic MUST NOT write it directly (atos-spec
+	// docs/IMPLEMENTATION_ROADMAP.md §7.2.2). created/revoked mirror
+	// tos-protocol's own AuthorizeExecutionSignerResponse.created /
+	// RevokeExecutionSignerResponse.revoked -- false on an idempotent
+	// replay of an already-completed request, true on first application.
+	AuthorizeExecutionSigner(ctx context.Context, req AuthorizeExecutionSignerRequest) (authorization ExecutionSignerAuthorization, created bool, err error)
+	RevokeExecutionSigner(ctx context.Context, req RevokeExecutionSignerRequest) (authorization ExecutionSignerAuthorization, revoked bool, err error)
 
 	// Escrow, receipt and settlement.
 	CreateEscrow(ctx context.Context, req CreateEscrowRequest) (domain.Escrow, error)

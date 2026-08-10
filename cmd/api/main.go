@@ -83,6 +83,11 @@ func main() {
 	var execution tosai.Provider
 	var core toscore.Core
 	var quoter tosai.Quoter
+	// remoteProber, when set, routes HealthService's readiness probing
+	// through the same execution/data-plane boundary as third-party
+	// execution (see service.ThirdPartyHealthProber's doc comment) instead
+	// of dialing binding.EndpointRef locally.
+	var remoteProber service.ThirdPartyHealthProber
 	switch cfg.TOSBackend {
 	case config.TOSBackendMock:
 		execution = tosaimock.New()
@@ -109,11 +114,24 @@ func main() {
 		}
 		defer rpcClient.Close()
 		execution, core, quoter = rpcClient, rpcClient, rpcClient
+		if cfg.RemoteThirdPartyExecution {
+			remoteProber = rpcClient
+		}
 		logger.Info("using tos-protocol RPC backend", "url", cfg.TOSRPC.URL)
 	default:
 		logger.Error("unsupported TOS backend", "backend", cfg.TOSBackend)
 		os.Exit(2)
 	}
+
+	// Shared by dispatch's third-party execution routing below and by
+	// HealthService's local (non-remote-probed) readiness checks --
+	// dialing binding.EndpointRef is the same outbound concern in both
+	// cases, just for two different purposes (executing vs. probing).
+	providerResolver := provideradapter.NewResolver(
+		httpadapter.New(httpadapter.Config{}),
+		mcpadapter.New(mcpadapter.Config{}),
+		a2aadapter.New(a2aadapter.Config{}),
+	)
 
 	// Wraps whichever native execution backend was just selected: a
 	// Capability whose binding is tos-native/human/absent executes exactly
@@ -122,13 +140,14 @@ func main() {
 	// and StreamService still talk to exactly one tosai.Provider -- this
 	// is the only place execution fans out by transport, never a second
 	// execution path. See internal/adapters/tosai/dispatch's package doc.
-	execution = dispatch.New(execution, provideradapter.NewResolver(
-		httpadapter.New(httpadapter.Config{}),
-		mcpadapter.New(mcpadapter.Config{}),
-		a2aadapter.New(a2aadapter.Config{}),
-	), dispatch.WithRemoteThirdPartyExecution(cfg.RemoteThirdPartyExecution))
+	execution = dispatch.New(execution, providerResolver,
+		dispatch.WithRemoteThirdPartyExecution(cfg.RemoteThirdPartyExecution))
 
 	capabilities := service.NewCapabilityService(st)
+	health := service.NewHealthService(st, capabilities, providerResolver)
+	if remoteProber != nil {
+		health.WithRemoteProber(remoteProber)
+	}
 	var quotes *service.QuoteService
 	if quoter == nil {
 		quotes = service.NewQuoteService(st)
@@ -178,6 +197,7 @@ func main() {
 	}
 	artifacts := service.NewArtifactService(st, blobStorage)
 	disputes := service.NewDisputeService(st, jobs, earnings, accounts, artifacts)
+	executionSigners := service.NewExecutionSignerService(st, core, capabilities)
 
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
 	defer reconcileCancel()
@@ -190,6 +210,12 @@ func main() {
 	go disputes.RunReconciler(reconcileCtx, 20*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("dispute economic reconciliation pending", "error", reconcileErr)
 	})
+	go health.RunReconciler(reconcileCtx, 5*time.Minute, 200, func(reconcileErr error) {
+		logger.Error("provider health sweep pending", "error", reconcileErr)
+	})
+	go executionSigners.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
+		logger.Error("execution-signer operation reconciliation pending", "error", reconcileErr)
+	})
 
 	if err := seedDemoCapability(capabilities, cfg.TOSBackend); err != nil {
 		logger.Error("failed to seed demo capability", "error", err)
@@ -197,13 +223,13 @@ func main() {
 	}
 
 	restServer := &httpapi.Server{
-		Auth: authorization, Capabilities: capabilities, Quotes: quotes,
+		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners, Quotes: quotes,
 		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts,
 		Earnings: earnings, Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 		ApprovalToken: cfg.Auth.ApprovalToken,
 	}
 	mcpServer := &mcp.Server{
-		Auth: authorization, Capabilities: capabilities, Quotes: quotes,
+		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners, Quotes: quotes,
 		Jobs: jobs, Accounts: accounts, Receipts: receipts, Earnings: earnings,
 		Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}

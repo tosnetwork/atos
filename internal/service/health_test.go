@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -58,14 +59,19 @@ func registerHTTPBoundCapability(t *testing.T, capabilities *service.CapabilityS
 // HealthService/CertificationService route through
 // service.ThirdPartyHealthProber when configured, without a real
 // tos-protocol/tos-ai deployment.
+// calls is atomic.Int32, not a plain int: RunReconciler probes from a
+// background goroutine (see TestHealthService_RunReconciler_SweepsImmediatelyOnStart,
+// which polls this field from the test goroutine while the reconciler
+// runs concurrently) -- a plain int here was a genuine, go test -race
+// -confirmed data race, not just theoretical.
 type fakeThirdPartyHealthProber struct {
-	calls  int
+	calls  atomic.Int32
 	result domain.AdapterHealthCheck
 	err    error
 }
 
 func (f *fakeThirdPartyHealthProber) ProbeThirdPartyHealth(_ context.Context, providerID, capabilityID, capabilityVersion string, binding domain.CapabilityBinding) (domain.AdapterHealthCheck, error) {
-	f.calls++
+	f.calls.Add(1)
 	if f.err != nil {
 		return domain.AdapterHealthCheck{}, f.err
 	}
@@ -98,8 +104,8 @@ func TestHealthService_CheckCapability_UsesRemoteProberWhenConfigured(t *testing
 	if err != nil {
 		t.Fatalf("CheckCapability: %v", err)
 	}
-	if prober.calls != 1 {
-		t.Fatalf("remote prober called %d times, want 1", prober.calls)
+	if prober.calls.Load() != 1 {
+		t.Fatalf("remote prober called %d times, want 1", prober.calls.Load())
 	}
 	if len(checks) != 1 || checks[0].Status != domain.AdapterHealthHealthy || checks[0].LatencyMS != 42 || !checks[0].DeepProbe {
 		t.Fatalf("checks = %+v, want a single healthy/deep_probe=true result from the remote prober", checks)
@@ -151,11 +157,27 @@ func TestHealthService_CheckCapability_RecordsUnhealthyResult(t *testing.T) {
 	}
 }
 
-// TestHealthService_CheckCapability_NeverMutatesModeSupport is the
-// roadmap's explicit regression requirement: a health check success must
-// not directly activate Verified or Native, or change SupportedTrustModes
-// at all.
-func TestHealthService_CheckCapability_NeverMutatesModeSupport(t *testing.T) {
+// TestHealthService_CheckCapability_NeverDirectlyActivatesStrongerModes is
+// the roadmap's explicit regression requirement: a health check success
+// must not directly activate Verified or Native, or change
+// SupportedTrustModes at all -- it may legitimately advance a requested
+// mode from requested to pending (RecordReadinessEvidence's whole job),
+// which is not an activation.
+//
+// This test previously asserted NO ModeSupport status may change at all
+// (renamed from TestHealthService_CheckCapability_NeverMutatesModeSupport),
+// which is stricter than the roadmap requirement above and contradicted
+// the intended requested->pending transition. It passed anyway, for the
+// wrong reason: capabilities.Get returned a domain.Capability whose
+// ModeSupport map was the SAME object the memory store held internally
+// (Go copies a struct by value but a map field by reference), so `before`
+// secretly aliased whatever `after` later became -- the comparison was
+// vacuously true regardless of what CheckCapability actually did. Fixed
+// by domain.ModeSupport's copy-on-write mutators (AdvanceToPending et
+// al.); `before` is now a genuine snapshot, and this test's real
+// assertion is the two Active() checks below plus the SupportedTrustModes
+// check, which is what the roadmap actually requires.
+func TestHealthService_CheckCapability_NeverDirectlyActivatesStrongerModes(t *testing.T) {
 	ctx := context.Background()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
 	defer srv.Close()
@@ -182,16 +204,19 @@ func TestHealthService_CheckCapability_NeverMutatesModeSupport(t *testing.T) {
 	if len(after.SupportedTrustModes) != len(before.SupportedTrustModes) {
 		t.Fatalf("supported_trust_modes changed by a health check: %v -> %v", before.SupportedTrustModes, after.SupportedTrustModes)
 	}
-	for mode := range after.ModeSupport {
-		if after.ModeSupport[mode].Status != before.ModeSupport[mode].Status {
-			t.Fatalf("mode_support[%s] changed by a health check: %s -> %s", mode, before.ModeSupport[mode].Status, after.ModeSupport[mode].Status)
-		}
-	}
 	if after.ModeSupport.Active(domain.TrustModeVerified) {
 		t.Fatal("a healthy transport check must never independently activate Verified")
 	}
 	if after.ModeSupport.Active(domain.TrustModeNative) {
 		t.Fatal("a healthy transport check must never independently activate Native")
+	}
+	// The legitimate side effect: a first evidence cycle for a requested
+	// mode advances it to pending (never straight past it to active).
+	for _, mode := range []domain.TrustMode{domain.TrustModeVerified, domain.TrustModeNative} {
+		if before.ModeSupport.Entry(mode).Status == domain.ModeSupportRequested &&
+			after.ModeSupport.Entry(mode).Status != domain.ModeSupportPending {
+			t.Fatalf("mode_support[%s] = %s after a healthy check, want pending", mode, after.ModeSupport.Entry(mode).Status)
+		}
 	}
 }
 
@@ -446,7 +471,15 @@ func TestHealthService_Availability_StaleHealthNotTreatedAsFresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if avail[0].TransportHealthy {
-		t.Fatal("a stale health check must not be treated as currently healthy")
+	// TransportHealthy and HealthFresh are independent dimensions (see
+	// domain.ModeAvailability's doc comment): the stale check's last
+	// known status was genuinely Healthy, so TransportHealthy correctly
+	// stays true -- staleness is HealthFresh's job to flag, not
+	// TransportHealthy's.
+	if !avail[0].TransportHealthy {
+		t.Fatal("a stale-but-formerly-healthy check should still report the last known status as healthy")
+	}
+	if avail[0].HealthFresh {
+		t.Fatal("a stale health check must not be treated as currently fresh")
 	}
 }

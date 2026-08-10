@@ -100,8 +100,8 @@ func TestCertificationOpen_UsesRemoteProberWhenConfigured(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if prober.calls != 1 {
-		t.Fatalf("remote prober called %d times, want 1", prober.calls)
+	if prober.calls.Load() != 1 {
+		t.Fatalf("remote prober called %d times, want 1", prober.calls.Load())
 	}
 	if cert.Status != domain.CertificationPassed {
 		t.Fatalf("status = %s, want passed", cert.Status)
@@ -385,8 +385,14 @@ func TestCertificationOpen_CombinedReadinessSignalsStillDoNotActivate(t *testing
 	if after.ModeSupport.Active(domain.TrustModeVerified) {
 		t.Fatal("endpoint healthy + certification passed + provider requested verified must still NOT activate verified")
 	}
+	// The health check and certification attempt above are exactly the
+	// §7.2.0 `requested -> pending` readiness-evidence trigger, so status
+	// legitimately advances to `pending` -- but no combination of health,
+	// certification or (implicit) signer evidence is activation authority,
+	// so it must go no further than `pending` on its own. See atos-spec
+	// docs/IMPLEMENTATION_ROADMAP.md §7.2.0/§7.2.1.
 	if after.ModeSupport.Entry(domain.TrustModeVerified).Status != domain.ModeSupportPending {
-		t.Fatalf("verified mode_support status = %s, want still pending", after.ModeSupport.Entry(domain.TrustModeVerified).Status)
+		t.Fatalf("verified mode_support status = %s, want pending", after.ModeSupport.Entry(domain.TrustModeVerified).Status)
 	}
 }
 
