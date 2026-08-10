@@ -233,3 +233,111 @@ func TestMemoryOpenAcceptanceOperation_InFlightGuard(t *testing.T) {
 		}
 	}
 }
+
+// TestMemoryUpdateAcceptanceOperation_TerminalIsImmutable proves the
+// corrected semantics of UpdateAcceptanceOperation once an operation
+// reaches a terminal checkpoint (an earlier version of this guard
+// unconditionally rejected any terminal next.Checkpoint, which broke
+// advanceAcceptance's own stale-worker CAS no-op -- a worker observing an
+// operation a DIFFERENT worker already completed would get a spurious
+// ErrIdempotencyConflict instead of safely converging):
+//  1. an update whose fn returns current UNCHANGED (exactly what
+//     advanceAcceptance's own CAS no-op branch produces) succeeds, not
+//     ErrIdempotencyConflict;
+//  2. an update that tries to move a terminal operation back to a
+//     non-terminal checkpoint is silently ignored, never applied;
+//  3. a concurrent stale driver holding a pre-completion snapshot (an
+//     expectedFrom that no longer matches, because a different driver
+//     already completed the operation) converges without error -- the
+//     exact "two concurrent reconcilers" scenario this whole journal
+//     exists to support.
+func TestMemoryUpdateAcceptanceOperation_TerminalIsImmutable(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+	now := time.Now().UTC()
+	taskID := "task_mem_terminal_immutable"
+	propID := "prop_mem_terminal_immutable"
+	if err := s.PutOpenTask(ctx, domain.OpenTask{
+		ID: taskID, PrincipalID: "prn_1", Title: "t", Status: domain.OpenTaskOpen,
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("PutOpenTask: %v", err)
+	}
+	if err := s.PutOpenTaskProposal(ctx, domain.OpenTaskProposal{
+		ID: propID, TaskID: taskID, ProviderID: "agt_1", CapabilityID: "cap_1", CapabilityVersion: "1.0.0",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("PutOpenTaskProposal: %v", err)
+	}
+	op, _, created, err := s.OpenAcceptanceOperation(ctx, taskID, propID, func(task domain.OpenTask, proposal domain.OpenTaskProposal) (domain.AcceptanceOperation, error) {
+		n := time.Now().UTC()
+		return domain.AcceptanceOperation{
+			ID: "accop_terminal_immutable", TaskID: taskID, ProposalID: propID,
+			PrincipalID: task.PrincipalID, ProviderID: proposal.ProviderID,
+			CapabilityID: proposal.CapabilityID, CapabilityVersion: proposal.CapabilityVersion,
+			Checkpoint: domain.AcceptanceJobBound, QuoteID: "q_1", JobID: "job_1",
+			IdempotencyKey: "idem_terminal_immutable", CreatedAt: n, UpdatedAt: n,
+		}, nil
+	})
+	if err != nil || !created {
+		t.Fatalf("OpenAcceptanceOperation: created=%v err=%v", created, err)
+	}
+	completed, _, err := s.CompleteAcceptance(ctx, op.ID)
+	if err != nil {
+		t.Fatalf("CompleteAcceptance: %v", err)
+	}
+	if completed.Checkpoint != domain.AcceptanceCompleted {
+		t.Fatalf("checkpoint = %s, want completed", completed.Checkpoint)
+	}
+
+	// Case 1: a stale worker's CAS no-op must succeed, not error.
+	noop, err := s.UpdateAcceptanceOperation(ctx, op.ID, func(current domain.AcceptanceOperation, exists bool) (domain.AcceptanceOperation, error) {
+		return current, nil // exactly what advanceAcceptance's own no-op branch does
+	})
+	if err != nil {
+		t.Fatalf("expected a no-op update against a terminal operation to succeed, got: %v", err)
+	}
+	if noop.Checkpoint != domain.AcceptanceCompleted {
+		t.Fatalf("no-op update changed checkpoint to %s", noop.Checkpoint)
+	}
+
+	// Case 2: an attempted revival must be silently ignored.
+	revived, err := s.UpdateAcceptanceOperation(ctx, op.ID, func(current domain.AcceptanceOperation, exists bool) (domain.AcceptanceOperation, error) {
+		current.Checkpoint = domain.AcceptanceReconciling
+		return current, nil
+	})
+	if err != nil {
+		t.Fatalf("expected an attempted revival to be silently ignored (no error), got: %v", err)
+	}
+	if revived.Checkpoint != domain.AcceptanceCompleted {
+		t.Fatalf("terminal operation was revived to checkpoint=%s", revived.Checkpoint)
+	}
+	stored, err := s.GetAcceptanceOperation(ctx, op.ID)
+	if err != nil {
+		t.Fatalf("GetAcceptanceOperation: %v", err)
+	}
+	if stored.Checkpoint != domain.AcceptanceCompleted {
+		t.Fatalf("stored operation was revived to checkpoint=%s", stored.Checkpoint)
+	}
+
+	// Case 3: a concurrent stale driver's advance (expectedFrom no longer
+	// matches, because this operation was already completed by someone
+	// else) must converge without error -- exactly advanceAcceptance's
+	// own CAS check reproduced here.
+	staleAdvance, err := s.UpdateAcceptanceOperation(ctx, op.ID, func(current domain.AcceptanceOperation, exists bool) (domain.AcceptanceOperation, error) {
+		if !exists {
+			return domain.AcceptanceOperation{}, domain.NewError(domain.ErrNotFound, "not found", false)
+		}
+		if current.Checkpoint.Terminal() || current.Checkpoint != domain.AcceptanceJobBound {
+			return current, nil
+		}
+		current.Checkpoint = domain.AcceptanceCompleted
+		return current, nil
+	})
+	if err != nil {
+		t.Fatalf("expected a stale driver's advance against an already-completed operation to converge without error, got: %v", err)
+	}
+	if staleAdvance.Checkpoint != domain.AcceptanceCompleted {
+		t.Fatalf("stale advance result checkpoint = %s, want completed", staleAdvance.Checkpoint)
+	}
+}

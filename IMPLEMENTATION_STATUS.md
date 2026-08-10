@@ -522,3 +522,54 @@ fixes' own test coverage and store contract, both fixed:
   `Completed`/`Failed` target checkpoint from `UpdateAcceptanceOperation`
   with `ErrIdempotencyConflict`, with a conformance-style assertion added
   to both stores' existing tests.
+
+### Fourth review round
+
+A fourth review (re-verifying commit `22ca289`, this round's own terminal-
+checkpoint guard above) found that the guard as first written was too
+strict: `advanceAcceptance`'s own CAS design (`internal/service/open_task.go`)
+has a no-op branch -- `if current.Checkpoint.Terminal() || current.Checkpoint
+!= expectedFrom { return current, nil }` -- that returns an ALREADY-terminal
+`current` completely unchanged, exactly reproducing a stale worker (a client
+retry, or the periodic reconciler) safely converging after a DIFFERENT
+worker already completed or failed the same operation. The guard added in
+the previous round rejected ANY `next.Checkpoint` equal to `Completed`/
+`Failed` unconditionally, including this exact legitimate no-op -- so two
+concurrent drivers racing the same operation (explicitly a supported
+scenario: "multiple service instances must be able to safely concurrently
+reconcile") could have the SLOWER one receive a spurious
+`ErrIdempotencyConflict` even though the operation it was driving forward
+had, in fact, already completed successfully. The same overly-narrow check
+also had a reverse gap: it only inspected `next.Checkpoint`, never
+`current.Checkpoint`, so nothing stopped a caller from moving an
+ALREADY-terminal operation back to a non-terminal one.
+
+Fixed with the semantics the review specified: once `current.Checkpoint`
+is terminal, `UpdateAcceptanceOperation` now ignores whatever `fn`
+computed entirely and returns the STORED `current` value unconditionally
+(no write) -- this is what makes a stale-worker no-op succeed correctly
+(the store never even compares `next`, so there is nothing to spuriously
+reject) while also making terminal-to-non-terminal revival structurally
+impossible (the store never looks at `next.Checkpoint` once `current` is
+terminal, so there is no path for a rogue `next` to be applied). The
+narrower rejection ("must not set a terminal checkpoint") now only fires
+when `current` is genuinely non-terminal and `next` tries to become
+terminal directly through this method -- the actual protection this guard
+was meant to provide.
+
+Four new regression tests (`TestMemoryUpdateAcceptanceOperation_TerminalIsImmutable`
+/ `TestUpdateAcceptanceOperation_TerminalIsImmutable`, one per store) cover
+exactly the scenarios the review specified: an unchanged update against an
+already-terminal operation succeeds; an attempted revival back to
+non-terminal is silently ignored; a concurrent stale driver's advance
+(with a stale `expectedFrom` that no longer matches, because a different
+driver already completed the operation) converges without error; and the
+pre-existing non-terminal-to-terminal rejection (already covered by
+`TestMemoryOpenAcceptanceOperation_InFlightGuard`/
+`TestOpenAcceptanceOperation_RejectsSecondAttemptWhileFirstInFlight`)
+still holds.
+
+This same round also re-verified, using the stronger
+server-log-inspection method from the third round, that the lock-ordering
+fix and idempotency digest fix from earlier rounds remain correct at the
+current commit -- both were already fixed and nothing regressed.

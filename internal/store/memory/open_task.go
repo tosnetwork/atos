@@ -348,6 +348,23 @@ func (s *Store) UpdateAcceptanceOperation(ctx context.Context, id string, fn fun
 	if err != nil {
 		return domain.AcceptanceOperation{}, err
 	}
+	// Once terminal, an operation is fully immutable through this method:
+	// return the STORED current value, unconditionally, ignoring whatever
+	// fn computed -- never writing again. This is deliberately NOT "compare
+	// next against current and reject if different": advanceAcceptance's
+	// own CAS no-op branch (see its doc comment) returns current verbatim
+	// when it observes an already-terminal operation, exactly reproducing
+	// a stale worker converging safely after a different worker already
+	// completed/failed it -- that must succeed as a no-op, not surface
+	// ErrIdempotencyConflict to a caller whose operation actually finished
+	// successfully. Ignoring next entirely here (rather than trying to
+	// detect "did fn actually change anything", fragile with pointer-typed
+	// fields like CompletedAt) also closes the reverse hole: nothing can
+	// ever "revive" a terminal operation back to non-terminal through this
+	// method, since next is never consulted once current is terminal.
+	if exists && current.Checkpoint.Terminal() {
+		return current, nil
+	}
 	if exists {
 		if next.ID != current.ID {
 			return domain.AcceptanceOperation{}, domain.NewError(domain.ErrIdempotencyConflict, "acceptance operation update must not change the operation id", false)
@@ -356,14 +373,13 @@ func (s *Store) UpdateAcceptanceOperation(ctx context.Context, id string, fn fun
 			return domain.AcceptanceOperation{}, domain.NewError(domain.ErrIdempotencyConflict, "acceptance operation update must not change identity fields", false)
 		}
 	}
-	// Completed/Failed MUST only ever be reached through
-	// CompleteAcceptance/FailAcceptance, which atomically pair the
-	// checkpoint transition with the OpenTask projection/reopen -- a plain
-	// UpdateAcceptanceOperation call reaching either terminal checkpoint
-	// would recreate exactly the split-commit crash window those two
-	// methods exist to close. Enforced here, not just documented on the
-	// interface, so a future caller mistake fails loudly instead of
-	// silently reintroducing the bug.
+	// current is non-terminal here (or didn't exist): Completed/Failed
+	// MUST only ever be reached through CompleteAcceptance/FailAcceptance,
+	// which atomically pair the checkpoint transition with the OpenTask
+	// projection/reopen -- a plain UpdateAcceptanceOperation call pushing a
+	// STILL-non-terminal operation INTO a terminal checkpoint would
+	// recreate exactly the split-commit crash window those two methods
+	// exist to close.
 	if next.Checkpoint == domain.AcceptanceCompleted || next.Checkpoint == domain.AcceptanceFailed {
 		return domain.AcceptanceOperation{}, domain.NewError(domain.ErrIdempotencyConflict,
 			"UpdateAcceptanceOperation must not set a terminal checkpoint; use CompleteAcceptance/FailAcceptance", false)
