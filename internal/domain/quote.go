@@ -45,6 +45,19 @@ type Quote struct {
 	// trail -- so two Quotes cannot share a TermsHash while differing in
 	// how a Job would actually be charged.
 	PricingModel PricingModel `json:"pricing_model,omitempty"`
+	// Binding, InputSchema and OutputSchema are frozen from the Capability
+	// at Quote-creation time via SelectBinding, exactly like MeteredRates/
+	// PricingModel above. Job creation (internal/service/job.go's submit)
+	// MUST use these frozen values, never re-derive them from the
+	// Capability's live state -- an already-issued Quote/Job MUST continue
+	// to use its frozen version/binding semantics after a later Capability
+	// update (atos-spec docs/IMPLEMENTATION_ROADMAP.md §7.1.0's binding-
+	// freeze rule). Binding is nil when the Capability has no transport
+	// binding at all (the ordinary tos-native/human path), not as a signal
+	// that this Quote predates this field.
+	Binding      *CapabilityBinding `json:"binding,omitempty"`
+	InputSchema  map[string]any     `json:"input_schema,omitempty"`
+	OutputSchema map[string]any     `json:"output_schema,omitempty"`
 }
 
 func (q Quote) Expired(now time.Time) bool {

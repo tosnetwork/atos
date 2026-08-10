@@ -70,11 +70,17 @@ func (s *JobService) markEconomicReconciliationUnderLock(ctx context.Context, jo
 	return updated
 }
 
+// validateRecoveredEscrow compares the recovered escrow against the
+// Quote's own frozen identity (CapabilityVersion included), never the
+// live Capability's current version -- an escrow created for a Job
+// executing against a frozen, possibly-now-superseded Quote version must
+// validate against that same frozen version on recovery, exactly like
+// recoverOrCreateEscrowUnderLock's CreateEscrow call below.
 func validateRecoveredEscrow(job domain.Job, quote domain.Quote, capability domain.Capability, escrow domain.Escrow) error {
 	expectedReserve := domain.Money{Amount: quote.Price.TotalMax, Currency: quote.Price.Currency}
 	if escrow.JobID != job.ID || escrow.QuoteID != quote.ID || escrow.PrincipalID != job.PrincipalID ||
 		escrow.ProviderID != capability.ProviderID || escrow.CapabilityID != capability.ID ||
-		escrow.CapabilityVersion != capability.Version || escrow.TrustMode != quote.TrustMode ||
+		escrow.CapabilityVersion != quote.CapabilityVersion || escrow.TrustMode != quote.TrustMode ||
 		escrow.ProofProfile != quote.ProofProfile || escrow.Reserved != expectedReserve {
 		return domain.NewError(domain.ErrSettlementFailed, "recovered escrow does not match the committed Job/Quote", false)
 	}
@@ -92,7 +98,13 @@ func (s *JobService) recoverOrCreateEscrowUnderLock(ctx context.Context, job dom
 	}
 	return s.core.CreateEscrow(ctx, toscore.CreateEscrowRequest{
 		QuoteID: quote.ID, JobID: job.ID,
-		CapabilityID: capability.ID, CapabilityVersion: capability.Version,
+		// CapabilityVersion is the Quote's own frozen version, not the
+		// (possibly since-updated) live Capability's current one -- the
+		// escrow/settlement/dispute audit trail must reference exactly
+		// what the Job actually executed against, matching
+		// domain.Job.CapabilityVersion and every other frozen-Quote
+		// consumer (internal/service/billing.go, dispute.go).
+		CapabilityID: capability.ID, CapabilityVersion: quote.CapabilityVersion,
 		PrincipalID: job.PrincipalID, ProviderID: capability.ProviderID,
 		TrustMode: quote.TrustMode, ProofProfile: quote.ProofProfile,
 		Settlement: quote.Settlement,
@@ -133,7 +145,18 @@ func (s *JobService) prepareExecutionUnderLock(ctx context.Context, jobID string
 		return s.markEconomicReconciliationUnderLock(ctx, job.ID, job.EconomicState, domain.JobFailed, domain.ErrCapabilityUnavailable, "capability unavailable while economic recovery is required"), domain.Capability{}, err
 	}
 	capability = normalizeCapability(capability)
-	if capability.Version != quote.CapabilityVersion || capability.ProviderID != quote.ProviderID || job.TrustMode != quote.TrustMode || job.ProofProfile != quote.ProofProfile {
+	// capability.Version is deliberately NOT compared against
+	// quote.CapabilityVersion here, for the same reason
+	// internal/service/job.go's submit no longer does: an already-issued
+	// Quote/Job MUST continue to use its frozen version/binding semantics
+	// after a later Capability update (atos-spec
+	// docs/IMPLEMENTATION_ROADMAP.md §7.1.0). The remaining three checks
+	// are unrelated data-integrity sanity checks (provider_id is immutable
+	// via Update; job.TrustMode/ProofProfile were themselves frozen from
+	// this same quote at Job creation, so a mismatch here would indicate
+	// storage corruption, not a legitimate live-configuration change) and
+	// stay live-checked.
+	if capability.ProviderID != quote.ProviderID || job.TrustMode != quote.TrustMode || job.ProofProfile != quote.ProofProfile {
 		if job.EconomicState == domain.EconomicNone {
 			failed := s.finalizeNoEconomyUnderLock(ctx, job, domain.JobFailed, domain.ErrQuoteMismatch, "execution contract no longer matches quote")
 			return failed, capability, nil
