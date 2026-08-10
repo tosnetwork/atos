@@ -203,7 +203,9 @@ func (s *ExecutionSignerService) Authorize(ctx context.Context, in AuthorizeSign
 			existing.NewExecutionSignerID == in.ExecutionSignerID &&
 			bytes.Equal(existing.NewSignerPublicKey, in.SignerPublicKey) &&
 			existing.NewSignatureAlgorithm == in.SignatureAlgorithm &&
+			existing.NewValidFromExplicit == in.ValidFromExplicit &&
 			(!in.ValidFromExplicit || existing.NewValidFrom.Equal(in.ValidFrom)) &&
+			existing.NewValidUntilExplicit == in.ValidUntilExplicit &&
 			(!in.ValidUntilExplicit || existing.NewValidUntil.Equal(in.ValidUntil))
 	})
 	if err != nil {
@@ -238,6 +240,8 @@ func (s *ExecutionSignerService) Authorize(ctx context.Context, in AuthorizeSign
 				NewSignatureAlgorithm: in.SignatureAlgorithm,
 				NewValidFrom:          in.ValidFrom,
 				NewValidUntil:         in.ValidUntil,
+				NewValidFromExplicit:  in.ValidFromExplicit,
+				NewValidUntilExplicit: in.ValidUntilExplicit,
 				CreatedAt:             now, UpdatedAt: now,
 			}, nil
 		})
@@ -363,7 +367,9 @@ func (s *ExecutionSignerService) Rotate(ctx context.Context, in RotateSignerInpu
 			bytes.Equal(existing.NewSignerPublicKey, in.NewSignerPublicKey) &&
 			existing.NewSignatureAlgorithm == in.NewSignatureAlgorithm &&
 			existing.RevocationReasonCode == in.RevocationReasonCode &&
+			existing.NewValidFromExplicit == in.NewValidFromExplicit &&
 			(!in.NewValidFromExplicit || existing.NewValidFrom.Equal(in.NewValidFrom)) &&
+			existing.NewValidUntilExplicit == in.NewValidUntilExplicit &&
 			(!in.NewValidUntilExplicit || existing.NewValidUntil.Equal(in.NewValidUntil))
 	})
 	if err != nil {
@@ -395,6 +401,8 @@ func (s *ExecutionSignerService) Rotate(ctx context.Context, in RotateSignerInpu
 				NewSignatureAlgorithm: in.NewSignatureAlgorithm,
 				NewValidFrom:          in.NewValidFrom,
 				NewValidUntil:         in.NewValidUntil,
+				NewValidFromExplicit:  in.NewValidFromExplicit,
+				NewValidUntilExplicit: in.NewValidUntilExplicit,
 				OldAuthorizationID:    currentAuthorizationID,
 				OldExecutionSignerID:  currentExecutionSignerID,
 				RevocationReasonCode:  in.RevocationReasonCode,

@@ -25,6 +25,18 @@ CREATE TABLE IF NOT EXISTS execution_signer_operations (
     new_signature_algorithm  TEXT NOT NULL DEFAULT '',
     new_valid_from           TIMESTAMPTZ,
     new_valid_until          TIMESTAMPTZ,
+    -- new_valid_from_explicit/new_valid_until_explicit record whether the
+    -- CALLER supplied the corresponding field, as opposed to the transport
+    -- layer (httpapi/mcp) defaulting it from time.Now() because the caller
+    -- omitted it. This is part of the operation's identity, not a lifecycle
+    -- field: an idempotency-key replay that explicitly supplies a
+    -- different value than what was persisted must conflict; a replay
+    -- that OMITS a field the original call explicitly supplied must ALSO
+    -- conflict (it is not the same request merely by having a blank
+    -- field) -- only a replay that omits a field the original call itself
+    -- omitted may resume the original operation's defaulted value.
+    new_valid_from_explicit  BOOLEAN NOT NULL DEFAULT FALSE,
+    new_valid_until_explicit BOOLEAN NOT NULL DEFAULT FALSE,
     new_authorization_ref    TEXT NOT NULL DEFAULT '',
     old_authorization_id     TEXT NOT NULL DEFAULT '',
     old_execution_signer_id  TEXT NOT NULL DEFAULT '',

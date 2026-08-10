@@ -15,7 +15,8 @@ import (
 )
 
 const signerOperationColumns = `id, provider_id, capability_id, capability_version, type, checkpoint, idempotency_key,
-	new_authorization_id, new_execution_signer_id, new_signer_public_key, new_signature_algorithm, new_valid_from, new_valid_until, new_authorization_ref,
+	new_authorization_id, new_execution_signer_id, new_signer_public_key, new_signature_algorithm, new_valid_from, new_valid_until,
+	new_valid_from_explicit, new_valid_until_explicit, new_authorization_ref,
 	old_authorization_id, old_execution_signer_id, revocation_reason_code, failure_reason, content_hash, created_at, completed_at, updated_at`
 
 // signerOperationContentHash summarizes the identity fields that must
@@ -43,6 +44,14 @@ const signerOperationColumns = `id, provider_id, capability_id, capability_versi
 // idempotency-key replay that supplies a different reason code is a
 // different logical request and must conflict, not silently keep whatever
 // reason the first call happened to persist.
+//
+// NewValidFromExplicit/NewValidUntilExplicit are hashed alongside the
+// values themselves: whether the caller explicitly supplied the field is
+// itself part of this operation's identity, not just the value when
+// present -- a replay that OMITS a field the original call explicitly
+// supplied is a different request (see
+// service.ExecutionSignerService.resumeOrConflict's doc comment), not a
+// legitimate transport-retry shape, and must conflict here too.
 func signerOperationContentHash(op domain.ExecutionSignerOperation) string {
 	encoded, _ := json.Marshal(struct {
 		ProviderID, CapabilityID, CapabilityVersion   string
@@ -52,12 +61,14 @@ func signerOperationContentHash(op domain.ExecutionSignerOperation) string {
 		NewSignerPublicKey                            []byte
 		NewSignatureAlgorithm                         string
 		NewValidFromUnixMicro, NewValidUntilUnixMicro int64
+		NewValidFromExplicit, NewValidUntilExplicit   bool
 		OldAuthorizationID, OldExecutionSignerID      string
 		RevocationReasonCode                          string
 	}{
 		op.ProviderID, op.CapabilityID, op.CapabilityVersion, op.Type,
 		op.IdempotencyKey, op.NewExecutionSignerID,
 		op.NewSignerPublicKey, op.NewSignatureAlgorithm, op.NewValidFrom.UnixMicro(), op.NewValidUntil.UnixMicro(),
+		op.NewValidFromExplicit, op.NewValidUntilExplicit,
 		op.OldAuthorizationID, op.OldExecutionSignerID,
 		op.RevocationReasonCode,
 	})
@@ -75,7 +86,8 @@ func signerOperationWriteArgs(op domain.ExecutionSignerOperation) []any {
 	}
 	return []any{
 		op.ID, op.ProviderID, op.CapabilityID, op.CapabilityVersion, string(op.Type), string(op.Checkpoint), op.IdempotencyKey,
-		op.NewAuthorizationID, op.NewExecutionSignerID, op.NewSignerPublicKey, op.NewSignatureAlgorithm, newValidFrom, newValidUntil, op.NewAuthorizationRef,
+		op.NewAuthorizationID, op.NewExecutionSignerID, op.NewSignerPublicKey, op.NewSignatureAlgorithm, newValidFrom, newValidUntil,
+		op.NewValidFromExplicit, op.NewValidUntilExplicit, op.NewAuthorizationRef,
 		op.OldAuthorizationID, op.OldExecutionSignerID, op.RevocationReasonCode, op.FailureReason,
 		signerOperationContentHash(op), op.CreatedAt, op.CompletedAt, op.UpdatedAt,
 	}
@@ -83,15 +95,15 @@ func signerOperationWriteArgs(op domain.ExecutionSignerOperation) []any {
 
 const insertSignerOperationSQL = `
 	INSERT INTO execution_signer_operations (` + signerOperationColumns + `)
-	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
 	ON CONFLICT (provider_id, idempotency_key) DO NOTHING
 `
 
 const upsertSignerOperationSQL = `
 	INSERT INTO execution_signer_operations (` + signerOperationColumns + `)
-	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
 	ON CONFLICT (id) DO UPDATE SET
-		checkpoint=$6, new_authorization_ref=$14, revocation_reason_code=$17, failure_reason=$18, completed_at=$21, updated_at=$22
+		checkpoint=$6, new_authorization_ref=$16, revocation_reason_code=$19, failure_reason=$20, completed_at=$23, updated_at=$24
 `
 
 func scanSignerOperation(row pgx.Row) (domain.ExecutionSignerOperation, error) {
@@ -100,7 +112,8 @@ func scanSignerOperation(row pgx.Row) (domain.ExecutionSignerOperation, error) {
 	var newValidFrom, newValidUntil *time.Time
 	if err := row.Scan(
 		&op.ID, &op.ProviderID, &op.CapabilityID, &op.CapabilityVersion, &opType, &checkpoint, &op.IdempotencyKey,
-		&op.NewAuthorizationID, &op.NewExecutionSignerID, &op.NewSignerPublicKey, &op.NewSignatureAlgorithm, &newValidFrom, &newValidUntil, &op.NewAuthorizationRef,
+		&op.NewAuthorizationID, &op.NewExecutionSignerID, &op.NewSignerPublicKey, &op.NewSignatureAlgorithm, &newValidFrom, &newValidUntil,
+		&op.NewValidFromExplicit, &op.NewValidUntilExplicit, &op.NewAuthorizationRef,
 		&op.OldAuthorizationID, &op.OldExecutionSignerID, &op.RevocationReasonCode, &op.FailureReason,
 		&contentHash, &op.CreatedAt, &op.CompletedAt, &op.UpdatedAt,
 	); err != nil {

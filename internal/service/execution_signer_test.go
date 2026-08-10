@@ -187,6 +187,47 @@ func TestExecutionSignerAuthorize_ExplicitValidityChangeConflicts(t *testing.T) 
 	}
 }
 
+// TestExecutionSignerAuthorize_OmittingPreviouslyExplicitValidityConflicts
+// closes the asymmetric gap the explicit-value-only comparison left open:
+// the FIRST call explicitly supplies valid_until, gets persisted; the
+// SECOND call under the same idempotency_key OMITS valid_until entirely
+// (ValidUntilExplicit=false). Comparing only "if the CURRENT call is
+// explicit, values must match" lets this silently resume the original
+// operation -- the caller has no way to tell "the server defaulted this"
+// from "I deliberately dropped a field I previously set". Explicitness
+// itself must match between the persisted operation and the replay, not
+// just the value when both happen to be explicit.
+func TestExecutionSignerAuthorize_OmittingPreviouslyExplicitValidityConflicts(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	core := toscoremock.NewContractFixture(st)
+	signers := service.NewExecutionSignerService(st, core, capabilities)
+	cap := registerSignerTestCapability(t, capabilities, "agt_sig_validity_omit", domain.TrustModeManaged)
+
+	now := time.Now().UTC()
+	first := service.AuthorizeSignerInput{
+		ProviderID: "agt_sig_validity_omit", CapabilityID: cap.ID,
+		ExecutionSignerID: "signer-validity-omit", SignerPublicKey: testSignerKey(t), SignatureAlgorithm: "ed25519",
+		ValidFrom: now.Add(-time.Minute), ValidUntil: now.Add(24 * time.Hour),
+		ValidFromExplicit: true, ValidUntilExplicit: true,
+		IdempotencyKey: "authz-validity-omit-1",
+	}
+	if _, err := signers.Authorize(ctx, first); err != nil {
+		t.Fatalf("first Authorize: %v", err)
+	}
+
+	// The transport layer would default ValidUntil to a fresh time.Now()-based
+	// value here since the field is omitted -- simulated by leaving ValidUntil
+	// as a different value with ValidUntilExplicit now false.
+	retry := first
+	retry.ValidUntil = now.Add(72 * time.Hour)
+	retry.ValidUntilExplicit = false
+	if _, err := signers.Authorize(ctx, retry); err == nil {
+		t.Fatal("expected omitting a field the original call explicitly supplied to conflict, not silently resume")
+	}
+}
+
 func TestExecutionSignerAuthorize_IdempotentReplayDoesNotCallRPCTwice(t *testing.T) {
 	ctx := context.Background()
 	st := memory.New()
@@ -391,6 +432,46 @@ func TestExecutionSignerRevoke_NotFoundWhenNoCurrentSigner(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected an error revoking when no signer has ever been authorized")
+	}
+}
+
+// TestExecutionSignerRotate_OmittingPreviouslyExplicitValidityConflicts is
+// Rotate's counterpart to the identically-named Authorize test -- see its
+// doc comment for the gap this closes.
+func TestExecutionSignerRotate_OmittingPreviouslyExplicitValidityConflicts(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	core := toscoremock.NewContractFixture(st)
+	signers := service.NewExecutionSignerService(st, core, capabilities)
+	cap := registerSignerTestCapability(t, capabilities, "agt_sig_rotate_validity_omit", domain.TrustModeManaged)
+
+	if _, err := signers.Authorize(ctx, service.AuthorizeSignerInput{
+		ProviderID: "agt_sig_rotate_validity_omit", CapabilityID: cap.ID,
+		ExecutionSignerID: "signer-old-rvo", SignerPublicKey: testSignerKey(t), SignatureAlgorithm: "ed25519",
+		ValidFrom: time.Now().UTC().Add(-time.Minute), ValidUntil: time.Now().UTC().Add(24 * time.Hour),
+		IdempotencyKey: "authz-rvo-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	first := service.RotateSignerInput{
+		ProviderID: "agt_sig_rotate_validity_omit", CapabilityID: cap.ID,
+		NewExecutionSignerID: "signer-new-rvo", NewSignerPublicKey: testSignerKey(t), NewSignatureAlgorithm: "ed25519",
+		NewValidFrom: now.Add(-time.Minute), NewValidUntil: now.Add(24 * time.Hour),
+		NewValidFromExplicit: true, NewValidUntilExplicit: true,
+		RevocationReasonCode: "rotation", IdempotencyKey: "rotate-rvo-1",
+	}
+	if _, err := signers.Rotate(ctx, first); err != nil {
+		t.Fatalf("first Rotate: %v", err)
+	}
+
+	retry := first
+	retry.NewValidUntil = now.Add(72 * time.Hour)
+	retry.NewValidUntilExplicit = false
+	if _, err := signers.Rotate(ctx, retry); err == nil {
+		t.Fatal("expected omitting a field the original Rotate call explicitly supplied to conflict, not silently resume")
 	}
 }
 

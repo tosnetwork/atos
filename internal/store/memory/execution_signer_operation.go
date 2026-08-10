@@ -37,6 +37,14 @@ import (
 // idempotency-key replay that supplies a different reason code is a
 // different logical request and must conflict, not silently keep whatever
 // reason the first call happened to persist.
+//
+// NewValidFromExplicit/NewValidUntilExplicit are hashed alongside the
+// values themselves: whether the caller explicitly supplied the field is
+// itself part of this operation's identity, not just the value when
+// present -- a replay that OMITS a field the original call explicitly
+// supplied is a different request (see
+// service.ExecutionSignerService.resumeOrConflict's doc comment), not a
+// legitimate transport-retry shape, and must conflict here too.
 func signerOperationContentHash(op domain.ExecutionSignerOperation) string {
 	encoded, _ := json.Marshal(struct {
 		ProviderID, CapabilityID, CapabilityVersion   string
@@ -46,12 +54,14 @@ func signerOperationContentHash(op domain.ExecutionSignerOperation) string {
 		NewSignerPublicKey                            []byte
 		NewSignatureAlgorithm                         string
 		NewValidFromUnixMicro, NewValidUntilUnixMicro int64
+		NewValidFromExplicit, NewValidUntilExplicit   bool
 		OldAuthorizationID, OldExecutionSignerID      string
 		RevocationReasonCode                          string
 	}{
 		op.ProviderID, op.CapabilityID, op.CapabilityVersion, op.Type,
 		op.IdempotencyKey, op.NewExecutionSignerID,
 		op.NewSignerPublicKey, op.NewSignatureAlgorithm, op.NewValidFrom.UnixMicro(), op.NewValidUntil.UnixMicro(),
+		op.NewValidFromExplicit, op.NewValidUntilExplicit,
 		op.OldAuthorizationID, op.OldExecutionSignerID,
 		op.RevocationReasonCode,
 	})

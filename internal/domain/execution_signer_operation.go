@@ -87,6 +87,17 @@ type ExecutionSignerOperation struct {
 	NewSignatureAlgorithm string    `json:"new_signature_algorithm,omitempty"`
 	NewValidFrom          time.Time `json:"new_valid_from,omitempty"`
 	NewValidUntil         time.Time `json:"new_valid_until,omitempty"`
+	// NewValidFromExplicit/NewValidUntilExplicit record whether the CALLER
+	// supplied the corresponding field, as opposed to the transport layer
+	// defaulting it because the caller omitted it. Part of this
+	// operation's identity, not a lifecycle field: an idempotency-key
+	// replay must match both whether the field was explicit AND, if so,
+	// its value -- omitting a field the ORIGINAL call explicitly supplied
+	// is a different request, not a legitimate transport-retry shape, and
+	// must conflict like any other changed field. See
+	// service.ExecutionSignerService.resumeOrConflict.
+	NewValidFromExplicit  bool `json:"new_valid_from_explicit,omitempty"`
+	NewValidUntilExplicit bool `json:"new_valid_until_explicit,omitempty"`
 	// NewAuthorizationRef is populated only once tos-protocol's
 	// AuthorizeExecutionSigner call actually succeeds (checkpoint reaches
 	// new_authorized) -- its presence is itself evidence that step
