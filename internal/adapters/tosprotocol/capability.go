@@ -75,6 +75,22 @@ func (c *Client) QuoteExecution(ctx context.Context, req tosai.QuoteExecutionReq
 	if err != nil {
 		return tosai.ServiceExecutionQuote{}, err
 	}
+	// The binding selected here is what QuoteExecution asks tos-protocol to
+	// anchor a ServiceExecutionQuote against; JobService.submit freezes its
+	// own independent domain.SelectBinding result onto the committed Job
+	// (see domain.Job.Binding's doc comment) rather than re-deriving it
+	// from this quote. If a live Capability update lands in between and the
+	// two disagree, tos-protocol's SubmitJob rejects the mismatch
+	// (QUOTE_MISMATCH) rather than silently executing against a binding
+	// nobody actually committed to.
+	selectedBinding, hasBinding := domain.SelectBinding(req.Capability.Bindings, req.TrustMode)
+	var thirdPartyBinding *atostosv1.ThirdPartyBinding
+	if hasBinding {
+		thirdPartyBinding, err = thirdPartyBindingProto(&selectedBinding)
+		if err != nil {
+			return tosai.ServiceExecutionQuote{}, err
+		}
+	}
 	callCtx, cancel := c.callContext(ctx, req.ExecutionDeadline)
 	defer cancel()
 	request := connect.NewRequest(&atostosv1.QuoteExecutionRequest{
@@ -84,6 +100,7 @@ func (c *Client) QuoteExecution(ctx context.Context, req tosai.QuoteExecutionReq
 		InputBytes: req.InputBytes, MaxOutputBytes: req.MaxOutputBytes,
 		ExecutionDeadlineUnixMillis: req.ExecutionDeadline.UnixMilli(),
 		IntendedTrustMode:           requestedMode, IntendedProofProfile: proofProfile(req.ProofProfile),
+		ThirdPartyBinding: thirdPartyBinding,
 	})
 	decorateRequest(c, ctx, request)
 	response, err := c.execution.QuoteExecution(callCtx, request)

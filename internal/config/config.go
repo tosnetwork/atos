@@ -80,6 +80,14 @@ type Config struct {
 	TOSBackend     TOSBackend
 	TOSRPC         TOSRPCConfig
 	PayoutBackend  PayoutBackend
+	// RemoteThirdPartyExecution routes http/mcp/a2a Job execution through
+	// tos-protocol/tos-ai (see internal/adapters/tosai/dispatch.
+	// WithRemoteThirdPartyExecution's doc comment) instead of this process
+	// dialing the provider endpoint directly. Defaults to false: that
+	// stack must actually be deployed with an operator-approved binding
+	// allowlist configured, which is not yet the case for every
+	// TOSBackendRPC deployment.
+	RemoteThirdPartyExecution bool
 }
 
 func Load() (Config, error) {
@@ -114,6 +122,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	remoteThirdParty, err := boolEnv("ATOS_REMOTE_THIRD_PARTY_EXECUTION", false)
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
 		Environment:   environment,
@@ -143,7 +155,8 @@ func Load() (Config, error) {
 			ClientCertFile: strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_CLIENT_CERT_FILE")),
 			ClientKeyFile:  strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_CLIENT_KEY_FILE")),
 		},
-		PayoutBackend: PayoutBackend(strings.ToLower(envOr("ATOS_PAYOUT_BACKEND", string(PayoutBackendDisabled)))),
+		PayoutBackend:             PayoutBackend(strings.ToLower(envOr("ATOS_PAYOUT_BACKEND", string(PayoutBackendDisabled)))),
+		RemoteThirdPartyExecution: remoteThirdParty,
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
