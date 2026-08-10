@@ -137,3 +137,47 @@ func (c *Client) GetProviderStatus(ctx context.Context, providerID string) (bool
 	}
 	return true, nil
 }
+
+// ProbeThirdPartyHealth asks tos-protocol's
+// ExecutionGatewayService.GetProviderStatus to probe binding through the
+// execution/data-plane boundary (tos-protocol -> tos-ai's operator-
+// allowlisted ThirdPartyExecutionService) instead of this process dialing
+// binding.EndpointRef itself -- the remote-path counterpart to
+// provideradapter.ProviderAdapter.Health, per atos-spec
+// docs/THIRD_PARTY_EXECUTION_PLANE.md §3.1 and this repository's own
+// §7.1.1 placement rule. It implements service.ThirdPartyHealthProber.
+func (c *Client) ProbeThirdPartyHealth(ctx context.Context, providerID, capabilityID, capabilityVersion string, binding domain.CapabilityBinding) (domain.AdapterHealthCheck, error) {
+	thirdPartyBinding, err := thirdPartyBindingProto(&binding)
+	if err != nil {
+		return domain.AdapterHealthCheck{}, err
+	}
+	if thirdPartyBinding == nil {
+		return domain.AdapterHealthCheck{}, domain.NewError(domain.ErrValidationFailed, "binding is not a third-party transport", false)
+	}
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	request := connect.NewRequest(&atostosv1.GetProviderStatusRequest{
+		Context: c.requestContext(ctx, providerID, "", time.Time{}), ProviderId: providerID,
+		CapabilityId: capabilityID, ThirdPartyBinding: thirdPartyBinding,
+	})
+	decorateRequest(c, ctx, request)
+	response, err := c.execution.GetProviderStatus(callCtx, request)
+	if err != nil {
+		return domain.AdapterHealthCheck{}, rpcError(err)
+	}
+	if response.Msg == nil {
+		return domain.AdapterHealthCheck{}, domain.NewError(domain.ErrNetworkUnavailable, "tos-protocol returned an empty provider status", true)
+	}
+	check := domain.AdapterHealthCheck{
+		CapabilityID: capabilityID, CapabilityVersion: capabilityVersion,
+		Transport: binding.Transport, EndpointRef: binding.EndpointRef,
+		Status: domain.AdapterHealthUnhealthy, LatencyMS: response.Msg.LatencyUnixMillis,
+		FailureReason: response.Msg.ReasonCode, DeepProbe: response.Msg.DeepProbe,
+		CheckedAt: time.Now().UTC(),
+	}
+	if response.Msg.Readiness == atostosv1.ProviderReadiness_PROVIDER_READINESS_READY {
+		check.Status = domain.AdapterHealthHealthy
+		check.FailureReason = ""
+	}
+	return check, nil
+}

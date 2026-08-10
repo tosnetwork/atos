@@ -21,10 +21,20 @@ type CertificationService struct {
 	store        store.Store
 	capabilities *CapabilityService
 	resolver     *provideradapter.Resolver
+	remoteProber ThirdPartyHealthProber
 }
 
 func NewCertificationService(s store.Store, capabilities *CapabilityService, resolver *provideradapter.Resolver) *CertificationService {
 	return &CertificationService{store: s, capabilities: capabilities, resolver: resolver}
+}
+
+// WithRemoteProber routes third-party transport certification probing
+// through p (the execution/data-plane boundary) instead of dialing
+// binding.EndpointRef from this process via resolver. See
+// ThirdPartyHealthProber's doc comment (internal/service/health.go).
+func (s *CertificationService) WithRemoteProber(p ThirdPartyHealthProber) *CertificationService {
+	s.remoteProber = p
+	return s
 }
 
 type OpenCertificationInput struct {
@@ -97,6 +107,18 @@ func (s *CertificationService) Open(ctx context.Context, in OpenCertificationInp
 	if !created && stored.Status != domain.CertificationPending {
 		// Already reached a terminal outcome -- idempotent no-op replay.
 		return stored, nil
+	}
+
+	if s.remoteProber != nil {
+		check, err := s.remoteProber.ProbeThirdPartyHealth(ctx, in.ProviderID, cap.ID, cap.Version, binding)
+		if err != nil {
+			return s.completeCertification(ctx, stored.ID, domain.CertificationFailed, err.Error(), nil)
+		}
+		evidence := map[string]any{"health_status": string(check.Status), "latency_ms": check.LatencyMS, "deep_probe": check.DeepProbe}
+		if check.Status != domain.AdapterHealthHealthy {
+			return s.completeCertification(ctx, stored.ID, domain.CertificationFailed, check.FailureReason, evidence)
+		}
+		return s.completeCertification(ctx, stored.ID, domain.CertificationPassed, "", evidence)
 	}
 
 	adapter, ok := s.resolver.For(binding.Transport)

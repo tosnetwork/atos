@@ -27,7 +27,16 @@ type AdapterHealthCheck struct {
 	Status            AdapterHealthStatus `json:"status"`
 	LatencyMS         int64               `json:"latency_ms,omitempty"`
 	FailureReason     string              `json:"failure_reason,omitempty"`
-	CheckedAt         time.Time           `json:"checked_at"`
+	// DeepProbe distinguishes bare reachability from a transport-specific
+	// deeper check -- see SandboxCertification's doc comment for the same
+	// distinction applied to certification evidence. Only a remote probe
+	// through tos-protocol/tos-ai's ThirdPartyExecutionService (see
+	// docs/THIRD_PARTY_EXECUTION_PLANE.md §3.1) populates this; a locally
+	// dialed check (provideradapter.ProviderAdapter.Health) never sets it,
+	// since that path's own deeper check is a separate
+	// provideradapter.CertificationProbe step this struct does not carry.
+	DeepProbe bool      `json:"deep_probe,omitempty"`
+	CheckedAt time.Time `json:"checked_at"`
 }
 
 // Stale reports whether this health check is too old to be trusted as

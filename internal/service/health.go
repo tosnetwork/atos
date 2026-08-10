@@ -14,6 +14,20 @@ import (
 // current -- an old success must not be treated as indefinitely fresh.
 const maxHealthAge = 10 * time.Minute
 
+// ThirdPartyHealthProber probes a third-party transport binding through
+// the execution/data-plane boundary (tos-protocol -> tos-ai's operator-
+// allowlisted ThirdPartyExecutionService) instead of this process dialing
+// binding.EndpointRef itself. Implemented by
+// tosprotocol.Client.ProbeThirdPartyHealth -- see atos-spec
+// docs/THIRD_PARTY_EXECUTION_PLANE.md §3.1 and this repository's own
+// §7.1.1 placement rule, which HealthService/CertificationService satisfy
+// only when a prober is configured via WithRemoteProber; a nil prober (the
+// default) keeps dialing binding.EndpointRef locally via resolver, exactly
+// as before this option existed.
+type ThirdPartyHealthProber interface {
+	ProbeThirdPartyHealth(ctx context.Context, providerID, capabilityID, capabilityVersion string, binding domain.CapabilityBinding) (domain.AdapterHealthCheck, error)
+}
+
 // HealthService checks provider adapter reachability per Capability
 // binding and projects per-mode readiness from it. Health is evidence
 // only: nothing here reads or writes domain.ModeSupport/
@@ -22,10 +36,20 @@ type HealthService struct {
 	store        store.Store
 	capabilities *CapabilityService
 	resolver     *provideradapter.Resolver
+	remoteProber ThirdPartyHealthProber
 }
 
 func NewHealthService(s store.Store, capabilities *CapabilityService, resolver *provideradapter.Resolver) *HealthService {
 	return &HealthService{store: s, capabilities: capabilities, resolver: resolver}
+}
+
+// WithRemoteProber routes third-party transport health probing through p
+// (the execution/data-plane boundary) instead of dialing
+// binding.EndpointRef from this process via resolver. See
+// ThirdPartyHealthProber's doc comment.
+func (s *HealthService) WithRemoteProber(p ThirdPartyHealthProber) *HealthService {
+	s.remoteProber = p
+	return s
 }
 
 // isThirdPartyTransport reports whether transport routes through a
@@ -57,11 +81,20 @@ func (s *HealthService) CheckCapability(ctx context.Context, capabilityID string
 			continue
 		}
 		seen[binding.Transport] = true
-		adapter, ok := s.resolver.For(binding.Transport)
-		if !ok {
-			continue
+		var check domain.AdapterHealthCheck
+		if s.remoteProber != nil {
+			var err error
+			check, err = s.remoteProber.ProbeThirdPartyHealth(ctx, cap.ProviderID, cap.ID, cap.Version, binding)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			adapter, ok := s.resolver.For(binding.Transport)
+			if !ok {
+				continue
+			}
+			check = adapter.Health(ctx, binding.EndpointRef)
 		}
-		check := adapter.Health(ctx, binding.EndpointRef)
 		check.CapabilityID = cap.ID
 		check.CapabilityVersion = cap.Version
 		check.Transport = binding.Transport
