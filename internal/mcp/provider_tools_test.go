@@ -374,3 +374,90 @@ func TestDisputeJobTool_InvalidOperationRejected(t *testing.T) {
 		t.Fatal("expected an error for an invalid operation")
 	}
 }
+
+// revokedDeviceToken issues a real device access token carrying scopes,
+// then immediately revokes the issuing device -- modeling a principal
+// whose authorization was granted and has since been withdrawn (as
+// opposed to one who never had it, which the *_HiddenWithoutScope tests
+// above already cover). server.go's handleRequest calls s.authenticate
+// uniformly for every method before any tool-specific dispatch (see
+// server.go's "principal, err := s.authenticate(r)"), so a correctly
+// wired tool must be denied at that same protocol layer, never reached.
+func revokedDeviceToken(t *testing.T, authorization *auth.Service, scopes ...auth.Scope) (token, principalID string) {
+	t.Helper()
+	raw := make([]string, len(scopes))
+	for i, scope := range scopes {
+		raw[i] = string(scope)
+	}
+	grant, err := authorization.StartDevice("test", "MCP Test", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair, err := authorization.ExchangeDevice(grant.DeviceCode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := authorization.RevokeDevice(pair.Principal.ID, pair.Principal.DeviceID); err != nil {
+		t.Fatal(err)
+	}
+	return pair.AccessToken, pair.Principal.ID
+}
+
+// assertDeniedByRevocation asserts resp was rejected at the protocol
+// (authentication) layer -- codeUnauthorized in resp.Error -- not by a
+// domain-level tool error (isError in the result), proving the request
+// never reached the tool handler at all once the issuing device was
+// revoked.
+func assertDeniedByRevocation(t *testing.T, toolName string, resp rpcResponse) {
+	t.Helper()
+	if resp.Error == nil {
+		t.Fatalf("%s: expected a protocol-level auth error after device revocation, got %+v", toolName, resp)
+	}
+	if resp.Error.Code != codeUnauthorized {
+		t.Fatalf("%s: error code = %d, want codeUnauthorized (%d): %+v", toolName, resp.Error.Code, codeUnauthorized, resp.Error)
+	}
+}
+
+func TestProviderJobsTool_DeniedAfterDeviceRevoked(t *testing.T) {
+	h := newProviderToolsHarness(t)
+	token, providerID := revokedDeviceToken(t, h.auth, auth.ScopeProviderJobsRead)
+	h.completedJob(t, providerID, "prn_revoked_1")
+
+	resp := callTool(t, h.server(), token, "atos_provider_jobs", map[string]any{})
+	assertDeniedByRevocation(t, "atos_provider_jobs", resp)
+}
+
+func TestDeliverJobTool_DeniedAfterDeviceRevoked(t *testing.T) {
+	h := newProviderToolsHarness(t)
+	token, providerID := revokedDeviceToken(t, h.auth, auth.ScopeProviderJobsDeliver)
+	job := h.completedJob(t, providerID, "prn_revoked_2")
+
+	resp := callTool(t, h.server(), token, "atos_deliver_job", map[string]any{
+		"job_id": job.ID, "output": map[string]any{}, "idempotency_key": "deliver-revoked-2",
+	})
+	assertDeniedByRevocation(t, "atos_deliver_job", resp)
+}
+
+func TestRequestSettlementTool_DeniedAfterDeviceRevoked(t *testing.T) {
+	h := newProviderToolsHarness(t)
+	token, providerID := revokedDeviceToken(t, h.auth, auth.ScopeSettlementWrite)
+	job := h.completedJob(t, providerID, "prn_revoked_3")
+
+	resp := callTool(t, h.server(), token, "atos_request_settlement", map[string]any{"job_id": job.ID})
+	assertDeniedByRevocation(t, "atos_request_settlement", resp)
+}
+
+func TestDisputeJobTool_DeniedAfterDeviceRevoked(t *testing.T) {
+	h := newProviderToolsHarness(t)
+	job := h.completedJob(t, "agt_dispute_revoked", "prn_revoked_4")
+	d, err := h.disputes.Open(context.Background(), service.OpenDisputeInput{
+		PrincipalID: "prn_revoked_4", JobID: job.ID, Reason: "not delivered", IdempotencyKey: "dispute-open-revoked-4",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, _ := revokedDeviceToken(t, h.auth, auth.ScopeDisputesReview)
+
+	resp := callTool(t, h.server(), token, "atos_dispute_job", map[string]any{"operation": "review", "dispute_id": d.ID})
+	assertDeniedByRevocation(t, "atos_dispute_job", resp)
+}
