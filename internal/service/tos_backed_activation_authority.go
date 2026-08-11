@@ -81,10 +81,15 @@ func (a *TOSBackedActivationAuthority) Evaluate(ctx context.Context, providerID,
 	if err != nil {
 		return false, "", err
 	}
+	// revoked is checked unconditionally, not only inside `if !bound` --
+	// Bound and revoked are independently-sourced signals with no
+	// guarantee they can never both be true at once (a defensive read: if
+	// the underlying implementation is ever wrong about that invariant,
+	// this must still fail closed rather than silently grant).
+	if revoked {
+		return false, ReasonProviderIdentityRevoked, nil
+	}
 	if !bound {
-		if revoked {
-			return false, ReasonProviderIdentityRevoked, nil
-		}
 		return false, ReasonProviderIdentityNotBound, nil
 	}
 	if binding.Network != network {

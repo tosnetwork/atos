@@ -59,7 +59,15 @@ func (c *Client) commitCapability(ctx context.Context, capability domain.Capabil
 }
 
 func (c *Client) QuoteExecution(ctx context.Context, req tosai.QuoteExecutionRequest) (tosai.ServiceExecutionQuote, error) {
-	// capability identity is validated inside commitCapability below.
+	// Checked explicitly here (in addition to commitCapability's own copy of
+	// this same guard below) so a request with BOTH an incomplete
+	// capability identity and a non-future execution_deadline still
+	// reports the identity problem first -- moving this guard into
+	// commitCapability alone would silently reorder it after the deadline
+	// check purely as a side effect of which helper happens to run first.
+	if req.Capability.ID == "" || req.Capability.ProviderID == "" || req.Capability.Version == "" {
+		return tosai.ServiceExecutionQuote{}, domain.NewError(domain.ErrValidationFailed, "capability identity is incomplete", false)
+	}
 	if err := requireFuture(req.ExecutionDeadline, "execution_deadline"); err != nil {
 		return tosai.ServiceExecutionQuote{}, err
 	}

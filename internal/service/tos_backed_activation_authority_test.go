@@ -233,6 +233,68 @@ func TestTOSBackedActivationAuthority_NoSignerDenies(t *testing.T) {
 	}
 }
 
+// boundAndRevokedCore wraps a working *toscoremock.Core and forces
+// ResolvePrincipalBindingStatus to report bound=true together with
+// revoked=true -- a combination the mock's own bookkeeping (a binding is
+// either in principalBindings XOR revokedBindings) can never produce, but
+// that a real tos-protocol server response is not wire-guaranteed to
+// exclude (Bound and Status are independent response fields). This proves
+// TOSBackedActivationAuthority.Evaluate checks revoked unconditionally
+// rather than only inside `if !bound`.
+type boundAndRevokedCore struct {
+	*toscoremock.Core
+	binding domain.PrincipalIdentityBinding
+}
+
+func (c *boundAndRevokedCore) ResolvePrincipalBindingStatus(ctx context.Context, principalID string) (domain.PrincipalIdentityBinding, bool, bool, string, error) {
+	return c.binding, true, true, "test-forced-revocation", nil
+}
+
+func TestTOSBackedActivationAuthority_BoundAndRevokedSimultaneouslyDenies(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	core := toscoremock.NewContractFixture(st)
+	core.SetNetwork("tos-devnet")
+	capabilities.WithManifestAnchor(core)
+	signers := service.NewExecutionSignerService(st, core, capabilities)
+	identities := service.NewIdentityBindingService(st, core)
+	cap := registerSignerTestCapability(t, capabilities, "prn_authority_boundrevoked", domain.TrustModeManaged, domain.TrustModeVerified)
+
+	core.SeedAgentIdentity("agt_prn_authority_boundrevoked")
+	if _, err := identities.Bind(ctx, service.BindIdentityInput{
+		PrincipalID: "prn_authority_boundrevoked", AgentID: "agt_prn_authority_boundrevoked", IdempotencyKey: "bind-boundrevoked",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := signers.Authorize(ctx, service.AuthorizeSignerInput{
+		ProviderID: "prn_authority_boundrevoked", CapabilityID: cap.ID,
+		ExecutionSignerID: "signer-boundrevoked", SignerPublicKey: testSignerKey(t), SignatureAlgorithm: "ed25519",
+		ValidFrom: now.Add(-time.Minute), ValidUntil: now.Add(24 * time.Hour),
+		IdempotencyKey: "authz-boundrevoked",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	wrapped := &boundAndRevokedCore{
+		Core: core,
+		binding: domain.PrincipalIdentityBinding{
+			PrincipalID: "prn_authority_boundrevoked", AgentID: "agt_prn_authority_boundrevoked",
+			Network: "tos-devnet", BindingRef: "ref",
+		},
+	}
+	authority := service.NewTOSBackedActivationAuthority(wrapped, st, signers)
+
+	granted, reasonCode, err := authority.Evaluate(ctx, "prn_authority_boundrevoked", cap.ID, cap.Version, domain.TrustModeVerified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if granted || reasonCode != service.ReasonProviderIdentityRevoked {
+		t.Fatalf("got granted=%v reasonCode=%q, want denied with %q when bound=true and revoked=true are both reported", granted, reasonCode, service.ReasonProviderIdentityRevoked)
+	}
+}
+
 func TestTOSBackedActivationAuthority_RevokedSignerDenies(t *testing.T) {
 	authority, cap, _, signers := tosBackedAuthorityFixture(t, "prn_authority_sigrevoked")
 	ctx := context.Background()

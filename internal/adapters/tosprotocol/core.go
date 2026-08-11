@@ -94,7 +94,14 @@ func (c *Client) ResolvePrincipalBindingStatus(ctx context.Context, principalID 
 		PrincipalID: principalID, AgentID: response.Msg.Identity.AgentId,
 		Network: response.Msg.BindingRef.Network, BindingRef: response.Msg.BindingRef.Reference,
 	}
-	return binding, true, false, "", nil
+	// revoked (computed above from Status) is threaded through here too,
+	// not hardcoded false: Bound and Status are independent response
+	// fields with no wire-level guarantee a conforming server can never
+	// return Bound=true with Status=REVOKED -- hardcoding false here would
+	// let that combination silently discard the revocation fact at the
+	// source, the same discard-instead-of-thread bug class already fixed
+	// once for RevokePrincipalBinding's revoked bool.
+	return binding, true, revoked, response.Msg.RevocationReasonCode, nil
 }
 
 // CreatePrincipalBinding anchors a durable binding from principalID to
