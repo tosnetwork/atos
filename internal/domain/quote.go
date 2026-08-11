@@ -91,7 +91,25 @@ type Quote struct {
 	// record) -- without this field, a LATER call reusing the same key
 	// with genuinely different content would silently receive the old
 	// Quote back instead of being rejected as a conflicting reuse.
-	IdempotencyRequestHash string `json:"idempotency_request_hash,omitempty"`
+	IdempotencyRequestHash string                     `json:"idempotency_request_hash,omitempty"`
+	NetworkID              string                     `json:"network_id,omitempty"`
+	CommitmentDomain       string                     `json:"commitment_domain,omitempty"`
+	RequesterAgentID       string                     `json:"requester_agent_id,omitempty"`
+	ManifestCommitment     string                     `json:"manifest_commitment,omitempty"`
+	OwnershipRef           string                     `json:"ownership_ref,omitempty"`
+	SignerAuthorizationID  string                     `json:"signer_authorization_id,omitempty"`
+	SignerAuthorizationRef string                     `json:"signer_authorization_ref,omitempty"`
+	AssetDecimals          uint32                     `json:"asset_decimals,omitempty"`
+	Commitment             *QuoteCommitmentProjection `json:"commitment,omitempty"`
+}
+
+type QuoteCommitmentProjection struct {
+	State               string `json:"state"`
+	Network             string `json:"network"`
+	Reference           string `json:"reference"`
+	Digest              string `json:"digest"`
+	Finalized           bool   `json:"finalized"`
+	FinalizedCheckpoint uint64 `json:"finalized_checkpoint,omitempty"`
 }
 
 func (q Quote) Expired(now time.Time) bool {
@@ -107,27 +125,28 @@ func (q Quote) Expired(now time.Time) bool {
 // token/network cost for a caller that never needs them: Job responses
 // already carry the same frozen values a Job actually executes against.
 type PublicQuote struct {
-	ID                        string               `json:"quote_id"`
-	CapabilityID              string               `json:"capability_id"`
-	CapabilityVersion         string               `json:"capability_version"`
-	ProviderID                string               `json:"provider_id"`
-	PrincipalID               string               `json:"principal_id,omitempty"`
-	RequestedTrustMode        RequestedTrustMode   `json:"requested_trust_mode"`
-	TrustMode                 TrustMode            `json:"trust_mode"`
-	ProofProfile              ProofProfile         `json:"proof_profile,omitempty"`
-	Price                     Price                `json:"price"`
-	Settlement                SettlementDescriptor `json:"settlement"`
-	Proof                     ProofDescriptor      `json:"proof"`
-	ExpiresAt                 time.Time            `json:"expires_at"`
-	RequiresConfirmation      bool                 `json:"requires_confirmation"`
-	TermsHash                 string               `json:"terms_hash"`
-	DisputePolicyHash         string               `json:"dispute_policy_hash,omitempty"`
-	ServiceQuoteID            string               `json:"service_quote_id,omitempty"`
-	UnderlyingServiceQuoteRef string               `json:"underlying_service_quote_ref,omitempty"`
-	InputSummaryCommitment    string               `json:"input_summary_commitment,omitempty"`
-	ExecutionDeadline         time.Time            `json:"execution_deadline,omitempty"`
-	MeteredRates              *MeteredRates        `json:"metered_rates,omitempty"`
-	PricingModel              PricingModel         `json:"pricing_model,omitempty"`
+	ID                        string                     `json:"quote_id"`
+	CapabilityID              string                     `json:"capability_id"`
+	CapabilityVersion         string                     `json:"capability_version"`
+	ProviderID                string                     `json:"provider_id"`
+	PrincipalID               string                     `json:"principal_id,omitempty"`
+	RequestedTrustMode        RequestedTrustMode         `json:"requested_trust_mode"`
+	TrustMode                 TrustMode                  `json:"trust_mode"`
+	ProofProfile              ProofProfile               `json:"proof_profile,omitempty"`
+	Price                     Price                      `json:"price"`
+	Settlement                SettlementDescriptor       `json:"settlement"`
+	Proof                     ProofDescriptor            `json:"proof"`
+	ExpiresAt                 time.Time                  `json:"expires_at"`
+	RequiresConfirmation      bool                       `json:"requires_confirmation"`
+	TermsHash                 string                     `json:"terms_hash"`
+	DisputePolicyHash         string                     `json:"dispute_policy_hash,omitempty"`
+	ServiceQuoteID            string                     `json:"service_quote_id,omitempty"`
+	UnderlyingServiceQuoteRef string                     `json:"underlying_service_quote_ref,omitempty"`
+	InputSummaryCommitment    string                     `json:"input_summary_commitment,omitempty"`
+	ExecutionDeadline         time.Time                  `json:"execution_deadline,omitempty"`
+	MeteredRates              *MeteredRates              `json:"metered_rates,omitempty"`
+	PricingModel              PricingModel               `json:"pricing_model,omitempty"`
+	Commitment                *QuoteCommitmentProjection `json:"commitment,omitempty"`
 }
 
 // Public returns q's atos-spec-normative public representation -- every
@@ -144,5 +163,25 @@ func (q Quote) Public() PublicQuote {
 		ServiceQuoteID: q.ServiceQuoteID, UnderlyingServiceQuoteRef: q.UnderlyingServiceQuoteRef,
 		InputSummaryCommitment: q.InputSummaryCommitment, ExecutionDeadline: q.ExecutionDeadline,
 		MeteredRates: q.MeteredRates, PricingModel: q.PricingModel,
+		Commitment: q.Commitment,
 	}
+}
+
+type QuoteCommitmentCheckpoint string
+
+const (
+	QuoteCommitmentIntentPersisted QuoteCommitmentCheckpoint = "intent_persisted"
+	QuoteCommitmentReconciling     QuoteCommitmentCheckpoint = "reconciling"
+	QuoteCommitmentCompleted       QuoteCommitmentCheckpoint = "completed"
+)
+
+type QuoteCommitmentOperation struct {
+	QuoteID       string                    `json:"quote_id"`
+	Quote         Quote                     `json:"quote"`
+	ContentHash   string                    `json:"content_hash"`
+	Checkpoint    QuoteCommitmentCheckpoint `json:"checkpoint"`
+	FailureReason string                    `json:"failure_reason,omitempty"`
+	CreatedAt     time.Time                 `json:"created_at"`
+	UpdatedAt     time.Time                 `json:"updated_at"`
+	CompletedAt   *time.Time                `json:"completed_at,omitempty"`
 }

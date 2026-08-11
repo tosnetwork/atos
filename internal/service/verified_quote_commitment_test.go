@@ -1,0 +1,85 @@
+package service_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	toscoremock "github.com/tosnetwork/atos/internal/adapters/toscore/mock"
+	"github.com/tosnetwork/atos/internal/domain"
+	"github.com/tosnetwork/atos/internal/service"
+	"github.com/tosnetwork/atos/internal/store/memory"
+)
+
+func verifiedQuoteHarness(t *testing.T) (*service.QuoteService, *service.ExecutionSignerService, *toscoremock.Core, *memory.Store, domain.Capability) {
+	t.Helper()
+	ctx := context.Background()
+	st := memory.New()
+	core := toscoremock.NewContractFixture(st)
+	core.SetNetwork("tos-test")
+	for _, id := range []string{"requester-agent", "provider-agent"} {
+		core.SeedAgentIdentity(id)
+	}
+	if _, _, err := core.CreatePrincipalBinding(ctx, "gateway", "bind-requester", "requester", "requester-agent"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.CreatePrincipalBinding(ctx, "gateway", "bind-provider", "provider", "provider-agent"); err != nil {
+		t.Fatal(err)
+	}
+	cap := domain.Capability{ID: "cap-verified", ProviderID: "provider", Name: "Verified", Description: "test", Version: "1.0.0", ManifestCommitment: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Status: domain.CapabilityActive, DeliveryMode: domain.DeliveryInstant, InputSchema: map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"}, Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}}, ModeSupport: domain.ModeSupport{domain.TrustModeVerified: {Status: domain.ModeSupportActive, ProofProfile: domain.ProofProfileTOSVerifiedV1}}, SupportedTrustModes: []domain.TrustMode{domain.TrustModeVerified}}
+	ref, err := core.CommitCapabilityManifest(ctx, cap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap.Ownership = domain.CapabilityOwnership{Status: domain.OwnershipAnchored, Network: "tos-test", Commitment: ref}
+	if err := st.Put(ctx, cap); err != nil {
+		t.Fatal(err)
+	}
+	signers := service.NewExecutionSignerService(st, core, service.NewCapabilityService(st))
+	_, err = signers.Authorize(ctx, service.AuthorizeSignerInput{ProviderID: "provider", CapabilityID: cap.ID, ExecutionSignerID: "signer-1", SignerPublicKey: []byte("01234567890123456789012345678901"), SignatureAlgorithm: "ed25519", ValidFrom: time.Now().UTC().Add(-time.Minute), ValidUntil: time.Now().UTC().Add(time.Hour), ValidFromExplicit: true, ValidUntilExplicit: true, IdempotencyKey: "signer-idem"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	quotes := service.NewQuoteService(st).WithVerifiedCommitmentAuthority(core, signers, "atos.im")
+	return quotes, signers, core, st, cap
+}
+
+func TestVerifiedQuoteIsCommittedBeforeUsableAndAutoIsConcrete(t *testing.T) {
+	quotes, _, _, st, cap := verifiedQuoteHarness(t)
+	q, err := quotes.Create(context.Background(), service.CreateQuoteInput{PrincipalID: "requester", CapabilityID: cap.ID, RequestedTrustMode: domain.RequestedTrustAuto, ProofRequirements: domain.ProofRequirements{NetworkVerifiableReceipt: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.TrustMode != domain.TrustModeVerified || q.Commitment == nil || !q.Commitment.Finalized || q.Commitment.State != "committed" {
+		t.Fatalf("quote not canonically committed: %+v", q)
+	}
+	stored, err := st.GetQuote(context.Background(), q.ID)
+	if err != nil || stored.Commitment.Reference != q.Commitment.Reference {
+		t.Fatalf("stored=%+v err=%v", stored, err)
+	}
+	op, err := st.GetQuoteCommitmentOperation(context.Background(), q.ID)
+	if err != nil || op.Checkpoint != domain.QuoteCommitmentCompleted {
+		t.Fatalf("op=%+v err=%v", op, err)
+	}
+}
+
+func TestVerifiedQuoteChangedSemanticsConflictAndJobGate(t *testing.T) {
+	quotes, _, core, st, cap := verifiedQuoteHarness(t)
+	q, err := quotes.Create(context.Background(), service.CreateQuoteInput{PrincipalID: "requester", CapabilityID: cap.ID, RequestedTrustMode: domain.RequestedTrustVerified})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := q
+	mutated.Price.TotalMax = "9.99"
+	if _, err := core.CommitQuote(context.Background(), mutated); err == nil {
+		t.Fatal("changed committed Quote semantics succeeded")
+	}
+	q.Commitment = nil
+	if err := st.PutQuote(context.Background(), q); err != nil {
+		t.Fatal(err)
+	}
+	jobs := service.NewJobService(st, nil, core, service.NewAccountService(st))
+	if _, err := jobs.CreateJob(context.Background(), service.SubmitInput{PrincipalID: "requester", CapabilityID: cap.ID, QuoteID: q.ID, IdempotencyKey: "job-gate"}); err == nil {
+		t.Fatal("job started from uncommitted Verified Quote")
+	}
+}

@@ -18,6 +18,7 @@ type Store struct {
 	mu                         sync.Mutex
 	capabilities               map[string]domain.Capability
 	quotes                     map[string]domain.Quote
+	quoteCommitmentOps         map[string]domain.QuoteCommitmentOperation
 	escrows                    map[string]domain.Escrow
 	receipts                   map[string]domain.Receipt
 	receiptsByJob              map[string]string // jobID -> receiptID
@@ -58,6 +59,7 @@ func New() *Store {
 	return &Store{
 		capabilities:               make(map[string]domain.Capability),
 		quotes:                     make(map[string]domain.Quote),
+		quoteCommitmentOps:         make(map[string]domain.QuoteCommitmentOperation),
 		escrows:                    make(map[string]domain.Escrow),
 		receipts:                   make(map[string]domain.Receipt),
 		receiptsByJob:              make(map[string]string),
@@ -224,6 +226,39 @@ func (s *Store) QuoteByIdempotencyKey(ctx context.Context, principalID, key stri
 		}
 	}
 	return domain.Quote{}, store.ErrNotFound
+}
+
+func (s *Store) OpenQuoteCommitment(_ context.Context, op domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.quoteCommitmentOps[op.QuoteID]; ok {
+		return existing, false, nil
+	}
+	s.quoteCommitmentOps[op.QuoteID] = op
+	return op, true, nil
+}
+func (s *Store) GetQuoteCommitmentOperation(_ context.Context, quoteID string) (domain.QuoteCommitmentOperation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	op, ok := s.quoteCommitmentOps[quoteID]
+	if !ok {
+		return domain.QuoteCommitmentOperation{}, store.ErrNotFound
+	}
+	return op, nil
+}
+func (s *Store) UpdateQuoteCommitmentOperation(_ context.Context, quoteID string, fn func(domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error)) (domain.QuoteCommitmentOperation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	op, ok := s.quoteCommitmentOps[quoteID]
+	if !ok {
+		return domain.QuoteCommitmentOperation{}, store.ErrNotFound
+	}
+	next, err := fn(op)
+	if err != nil {
+		return domain.QuoteCommitmentOperation{}, err
+	}
+	s.quoteCommitmentOps[quoteID] = next
+	return next, nil
 }
 
 func (s *Store) PutEscrow(ctx context.Context, e domain.Escrow) error {

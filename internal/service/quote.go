@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/tosnetwork/atos/internal/adapters/tosai"
+	"github.com/tosnetwork/atos/internal/adapters/toscore"
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/money"
 	"github.com/tosnetwork/atos/internal/store"
@@ -27,9 +28,22 @@ const (
 )
 
 type QuoteService struct {
-	store    store.Store
-	quoter   tosai.Quoter
-	accounts *AccountService
+	store            store.Store
+	quoter           tosai.Quoter
+	accounts         *AccountService
+	core             toscore.Core
+	signers          *ExecutionSignerService
+	commitmentDomain string
+}
+
+func (s *QuoteService) WithVerifiedCommitmentAuthority(core toscore.Core, signers *ExecutionSignerService, domainName string) *QuoteService {
+	s.core = core
+	s.signers = signers
+	s.commitmentDomain = strings.TrimSpace(domainName)
+	if s.commitmentDomain == "" {
+		s.commitmentDomain = "atos.im"
+	}
+	return s
 }
 
 // NewQuoteService accepts an optional provider/Edge quoter. Omitting it keeps
@@ -91,6 +105,10 @@ type CreateQuoteInput struct {
 func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.Quote, error) {
 	if in.IdempotencyKey == "" {
 		q, err := s.buildQuote(ctx, in)
+		if err != nil {
+			return domain.Quote{}, err
+		}
+		q, err = s.commitVerifiedQuote(ctx, q)
 		if err != nil {
 			return domain.Quote{}, err
 		}
@@ -159,6 +177,10 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 	}
 	q.IdempotencyRequestHash = requestHash
 	q.IdempotencyKey = in.IdempotencyKey
+	q, err = s.commitVerifiedQuote(ctx, q)
+	if err != nil {
+		return domain.Quote{}, err
+	}
 	if err := s.store.PutQuote(ctx, q); err != nil {
 		return domain.Quote{}, err
 	}
@@ -364,7 +386,119 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 		// against.
 		hashCommitment(q.Binding), hashCommitment(q.InputSchema), hashCommitment(q.OutputSchema),
 	)
+	if q.TrustMode == domain.TrustModeVerified {
+		if s.core == nil || s.signers == nil || s.core.Network() == "" {
+			return domain.Quote{}, domain.NewError(domain.ErrNetworkUnavailable, "verified quote commitment authority is unavailable", true)
+		}
+		q.NetworkID, q.CommitmentDomain, q.AssetDecimals = s.core.Network(), s.commitmentDomain, quoteDecimals
+		requester, bound, revoked, _, err := s.core.ResolvePrincipalBindingStatus(ctx, q.PrincipalID)
+		if err != nil {
+			return domain.Quote{}, err
+		}
+		if !bound || revoked || requester.Network != q.NetworkID {
+			return domain.Quote{}, domain.NewError(domain.ErrQuoteMismatch, "requester identity is not currently bound on the configured network", false)
+		}
+		q.RequesterAgentID = requester.AgentID
+		provider, providerBound, providerRevoked, _, err := s.core.ResolvePrincipalBindingStatus(ctx, q.ProviderID)
+		if err != nil {
+			return domain.Quote{}, err
+		}
+		if !providerBound || providerRevoked || provider.Network != q.NetworkID {
+			return domain.Quote{}, domain.NewError(domain.ErrQuoteMismatch, "provider identity is not currently bound on the configured network", false)
+		}
+		if cap.ManifestCommitment == "" || cap.Ownership.Status != domain.OwnershipAnchored || cap.Ownership.Network != q.NetworkID || cap.Ownership.Commitment == "" {
+			return domain.Quote{}, domain.NewError(domain.ErrQuoteMismatch, "capability manifest/ownership is not currently anchored", false)
+		}
+		verified, _, err := s.core.VerifyCapabilityOwnership(ctx, q.CapabilityID, q.ProviderID, q.CapabilityVersion, cap.ManifestCommitment)
+		if err != nil {
+			return domain.Quote{}, err
+		}
+		if !verified {
+			return domain.Quote{}, domain.NewError(domain.ErrQuoteMismatch, "capability ownership is not current", false)
+		}
+		q.ManifestCommitment = cap.ManifestCommitment
+		q.OwnershipRef = cap.Ownership.Commitment
+		authID, signerID, found, err := s.signers.SignerAt(ctx, q.CapabilityID, q.CapabilityVersion)
+		if err != nil {
+			return domain.Quote{}, err
+		}
+		if !found {
+			return domain.Quote{}, domain.NewError(domain.ErrQuoteMismatch, "execution signer authorization is missing", false)
+		}
+		auth, valid, err := s.core.ResolveExecutionSignerAuthorization(ctx, q.ProviderID, q.CapabilityID, q.CapabilityVersion, signerID, time.Now().UTC())
+		if err != nil {
+			return domain.Quote{}, err
+		}
+		if !valid || auth.Revoked || auth.AuthorizationID != authID || auth.AuthorizationRef == "" {
+			return domain.Quote{}, domain.NewError(domain.ErrQuoteMismatch, "execution signer authorization is stale, revoked, or mismatched", false)
+		}
+		q.SignerAuthorizationID = auth.AuthorizationID
+		q.SignerAuthorizationRef = auth.AuthorizationRef
+		q.TermsHash = termsHash("atos-verified-quote-terms-v1", q.TermsHash, q.NetworkID, q.CommitmentDomain, q.RequesterAgentID, q.ManifestCommitment, q.OwnershipRef, q.SignerAuthorizationID, q.SignerAuthorizationRef, fmt.Sprint(q.AssetDecimals))
+	}
 	return q, nil
+}
+
+func (s *QuoteService) commitVerifiedQuote(ctx context.Context, q domain.Quote) (domain.Quote, error) {
+	if q.TrustMode != domain.TrustModeVerified {
+		return q, nil
+	}
+	contentHash := termsHash("atos-verified-quote-operation-v1", q.ID, q.TermsHash, q.NetworkID, q.CommitmentDomain, q.ManifestCommitment, q.OwnershipRef, q.SignerAuthorizationID, q.SignerAuthorizationRef)
+	now := time.Now().UTC()
+	op, created, err := s.store.OpenQuoteCommitment(ctx, domain.QuoteCommitmentOperation{QuoteID: q.ID, Quote: q, ContentHash: contentHash, Checkpoint: domain.QuoteCommitmentIntentPersisted, CreatedAt: now, UpdatedAt: now})
+	if err != nil {
+		return domain.Quote{}, err
+	}
+	if !created && op.ContentHash != contentHash {
+		return domain.Quote{}, domain.NewError(domain.ErrIdempotencyConflict, "quote commitment identity has different semantics", false)
+	}
+	q = op.Quote
+	commitment, found, resolveErr := s.core.GetQuoteCommitment(ctx, q.ID)
+	if resolveErr != nil {
+		_, _ = s.store.UpdateQuoteCommitmentOperation(context.Background(), q.ID, func(current domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error) {
+			current.Checkpoint = domain.QuoteCommitmentReconciling
+			current.FailureReason = resolveErr.Error()
+			current.UpdatedAt = time.Now().UTC()
+			return current, nil
+		})
+		return domain.Quote{}, resolveErr
+	}
+	if !found {
+		commitment, err = s.core.CommitQuote(ctx, q)
+		if err != nil {
+			_, _ = s.store.UpdateQuoteCommitmentOperation(context.Background(), q.ID, func(current domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error) {
+				current.Checkpoint = domain.QuoteCommitmentReconciling
+				current.FailureReason = err.Error()
+				current.UpdatedAt = time.Now().UTC()
+				return current, nil
+			})
+			return domain.Quote{}, err
+		}
+	}
+	if err := validateQuoteCommitment(q, commitment); err != nil {
+		return domain.Quote{}, err
+	}
+	q.Commitment = &domain.QuoteCommitmentProjection{State: "committed", Network: commitment.Network, Reference: commitment.Reference, Digest: commitment.Digest, Finalized: commitment.Finalized, FinalizedCheckpoint: commitment.FinalizedCheckpoint}
+	completed := time.Now().UTC()
+	_, err = s.store.UpdateQuoteCommitmentOperation(ctx, q.ID, func(current domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error) {
+		if current.ContentHash != contentHash {
+			return current, domain.NewError(domain.ErrIdempotencyConflict, "quote commitment operation changed", false)
+		}
+		current.Quote = q
+		current.Checkpoint = domain.QuoteCommitmentCompleted
+		current.FailureReason = ""
+		current.UpdatedAt = completed
+		current.CompletedAt = &completed
+		return current, nil
+	})
+	return q, err
+}
+
+func validateQuoteCommitment(q domain.Quote, c toscore.QuoteCommitment) error {
+	if c.Quote.ID != q.ID || c.Quote.TermsHash != q.TermsHash || c.Quote.PrincipalID != q.PrincipalID || c.Quote.ProviderID != q.ProviderID || c.Quote.CapabilityID != q.CapabilityID || c.Quote.CapabilityVersion != q.CapabilityVersion || c.Quote.TrustMode != q.TrustMode || c.Quote.ProofProfile != q.ProofProfile || c.Quote.NetworkID != q.NetworkID || c.Quote.CommitmentDomain != q.CommitmentDomain || c.Quote.RequesterAgentID != q.RequesterAgentID || c.Quote.ManifestCommitment != q.ManifestCommitment || c.Quote.OwnershipRef != q.OwnershipRef || c.Quote.SignerAuthorizationID != q.SignerAuthorizationID || c.Quote.SignerAuthorizationRef != q.SignerAuthorizationRef || c.Quote.Price.Subtotal != q.Price.Subtotal || c.Quote.Price.Fees != q.Price.Fees || c.Quote.Price.TotalMax != q.Price.TotalMax || c.Quote.Price.Currency != q.Price.Currency || c.Quote.AssetDecimals != q.AssetDecimals || !c.Quote.ExpiresAt.Equal(q.ExpiresAt) || !c.Quote.ExecutionDeadline.Equal(q.ExecutionDeadline) || c.Quote.DisputePolicyHash != q.DisputePolicyHash || c.Quote.ServiceQuoteID != q.ServiceQuoteID || c.Network != q.NetworkID || !c.Finalized || c.Reference == "" || c.Digest == "" {
+		return domain.NewError(domain.ErrQuoteMismatch, "canonical quote commitment is absent, non-final, or mismatched", false)
+	}
+	return nil
 }
 
 func quoteGuarantees(mode domain.TrustMode, clientAsset string) (domain.SettlementDescriptor, domain.ProofDescriptor) {
@@ -396,6 +530,24 @@ func (s *QuoteService) Get(ctx context.Context, id string) (domain.Quote, error)
 		q.RequestedTrustMode = domain.RequestedTrustManaged
 		q.TrustMode = domain.TrustModeManaged
 		q.Settlement, q.Proof = quoteGuarantees(q.TrustMode, q.Price.Currency)
+	}
+	if q.TrustMode == domain.TrustModeVerified {
+		if s.core == nil || q.Commitment == nil || q.Commitment.State != "committed" {
+			return domain.Quote{}, domain.NewError(domain.ErrQuoteMismatch, "verified quote is not committed", false)
+		}
+		commitment, found, resolveErr := s.core.GetQuoteCommitment(ctx, q.ID)
+		if resolveErr != nil {
+			return domain.Quote{}, resolveErr
+		}
+		if !found {
+			return domain.Quote{}, domain.NewError(domain.ErrQuoteMismatch, "verified quote commitment is missing", false)
+		}
+		if err := validateQuoteCommitment(q, commitment); err != nil {
+			return domain.Quote{}, err
+		}
+		if q.Commitment.Reference != commitment.Reference || q.Commitment.Digest != commitment.Digest {
+			return domain.Quote{}, domain.NewError(domain.ErrQuoteMismatch, "verified quote commitment projection is mismatched", false)
+		}
 	}
 	return q, nil
 }

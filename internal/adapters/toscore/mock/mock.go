@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
@@ -280,20 +281,42 @@ func (c *Core) UpdateReputationEvidence(ctx context.Context, providerID string, 
 	return nil
 }
 
-func (c *Core) CommitQuote(ctx context.Context, quote domain.Quote) (string, error) {
+func (c *Core) CommitQuote(ctx context.Context, quote domain.Quote) (toscore.QuoteCommitment, error) {
 	if !c.supports(quote.TrustMode) {
-		return "", domain.NewError(domain.ErrNetworkUnavailable, "mock tos-core is not configured for this trust mode", true)
+		return toscore.QuoteCommitment{}, domain.NewError(domain.ErrNetworkUnavailable, "mock tos-core is not configured for this trust mode", true)
 	}
 	if err := domain.ValidateCommittedTrust(quote.TrustMode, quote.ProofProfile); err != nil {
-		return "", err
+		return toscore.QuoteCommitment{}, err
 	}
 	c.mu.Lock()
+	if existing, ok := c.quotes[quote.ID]; ok && !sameQuoteSemantics(existing, quote) {
+		c.mu.Unlock()
+		return toscore.QuoteCommitment{}, domain.NewError(domain.ErrIdempotencyConflict, "quote ID is already committed to different terms", false)
+	}
 	c.quotes[quote.ID] = quote
 	c.mu.Unlock()
 	if c.simulated && quote.TrustMode != domain.TrustModeManaged {
-		return simulatedRef("quote", quote.TrustMode, quote.ID), nil
+		return toscore.QuoteCommitment{Quote: quote, Network: quote.NetworkID, Reference: simulatedRef("quote", quote.TrustMode, quote.ID), Digest: quote.TermsHash, Finalized: true, FinalizedCheckpoint: 1}, nil
 	}
-	return "", nil
+	return toscore.QuoteCommitment{Quote: quote}, nil
+}
+
+func sameQuoteSemantics(a, b domain.Quote) bool {
+	a.Commitment = nil
+	b.Commitment = nil
+	a.CreatedAt = time.Time{}
+	b.CreatedAt = time.Time{}
+	return reflect.DeepEqual(a, b)
+}
+
+func (c *Core) GetQuoteCommitment(_ context.Context, quoteID string) (toscore.QuoteCommitment, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	q, ok := c.quotes[quoteID]
+	if !ok {
+		return toscore.QuoteCommitment{}, false, nil
+	}
+	return toscore.QuoteCommitment{Quote: q, Network: q.NetworkID, Reference: simulatedRef("quote", q.TrustMode, q.ID), Digest: q.TermsHash, Finalized: true, FinalizedCheckpoint: 1}, true, nil
 }
 
 // ResolveExecutionSignerAuthorization scans the real, mutable signer

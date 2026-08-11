@@ -250,19 +250,19 @@ func (c *Client) UpdateReputationEvidence(context.Context, string, string) error
 	return domain.NewError(domain.ErrValidationFailed, "direct reputation evidence is unsupported; commit verified Proof-of-Service evidence instead", false)
 }
 
-func (c *Client) CommitQuote(ctx context.Context, quote domain.Quote) (string, error) {
+func (c *Client) CommitQuote(ctx context.Context, quote domain.Quote) (toscore.QuoteCommitment, error) {
 	if quote.PrincipalID == "" {
-		return "", domain.NewError(domain.ErrQuoteMismatch, "quote principal_id is required by the tos-protocol backend", false)
+		return toscore.QuoteCommitment{}, domain.NewError(domain.ErrQuoteMismatch, "quote principal_id is required by the tos-protocol backend", false)
 	}
 	terms, err := digest(quote.TermsHash)
 	if err != nil {
-		return "", err
+		return toscore.QuoteCommitment{}, err
 	}
 	var dispute *atostosv1.Digest
 	if quote.DisputePolicyHash != "" {
 		dispute, err = digest(quote.DisputePolicyHash)
 		if err != nil {
-			return "", err
+			return toscore.QuoteCommitment{}, err
 		}
 	}
 	// tos-protocol's SubmitJob binds a Job to its Quote by requiring
@@ -281,7 +281,7 @@ func (c *Client) CommitQuote(ctx context.Context, quote domain.Quote) (string, e
 	callCtx, cancel := c.callContext(ctx, quote.ExpiresAt)
 	defer cancel()
 	request := connect.NewRequest(&atostosv1.CommitQuoteRequest{
-		Context: c.requestContext(ctx, quote.PrincipalID, "commit-quote:"+quote.ID, quote.ExpiresAt),
+		Context: c.requestContext(ctx, quote.PrincipalID, quote.ID, quote.ExpiresAt),
 		Quote: &atostosv1.QuoteCommitmentInput{
 			QuoteId: quote.ID, PrincipalId: quote.PrincipalID,
 			ProviderId: quote.ProviderID, CapabilityId: quote.CapabilityID,
@@ -292,24 +292,87 @@ func (c *Client) CommitQuote(ctx context.Context, quote domain.Quote) (string, e
 			ExpiresUnixMillis: quote.ExpiresAt.UnixMilli(),
 			SettlementBackend: string(quote.Settlement.Backend), SettlementAsset: settlementAsset,
 			UnderlyingServiceQuoteRef: underlying,
+			Version:                   "atos_verified_quote_commitment_v1", NetworkId: quote.NetworkID, Domain: quote.CommitmentDomain,
+			RequesterAgentId: quote.RequesterAgentID, ManifestDigest: mustDigest(quote.ManifestCommitment),
+			OwnershipRef: parseReference(quote.NetworkID, quote.OwnershipRef),
+			Subtotal:     &atostosv1.Money{Amount: quote.Price.Subtotal, Currency: quote.Price.Currency}, Fees: &atostosv1.Money{Amount: quote.Price.Fees, Currency: quote.Price.Currency}, AssetDecimals: quote.AssetDecimals,
+			AcceptanceDeadlineUnixMillis: quote.ExpiresAt.UnixMilli(), ExecutionDeadlineUnixMillis: quote.ExecutionDeadline.UnixMilli(),
+			SignerAuthorizationId: quote.SignerAuthorizationID, SignerAuthorizationRef: parseReference(quote.NetworkID, quote.SignerAuthorizationRef),
 		},
 	})
 	decorateRequest(c, ctx, request)
 	response, err := c.trust.CommitQuote(callCtx, request)
 	if err != nil {
-		return "", rpcError(err)
+		return toscore.QuoteCommitment{}, rpcError(err)
 	}
 	if response.Msg == nil || response.Msg.Quote == nil {
-		return "", domain.NewError(domain.ErrNetworkUnavailable, "tos-protocol returned an empty quote commitment", true)
+		return toscore.QuoteCommitment{}, domain.NewError(domain.ErrNetworkUnavailable, "tos-protocol returned an empty quote commitment", true)
 	}
 	ref := reference(response.Msg.Quote.CommitmentRef)
 	if ref != "" {
 		c.proofRefs.Store(quote.ID, ref)
 	}
-	if quote.TrustMode == domain.TrustModeManaged {
-		return "", nil
+	return mapQuoteCommitment(response.Msg.Quote, quote), nil
+}
+
+func (c *Client) GetQuoteCommitment(ctx context.Context, quoteID string) (toscore.QuoteCommitment, bool, error) {
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	request := connect.NewRequest(&atostosv1.GetQuoteCommitmentRequest{Context: c.requestContext(ctx, "atos-gateway", "", time.Time{}), QuoteId: quoteID})
+	decorateRequest(c, ctx, request)
+	response, err := c.trust.GetQuoteCommitment(callCtx, request)
+	if err != nil {
+		return toscore.QuoteCommitment{}, false, rpcError(err)
 	}
-	return ref, nil
+	if response.Msg == nil || !response.Msg.Found || response.Msg.Quote == nil {
+		return toscore.QuoteCommitment{}, false, nil
+	}
+	return mapQuoteCommitment(response.Msg.Quote, domain.Quote{}), true, nil
+}
+
+func mapQuoteCommitment(value *atostosv1.QuoteCommitment, fallback domain.Quote) toscore.QuoteCommitment {
+	ref := value.GetCommitmentRef()
+	digestValue := value.GetCommitmentDigest()
+	digestText := digestString(digestValue)
+	if q := value.GetValue(); q != nil {
+		fallback.ID = q.QuoteId
+		fallback.PrincipalID = q.PrincipalId
+		fallback.ProviderID = q.ProviderId
+		fallback.CapabilityID = q.CapabilityId
+		fallback.CapabilityVersion = q.CapabilityVersion
+		fallback.NetworkID = q.NetworkId
+		fallback.CommitmentDomain = q.Domain
+		fallback.RequesterAgentID = q.RequesterAgentId
+		fallback.ManifestCommitment = digestString(q.ManifestDigest)
+		fallback.OwnershipRef = reference(q.OwnershipRef)
+		fallback.SignerAuthorizationID = q.SignerAuthorizationId
+		fallback.SignerAuthorizationRef = reference(q.SignerAuthorizationRef)
+		fallback.TermsHash = digestString(q.TermsDigest)
+		fallback.DisputePolicyHash = digestString(q.DisputePolicyDigest)
+		fallback.ExpiresAt = time.UnixMilli(q.ExpiresUnixMillis)
+		fallback.ExecutionDeadline = time.UnixMilli(q.ExecutionDeadlineUnixMillis)
+		fallback.TrustMode = domainTrustMode(q.TrustMode)
+		fallback.ProofProfile = domainProofProfile(q.ProofProfile)
+		if q.TotalMax != nil {
+			fallback.Price.TotalMax = q.TotalMax.Amount
+			fallback.Price.Currency = q.TotalMax.Currency
+		}
+		if q.Subtotal != nil {
+			fallback.Price.Subtotal = q.Subtotal.Amount
+		}
+		if q.Fees != nil {
+			fallback.Price.Fees = q.Fees.Amount
+		}
+		fallback.AssetDecimals = q.AssetDecimals
+		fallback.Settlement.Backend = domain.SettlementBackend(q.SettlementBackend)
+		fallback.Settlement.ProviderAsset = q.SettlementAsset
+		fallback.ServiceQuoteID = q.UnderlyingServiceQuoteRef
+	}
+	return toscore.QuoteCommitment{Quote: fallback, Network: ref.GetNetwork(), Reference: ref.GetReference(), Digest: digestText, Finalized: ref.GetFinalized(), FinalizedCheckpoint: ref.GetFinalizedCheckpoint()}
+}
+func mustDigest(value string) *atostosv1.Digest { d, _ := digest(value); return d }
+func parseReference(network, value string) *atostosv1.NetworkReference {
+	return &atostosv1.NetworkReference{Network: network, Reference: strings.TrimPrefix(value, network+":")}
 }
 
 func (c *Client) ResolveExecutionSignerAuthorization(

@@ -52,17 +52,19 @@ type Config struct {
 	// config.TOSRPCConfig.Network's doc comment). Empty means unconfigured
 	// -- Client.Network() then returns "", which TOSBackedActivationAuthority
 	// treats as a hard fail-closed condition, never a wildcard.
-	Network string
+	Network     string
+	TrustDomain string
 }
 
 type Client struct {
-	baseURL    string
-	token      string
-	timeout    time.Duration
-	retention  time.Duration
-	network    string
-	httpClient *http.Client
-	store      store.Store
+	baseURL     string
+	token       string
+	timeout     time.Duration
+	retention   time.Duration
+	network     string
+	trustDomain string
+	httpClient  *http.Client
+	store       store.Store
 
 	identity           atostosv1connect.IdentityServiceClient
 	capability         atostosv1connect.CapabilityServiceClient
@@ -107,6 +109,9 @@ func New(config Config) (*Client, error) {
 	if config.MaxMessageBytes <= 0 || config.MaxMessageBytes > 64<<20 {
 		return nil, errors.New("invalid tos-protocol RPC message limit")
 	}
+	if strings.TrimSpace(config.TrustDomain) == "" {
+		config.TrustDomain = "atos.im"
+	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if parsed.Scheme == "https" {
@@ -145,7 +150,7 @@ func New(config Config) (*Client, error) {
 	client := &Client{
 		baseURL: config.BaseURL, token: config.BearerToken,
 		timeout: config.Timeout, retention: defaultRetention,
-		httpClient: httpClient, store: config.Store, network: config.Network,
+		httpClient: httpClient, store: config.Store, network: config.Network, trustDomain: config.TrustDomain,
 	}
 	client.identity = atostosv1connect.NewIdentityServiceClient(httpClient, config.BaseURL, options...)
 	client.capability = atostosv1connect.NewCapabilityServiceClient(httpClient, config.BaseURL, options...)

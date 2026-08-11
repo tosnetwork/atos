@@ -248,6 +248,9 @@ func main() {
 		disputes.WithFinancialAuthority(financialAdapter)
 	}
 	executionSigners := service.NewExecutionSignerService(st, core, capabilities)
+	if cfg.TOSBackend == config.TOSBackendRPC && cfg.TOSRPC.Network != "" {
+		quotes.WithVerifiedCommitmentAuthority(core, executionSigners, "atos.im")
+	}
 	certifications := service.NewCertificationService(st, capabilities, providerResolver)
 	if remoteProber != nil {
 		certifications.WithRemoteProber(remoteProber)
