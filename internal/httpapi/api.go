@@ -98,6 +98,7 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("DELETE /v1/auth/devices/{id}", s.withScopes(s.handleRevokeDevice))
 
 	mux.HandleFunc("GET /v1/capabilities", s.withScopes(s.handleSearchCapabilities, auth.ScopeCapabilitiesRead))
+	mux.HandleFunc("GET /v1/capabilities/mine", s.withScopes(s.handleListMyCapabilities, auth.ScopeCapabilitiesWrite))
 	mux.HandleFunc("GET /v1/capabilities/{id}", s.withScopes(s.handleGetCapability, auth.ScopeCapabilitiesRead))
 	mux.HandleFunc("POST /v1/capabilities", s.withScopes(s.handleRegisterCapability, auth.ScopeCapabilitiesWrite))
 	mux.HandleFunc("PATCH /v1/capabilities/{id}", s.withScopes(s.handleUpdateCapability, auth.ScopeCapabilitiesWrite))

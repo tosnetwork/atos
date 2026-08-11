@@ -84,6 +84,15 @@ func (s *Server) handleGetCapability(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, cap)
 }
 
+func (s *Server) handleListMyCapabilities(w http.ResponseWriter, r *http.Request) {
+	caps, err := s.Capabilities.ListByProvider(r.Context(), principalFrom(r))
+	if err != nil {
+		writeDomainErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"capabilities": caps})
+}
+
 type registerCapabilityRequest struct {
 	Name                string                     `json:"name"`
 	Description         string                     `json:"description"`
