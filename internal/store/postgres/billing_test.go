@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -324,6 +325,53 @@ func TestUpdateEarningCASConcurrentPayoutTransitionHasSingleWinner(t *testing.T)
 	}
 	if final.Status != domain.EarningPayoutPending {
 		t.Fatalf("final status = %s, want payout_pending", final.Status)
+	}
+}
+
+// TestEarningDedicatedLifecycleColumnsOverrideStalePayload covers rolling
+// upgrades and legacy repairs where the indexed payout checkpoint is newer
+// than the compatibility JSON payload. Financial decisions must observe one
+// coherent relational state rather than combining the new status with an old
+// payout timestamp from payload.
+func TestEarningDedicatedLifecycleColumnsOverrideStalePayload(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	e := testEarning("prov_projection_"+suffix, "job_projection_"+suffix, "settle_projection_"+suffix)
+	e.Status = domain.EarningAvailable
+	if _, _, err := s.CreateEarning(ctx, e); err != nil {
+		t.Fatalf("CreateEarning: %v", err)
+	}
+
+	// Preserve the original Available payload while advancing the dedicated
+	// columns, exactly the mismatch a rolling writer or legacy repair can leave
+	// behind.
+	stalePayload, err := json.Marshal(e)
+	if err != nil {
+		t.Fatalf("marshal stale payload: %v", err)
+	}
+	requestedAt := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := s.Pool().Exec(ctx, `
+		UPDATE provider_earnings
+		SET status='payout_pending', payout_requested_at=$2,
+		    payout_reference='payout_projection', payload=$3
+		WHERE id=$1
+	`, e.ID, requestedAt, stalePayload); err != nil {
+		t.Fatalf("seed mismatched projection: %v", err)
+	}
+
+	got, err := s.GetEarning(ctx, e.ID)
+	if err != nil {
+		t.Fatalf("GetEarning: %v", err)
+	}
+	if got.Status != domain.EarningPayoutPending {
+		t.Fatalf("status = %q, want %q", got.Status, domain.EarningPayoutPending)
+	}
+	if got.PayoutRequestedAt == nil || !got.PayoutRequestedAt.Equal(requestedAt) {
+		t.Fatalf("payout_requested_at = %v, want %v", got.PayoutRequestedAt, requestedAt)
+	}
+	if got.PayoutReference != "payout_projection" {
+		t.Fatalf("payout_reference = %q, want payout_projection", got.PayoutReference)
 	}
 }
 

@@ -178,6 +178,12 @@ func scanEarning(row pgx.Row) (domain.ProviderEarning, error) {
 	if payoutLastAttemptAt != nil {
 		e.PayoutLastAttemptAt = *payoutLastAttemptAt
 	}
+	// Keep a copy of every field backed by a dedicated relational column.
+	// The JSON payload may legitimately lag those columns during a rolling
+	// deployment or a legacy data repair. It carries extensible
+	// fields, but must never override the indexed financial state used by
+	// payout and dispute decisions.
+	columns := e
 	if err := applyPayload(payload, &e); err != nil {
 		return domain.ProviderEarning{}, err
 	}
@@ -186,9 +192,33 @@ func scanEarning(row pgx.Row) (domain.ProviderEarning, error) {
 	// domain.ProviderEarning, so they are never part of payload and
 	// applyPayload cannot touch them; they already hold the values scanned
 	// from their dedicated columns above. Status IS part of the public
-	// payload, so re-assert the dedicated column's value defensively,
-	// mirroring scanJob's convention.
-	e.Status = domain.EarningStatus(status)
+	// payload. Re-assert every dedicated column, including the public payout
+	// timestamps and references: mixing Status from the column with an older
+	// PayoutRequestedAt from payload creates a torn state for concurrent
+	// callers even though PostgreSQL serialized the mutation correctly.
+	e.ID = columns.ID
+	e.ProviderID = columns.ProviderID
+	e.JobID = columns.JobID
+	e.QuoteID = columns.QuoteID
+	e.ReceiptID = columns.ReceiptID
+	e.SettlementID = columns.SettlementID
+	e.CapabilityID = columns.CapabilityID
+	e.CapabilityVersion = columns.CapabilityVersion
+	e.GrossAmount = columns.GrossAmount
+	e.GatewayFee = columns.GatewayFee
+	e.NetAmount = columns.NetAmount
+	e.Status = columns.Status
+	e.CreatedAt = columns.CreatedAt
+	e.MaturesAt = columns.MaturesAt
+	e.AvailableAt = columns.AvailableAt
+	e.PayoutRequestedAt = columns.PayoutRequestedAt
+	e.PayoutReference = columns.PayoutReference
+	e.PaidAt = columns.PaidAt
+	e.PayoutIdempotencyKey = columns.PayoutIdempotencyKey
+	e.PayoutAttempts = columns.PayoutAttempts
+	e.PayoutLastAttemptAt = columns.PayoutLastAttemptAt
+	e.PayoutFailureReason = columns.PayoutFailureReason
+	e.DisputeHoldID = columns.DisputeHoldID
 	return e, nil
 }
 
