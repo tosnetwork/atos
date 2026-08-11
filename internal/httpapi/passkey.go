@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
@@ -32,22 +33,60 @@ import (
 // ReadTimeout, which would also bound GET /v1/jobs/{id}/stream's 5-minute
 // SSE response and blob uploads' 15-minute upload TTL -- see
 // cmd/api/main.go's httpServer construction for that reasoning.
-const passkeyFinishReadDeadline = 10 * time.Second
+// var, not const, so tests can shrink it and prove the deadline actually
+// fires within a bounded, fast test run rather than waiting out the real
+// production value.
+var passkeyFinishReadDeadline = 10 * time.Second
 
 // clientIP identifies the caller for rate-limiting purposes only -- never
-// as an identity or authorization signal. Deliberately does NOT trust any
-// proxy header (X-Real-IP, X-Forwarded-For, ...): atos has no configured,
-// verified trusted-reverse-proxy boundary (the same gap docs/AUTH.md's
-// "Human Account Authentication" section exists to start closing), so
-// trusting a client-suppliable header here would let every anonymous
-// caller pick their own rate-limit bucket per request and bypass the
-// limiter entirely. RemoteAddr is the TCP connection's actual source
-// address, which an HTTP client cannot spoof on its own.
-func clientIP(r *http.Request) string {
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
+// as an identity or authorization signal. The forwarded-IP headers
+// (X-Real-IP, X-Forwarded-For) are trusted ONLY when the request's actual
+// TCP peer address falls inside s.TrustedProxyCIDRs (config
+// ATOS_TRUSTED_PROXY_CIDRS, empty/unset by default) -- an HTTP client
+// cannot spoof its own TCP source address, but it CAN set any header value
+// it likes, so trusting a header from an untrusted peer would let every
+// anonymous caller pick its own rate-limit bucket per request. The
+// opposite failure mode matters too: if ATOS actually runs behind a load
+// balancer/ingress/CDN and this is left unconfigured, every request
+// resolves to that proxy's own single address and shares one rate-limit
+// bucket -- set TrustedProxyCIDRs to the proxy's real address range to
+// avoid that. Single-hop only (the first/only forwarded value is used, no
+// X-Forwarded-For chain-walking) -- sufficient for one reverse proxy
+// directly in front of ATOS, not a multi-hop proxy chain.
+func (s *Server) clientIP(r *http.Request) string {
+	peer, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		peer = r.RemoteAddr
 	}
-	return r.RemoteAddr
+	if !s.peerIsTrustedProxy(peer) {
+		return peer
+	}
+	if ip := strings.TrimSpace(r.Header.Get("X-Real-IP")); ip != "" {
+		return ip
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if first, _, ok := strings.Cut(xff, ","); ok {
+			return strings.TrimSpace(first)
+		}
+		return strings.TrimSpace(xff)
+	}
+	return peer
+}
+
+func (s *Server) peerIsTrustedProxy(peer string) bool {
+	if len(s.TrustedProxyCIDRs) == 0 {
+		return false
+	}
+	parsed := net.ParseIP(peer)
+	if parsed == nil {
+		return false
+	}
+	for _, cidr := range s.TrustedProxyCIDRs {
+		if cidr.Contains(parsed) {
+			return true
+		}
+	}
+	return false
 }
 
 // writePasskeyErr never forwards a raw internal error string to an
@@ -85,7 +124,7 @@ func (s *Server) writePasskeyErr(w http.ResponseWriter, r *http.Request, err err
 }
 
 func (s *Server) handleBeginPasskeyRegistration(w http.ResponseWriter, r *http.Request) {
-	ceremonyID, options, err := s.Passkeys.BeginRegistration(r.Context(), clientIP(r))
+	ceremonyID, options, err := s.Passkeys.BeginRegistration(r.Context(), s.clientIP(r))
 	if err != nil {
 		s.writePasskeyErr(w, r, err)
 		return
@@ -93,9 +132,31 @@ func (s *Server) handleBeginPasskeyRegistration(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusOK, map[string]any{"ceremony_id": ceremonyID, "options": options})
 }
 
+// applyFinishReadDeadline bounds how long reading the (already
+// size-bounded) request body may take, and returns a func the caller MUST
+// defer to clear the deadline again before returning -- SetReadDeadline
+// sets an ABSOLUTE deadline on the underlying connection, and HTTP/1.1
+// keep-alive connections are reused across requests, so leaving a short
+// deadline in place after this handler finishes would corrupt reads for
+// whatever unrelated request lands on the same connection next. A failure
+// to set the deadline (e.g. a ResponseWriter that genuinely does not
+// support it, unlike the real server after statusRecorder's Unwrap fix) is
+// logged, not silently discarded -- MaxBytesReader still bounds total
+// damage either way, but a silent failure here is exactly the kind of bug
+// that let the read-deadline defense go unnoticed as ineffective before.
+func (s *Server) applyFinishReadDeadline(w http.ResponseWriter, r *http.Request) func() {
+	rc := http.NewResponseController(w)
+	if err := rc.SetReadDeadline(time.Now().Add(passkeyFinishReadDeadline)); err != nil && s.Logger != nil {
+		s.Logger.Warn("passkey finish route could not set a read deadline", "error", err, "path", r.URL.Path)
+	}
+	return func() {
+		_ = rc.SetReadDeadline(time.Time{})
+	}
+}
+
 func (s *Server) handleFinishPasskeyRegistration(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestJSONBytes)
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(passkeyFinishReadDeadline))
+	defer s.applyFinishReadDeadline(w, r)()
 	pair, err := s.Passkeys.FinishRegistration(r.Context(), r.PathValue("ceremony_id"), r)
 	if err != nil {
 		s.writePasskeyErr(w, r, err)
@@ -105,7 +166,7 @@ func (s *Server) handleFinishPasskeyRegistration(w http.ResponseWriter, r *http.
 }
 
 func (s *Server) handleBeginPasskeyLogin(w http.ResponseWriter, r *http.Request) {
-	ceremonyID, options, err := s.Passkeys.BeginLogin(r.Context(), clientIP(r))
+	ceremonyID, options, err := s.Passkeys.BeginLogin(r.Context(), s.clientIP(r))
 	if err != nil {
 		s.writePasskeyErr(w, r, err)
 		return
@@ -115,7 +176,7 @@ func (s *Server) handleBeginPasskeyLogin(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleFinishPasskeyLogin(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestJSONBytes)
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(passkeyFinishReadDeadline))
+	defer s.applyFinishReadDeadline(w, r)()
 	pair, err := s.Passkeys.FinishLogin(r.Context(), r.PathValue("ceremony_id"), r)
 	if err != nil {
 		s.writePasskeyErr(w, r, err)

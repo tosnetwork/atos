@@ -82,6 +82,19 @@ func (w *statusRecorder) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap lets http.ResponseController see past this wrapper to the
+// underlying writer -- without it, ResponseController.SetReadDeadline/
+// SetWriteDeadline (used by internal/httpapi/passkey.go's anonymous
+// finish routes to bound slow-body reads) silently fails with
+// http.ErrNotSupported for every request that passes through this
+// middleware, i.e. every request the real server ever handles, since
+// Middleware wraps the whole mux. This is the standard library's own
+// documented mechanism for exactly this situation (net/http's
+// ResponseController docs: "If a ResponseWriter implements Unwrap...").
+func (w *statusRecorder) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 // Middleware wraps the whole HTTP mux (REST + MCP + A2A all multiplex
 // through one *http.ServeMux in cmd/api/main.go, so wrapping it once
 // covers all three transports docs/ARCHITECTURE.md names). It reads an

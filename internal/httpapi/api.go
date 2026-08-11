@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 
@@ -83,6 +84,11 @@ type Server struct {
 	// instead of it. Empty means admin-scoped grants can never be
 	// approved, matching secureEqual's own empty-vs-nonempty rejection.
 	AdminApprovalToken string
+	// TrustedProxyCIDRs mirrors config.Config.TrustedProxyCIDRs, parsed
+	// once at startup -- see clientIP's doc comment (internal/httpapi/
+	// passkey.go) for why an unconfigured (nil) value means forwarded-IP
+	// headers are never trusted.
+	TrustedProxyCIDRs []*net.IPNet
 }
 
 func (s *Server) Mux() *http.ServeMux {

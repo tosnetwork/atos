@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -231,6 +232,20 @@ func main() {
 	}
 	passkeys := service.NewPasskeyService(st, webAuthnInstance, authorization)
 
+	// config.Config.Validate already confirmed every entry parses as a
+	// CIDR, so this only ever fails on a config/validate drift, not on
+	// anything an operator can trigger by misconfiguring
+	// ATOS_TRUSTED_PROXY_CIDRS at runtime.
+	trustedProxyCIDRs := make([]*net.IPNet, 0, len(cfg.TrustedProxyCIDRs))
+	for _, raw := range cfg.TrustedProxyCIDRs {
+		_, parsed, err := net.ParseCIDR(raw)
+		if err != nil {
+			logger.Error("invalid trusted proxy CIDR", "cidr", raw, "error", err)
+			os.Exit(2)
+		}
+		trustedProxyCIDRs = append(trustedProxyCIDRs, parsed)
+	}
+
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
 	defer reconcileCancel()
 	go jobs.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
@@ -280,6 +295,7 @@ func main() {
 		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts,
 		Earnings: earnings, Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 		ApprovalToken: cfg.Auth.ApprovalToken, AdminApprovalToken: cfg.Auth.AdminApprovalToken,
+		TrustedProxyCIDRs: trustedProxyCIDRs,
 	}
 	mcpServer := &mcp.Server{
 		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -195,5 +196,53 @@ func TestPasskeyHTTP_RateLimitCannotBeBypassedBySpoofedHeader(t *testing.T) {
 	}
 	if last.Code != http.StatusTooManyRequests {
 		t.Fatalf("11th request (with a fresh spoofed X-Real-IP each time) status = %d, want 429 -- rate limiting must key on the real connection address, not a client-suppliable header: %s", last.Code, last.Body.String())
+	}
+}
+
+func TestClientIP_IgnoresForwardedHeaderWithoutTrustedProxyConfig(t *testing.T) {
+	server := &Server{}
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "192.0.2.1:5555"
+	req.Header.Set("X-Real-IP", "203.0.113.99")
+
+	if got := server.clientIP(req); got != "192.0.2.1" {
+		t.Fatalf("clientIP = %q, want the real peer address (192.0.2.1) since no trusted proxy is configured", got)
+	}
+}
+
+func TestClientIP_TrustsForwardedHeaderOnlyFromConfiguredProxyCIDR(t *testing.T) {
+	_, trustedCIDR, err := net.ParseCIDR("192.0.2.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{TrustedProxyCIDRs: []*net.IPNet{trustedCIDR}}
+
+	trusted := httptest.NewRequest(http.MethodPost, "/", nil)
+	trusted.RemoteAddr = "192.0.2.1:5555" // inside the trusted CIDR
+	trusted.Header.Set("X-Real-IP", "203.0.113.99")
+	if got := server.clientIP(trusted); got != "203.0.113.99" {
+		t.Fatalf("clientIP = %q, want the forwarded address (203.0.113.99) since the peer is a trusted proxy", got)
+	}
+
+	untrusted := httptest.NewRequest(http.MethodPost, "/", nil)
+	untrusted.RemoteAddr = "198.51.100.1:5555" // outside the trusted CIDR
+	untrusted.Header.Set("X-Real-IP", "203.0.113.99")
+	if got := server.clientIP(untrusted); got != "198.51.100.1" {
+		t.Fatalf("clientIP = %q, want the real peer address (198.51.100.1) -- an untrusted peer's forwarded header must never be trusted even when SOME proxy CIDR is configured", got)
+	}
+}
+
+func TestClientIP_FallsBackToForwardedForWhenNoRealIP(t *testing.T) {
+	_, trustedCIDR, err := net.ParseCIDR("192.0.2.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{TrustedProxyCIDRs: []*net.IPNet{trustedCIDR}}
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "192.0.2.1:5555"
+	req.Header.Set("X-Forwarded-For", "203.0.113.7, 192.0.2.1")
+	if got := server.clientIP(req); got != "203.0.113.7" {
+		t.Fatalf("clientIP = %q, want the first X-Forwarded-For entry (203.0.113.7)", got)
 	}
 }

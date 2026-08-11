@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -90,17 +91,31 @@ type ManagedAccountConfig struct {
 }
 
 type Config struct {
-	Environment    Environment
-	Addr           string
-	DatabaseURL    string
-	BlobDir        string
-	PublicBaseURL  string
-	Auth           AuthConfig
-	WebAuthn       WebAuthnConfig
-	ManagedAccount ManagedAccountConfig
-	TOSBackend     TOSBackend
-	TOSRPC         TOSRPCConfig
-	PayoutBackend  PayoutBackend
+	Environment   Environment
+	Addr          string
+	DatabaseURL   string
+	BlobDir       string
+	PublicBaseURL string
+	// TrustedProxyCIDRs lists the network ranges a forwarded-client-IP
+	// header (X-Real-IP / X-Forwarded-For) may be trusted from --
+	// currently consumed only by internal/httpapi's passkey rate limiter
+	// (see httpapi.Server.clientIP). Empty by default: with no configured
+	// trusted proxy, a forwarded header is never trusted and the raw TCP
+	// peer address is used instead, since trusting an arbitrary caller-
+	// suppliable header would let every anonymous caller pick their own
+	// rate-limit bucket per request. Set this explicitly (and only to the
+	// real load balancer/ingress/CDN's own address range) when ATOS is
+	// deployed behind one -- otherwise every request behind that proxy
+	// resolves to the SAME address and shares one rate-limit bucket,
+	// which is a real, separate problem from the spoofing one this
+	// defaults-empty behavior prevents.
+	TrustedProxyCIDRs []string
+	Auth              AuthConfig
+	WebAuthn          WebAuthnConfig
+	ManagedAccount    ManagedAccountConfig
+	TOSBackend        TOSBackend
+	TOSRPC            TOSRPCConfig
+	PayoutBackend     PayoutBackend
 	// RemoteThirdPartyExecution routes http/mcp/a2a Job execution through
 	// tos-protocol/tos-ai (see internal/adapters/tosai/dispatch.
 	// WithRemoteThirdPartyExecution's doc comment) instead of this process
@@ -149,11 +164,12 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		Environment:   environment,
-		Addr:          envOr("ATOS_ADDR", ":8080"),
-		DatabaseURL:   strings.TrimSpace(os.Getenv("ATOS_DATABASE_URL")),
-		BlobDir:       envOr("ATOS_BLOB_DIR", "./data/blobs"),
-		PublicBaseURL: envOr("ATOS_PUBLIC_BASE_URL", "http://localhost:8080"),
+		Environment:       environment,
+		Addr:              envOr("ATOS_ADDR", ":8080"),
+		DatabaseURL:       strings.TrimSpace(os.Getenv("ATOS_DATABASE_URL")),
+		BlobDir:           envOr("ATOS_BLOB_DIR", "./data/blobs"),
+		PublicBaseURL:     envOr("ATOS_PUBLIC_BASE_URL", "http://localhost:8080"),
+		TrustedProxyCIDRs: splitAndTrim(strings.TrimSpace(os.Getenv("ATOS_TRUSTED_PROXY_CIDRS"))),
 		Auth: AuthConfig{
 			AutoApprove:        autoApprove,
 			StatePath:          strings.TrimSpace(os.Getenv("ATOS_AUTH_STATE_PATH")),
@@ -164,7 +180,7 @@ func Load() (Config, error) {
 		WebAuthn: WebAuthnConfig{
 			RPID:          strings.TrimSpace(os.Getenv("ATOS_WEBAUTHN_RP_ID")),
 			RPDisplayName: envOr("ATOS_WEBAUTHN_RP_NAME", "ATOS"),
-			RPOrigins:     webAuthnOrigins(strings.TrimSpace(os.Getenv("ATOS_WEBAUTHN_RP_ORIGINS"))),
+			RPOrigins:     splitAndTrim(strings.TrimSpace(os.Getenv("ATOS_WEBAUTHN_RP_ORIGINS"))),
 		},
 		ManagedAccount: ManagedAccountConfig{
 			Currency:       strings.ToUpper(envOr("ATOS_MANAGED_CURRENCY", "USD")),
@@ -215,6 +231,11 @@ func (c Config) Validate() error {
 	}
 	if parsedBase.Path != "" && parsedBase.Path != "/" {
 		return errors.New("ATOS_PUBLIC_BASE_URL must not contain a path prefix")
+	}
+	for _, cidr := range c.TrustedProxyCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("ATOS_TRUSTED_PROXY_CIDRS contains an invalid CIDR %q: %w", cidr, err)
+		}
 	}
 	if c.Auth.TokenTTL <= 0 || c.Auth.TokenTTL > 30*24*time.Hour ||
 		c.Auth.DeviceTTL <= 0 || c.Auth.DeviceTTL > time.Hour ||
@@ -287,7 +308,9 @@ func (c Config) Validate() error {
 // webAuthnOrigins splits a comma-separated ATOS_WEBAUTHN_RP_ORIGINS value,
 // trimming whitespace around each entry. An empty input yields an empty
 // slice -- the caller defaults it from PublicBaseURL afterward.
-func webAuthnOrigins(raw string) []string {
+// splitAndTrim splits a comma-separated value, trimming whitespace around
+// each entry and dropping empty ones. An empty input yields a nil slice.
+func splitAndTrim(raw string) []string {
 	if raw == "" {
 		return nil
 	}

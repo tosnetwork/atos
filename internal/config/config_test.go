@@ -165,7 +165,7 @@ func clearEnvironment(t *testing.T) {
 		"ATOS_TOS_RPC_TIMEOUT", "ATOS_TOS_RPC_MAX_MESSAGE_BYTES", "ATOS_TOS_RPC_SERVER_NAME",
 		"ATOS_TOS_RPC_CA_FILE", "ATOS_TOS_RPC_CLIENT_CERT_FILE", "ATOS_TOS_RPC_CLIENT_KEY_FILE",
 		"ATOS_PAYOUT_BACKEND",
-		"ATOS_WEBAUTHN_RP_ID", "ATOS_WEBAUTHN_RP_NAME", "ATOS_WEBAUTHN_RP_ORIGINS",
+		"ATOS_WEBAUTHN_RP_ID", "ATOS_WEBAUTHN_RP_NAME", "ATOS_WEBAUTHN_RP_ORIGINS", "ATOS_TRUSTED_PROXY_CIDRS",
 	} {
 		t.Setenv(name, "")
 	}
@@ -204,5 +204,36 @@ func TestLoadWebAuthnEnabledDerivesOriginFromPublicBaseURL(t *testing.T) {
 	}
 	if len(cfg.WebAuthn.RPOrigins) != 1 || cfg.WebAuthn.RPOrigins[0] != "https://atos.im" {
 		t.Fatalf("WebAuthn.RPOrigins = %v, want [https://atos.im]", cfg.WebAuthn.RPOrigins)
+	}
+}
+
+func TestLoadDefaultsTrustedProxyCIDRsEmpty(t *testing.T) {
+	clearEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TrustedProxyCIDRs) != 0 {
+		t.Fatalf("TrustedProxyCIDRs = %v, want empty by default -- an unconfigured deployment must never trust a forwarded-IP header", cfg.TrustedProxyCIDRs)
+	}
+}
+
+func TestLoadParsesTrustedProxyCIDRs(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ATOS_TRUSTED_PROXY_CIDRS", "10.0.0.0/8, 172.16.0.0/12")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TrustedProxyCIDRs) != 2 || cfg.TrustedProxyCIDRs[0] != "10.0.0.0/8" || cfg.TrustedProxyCIDRs[1] != "172.16.0.0/12" {
+		t.Fatalf("TrustedProxyCIDRs = %v, want [10.0.0.0/8 172.16.0.0/12]", cfg.TrustedProxyCIDRs)
+	}
+}
+
+func TestLoadRejectsInvalidTrustedProxyCIDR(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ATOS_TRUSTED_PROXY_CIDRS", "not-a-cidr")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "ATOS_TRUSTED_PROXY_CIDRS") {
+		t.Fatalf("Load() error = %v, want an invalid trusted proxy CIDR error", err)
 	}
 }
