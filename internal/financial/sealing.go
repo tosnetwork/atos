@@ -141,7 +141,7 @@ func (s *HTTPSigner) Sign(ctx context.Context, request SignRequest) (SignRespons
 	return output, nil
 }
 
-func (r *Repository) SignBatch(ctx context.Context, batch Batch, signer ExternalSigner, keyID, algorithm, trustedPublicKey string) (SignatureEnvelope, error) {
+func (r *Repository) signBatchWith(ctx context.Context, db repositoryDB, batch Batch, signer ExternalSigner, keyID, algorithm, trustedPublicKey string) (SignatureEnvelope, error) {
 	if signer == nil {
 		return SignatureEnvelope{}, errors.New("financial: external signer is required")
 	}
@@ -166,7 +166,7 @@ func (r *Repository) SignBatch(ctx context.Context, batch Batch, signer External
 		return SignatureEnvelope{}, errors.Join(ErrIdempotencyConflict, err)
 	}
 	raw, _ := json.Marshal(envelope)
-	result, err := r.pool.Exec(ctx, `UPDATE financial_batches SET signing_key_id=$2,signature_envelope=$3,state='signed',updated_at=now()
+	result, err := db.Exec(ctx, `UPDATE financial_batches SET signing_key_id=$2,signature_envelope=$3,state='signed',updated_at=now()
  WHERE batch_id=$1 AND state IN ('created','signed') AND (signature_envelope IS NULL OR signature_envelope=$3)`, batch.Manifest.BatchID, keyID, raw)
 	if err != nil {
 		return SignatureEnvelope{}, err
@@ -434,7 +434,7 @@ func retainWithProof(ctx context.Context, retainer Retainer, key string, body []
 	return proof, nil
 }
 
-func (r *Repository) batchRetentionDeadline(ctx context.Context, batchID string, minimum time.Duration, anchorReceipt bool) (time.Time, error) {
+func (r *Repository) batchRetentionDeadlineWith(ctx context.Context, db repositoryDB, batchID string, minimum time.Duration, anchorReceipt bool) (time.Time, error) {
 	if minimum <= 0 {
 		return time.Time{}, errors.New("financial: positive minimum WORM retention is required")
 	}
@@ -446,13 +446,13 @@ func (r *Repository) batchRetentionDeadline(ctx context.Context, batchID string,
  WHERE batch_id=$1 AND state IN ('retained','anchored') RETURNING anchor_required_retain_until`
 	}
 	var deadline time.Time
-	if err := r.pool.QueryRow(ctx, query, batchID, candidate).Scan(&deadline); err != nil {
+	if err := db.QueryRow(ctx, query, batchID, candidate).Scan(&deadline); err != nil {
 		return time.Time{}, err
 	}
 	return deadline.UTC(), nil
 }
 
-func (r *Repository) RetainBatch(ctx context.Context, batch Batch, signature SignatureEnvelope, retainer Retainer) (string, string, error) {
+func (r *Repository) retainBatchWith(ctx context.Context, db repositoryDB, batch Batch, signature SignatureEnvelope, retainer Retainer) (string, string, error) {
 	if retainer == nil {
 		return "", "", errors.New("financial: retainer required")
 	}
@@ -466,7 +466,7 @@ func (r *Repository) RetainBatch(ctx context.Context, batch Batch, signature Sig
 	hash := sha256.Sum256(body)
 	digest := "sha256:" + hex.EncodeToString(hash[:])
 	key := fmt.Sprintf("atos-financial/v1/%s/%s/%d-%s.json", batch.Manifest.GatewayID, batch.Manifest.NetworkID, batch.Manifest.BatchSequence, batch.Manifest.BatchID)
-	deadline, err := r.batchRetentionDeadline(ctx, batch.Manifest.BatchID, retainer.MinimumRetention(), false)
+	deadline, err := r.batchRetentionDeadlineWith(ctx, db, batch.Manifest.BatchID, retainer.MinimumRetention(), false)
 	if err != nil {
 		return "", "", err
 	}
@@ -474,7 +474,7 @@ func (r *Repository) RetainBatch(ctx context.Context, batch Batch, signature Sig
 	if err != nil {
 		return "", "", err
 	}
-	result, err := r.pool.Exec(ctx, `UPDATE financial_batches SET retained_object_key=$2,retained_version_id=$3,state='retained',updated_at=now()
+	result, err := db.Exec(ctx, `UPDATE financial_batches SET retained_object_key=$2,retained_version_id=$3,state='retained',updated_at=now()
  WHERE batch_id=$1 AND state IN ('signed','retained') AND (retained_object_key='' OR retained_object_key=$2)`, batch.Manifest.BatchID, key, proof.VersionID)
 	if err != nil {
 		return "", "", err
@@ -489,21 +489,21 @@ func (r *Repository) SealNext(ctx context.Context, ledger interface {
 	ledgerClient
 	ledgerChainReader
 }, signer ExternalSigner, keyID, algorithm, trustedPublicKey string, retainer Retainer, publisher AnchorPublisher, limit int) (Batch, error) {
-	_, unlock, err := r.LockSealing(ctx)
+	lockConn, unlock, err := r.lockSealing(ctx)
 	if err != nil {
 		return Batch{}, err
 	}
 	defer unlock()
 
-	batch, signature, err := r.PendingBatch(ctx)
+	batch, signature, err := r.pendingBatchWith(ctx, lockConn)
 	if errors.Is(err, pgx.ErrNoRows) {
-		batch, err = r.CreateBatch(ctx, limit, ledger)
+		batch, err = r.createBatchWith(ctx, lockConn, limit, ledger)
 	}
 	if err != nil {
 		return Batch{}, err
 	}
 	if batch.State == "created" {
-		envelope, err := r.SignBatch(ctx, batch, signer, keyID, algorithm, trustedPublicKey)
+		envelope, err := r.signBatchWith(ctx, lockConn, batch, signer, keyID, algorithm, trustedPublicKey)
 		if err != nil {
 			return batch, err
 		}
@@ -514,13 +514,13 @@ func (r *Repository) SealNext(ctx context.Context, ledger interface {
 		return batch, errors.New("financial: sealed batch lacks signature")
 	}
 	if batch.State == "signed" {
-		if _, _, err := r.RetainBatch(ctx, batch, *signature, retainer); err != nil {
+		if _, _, err := r.retainBatchWith(ctx, lockConn, batch, *signature, retainer); err != nil {
 			return batch, err
 		}
 		batch.State = "retained"
 	}
 	if batch.State == "retained" {
-		if _, err := r.AnchorBatch(ctx, batch, *signature, publisher, retainer); err != nil {
+		if _, err := r.anchorBatchWith(ctx, lockConn, batch, *signature, publisher, retainer); err != nil {
 			return batch, err
 		}
 		batch.State = "anchored"

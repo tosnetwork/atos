@@ -234,6 +234,41 @@ func financialTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+func prepareSignedSealingBatch(t *testing.T, ctx context.Context, repository *Repository, suffix string) (*staticChainLedger, Batch, *countingSigner) {
+	t.Helper()
+	ledger := newTestLedger()
+	adapter, _ := NewAdapter(repository, ledger)
+	request := requestFor("sealer-genesis-"+suffix, EventAccountGenesis, GatewayCreditIssuance, PrincipalAvailable, "_", "principal-"+suffix)
+	request.AllowOverdraft = true
+	event, err := adapter.ProvisionAccount(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction, found, err := ledger.Lookup(ctx, event.LedgerReference)
+	if err != nil || !found {
+		t.Fatalf("finalized transaction missing: found=%t err=%v", found, err)
+	}
+	genesis := strings.Repeat("0", 64)
+	row := LedgerChainRow{Transaction: transaction, Amount: event.AtomicAmount, ChainVersion: blnkChainVersionCBORV3,
+		ChainSequence: 1, ChainPreviousHash: genesis}
+	row.ChainHash, err = ledgerChainHash(genesis, row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chainLedger := &staticChainLedger{testLedger: ledger, evidence: LedgerChainEvidence{
+		State: LedgerChainState{ChainKey: "global", FirstSequence: 1, LastSequence: 1, PreviousHash: genesis,
+			HeadHash: row.ChainHash, GenesisHash: genesis}, Transactions: []LedgerChainRow{row}}}
+	batch, err := repository.createBatchWith(ctx, repository.pool, 100, chainLedger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer := newCountingSigner(t)
+	if _, err := repository.signBatchWith(ctx, repository.pool, batch, signer, "kms-sealer-test", "ed25519", signer.public); err != nil {
+		t.Fatal(err)
+	}
+	return chainLedger, batch, signer
+}
+
 func TestRetentionDeadlinesAreDurableAndReplicaStable(t *testing.T) {
 	ctx := context.Background()
 	pool1 := financialTestPool(t)
@@ -258,7 +293,7 @@ func TestRetentionDeadlinesAreDurableAndReplicaStable(t *testing.T) {
 	for _, repository := range []*Repository{repository1, repository2} {
 		go func(repository *Repository) {
 			<-start
-			deadline, deadlineErr := repository.batchRetentionDeadline(ctx, batchID, 365*24*time.Hour, false)
+			deadline, deadlineErr := repository.batchRetentionDeadlineWith(ctx, repository.pool, batchID, 365*24*time.Hour, false)
 			deadlines <- deadline
 			errorsOut <- deadlineErr
 		}(repository)
@@ -287,11 +322,11 @@ func TestRetentionDeadlinesAreDurableAndReplicaStable(t *testing.T) {
 		anchorBatchID, batchID, GenesisDigest, anchorDigest); err != nil {
 		t.Fatal(err)
 	}
-	anchorDeadline, err := repository1.batchRetentionDeadline(ctx, anchorBatchID, 365*24*time.Hour, true)
+	anchorDeadline, err := repository1.batchRetentionDeadlineWith(ctx, repository1.pool, anchorBatchID, 365*24*time.Hour, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	retryDeadline, err := repository2.batchRetentionDeadline(ctx, anchorBatchID, 365*24*time.Hour, true)
+	retryDeadline, err := repository2.batchRetentionDeadlineWith(ctx, repository2.pool, anchorBatchID, 365*24*time.Hour, true)
 	if err != nil || !anchorDeadline.Equal(retryDeadline) {
 		t.Fatalf("anchor receipt deadline did not converge: first=%s retry=%s err=%v", anchorDeadline, retryDeadline, err)
 	}
@@ -308,45 +343,21 @@ func TestRetentionDeadlinesAreDurableAndReplicaStable(t *testing.T) {
 func TestConcurrentReplicaSealersSerializeCompleteStateMachine(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	pool1 := financialTestPool(t)
-	pool2, err := pgxpool.New(ctx, os.Getenv("ATOS_TEST_DATABASE_URL"))
+	_ = financialTestPool(t)
+	configuration, err := pgxpool.ParseConfig(os.Getenv("ATOS_TEST_DATABASE_URL"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pool2.Close()
+	configuration.MaxConns = 2
+	pool, err := pgxpool.NewWithConfig(ctx, configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
 	suffix := fmt.Sprint(time.Now().UnixNano())
-	repository1, _ := NewRepository(pool1, "gw-sealer-"+suffix, "net-sealer-"+suffix)
-	repository2, _ := NewRepository(pool2, "gw-sealer-"+suffix, "net-sealer-"+suffix)
-	ledger := newTestLedger()
-	adapter, _ := NewAdapter(repository1, ledger)
-	request := requestFor("sealer-genesis-"+suffix, EventAccountGenesis, GatewayCreditIssuance, PrincipalAvailable, "_", "principal-"+suffix)
-	request.AllowOverdraft = true
-	event, err := adapter.ProvisionAccount(ctx, request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	transaction, found, err := ledger.Lookup(ctx, event.LedgerReference)
-	if err != nil || !found {
-		t.Fatalf("finalized transaction missing: found=%t err=%v", found, err)
-	}
-	genesis := strings.Repeat("0", 64)
-	row := LedgerChainRow{Transaction: transaction, Amount: event.AtomicAmount, ChainVersion: blnkChainVersionCBORV3,
-		ChainSequence: 1, ChainPreviousHash: genesis}
-	row.ChainHash, err = ledgerChainHash(genesis, row)
-	if err != nil {
-		t.Fatal(err)
-	}
-	chainLedger := &staticChainLedger{testLedger: ledger, evidence: LedgerChainEvidence{
-		State: LedgerChainState{ChainKey: "global", FirstSequence: 1, LastSequence: 1, PreviousHash: genesis,
-			HeadHash: row.ChainHash, GenesisHash: genesis}, Transactions: []LedgerChainRow{row}}}
-	batch, err := repository1.CreateBatch(ctx, 100, chainLedger)
-	if err != nil {
-		t.Fatal(err)
-	}
-	signer := newCountingSigner(t)
-	if _, err := repository1.SignBatch(ctx, batch, signer, "kms-sealer-test", "ed25519", signer.public); err != nil {
-		t.Fatal(err)
-	}
+	repository1, _ := NewRepository(pool, "gw-sealer-"+suffix, "net-sealer-"+suffix)
+	repository2, _ := NewRepository(pool, "gw-sealer-"+suffix, "net-sealer-"+suffix)
+	chainLedger, batch, signer := prepareSignedSealingBatch(t, ctx, repository1, suffix)
 	retainer := newBlockingRetainer()
 	publisher := &countingAnchorPublisher{}
 	type sealResult struct {
@@ -365,13 +376,7 @@ func TestConcurrentReplicaSealersSerializeCompleteStateMachine(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 	go seal(repository2)
-	for pool2.Stat().AcquiredConns() == 0 {
-		select {
-		case <-ctx.Done():
-			t.Fatal(ctx.Err())
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
+	time.Sleep(100 * time.Millisecond)
 	close(retainer.release)
 	for range 2 {
 		result := <-results
@@ -383,7 +388,7 @@ func TestConcurrentReplicaSealersSerializeCompleteStateMachine(t *testing.T) {
 		}
 	}
 	var state string
-	if err := pool1.QueryRow(ctx, `SELECT state FROM financial_batches WHERE batch_id=$1`, batch.Manifest.BatchID).Scan(&state); err != nil || state != "anchored" {
+	if err := pool.QueryRow(ctx, `SELECT state FROM financial_batches WHERE batch_id=$1`, batch.Manifest.BatchID).Scan(&state); err != nil || state != "anchored" {
 		t.Fatalf("sealed batch state=%q err=%v", state, err)
 	}
 	retainer.mu.Lock()
@@ -401,7 +406,7 @@ func TestConcurrentReplicaSealersSerializeCompleteStateMachine(t *testing.T) {
 	}
 }
 
-func TestSealerRejectsSingleConnectionPoolWithoutDeadlock(t *testing.T) {
+func TestSealerLockSupportsSingleConnectionPoolWithoutDeadlock(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	_ = financialTestPool(t)
@@ -416,9 +421,85 @@ func TestSealerRejectsSingleConnectionPoolWithoutDeadlock(t *testing.T) {
 	}
 	defer pool.Close()
 	repository, _ := NewRepository(pool, "gw-single-sealer", "net-single-sealer")
-	_, err = repository.SealNext(ctx, (*staticChainLedger)(nil), nil, "", "", "", nil, nil, 1)
-	if err == nil || !strings.Contains(err.Error(), "at least two PostgreSQL pool connections") {
-		t.Fatalf("single-connection sealer error=%v", err)
+	conn, unlock, err := repository.lockSealing(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if _, _, err := repository.pendingBatchWith(ctx, conn); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("single-connection lock-owned read error=%v", err)
+	}
+}
+
+func TestLockSessionLossFencesStaleSealer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool1 := financialTestPool(t)
+	pool2, err := pgxpool.New(ctx, os.Getenv("ATOS_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool2.Close()
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	repository1, _ := NewRepository(pool1, "gw-fence-"+suffix, "net-fence-"+suffix)
+	repository2, _ := NewRepository(pool2, "gw-fence-"+suffix, "net-fence-"+suffix)
+	chainLedger, batch, signer := prepareSignedSealingBatch(t, ctx, repository1, "fence-"+suffix)
+	retainer := newBlockingRetainer()
+	publisher := &countingAnchorPublisher{}
+	type sealResult struct {
+		batch Batch
+		err   error
+	}
+	firstResult := make(chan sealResult, 1)
+	secondResult := make(chan sealResult, 1)
+	go func() {
+		sealed, sealErr := repository1.SealNext(ctx, chainLedger, signer, "kms-sealer-test", "ed25519", signer.public, retainer, publisher, 100)
+		firstResult <- sealResult{batch: sealed, err: sealErr}
+	}()
+	select {
+	case <-retainer.entered:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	var terminated bool
+	if err := pool2.QueryRow(ctx, `SELECT pg_terminate_backend(pid) FROM pg_locks
+ WHERE locktype='advisory' AND granted AND pid<>pg_backend_pid() ORDER BY pid LIMIT 1`).Scan(&terminated); err != nil || !terminated {
+		t.Fatalf("terminate lock-owning session: terminated=%t err=%v", terminated, err)
+	}
+	go func() {
+		sealed, sealErr := repository2.SealNext(ctx, chainLedger, signer, "kms-sealer-test", "ed25519", signer.public, retainer, publisher, 100)
+		secondResult <- sealResult{batch: sealed, err: sealErr}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	close(retainer.release)
+	stale := <-firstResult
+	recovered := <-secondResult
+	if stale.err == nil || errors.Is(stale.err, ErrIdempotencyConflict) {
+		t.Fatalf("stale sealer was not fenced by lock-session loss: batch=%s err=%v", stale.batch.Manifest.BatchID, stale.err)
+	}
+	if recovered.err != nil || recovered.batch.State != "anchored" {
+		t.Fatalf("new lock holder did not recover sealing: batch=%s state=%s err=%v", recovered.batch.Manifest.BatchID, recovered.batch.State, recovered.err)
+	}
+	entered, err := repository2.EnforceSealingHealth(ctx, time.Hour, stale.err)
+	if err != nil || entered {
+		t.Fatalf("fenced stale worker entered safe mode: entered=%t err=%v cause=%v", entered, err, stale.err)
+	}
+	var state string
+	if err := pool2.QueryRow(ctx, `SELECT state FROM financial_batches WHERE batch_id=$1`, batch.Manifest.BatchID).Scan(&state); err != nil || state != "anchored" {
+		t.Fatalf("recovered batch state=%q err=%v", state, err)
+	}
+	retainer.mu.Lock()
+	putCalls := retainer.putCalls
+	retainer.mu.Unlock()
+	publisher.mu.Lock()
+	publishCalls := publisher.count
+	publisher.mu.Unlock()
+	if signer.calls.Load() != 1 || putCalls != 3 || publishCalls != 1 {
+		t.Fatalf("fenced recovery effects signer=%d WORM puts=%d TOS publishes=%d", signer.calls.Load(), putCalls, publishCalls)
+	}
+	safeMode, reason, err := repository2.SafeMode(ctx)
+	if err != nil || safeMode {
+		t.Fatalf("fenced recovery entered safe mode: safe_mode=%t reason=%q err=%v", safeMode, reason, err)
 	}
 }
 

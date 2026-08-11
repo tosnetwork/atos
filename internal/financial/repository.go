@@ -151,30 +151,42 @@ func (r *Repository) LockReconciliation(ctx context.Context) (*pgxpool.Conn, fun
 	}, nil
 }
 
-// LockSealing serializes the complete batch create -> sign -> retain -> anchor
+// lockSealing serializes the complete batch create -> sign -> retain -> anchor
 // state machine across API replicas. It is session-scoped so PostgreSQL
 // releases it automatically when a crashed replica loses its connection. The
-// dedicated pooled connection must remain acquired until every external side
-// effect and its durable outcome have completed.
-func (r *Repository) LockSealing(ctx context.Context) (*pgxpool.Conn, func(), error) {
-	// One connection owns the session lock while normal repository operations
-	// use another. Reject an undersized pool instead of deadlocking it.
-	if r.pool.Config().MaxConns < 2 {
-		return nil, nil, errors.New("financial: sealing requires at least two PostgreSQL pool connections")
-	}
-	conn, err := r.pool.Acquire(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	if _, err = conn.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1,0))`, sealingLockName); err != nil {
-		// Acquisition may have reached PostgreSQL even if its response was
-		// lost. Destroy the session so an uncertain lock cannot leak into the
-		// pool or block every other replica.
-		hijacked := conn.Hijack()
-		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = hijacked.Close(closeCtx)
-		closeCancel()
-		return nil, nil, err
+// dedicated pooled connection is also the exclusive database execution path
+// until every external side effect and its durable outcome have completed. A
+// lost lock session therefore fences the stale worker from later persistence.
+func (r *Repository) lockSealing(ctx context.Context) (*pgxpool.Conn, func(), error) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	var conn *pgxpool.Conn
+	for {
+		var err error
+		conn, err = r.pool.Acquire(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		var acquired bool
+		err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtextextended($1,0))`, sealingLockName).Scan(&acquired)
+		if err != nil {
+			// Acquisition may have reached PostgreSQL even if its response was
+			// lost. Destroy the uncertain session instead of returning it pooled.
+			hijacked := conn.Hijack()
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = hijacked.Close(closeCtx)
+			closeCancel()
+			return nil, nil, err
+		}
+		if acquired {
+			break
+		}
+		conn.Release()
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-ticker.C:
+		}
 	}
 	return conn, func() {
 		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

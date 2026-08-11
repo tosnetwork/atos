@@ -62,11 +62,11 @@ type Batch struct {
 	State          string
 }
 
-func (r *Repository) PendingBatch(ctx context.Context) (Batch, *SignatureEnvelope, error) {
+func (r *Repository) pendingBatchWith(ctx context.Context, db repositoryDB) (Batch, *SignatureEnvelope, error) {
 	var batch Batch
 	var manifestRaw, signatureRaw []byte
 	var ledgerEvidenceRaw []byte
-	err := r.pool.QueryRow(ctx, `SELECT manifest,manifest_digest,manifest_cbor,ledger_evidence,state,COALESCE(signature_envelope,'null'::jsonb)
+	err := db.QueryRow(ctx, `SELECT manifest,manifest_digest,manifest_cbor,ledger_evidence,state,COALESCE(signature_envelope,'null'::jsonb)
  FROM financial_batches WHERE state<>'anchored' ORDER BY batch_sequence LIMIT 1`).Scan(&manifestRaw, &batch.ManifestDigest, &batch.ManifestCBOR, &ledgerEvidenceRaw, &batch.State, &signatureRaw)
 	if err != nil {
 		return Batch{}, nil, err
@@ -77,7 +77,7 @@ func (r *Repository) PendingBatch(ctx context.Context) (Batch, *SignatureEnvelop
 	if err := json.Unmarshal(ledgerEvidenceRaw, &batch.LedgerEvidence); err != nil {
 		return Batch{}, nil, err
 	}
-	rows, err := r.pool.Query(ctx, `SELECT commitment FROM financial_events WHERE batch_id=$1 ORDER BY sequence`, batch.Manifest.BatchID)
+	rows, err := db.Query(ctx, `SELECT commitment FROM financial_events WHERE batch_id=$1 ORDER BY sequence`, batch.Manifest.BatchID)
 	if err != nil {
 		return Batch{}, nil, err
 	}
@@ -178,14 +178,14 @@ func makeBatchManifest(gatewayID, networkID string, batchSequence int64, previou
 	return Batch{Manifest: manifest, ManifestDigest: digest, ManifestCBOR: canonical, Commitments: commitments, State: "created"}, nil
 }
 
-func (r *Repository) CreateBatch(ctx context.Context, limit int, ledger interface {
+func (r *Repository) createBatchWith(ctx context.Context, db repositoryDB, limit int, ledger interface {
 	ledgerClient
 	ledgerChainReader
 }) (Batch, error) {
 	if limit < 1 || limit > 4096 {
 		return Batch{}, errors.New("financial: batch limit must be 1-4096")
 	}
-	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return Batch{}, err
 	}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/tosnetwork/tos-protocol/pkg/codec"
 )
 
@@ -94,13 +95,13 @@ func AnchorPayloadDigest(anchor ManagedAnchor) (string, error) {
 	return codec.Digest(ManagedAnchorDomain, anchor)
 }
 
-func (r *Repository) AnchorBatch(ctx context.Context, batch Batch, signature SignatureEnvelope, publisher AnchorPublisher, retainer Retainer) (AnchorReceipt, error) {
+func (r *Repository) anchorBatchWith(ctx context.Context, db repositoryDB, batch Batch, signature SignatureEnvelope, publisher AnchorPublisher, retainer Retainer) (AnchorReceipt, error) {
 	if publisher == nil || retainer == nil {
 		return AnchorReceipt{}, errors.New("financial: anchor publisher and retainer are required")
 	}
 	var previousAnchorID string
 	if batch.Manifest.BatchSequence > 1 {
-		if err := r.pool.QueryRow(ctx, `SELECT anchor_id FROM financial_batches WHERE batch_sequence=$1 AND state='anchored'`, batch.Manifest.BatchSequence-1).Scan(&previousAnchorID); err != nil {
+		if err := db.QueryRow(ctx, `SELECT anchor_id FROM financial_batches WHERE batch_sequence=$1 AND state='anchored'`, batch.Manifest.BatchSequence-1).Scan(&previousAnchorID); err != nil {
 			return AnchorReceipt{}, err
 		}
 	}
@@ -108,7 +109,7 @@ func (r *Repository) AnchorBatch(ctx context.Context, batch Batch, signature Sig
 	if err != nil {
 		return AnchorReceipt{}, err
 	}
-	deadline, err := r.batchRetentionDeadline(ctx, batch.Manifest.BatchID, retainer.MinimumRetention(), true)
+	deadline, err := r.batchRetentionDeadlineWith(ctx, db, batch.Manifest.BatchID, retainer.MinimumRetention(), true)
 	if err != nil {
 		return AnchorReceipt{}, err
 	}
@@ -134,7 +135,12 @@ func (r *Repository) AnchorBatch(ctx context.Context, batch Batch, signature Sig
 	if err != nil {
 		return AnchorReceipt{}, err
 	}
-	result, err := r.pool.Exec(ctx, `UPDATE financial_batches SET anchor_id=$2,anchor_retained_object_key=$3,anchor_retained_version_id=$4,state='anchored',updated_at=now()
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return AnchorReceipt{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	result, err := tx.Exec(ctx, `UPDATE financial_batches SET anchor_id=$2,anchor_retained_object_key=$3,anchor_retained_version_id=$4,state='anchored',updated_at=now()
  WHERE batch_id=$1 AND state IN ('retained','anchored') AND (anchor_id='' OR anchor_id=$2)
    AND (anchor_retained_object_key='' OR anchor_retained_object_key=$3)
    AND (anchor_retained_version_id='' OR anchor_retained_version_id=$4)`, batch.Manifest.BatchID, anchor.AnchorID, key, proof.VersionID)
@@ -144,6 +150,11 @@ func (r *Repository) AnchorBatch(ctx context.Context, batch Batch, signature Sig
 	if result.RowsAffected() != 1 {
 		return AnchorReceipt{}, ErrIdempotencyConflict
 	}
-	_, _ = r.pool.Exec(ctx, `UPDATE financial_chain_state SET last_anchor_id=$1,updated_at=now() WHERE singleton=TRUE`, anchor.AnchorID)
+	if _, err := tx.Exec(ctx, `UPDATE financial_chain_state SET last_anchor_id=$1,updated_at=now() WHERE singleton=TRUE`, anchor.AnchorID); err != nil {
+		return AnchorReceipt{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return AnchorReceipt{}, err
+	}
 	return receipt, nil
 }
