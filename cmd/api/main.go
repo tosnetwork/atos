@@ -262,6 +262,7 @@ func main() {
 				if _, err := passkeys.PurgeExpiredCeremonies(reconcileCtx); err != nil {
 					logger.Error("passkey ceremony purge failed", "error", err)
 				}
+				passkeys.PurgeStaleRateLimitEntries()
 			}
 		}
 	}()

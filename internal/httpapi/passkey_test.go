@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -133,13 +134,15 @@ func TestPasskeyHTTP_NotConfiguredReturns503(t *testing.T) {
 	}
 }
 
-// TestPasskeyHTTP_UnclassifiedFailureDoesNotLeakInternals is a regression
-// test for a real P2: an unclassified error (here, go-webauthn's own
-// internal parse failure against a garbage attestation body) used to be
-// forwarded to the anonymous caller verbatim via err.Error(), and mapped to
-// a misleading 401 "authentication" status regardless of it actually being
-// a malformed-request/internal condition.
-func TestPasskeyHTTP_UnclassifiedFailureDoesNotLeakInternals(t *testing.T) {
+// TestPasskeyHTTP_InvalidWebAuthnResponseIsAuthFailureNotInternalError is a
+// regression test for a real P2: a *protocol.Error (go-webauthn's own
+// typed error for every challenge/origin/signature/CBOR validation
+// failure -- an ordinary, expected outcome when a caller submits an
+// invalid response, not a server malfunction) used to fall through to the
+// catch-all branch, forwarding err.Error() verbatim to the anonymous
+// caller and logging it as a server error. It must instead read as a
+// generic, non-leaky authentication failure.
+func TestPasskeyHTTP_InvalidWebAuthnResponseIsAuthFailureNotInternalError(t *testing.T) {
 	server := newPasskeyHTTPTestServer(t)
 
 	beginReq := httptest.NewRequest(http.MethodPost, "/v1/auth/passkey/register/begin", nil)
@@ -154,19 +157,43 @@ func TestPasskeyHTTP_UnclassifiedFailureDoesNotLeakInternals(t *testing.T) {
 	}
 
 	// Garbage, not a valid WebAuthn attestation response -- go-webauthn's
-	// FinishRegistration will fail with its own internal parse error.
+	// FinishRegistration fails with its own *protocol.Error.
 	finishReq := httptest.NewRequest(http.MethodPost, "/v1/auth/passkey/register/finish/"+begin.CeremonyID, bytes.NewReader([]byte(`{"not":"a valid attestation response"}`)))
 	finishReq.Header.Set("Content-Type", "application/json")
 	finishRecorder := httptest.NewRecorder()
 	server.Mux().ServeHTTP(finishRecorder, finishReq)
 
-	if finishRecorder.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500 for an unclassified internal failure: %s", finishRecorder.Code, finishRecorder.Body.String())
+	if finishRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 for an invalid WebAuthn response (an ordinary auth failure, not an internal error): %s", finishRecorder.Code, finishRecorder.Body.String())
 	}
 	body := finishRecorder.Body.String()
 	for _, leaky := range []string{"webauthn", "cbor", "json:", "unmarshal", "parse error"} {
 		if strings.Contains(strings.ToLower(body), leaky) {
 			t.Fatalf("response body leaks internal error detail (%q): %s", leaky, body)
 		}
+	}
+}
+
+// TestPasskeyHTTP_RateLimitCannotBeBypassedBySpoofedHeader is a regression
+// test for a real P1: clientIP used to trust a caller-suppliable X-Real-IP
+// header unconditionally, so an anonymous attacker could pick a fresh
+// rate-limit bucket on every single request just by varying that header,
+// completely defeating the limiter. All requests here share one
+// RemoteAddr (as httptest.NewRequest always sets) but carry a different
+// X-Real-IP each time -- the limit must still trigger based on the real
+// connection address.
+func TestPasskeyHTTP_RateLimitCannotBeBypassedBySpoofedHeader(t *testing.T) {
+	server := newPasskeyHTTPTestServer(t)
+
+	var last *httptest.ResponseRecorder
+	for i := 0; i < 11; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/auth/passkey/register/begin", nil)
+		req.Header.Set("X-Real-IP", fmt.Sprintf("198.51.100.%d", i))
+		recorder := httptest.NewRecorder()
+		server.Mux().ServeHTTP(recorder, req)
+		last = recorder
+	}
+	if last.Code != http.StatusTooManyRequests {
+		t.Fatalf("11th request (with a fresh spoofed X-Real-IP each time) status = %d, want 429 -- rate limiting must key on the real connection address, not a client-suppliable header: %s", last.Code, last.Body.String())
 	}
 }

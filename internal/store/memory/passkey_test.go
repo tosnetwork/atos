@@ -80,3 +80,54 @@ func TestCreatePasskeyAccountWithCredential_PrincipalIDCollision(t *testing.T) {
 		t.Fatalf("expected ErrConflict for a duplicate principal_id, got %v", err)
 	}
 }
+
+// TestCreatePasskeyAccountWithCredential_CredentialIDCollision is a
+// regression test for a real P2: the atomic write path checked
+// principal_id/display_handle uniqueness but never the credential's own
+// row ID or its actual WebAuthn CredentialID bytes, unlike Postgres (which
+// enforces both via schema constraints) -- a colliding credential used to
+// be silently overwritten instead of rejected.
+func TestCreatePasskeyAccountWithCredential_CredentialIDCollision(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+
+	if err := s.CreatePasskeyAccountWithCredential(ctx, domain.PasskeyAccount{PrincipalID: "prn_c1", DisplayHandle: "HC1", CreatedAt: time.Now().UTC()}, testCredentialRecord("prn_c1", "shared-cred-id")); err != nil {
+		t.Fatalf("first account: %v", err)
+	}
+	// A different account, different display handle, but the same
+	// underlying WebAuthn CredentialID bytes (e.g. two ceremonies racing
+	// against a cloned/replayed attestation).
+	err := s.CreatePasskeyAccountWithCredential(ctx, domain.PasskeyAccount{PrincipalID: "prn_c2", DisplayHandle: "HC2", CreatedAt: time.Now().UTC()}, testCredentialRecord("prn_c2", "shared-cred-id"))
+	if err != store.ErrConflict {
+		t.Fatalf("expected ErrConflict for a duplicate CredentialID, got %v", err)
+	}
+	// The first account's own credential must be untouched -- not silently
+	// overwritten by the rejected second attempt.
+	if _, err := s.PasskeyAccountByPrincipalID(ctx, "prn_c2"); err != store.ErrNotFound {
+		t.Fatalf("expected the rejected second account to not exist, got %v", err)
+	}
+	credentials, err := s.WebAuthnCredentialsByPrincipalID(ctx, "prn_c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(credentials) != 1 {
+		t.Fatalf("prn_c1's credentials = %+v, want exactly the original one, untouched", credentials)
+	}
+}
+
+// TestSaveWebAuthnCredential_CredentialIDCollision proves the same
+// uniqueness check applies to the standalone "add another passkey to an
+// already-existing account" path, not just the atomic signup path.
+func TestSaveWebAuthnCredential_CredentialIDCollision(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+
+	if err := s.CreatePasskeyAccountWithCredential(ctx, domain.PasskeyAccount{PrincipalID: "prn_add", DisplayHandle: "HADD", CreatedAt: time.Now().UTC()}, testCredentialRecord("prn_add", "shared-cred-id-2")); err != nil {
+		t.Fatalf("account: %v", err)
+	}
+	duplicate := testCredentialRecord("prn_add", "shared-cred-id-2")
+	duplicate.ID = "pkcred_different_row_id"
+	if err := s.SaveWebAuthnCredential(ctx, duplicate); err != store.ErrConflict {
+		t.Fatalf("expected ErrConflict for a duplicate CredentialID via SaveWebAuthnCredential, got %v", err)
+	}
+}

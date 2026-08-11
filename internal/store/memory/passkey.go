@@ -8,6 +8,24 @@ import (
 	"github.com/tosnetwork/atos/internal/store"
 )
 
+// credentialConflictLocked reports whether c's row ID or its actual
+// WebAuthn CredentialID bytes already belong to a different stored
+// credential -- callers MUST already hold s.mu. Mirrors the two unique
+// constraints the Postgres schema enforces (passkey_credentials' own
+// primary key, and passkey_credentials_credential_id_idx) so this
+// in-memory store cannot silently accept what Postgres would reject.
+func (s *Store) credentialConflictLocked(c domain.WebAuthnCredentialRecord) bool {
+	if _, exists := s.passkeyCredentials[c.ID]; exists {
+		return true
+	}
+	for _, existing := range s.passkeyCredentials {
+		if string(existing.CredentialID) == string(c.CredentialID) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) CreatePasskeyAccountWithCredential(ctx context.Context, a domain.PasskeyAccount, c domain.WebAuthnCredentialRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -17,9 +35,12 @@ func (s *Store) CreatePasskeyAccountWithCredential(ctx context.Context, a domain
 	if _, exists := s.passkeyHandles[a.DisplayHandle]; exists {
 		return store.ErrConflict
 	}
+	if s.credentialConflictLocked(c) {
+		return store.ErrConflict
+	}
 	// The whole-store mutex already held for the duration of this method
-	// is what makes this atomic -- both writes commit together or (on the
-	// conflict checks above) neither does.
+	// is what makes this atomic -- both writes commit together or (on any
+	// conflict check above) neither does.
 	s.passkeyAccounts[a.PrincipalID] = a
 	s.passkeyHandles[a.DisplayHandle] = a.PrincipalID
 	s.passkeyCredentials[c.ID] = c
@@ -49,6 +70,9 @@ func (s *Store) PasskeyAccountByDisplayHandle(ctx context.Context, handle string
 func (s *Store) SaveWebAuthnCredential(ctx context.Context, c domain.WebAuthnCredentialRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.credentialConflictLocked(c) {
+		return store.ErrConflict
+	}
 	s.passkeyCredentials[c.ID] = c
 	return nil
 }

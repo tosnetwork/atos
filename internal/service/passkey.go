@@ -355,3 +355,10 @@ func (s *PasskeyService) FinishLogin(ctx context.Context, ceremonyID string, r *
 func (s *PasskeyService) PurgeExpiredCeremonies(ctx context.Context) (int, error) {
 	return s.store.PurgeExpiredWebAuthnCeremonies(ctx, time.Now().UTC())
 }
+
+// PurgeStaleRateLimitEntries bounds the in-memory rate limiter's own
+// memory growth -- see passkeyRateLimiter.purgeStale's doc comment. Pure
+// in-process bookkeeping, no store access, so it never fails.
+func (s *PasskeyService) PurgeStaleRateLimitEntries() int {
+	return s.rateLimiter.purgeStale(passkeyBeginRateWindow, time.Now().UTC())
+}
