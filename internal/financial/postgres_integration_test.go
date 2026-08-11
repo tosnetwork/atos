@@ -2,6 +2,9 @@ package financial
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,13 +50,134 @@ func (l *testLedger) Submit(_ context.Context, e Event, allow bool) (LedgerTrans
 	}
 	l.balances[e.SourceIndicator] -= amount
 	l.balances[e.DestinationIndicator] += amount
-	tx := LedgerTransaction{TransactionID: e.LedgerTransactionID, Source: e.SourceIndicator, Destination: e.DestinationIndicator, Reference: e.LedgerReference, PreciseAmount: json.Number(e.AtomicAmount), Currency: e.Asset, Description: "atos-financial-v1:" + e.Digest, Status: "APPLIED"}
+	tx := LedgerTransaction{TransactionID: e.LedgerTransactionID, Source: e.SourceIndicator, Destination: e.DestinationIndicator,
+		SourceIndicator: e.SourceIndicator, DestinationIndicator: e.DestinationIndicator, Reference: e.LedgerReference,
+		PreciseAmount: json.Number(e.AtomicAmount), Currency: e.Asset, Description: "atos-financial-v1:" + e.Digest,
+		Status: "APPLIED", CreatedAt: time.Now().UTC()}
 	l.transactions[e.LedgerReference] = tx
 	if l.lostOnce {
 		l.lostOnce = false
 		return LedgerTransaction{}, errors.New("injected lost response")
 	}
 	return tx, nil
+}
+
+type staticChainLedger struct {
+	*testLedger
+	evidence LedgerChainEvidence
+}
+
+func (l *staticChainLedger) ChainEvidence(context.Context) (LedgerChainEvidence, error) {
+	return l.evidence, nil
+}
+
+type countingSigner struct {
+	private ed25519.PrivateKey
+	public  string
+	calls   atomic.Int32
+}
+
+func newCountingSigner(t *testing.T) *countingSigner {
+	t.Helper()
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &countingSigner{private: private, public: base64.StdEncoding.EncodeToString(public)}
+}
+
+func (s *countingSigner) Sign(_ context.Context, request SignRequest) (SignResponse, error) {
+	s.calls.Add(1)
+	digest, err := DigestBytes(request.Digest)
+	if err != nil {
+		return SignResponse{}, err
+	}
+	return SignResponse{KeyID: request.KeyID, Algorithm: request.Algorithm,
+		Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(s.private, digest)), PublicKey: s.public,
+		SignedUnixMillis: time.Now().UTC().UnixMilli()}, nil
+}
+
+type retainedTestObject struct {
+	version string
+	digest  string
+}
+
+type blockingRetainer struct {
+	mu        sync.Mutex
+	objects   map[string]retainedTestObject
+	putCalls  int
+	firstPut  sync.Once
+	entered   chan struct{}
+	release   chan struct{}
+	retention time.Duration
+}
+
+func newBlockingRetainer() *blockingRetainer {
+	return &blockingRetainer{objects: map[string]retainedTestObject{}, entered: make(chan struct{}), release: make(chan struct{}), retention: time.Hour}
+}
+
+func (r *blockingRetainer) MinimumRetention() time.Duration { return r.retention }
+
+func (r *blockingRetainer) PutIfAbsent(_ context.Context, key string, _ []byte, digest string) (string, error) {
+	r.firstPut.Do(func() {
+		close(r.entered)
+		<-r.release
+	})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.putCalls++
+	if object, ok := r.objects[key]; ok {
+		if object.digest != digest {
+			return "", ErrIdempotencyConflict
+		}
+		return object.version, nil
+	}
+	version := fmt.Sprintf("locked-version-%d", len(r.objects)+1)
+	r.objects[key] = retainedTestObject{version: version, digest: digest}
+	return version, nil
+}
+
+func (r *blockingRetainer) ResolveRetention(_ context.Context, key, version, digest string) (RetentionProof, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	object, ok := r.objects[key]
+	if !ok || object.version != version || object.digest != digest {
+		return RetentionProof{}, ErrIdempotencyConflict
+	}
+	return RetentionProof{ObjectKey: key, VersionID: version, Digest: digest, LockMode: "COMPLIANCE", RetainUntil: time.Now().UTC().Add(2 * r.retention)}, nil
+}
+
+type countingAnchorPublisher struct {
+	mu      sync.Mutex
+	receipt AnchorReceipt
+	found   bool
+	count   int
+}
+
+func (p *countingAnchorPublisher) ResolveManagedFinancialAnchor(_ context.Context, anchor ManagedAnchor) (AnchorReceipt, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.found {
+		return AnchorReceipt{}, false, nil
+	}
+	if p.receipt.Anchor != anchor {
+		return AnchorReceipt{}, false, ErrIdempotencyConflict
+	}
+	return p.receipt, true, nil
+}
+
+func (p *countingAnchorPublisher) PublishManagedFinancialAnchor(_ context.Context, anchor ManagedAnchor) (AnchorReceipt, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.count++
+	digest, err := AnchorPayloadDigest(anchor)
+	if err != nil {
+		return AnchorReceipt{}, err
+	}
+	p.receipt = AnchorReceipt{Anchor: anchor, PayloadDigest: digest, NetworkReferenceID: "tos:test:" + anchor.AnchorID,
+		NetworkID: anchor.NetworkID, Finalized: true, FinalizedCheckpoint: 1}
+	p.found = true
+	return p.receipt, nil
 }
 func (l *testLedger) Lookup(_ context.Context, ref string) (LedgerTransaction, bool, error) {
 	l.mu.Lock()
@@ -177,6 +302,123 @@ func TestRetentionDeadlinesAreDurableAndReplicaStable(t *testing.T) {
 	entered, err = repository1.EnforceSealingHealth(ctx, time.Hour, errors.Join(ErrIdempotencyConflict, errors.New("retention proof mismatch")))
 	if err != nil || !entered {
 		t.Fatalf("authenticated retention mismatch did not enter safe mode: entered=%t err=%v", entered, err)
+	}
+}
+
+func TestConcurrentReplicaSealersSerializeCompleteStateMachine(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool1 := financialTestPool(t)
+	pool2, err := pgxpool.New(ctx, os.Getenv("ATOS_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool2.Close()
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	repository1, _ := NewRepository(pool1, "gw-sealer-"+suffix, "net-sealer-"+suffix)
+	repository2, _ := NewRepository(pool2, "gw-sealer-"+suffix, "net-sealer-"+suffix)
+	ledger := newTestLedger()
+	adapter, _ := NewAdapter(repository1, ledger)
+	request := requestFor("sealer-genesis-"+suffix, EventAccountGenesis, GatewayCreditIssuance, PrincipalAvailable, "_", "principal-"+suffix)
+	request.AllowOverdraft = true
+	event, err := adapter.ProvisionAccount(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction, found, err := ledger.Lookup(ctx, event.LedgerReference)
+	if err != nil || !found {
+		t.Fatalf("finalized transaction missing: found=%t err=%v", found, err)
+	}
+	genesis := strings.Repeat("0", 64)
+	row := LedgerChainRow{Transaction: transaction, Amount: event.AtomicAmount, ChainVersion: blnkChainVersionCBORV3,
+		ChainSequence: 1, ChainPreviousHash: genesis}
+	row.ChainHash, err = ledgerChainHash(genesis, row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chainLedger := &staticChainLedger{testLedger: ledger, evidence: LedgerChainEvidence{
+		State: LedgerChainState{ChainKey: "global", FirstSequence: 1, LastSequence: 1, PreviousHash: genesis,
+			HeadHash: row.ChainHash, GenesisHash: genesis}, Transactions: []LedgerChainRow{row}}}
+	batch, err := repository1.CreateBatch(ctx, 100, chainLedger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer := newCountingSigner(t)
+	if _, err := repository1.SignBatch(ctx, batch, signer, "kms-sealer-test", "ed25519", signer.public); err != nil {
+		t.Fatal(err)
+	}
+	retainer := newBlockingRetainer()
+	publisher := &countingAnchorPublisher{}
+	type sealResult struct {
+		batch Batch
+		err   error
+	}
+	results := make(chan sealResult, 2)
+	seal := func(repository *Repository) {
+		sealed, sealErr := repository.SealNext(ctx, chainLedger, signer, "kms-sealer-test", "ed25519", signer.public, retainer, publisher, 100)
+		results <- sealResult{batch: sealed, err: sealErr}
+	}
+	go seal(repository1)
+	select {
+	case <-retainer.entered:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	go seal(repository2)
+	for pool2.Stat().AcquiredConns() == 0 {
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	close(retainer.release)
+	for range 2 {
+		result := <-results
+		if result.err != nil && !errors.Is(result.err, pgx.ErrNoRows) {
+			t.Fatalf("normal replica sealing contention failed: batch=%s err=%v", result.batch.Manifest.BatchID, result.err)
+		}
+		if errors.Is(result.err, ErrIdempotencyConflict) {
+			t.Fatalf("normal replica sealing contention became an integrity conflict: %v", result.err)
+		}
+	}
+	var state string
+	if err := pool1.QueryRow(ctx, `SELECT state FROM financial_batches WHERE batch_id=$1`, batch.Manifest.BatchID).Scan(&state); err != nil || state != "anchored" {
+		t.Fatalf("sealed batch state=%q err=%v", state, err)
+	}
+	retainer.mu.Lock()
+	putCalls := retainer.putCalls
+	retainer.mu.Unlock()
+	publisher.mu.Lock()
+	publishCalls := publisher.count
+	publisher.mu.Unlock()
+	if signer.calls.Load() != 1 || putCalls != 2 || publishCalls != 1 {
+		t.Fatalf("external effects signer=%d WORM puts=%d TOS publishes=%d", signer.calls.Load(), putCalls, publishCalls)
+	}
+	safeMode, reason, err := repository1.SafeMode(ctx)
+	if err != nil || safeMode {
+		t.Fatalf("normal replica sealing contention entered safe mode: safe_mode=%t reason=%q err=%v", safeMode, reason, err)
+	}
+}
+
+func TestSealerRejectsSingleConnectionPoolWithoutDeadlock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = financialTestPool(t)
+	configuration, err := pgxpool.ParseConfig(os.Getenv("ATOS_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(ctx, configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	repository, _ := NewRepository(pool, "gw-single-sealer", "net-single-sealer")
+	_, err = repository.SealNext(ctx, (*staticChainLedger)(nil), nil, "", "", "", nil, nil, 1)
+	if err == nil || !strings.Contains(err.Error(), "at least two PostgreSQL pool connections") {
+		t.Fatalf("single-connection sealer error=%v", err)
 	}
 }
 

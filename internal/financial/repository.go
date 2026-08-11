@@ -29,6 +29,7 @@ type Repository struct {
 const (
 	reconciliationLockName  = "atos-financial-global-reconciliation-v1"
 	reconciliationLeaseName = "managed-financial-integrity-v1"
+	sealingLockName         = "atos-financial-global-sealing-v1"
 )
 
 func NewRepository(pool *pgxpool.Pool, gatewayID, networkID string) (*Repository, error) {
@@ -146,6 +147,49 @@ func (r *Repository) LockReconciliation(ctx context.Context) (*pgxpool.Conn, fun
 		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_, _ = conn.Exec(releaseCtx, `SELECT pg_advisory_unlock(hashtextextended($1,0))`, reconciliationLockName)
+		conn.Release()
+	}, nil
+}
+
+// LockSealing serializes the complete batch create -> sign -> retain -> anchor
+// state machine across API replicas. It is session-scoped so PostgreSQL
+// releases it automatically when a crashed replica loses its connection. The
+// dedicated pooled connection must remain acquired until every external side
+// effect and its durable outcome have completed.
+func (r *Repository) LockSealing(ctx context.Context) (*pgxpool.Conn, func(), error) {
+	// One connection owns the session lock while normal repository operations
+	// use another. Reject an undersized pool instead of deadlocking it.
+	if r.pool.Config().MaxConns < 2 {
+		return nil, nil, errors.New("financial: sealing requires at least two PostgreSQL pool connections")
+	}
+	conn, err := r.pool.Acquire(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err = conn.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1,0))`, sealingLockName); err != nil {
+		// Acquisition may have reached PostgreSQL even if its response was
+		// lost. Destroy the session so an uncertain lock cannot leak into the
+		// pool or block every other replica.
+		hijacked := conn.Hijack()
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = hijacked.Close(closeCtx)
+		closeCancel()
+		return nil, nil, err
+	}
+	return conn, func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		var unlocked bool
+		unlockErr := conn.QueryRow(releaseCtx, `SELECT pg_advisory_unlock(hashtextextended($1,0))`, sealingLockName).Scan(&unlocked)
+		cancel()
+		if unlockErr != nil || !unlocked {
+			// Never return a possibly lock-bearing session to the pool. Closing a
+			// hijacked connection also makes PostgreSQL release the session lock.
+			hijacked := conn.Hijack()
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = hijacked.Close(closeCtx)
+			closeCancel()
+			return
+		}
 		conn.Release()
 	}, nil
 }

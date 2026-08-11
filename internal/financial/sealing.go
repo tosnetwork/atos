@@ -489,6 +489,12 @@ func (r *Repository) SealNext(ctx context.Context, ledger interface {
 	ledgerClient
 	ledgerChainReader
 }, signer ExternalSigner, keyID, algorithm, trustedPublicKey string, retainer Retainer, publisher AnchorPublisher, limit int) (Batch, error) {
+	_, unlock, err := r.LockSealing(ctx)
+	if err != nil {
+		return Batch{}, err
+	}
+	defer unlock()
+
 	batch, signature, err := r.PendingBatch(ctx)
 	if errors.Is(err, pgx.ErrNoRows) {
 		batch, err = r.CreateBatch(ctx, limit, ledger)
