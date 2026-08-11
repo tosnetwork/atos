@@ -35,6 +35,9 @@ func TestCapabilityUpdate_ReanchorsManifestOnVersionBump(t *testing.T) {
 	if !verifiedBefore {
 		t.Fatal("precondition failed: original version should already be anchored by Register")
 	}
+	if original.Ownership.Status != domain.OwnershipAnchored || original.Ownership.Commitment == "" {
+		t.Fatalf("Register did not update the public Ownership projection: %+v", original.Ownership)
+	}
 
 	updated, err := capabilities.Update(ctx, original.ID, "agt_reanchor", map[string]any{
 		"pricing": map[string]any{"model": "fixed", "price_hint": map[string]any{"amount": "2.00", "currency": "USD"}},
@@ -55,6 +58,12 @@ func TestCapabilityUpdate_ReanchorsManifestOnVersionBump(t *testing.T) {
 	}
 	if !verifiedAfter {
 		t.Fatalf("new version's manifest was not anchored by Update: reasonCode=%q", reasonCode)
+	}
+	if updated.Ownership.Status != domain.OwnershipAnchored || updated.Ownership.Commitment == "" {
+		t.Fatalf("Update did not refresh the public Ownership projection for the new version: %+v", updated.Ownership)
+	}
+	if updated.Ownership.Commitment == original.Ownership.Commitment {
+		t.Fatal("new version's ownership commitment must differ from the old version's")
 	}
 
 	// The OLD version's manifest remains separately anchored and valid --

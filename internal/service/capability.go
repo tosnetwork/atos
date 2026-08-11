@@ -49,12 +49,17 @@ func (s *CapabilityService) WithManifestAnchor(core toscore.Core) *CapabilitySer
 
 // anchorManifestIfRequested calls CommitCapabilityManifest and persists the
 // resulting CapabilityOwnershipCommitment when c requests any non-Managed
-// mode and a manifest anchor is configured. It is a no-op (nil error) for a
-// Managed-only capability or when no anchor is configured, so Register/
-// Update remain usable in mock/dev deployments exactly as before Phase 4A.
-func (s *CapabilityService) anchorManifestIfRequested(ctx context.Context, c domain.Capability) error {
+// mode and a manifest anchor is configured, returning c with its public
+// Ownership projection (docs/CAPABILITIES.md §1/§13) updated to reflect the
+// anchor. It is a no-op (c returned unchanged) for a Managed-only
+// capability or when no anchor is configured, so Register/Update remain
+// usable in mock/dev deployments exactly as before Phase 4A -- Ownership
+// then stays at normalizeCapability's "unanchored" default, matching
+// "Managed registration MAY create a capability before any TOS anchor
+// exists."
+func (s *CapabilityService) anchorManifestIfRequested(ctx context.Context, c domain.Capability) (domain.Capability, error) {
 	if s.manifestAnchor == nil {
-		return nil
+		return c, nil
 	}
 	requestsStrongerMode := false
 	for _, mode := range c.RequestedTrustModes {
@@ -64,17 +69,24 @@ func (s *CapabilityService) anchorManifestIfRequested(ctx context.Context, c dom
 		}
 	}
 	if !requestsStrongerMode {
-		return nil
+		return c, nil
 	}
 	ownershipRef, err := s.manifestAnchor.CommitCapabilityManifest(ctx, c)
 	if err != nil {
-		return err
+		return domain.Capability{}, err
 	}
-	return s.store.PutCapabilityOwnershipCommitment(ctx, domain.CapabilityOwnershipCommitment{
+	network := s.manifestAnchor.Network()
+	if err := s.store.PutCapabilityOwnershipCommitment(ctx, domain.CapabilityOwnershipCommitment{
 		CapabilityID: c.ID, Version: c.Version, ProviderID: c.ProviderID,
-		Network: s.manifestAnchor.Network(), ManifestCommitment: c.ManifestCommitment,
+		Network: network, ManifestCommitment: c.ManifestCommitment,
 		OwnershipCommitment: ownershipRef, CommittedAt: time.Now().UTC(),
-	})
+	}); err != nil {
+		return domain.Capability{}, err
+	}
+	c.Ownership = domain.CapabilityOwnership{
+		Status: domain.OwnershipAnchored, Network: network, Commitment: ownershipRef,
+	}
+	return c, nil
 }
 
 func (s *CapabilityService) Get(ctx context.Context, id string) (domain.Capability, error) {
@@ -184,7 +196,8 @@ func (s *CapabilityService) Register(ctx context.Context, in RegisterCapabilityI
 	}
 	c.SupportedTrustModes = c.ModeSupport.ActiveModes()
 	c.ManifestCommitment = capabilityManifestCommitment(c)
-	if err := s.anchorManifestIfRequested(ctx, c); err != nil {
+	c, err = s.anchorManifestIfRequested(ctx, c)
+	if err != nil {
 		return domain.Capability{}, err
 	}
 	if err := s.store.Put(ctx, c); err != nil {
@@ -328,8 +341,29 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 	// whatever is NOW current, so termsChanged correctly becomes a no-op
 	// if this attempt's fields already match, rather than double-bumping
 	// the version.
-	if err := s.anchorManifestIfRequested(ctx, c); err != nil {
+	anchored, err := s.anchorManifestIfRequested(ctx, c)
+	if err != nil {
 		return domain.Capability{}, err
+	}
+	if anchored.Ownership != c.Ownership {
+		// c is already durably committed by the UpdateCapability call
+		// above; anchoring ran afterward (never inside that closure -- see
+		// this function's own anchoring comment) so the resulting
+		// Ownership projection needs a second, narrowly-scoped CAS write.
+		// Guarded on the row still being at THIS exact version: if a
+		// concurrent Update has already superseded it, this anchor's
+		// Ownership fact no longer describes the CURRENT row and must not
+		// be force-written over whatever that concurrent write produced.
+		c, err = s.store.UpdateCapability(ctx, id, func(current domain.Capability, exists bool) (domain.Capability, error) {
+			if !exists || current.Version != anchored.Version {
+				return current, nil
+			}
+			current.Ownership = anchored.Ownership
+			return current, nil
+		})
+		if err != nil {
+			return domain.Capability{}, err
+		}
 	}
 	if err := s.store.Finish(ctx, requestingProviderID, idempotencyKey, c.ID); err != nil {
 		return domain.Capability{}, err

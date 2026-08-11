@@ -103,6 +103,7 @@ func main() {
 			Insecure: cfg.TOSRPC.Insecure, ServerName: cfg.TOSRPC.ServerName,
 			CAFile: cfg.TOSRPC.CAFile, ClientCertFile: cfg.TOSRPC.ClientCertFile,
 			ClientKeyFile: cfg.TOSRPC.ClientKeyFile, Store: st,
+			Network: cfg.TOSRPC.Network,
 		})
 		if rpcErr != nil {
 			logger.Error("configure tos-protocol RPC backend", "error", rpcErr)
