@@ -26,7 +26,9 @@ separate, explicit Device Authorization grant that adds
 the frozen `GET /capabilities/mine` contract and is never given to an ordinary
 marketplace session. A Provider grant is accepted only when its returned
 `principal_id` matches the existing requester session; a mismatched grant is
-immediately revoked and never replaces the current identity. Both flows open the server-issued
+revoked and never replaces the current identity. A successful upgrade retires
+the old device before switching sessions; cleanup failures remain visible and
+abort the switch instead of being silently ignored. Both flows open the server-issued
 `verification_uri_complete` and poll at the server-provided interval. The
 existing trusted login/reverse-proxy boundary on `/activate` authenticates the
 human and injects the approval headers.

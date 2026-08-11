@@ -21,6 +21,36 @@ export function sessionFromToken(token: TokenResponse, expectedPrincipalId?: str
   return { accessToken: token.access_token, refreshToken: token.refresh_token, expiresAt: Date.now() + token.expires_in * 1000, principalId: token.principal_id, deviceId: token.device_id, scopes: token.scopes }
 }
 
+type RevokeRequest = (path: string, session: Session, init: RequestInit) => Promise<unknown>
+
+export function revokeSessionDevice(session: Session, send: RevokeRequest = request): Promise<unknown> {
+  if (session.deviceId) return send(`/auth/devices/${encodeURIComponent(session.deviceId)}`, session, { method: 'DELETE' })
+  return send('/auth/revoke', session, { method: 'POST' })
+}
+
+const errorMessage = (error: unknown) => error instanceof Error ? error.message : 'unknown error'
+
+export async function prepareAuthorizedSession(token: TokenResponse, currentSession?: Session, revoke = revokeSessionDevice): Promise<Session> {
+  let nextSession: Session
+  try {
+    nextSession = sessionFromToken(token, currentSession?.principalId)
+  } catch (identityError) {
+    const mismatchedSession = sessionFromToken(token)
+    try { await revoke(mismatchedSession) } catch (cleanupError) {
+      throw new Error(`${errorMessage(identityError)} The rejected authorization could not be revoked: ${errorMessage(cleanupError)}`, { cause: cleanupError })
+    }
+    throw identityError
+  }
+  if (!currentSession) return nextSession
+  try { await revoke(currentSession) } catch (retireError) {
+    try { await revoke(nextSession) } catch (rollbackError) {
+      throw new Error(`Provider authorization was not activated because the previous device could not be revoked: ${errorMessage(retireError)} The new authorization also requires manual cleanup: ${errorMessage(rollbackError)}`, { cause: rollbackError })
+    }
+    throw new Error(`Provider authorization was not activated because the previous device could not be revoked: ${errorMessage(retireError)}`, { cause: retireError })
+  }
+  return nextSession
+}
+
 export function AuthProvider({ children }: PropsWithChildren) {
   const [session, setSession] = useState<Session | null>(readSession)
   const [loggingIn, setLoggingIn] = useState(false)
@@ -60,20 +90,9 @@ export function AuthProvider({ children }: PropsWithChildren) {
         try {
           const token = await request<TokenResponse>('/auth/device/token', null, { method: 'POST', body: JSON.stringify({ device_code: grant.device_code }) })
           let nextSession: Session
-          try {
-            nextSession = sessionFromToken(token, expectedPrincipalId)
-          } catch (identityError) {
-            const mismatchedSession = sessionFromToken(token)
-            if (mismatchedSession.deviceId) await request<void>(`/auth/devices/${encodeURIComponent(mismatchedSession.deviceId)}`, mismatchedSession, { method: 'DELETE' }).catch(() => undefined)
-            else await request<void>('/auth/revoke', mismatchedSession, { method: 'POST' }).catch(() => undefined)
-            popup.close()
-            throw identityError
-          }
+          try { nextSession = await prepareAuthorizedSession(token, expectedPrincipalId ? session || undefined : undefined) }
+          catch (authorizationError) { popup.close(); throw authorizationError }
           save(nextSession)
-          if (expectedPrincipalId && session) {
-            if (session.deviceId) await request<void>(`/auth/devices/${encodeURIComponent(session.deviceId)}`, session, { method: 'DELETE' }).catch(() => undefined)
-            else await request<void>('/auth/revoke', session, { method: 'POST' }).catch(() => undefined)
-          }
           popup.close()
           return
         } catch (error) {
