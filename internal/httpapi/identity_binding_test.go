@@ -178,6 +178,13 @@ func TestHandleIdentityBindingStatus_BoundThenRevoked(t *testing.T) {
 	if !revokeDecoded.Revoked {
 		t.Fatalf("expected revoked=true: %s", revokeRecorder.Body.String())
 	}
+	// docs/API.md §9A's frozen revoke response includes network+
+	// revocation_ref (the same NetworkReference shape bind's binding_ref
+	// uses) -- a caller needs this to audit the revocation itself, not just
+	// its local side effect.
+	if revokeDecoded.Network == "" || revokeDecoded.RevocationRef == "" {
+		t.Fatalf("expected network/revocation_ref to be populated on a real revoke: %+v", revokeDecoded)
+	}
 
 	afterRevoke := callIdentityBindingStatus(t, server, token, "prn_rest_status")
 	var afterDecoded identityBindingStatusResponse
@@ -201,5 +208,8 @@ func TestHandleRevokeIdentity_NothingToRevokeIsNotAnError(t *testing.T) {
 	}
 	if decoded.Revoked {
 		t.Fatalf("expected revoked=false, got true")
+	}
+	if decoded.Network != "" || decoded.RevocationRef != "" {
+		t.Fatalf("a no-op revoke (nothing bound) must not fabricate a ref: %+v", decoded)
 	}
 }

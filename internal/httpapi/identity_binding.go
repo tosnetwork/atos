@@ -70,7 +70,9 @@ type revokeIdentityRequest struct {
 }
 
 type revokeIdentityResponse struct {
-	Revoked bool `json:"revoked"`
+	Revoked       bool   `json:"revoked"`
+	Network       string `json:"network,omitempty"`
+	RevocationRef string `json:"revocation_ref,omitempty"`
 }
 
 // handleRevokeIdentity is Phase 4A's admin-triggered entry point for
@@ -98,13 +100,16 @@ func (s *Server) handleRevokeIdentity(w http.ResponseWriter, r *http.Request) {
 		writeDomainErr(w, err)
 		return
 	}
-	if _, err := s.IdentityBindings.Revoke(r.Context(), service.RevokeIdentityBindingInput{
+	op, err := s.IdentityBindings.Revoke(r.Context(), service.RevokeIdentityBindingInput{
 		PrincipalID: principalID, ReasonCode: req.ReasonCode, IdempotencyKey: idempotencyKey,
-	}); err != nil {
+	})
+	if err != nil {
 		writeIdentityBindingErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, revokeIdentityResponse{Revoked: wasBound})
+	writeJSON(w, http.StatusOK, revokeIdentityResponse{
+		Revoked: wasBound, Network: op.RefNetwork, RevocationRef: op.BindingRef,
+	})
 }
 
 type identityBindingStatusResponse struct {

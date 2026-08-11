@@ -89,6 +89,32 @@ func TestToolIdentityBindingStatus_ReadScopeAloneCanRead(t *testing.T) {
 	}
 }
 
+func TestToolRevokeIdentity_GoldenPathReturnsRevocationRef(t *testing.T) {
+	server, core, token := newIdentityBindingToolTestServer(t, auth.ScopeIdentityBindingsWrite)
+	core.SeedAgentIdentity("agt_mcp_revoke")
+	if resp := callTool(t, server, token, "atos_bind_identity", map[string]any{
+		"principal_id": "prn_mcp_revoke", "agent_id": "agt_mcp_revoke", "idempotency_key": "bind-mcp-revoke",
+	}); toolCallFailed(t, resp) {
+		t.Fatalf("bind failed: %+v", resp)
+	}
+
+	resp := callTool(t, server, token, "atos_revoke_identity", map[string]any{
+		"principal_id": "prn_mcp_revoke", "idempotency_key": "revoke-mcp-golden",
+	})
+	if toolCallFailed(t, resp) {
+		t.Fatalf("revoke failed: %+v", resp)
+	}
+	result := resp.Result.(map[string]any)
+	structured := result["structuredContent"].(map[string]any)
+	if structured["revoked"] != true {
+		t.Fatalf("revoked = %v, want true", structured["revoked"])
+	}
+	if structured["network"] == "" || structured["network"] == nil ||
+		structured["revocation_ref"] == "" || structured["revocation_ref"] == nil {
+		t.Fatalf("expected network/revocation_ref on a real revoke: %+v", structured)
+	}
+}
+
 func TestToolRevokeIdentity_NothingToRevokeIsNotAnError(t *testing.T) {
 	server, _, token := newIdentityBindingToolTestServer(t, auth.ScopeIdentityBindingsWrite)
 	resp := callTool(t, server, token, "atos_revoke_identity", map[string]any{

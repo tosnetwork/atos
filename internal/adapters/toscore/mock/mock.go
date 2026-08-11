@@ -177,15 +177,16 @@ func (c *Core) CreatePrincipalBinding(ctx context.Context, callerID, idempotency
 	return binding, true, nil
 }
 
-func (c *Core) RevokePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, reasonCode string) (bool, error) {
+func (c *Core) RevokePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, reasonCode string) (bool, string, string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.principalBindings[principalID]; !ok {
-		return false, nil
+		return false, "", "", nil
 	}
 	delete(c.principalBindings, principalID)
 	c.revokedBindings[principalID] = reasonCode
-	return true, nil
+	ref := simulatedRef("principal-binding-revocation", domain.TrustModeManaged, principalID+":"+idempotencyKey)
+	return true, c.network, ref, nil
 }
 
 func (c *Core) ResolveCapability(ctx context.Context, capabilityID string) (domain.Trust, error) {

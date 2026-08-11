@@ -80,7 +80,7 @@ func TestIdentityEvidenceReconciler_SuspendsAfterIdentityRevoked(t *testing.T) {
 	// Now revoke the provider's identity binding entirely OUT-OF-BAND
 	// (never through EvaluateActivation) -- the reconciler, not an admin,
 	// must be the one to notice.
-	if _, err := core.RevokePrincipalBinding(ctx, "atos-gateway", "revoke-"+providerID, providerID, "test-revocation"); err != nil {
+	if _, _, _, err := core.RevokePrincipalBinding(ctx, "atos-gateway", "revoke-"+providerID, providerID, "test-revocation"); err != nil {
 		t.Fatal(err)
 	}
 	if err := reconciler.SweepVerified(ctx, 100); err != nil {

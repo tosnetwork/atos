@@ -45,7 +45,13 @@ CREATE TABLE IF NOT EXISTS identity_binding_operations (
     idempotency_key        TEXT NOT NULL,
     agent_id               TEXT NOT NULL DEFAULT '',
     reason_code            TEXT NOT NULL DEFAULT '',
+    -- binding_ref is the opaque TOS reference for this operation's
+    -- anchored fact: for type='bind', CreatePrincipalBinding's binding_ref;
+    -- for type='revoke', RevokePrincipalBinding's revocation_ref. The two
+    -- types never populate it simultaneously (mirrors agent_id/reason_code
+    -- above), and ref_network carries the network component for both.
     binding_ref            TEXT NOT NULL DEFAULT '',
+    ref_network            TEXT NOT NULL DEFAULT '',
     -- content_hash summarizes the identity fields that must never change
     -- once an operation is opened (principal_id/type/idempotency_key/
     -- agent_id/reason_code) -- mirrors execution_signer_operations'

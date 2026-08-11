@@ -41,14 +41,14 @@ func (f *flakyIdentityCore) CreatePrincipalBinding(ctx context.Context, callerID
 	return f.Core.CreatePrincipalBinding(ctx, callerID, idempotencyKey, principalID, agentID)
 }
 
-func (f *flakyIdentityCore) RevokePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, reasonCode string) (bool, error) {
+func (f *flakyIdentityCore) RevokePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, reasonCode string) (bool, string, string, error) {
 	f.mu.Lock()
 	f.revokeCalls++
 	if f.revokeFailuresLeft > 0 {
 		f.revokeFailuresLeft--
 		retryable := f.revokeFailureRetryable
 		f.mu.Unlock()
-		return false, domain.NewError(domain.ErrNetworkUnavailable, "simulated network failure", retryable)
+		return false, "", "", domain.NewError(domain.ErrNetworkUnavailable, "simulated network failure", retryable)
 	}
 	f.mu.Unlock()
 	return f.Core.RevokePrincipalBinding(ctx, callerID, idempotencyKey, principalID, reasonCode)
@@ -134,6 +134,7 @@ func TestIdentityBindingRevoke_GoldenPathThenNoOp(t *testing.T) {
 	ctx := context.Background()
 	st := memory.New()
 	core := toscoremock.New(st)
+	core.SetNetwork("tos-devnet")
 	core.SeedAgentIdentity("agt_1")
 	svc := service.NewIdentityBindingService(st, core)
 
@@ -150,6 +151,13 @@ func TestIdentityBindingRevoke_GoldenPathThenNoOp(t *testing.T) {
 	if _, found, err := svc.CurrentBinding(ctx, "prn_1"); err != nil || found {
 		t.Fatalf("found=%v err=%v after revoke, want not found", found, err)
 	}
+	// A real revocation must carry its own TOS reference, mirroring bind's
+	// binding_ref -- REST/MCP surfaces this as revocation_ref/network so a
+	// caller has audit proof of the revocation event itself, not just its
+	// local side effect.
+	if op.BindingRef == "" || op.RefNetwork == "" {
+		t.Fatalf("golden-path revoke must record a revocation ref/network, got BindingRef=%q RefNetwork=%q", op.BindingRef, op.RefNetwork)
+	}
 
 	// Revoking a principal with no current binding is not an error.
 	noOp, err := svc.Revoke(ctx, service.RevokeIdentityBindingInput{PrincipalID: "prn_never_bound", ReasonCode: "TEST", IdempotencyKey: "key-noop"})
@@ -158,6 +166,9 @@ func TestIdentityBindingRevoke_GoldenPathThenNoOp(t *testing.T) {
 	}
 	if noOp.Checkpoint != domain.IdentityBindingCheckpointCompleted {
 		t.Fatalf("no-op revoke checkpoint = %s, want completed", noOp.Checkpoint)
+	}
+	if noOp.BindingRef != "" || noOp.RefNetwork != "" {
+		t.Fatalf("no-op revoke (nothing bound) must not fabricate a ref, got BindingRef=%q RefNetwork=%q", noOp.BindingRef, noOp.RefNetwork)
 	}
 }
 

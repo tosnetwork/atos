@@ -48,7 +48,9 @@ func (s *Server) toolBindIdentity(ctx context.Context, principal auth.Principal,
 }
 
 type revokeIdentityResult struct {
-	Revoked bool `json:"revoked"`
+	Revoked       bool   `json:"revoked"`
+	Network       string `json:"network,omitempty"`
+	RevocationRef string `json:"revocation_ref,omitempty"`
 }
 
 // toolRevokeIdentity mirrors httpapi's handleRevokeIdentity: revoked:false
@@ -66,12 +68,13 @@ func (s *Server) toolRevokeIdentity(ctx context.Context, principal auth.Principa
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.IdentityBindings.Revoke(ctx, service.RevokeIdentityBindingInput{
+	op, err := s.IdentityBindings.Revoke(ctx, service.RevokeIdentityBindingInput{
 		PrincipalID: principalID, ReasonCode: argString(args, "reason_code"), IdempotencyKey: idempotencyKey,
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
-	return revokeIdentityResult{Revoked: wasBound}, nil
+	return revokeIdentityResult{Revoked: wasBound, Network: op.RefNetwork, RevocationRef: op.BindingRef}, nil
 }
 
 type identityBindingStatusResult struct {

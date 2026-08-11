@@ -143,14 +143,26 @@ func TestUpdateIdentityBindingOperation_AllowsCheckpointAdvance(t *testing.T) {
 		}
 		current.Checkpoint = domain.IdentityBindingCheckpointCompleted
 		current.BindingRef = "tos:ref:" + suffix
+		current.RefNetwork = "tos-devnet"
 		current.UpdatedAt = time.Now().UTC()
 		return current, nil
 	})
 	if err != nil {
 		t.Fatalf("UpdateIdentityBindingOperation: %v", err)
 	}
-	if updated.Checkpoint != domain.IdentityBindingCheckpointCompleted || updated.BindingRef != "tos:ref:"+suffix {
+	if updated.Checkpoint != domain.IdentityBindingCheckpointCompleted || updated.BindingRef != "tos:ref:"+suffix ||
+		updated.RefNetwork != "tos-devnet" {
 		t.Fatalf("unexpected updated operation: %+v", updated)
+	}
+
+	// ref_network must round-trip through a fresh read, not just the
+	// in-memory return value from UpdateIdentityBindingOperation itself.
+	reread, err := s.GetIdentityBindingOperation(ctx, op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reread.RefNetwork != "tos-devnet" || reread.BindingRef != "tos:ref:"+suffix {
+		t.Fatalf("ref_network/binding_ref did not round-trip through storage: %+v", reread)
 	}
 }
 

@@ -185,21 +185,24 @@ func (s *IdentityBindingService) driveBind(ctx context.Context, op domain.Identi
 	}); err != nil {
 		return op, err
 	}
-	return s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointCompleted, binding.BindingRef, "")
+	return s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointCompleted, binding.BindingRef, binding.Network, "")
 }
 
 func (s *IdentityBindingService) driveRevoke(ctx context.Context, op domain.IdentityBindingOperation) (domain.IdentityBindingOperation, error) {
-	_, callErr := s.core.RevokePrincipalBinding(ctx, identityBindingCallerID, op.IdempotencyKey, op.PrincipalID, op.ReasonCode)
+	_, revocationNetwork, revocationRef, callErr := s.core.RevokePrincipalBinding(ctx, identityBindingCallerID, op.IdempotencyKey, op.PrincipalID, op.ReasonCode)
 	if callErr != nil {
 		return s.handleAmbiguousOrFail(ctx, op, callErr)
 	}
 	if err := s.store.DeletePrincipalBinding(ctx, op.PrincipalID); err != nil {
 		return op, err
 	}
-	return s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointCompleted, "", "")
+	// A revoke with nothing to revoke (revocationRef=="") still completes
+	// the operation but leaves RefNetwork/BindingRef empty -- advance's
+	// bindingRef!="" guard already handles that as a no-op write.
+	return s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointCompleted, revocationRef, revocationNetwork, "")
 }
 
-func (s *IdentityBindingService) advance(ctx context.Context, id string, expectedFrom, checkpoint domain.IdentityBindingCheckpoint, bindingRef, failureReason string) (domain.IdentityBindingOperation, error) {
+func (s *IdentityBindingService) advance(ctx context.Context, id string, expectedFrom, checkpoint domain.IdentityBindingCheckpoint, bindingRef, refNetwork, failureReason string) (domain.IdentityBindingOperation, error) {
 	return s.store.UpdateIdentityBindingOperation(ctx, id, func(current domain.IdentityBindingOperation, exists bool) (domain.IdentityBindingOperation, error) {
 		if !exists {
 			return domain.IdentityBindingOperation{}, domain.NewError(domain.ErrNotFound, "identity-binding operation not found", false)
@@ -210,6 +213,7 @@ func (s *IdentityBindingService) advance(ctx context.Context, id string, expecte
 		current.Checkpoint = checkpoint
 		if bindingRef != "" {
 			current.BindingRef = bindingRef
+			current.RefNetwork = refNetwork
 		}
 		current.FailureReason = failureReason
 		current.UpdatedAt = time.Now().UTC()
@@ -235,13 +239,13 @@ func isAmbiguousIdentityBindingFailure(err error) bool {
 
 func (s *IdentityBindingService) handleAmbiguousOrFail(ctx context.Context, op domain.IdentityBindingOperation, callErr error) (domain.IdentityBindingOperation, error) {
 	if isAmbiguousIdentityBindingFailure(callErr) {
-		updated, err := s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointReconciling, "", callErr.Error())
+		updated, err := s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointReconciling, "", "", callErr.Error())
 		if err != nil {
 			return updated, err
 		}
 		return updated, domain.NewError(domain.ErrNetworkUnavailable, "identity-binding operation outcome is uncertain, retry", true)
 	}
-	updated, err := s.advance(ctx, op.ID, op.Checkpoint, op.Checkpoint, "", callErr.Error())
+	updated, err := s.advance(ctx, op.ID, op.Checkpoint, op.Checkpoint, "", "", callErr.Error())
 	if err != nil {
 		return updated, err
 	}

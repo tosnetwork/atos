@@ -119,7 +119,7 @@ func TestTOSBackedActivationAuthority_UnboundProviderDenies(t *testing.T) {
 func TestTOSBackedActivationAuthority_RevokedProviderIdentityDenies(t *testing.T) {
 	authority, cap, core, _ := tosBackedAuthorityFixture(t, "prn_authority_revoked")
 	ctx := context.Background()
-	if _, err := core.RevokePrincipalBinding(ctx, "atos-gateway", "revoke-"+cap.ProviderID, "prn_authority_revoked", "test-revocation"); err != nil {
+	if _, _, _, err := core.RevokePrincipalBinding(ctx, "atos-gateway", "revoke-"+cap.ProviderID, "prn_authority_revoked", "test-revocation"); err != nil {
 		t.Fatal(err)
 	}
 

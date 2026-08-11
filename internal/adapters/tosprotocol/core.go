@@ -130,9 +130,9 @@ func (c *Client) CreatePrincipalBinding(ctx context.Context, callerID, idempoten
 // tos-protocol's IdentityService.RevokePrincipalBinding. revoked=false with
 // a nil error means there was nothing to revoke -- not an error, mirroring
 // tos-protocol's own convention.
-func (c *Client) RevokePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, reasonCode string) (revoked bool, err error) {
+func (c *Client) RevokePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, reasonCode string) (revoked bool, revocationNetwork, revocationRef string, err error) {
 	if strings.TrimSpace(principalID) == "" {
-		return false, domain.NewError(domain.ErrValidationFailed, "principal_id is required", false)
+		return false, "", "", domain.NewError(domain.ErrValidationFailed, "principal_id is required", false)
 	}
 	callCtx, cancel := c.callContext(ctx, time.Time{})
 	defer cancel()
@@ -143,9 +143,15 @@ func (c *Client) RevokePrincipalBinding(ctx context.Context, callerID, idempoten
 	decorateRequest(c, ctx, request)
 	response, err := c.identity.RevokePrincipalBinding(callCtx, request)
 	if err != nil {
-		return false, rpcError(err)
+		return false, "", "", rpcError(err)
 	}
-	return response.Msg != nil && response.Msg.Revoked, nil
+	if response.Msg == nil {
+		return false, "", "", nil
+	}
+	if response.Msg.RevocationRef != nil {
+		revocationNetwork, revocationRef = response.Msg.RevocationRef.Network, response.Msg.RevocationRef.Reference
+	}
+	return response.Msg.Revoked, revocationNetwork, revocationRef, nil
 }
 
 func (c *Client) ResolveCapability(ctx context.Context, capabilityID string) (domain.Trust, error) {

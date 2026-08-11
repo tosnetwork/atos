@@ -72,12 +72,17 @@ type IdentityBindingOperation struct {
 	IdempotencyKey string                       `json:"idempotency_key"`
 	AgentID        string                       `json:"agent_id,omitempty"`
 	ReasonCode     string                       `json:"reason_code,omitempty"`
-	BindingRef     string                       `json:"binding_ref,omitempty"`
-	ContentHash    string                       `json:"content_hash"`
-	FailureReason  string                       `json:"failure_reason,omitempty"`
-	CreatedAt      time.Time                    `json:"created_at"`
-	CompletedAt    *time.Time                   `json:"completed_at,omitempty"`
-	UpdatedAt      time.Time                    `json:"updated_at"`
+	// BindingRef/RefNetwork are the opaque TOS reference for this
+	// operation's anchored fact: for type="bind", CreatePrincipalBinding's
+	// binding_ref; for type="revoke", RevokePrincipalBinding's
+	// revocation_ref. Mutually exclusive by Type, like AgentID/ReasonCode.
+	BindingRef    string     `json:"binding_ref,omitempty"`
+	RefNetwork    string     `json:"ref_network,omitempty"`
+	ContentHash   string     `json:"content_hash"`
+	FailureReason string     `json:"failure_reason,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	CompletedAt   *time.Time `json:"completed_at,omitempty"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
 // OwnershipStatus is atos-spec docs/CAPABILITIES.md §1's

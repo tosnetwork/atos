@@ -125,7 +125,7 @@ type Core interface {
 	// ResolvePrincipalBindingStatus instead.
 	ResolvePrincipalBindingStatus(ctx context.Context, principalID string) (binding domain.PrincipalIdentityBinding, bound, revoked bool, revocationReasonCode string, err error)
 	CreatePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, agentID string) (domain.PrincipalIdentityBinding, bool, error)
-	RevokePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, reasonCode string) (revoked bool, err error)
+	RevokePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, reasonCode string) (revoked bool, revocationNetwork, revocationRef string, err error)
 
 	// Quote and execution-signer trust.
 	CommitQuote(ctx context.Context, quote domain.Quote) (proofRef string, err error)
