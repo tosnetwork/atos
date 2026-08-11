@@ -17,9 +17,13 @@ import (
 // MCP. The caller never chooses a new trust mode here: the supplied Quote is
 // authoritative and its concrete mode/profile flow into Task metadata.
 type Server struct {
-	Auth          *auth.Service
-	Quotes        *service.QuoteService
-	Jobs          *service.JobService
+	Auth   *auth.Service
+	Quotes *service.QuoteService
+	Jobs   *service.JobService
+	// OpenTasks backs the openTasks/* method namespace (docs/A2A.md's
+	// "Open Task Marketplace Extension") -- deliberately not optional in
+	// production wiring, mirroring Jobs/Quotes' own treatment.
+	OpenTasks     *service.OpenTaskService
 	Logger        *slog.Logger
 	PublicBaseURL string
 }
@@ -101,6 +105,54 @@ func (s *Server) Handler() http.HandlerFunc {
 				return
 			}
 			s.handleTasksCancel(ctx, w, req, principal.ID)
+		case "openTasks/publish":
+			if !principal.Has(auth.ScopeOpenTasksWrite) {
+				writeRPCError(w, req.ID, codeForbidden, "openTasks/publish requires open_tasks:write", map[string]any{"code": domain.ErrPermissionDenied})
+				return
+			}
+			s.handleOpenTasksPublish(ctx, w, req, principal.ID)
+		case "openTasks/search":
+			if !principal.Has(auth.ScopeOpenTasksRead) {
+				writeRPCError(w, req.ID, codeForbidden, "openTasks/search requires open_tasks:read", map[string]any{"code": domain.ErrPermissionDenied})
+				return
+			}
+			s.handleOpenTasksSearch(ctx, w, req, principal.ID)
+		case "openTasks/get":
+			if !principal.Has(auth.ScopeOpenTasksRead) {
+				writeRPCError(w, req.ID, codeForbidden, "openTasks/get requires open_tasks:read", map[string]any{"code": domain.ErrPermissionDenied})
+				return
+			}
+			s.handleOpenTasksGet(ctx, w, req, principal.ID)
+		case "openTasks/cancel":
+			if !principal.Has(auth.ScopeOpenTasksWrite) {
+				writeRPCError(w, req.ID, codeForbidden, "openTasks/cancel requires open_tasks:write", map[string]any{"code": domain.ErrPermissionDenied})
+				return
+			}
+			s.handleOpenTasksCancel(ctx, w, req, principal.ID)
+		case "openTasks/proposals/submit":
+			if !principal.Has(auth.ScopeOpenTaskProposalsWrite) {
+				writeRPCError(w, req.ID, codeForbidden, "openTasks/proposals/submit requires open_task_proposals:write", map[string]any{"code": domain.ErrPermissionDenied})
+				return
+			}
+			s.handleOpenTasksProposalsSubmit(ctx, w, req, principal.ID)
+		case "openTasks/proposals/list":
+			if !principal.Has(auth.ScopeOpenTasksRead) {
+				writeRPCError(w, req.ID, codeForbidden, "openTasks/proposals/list requires open_tasks:read", map[string]any{"code": domain.ErrPermissionDenied})
+				return
+			}
+			s.handleOpenTasksProposalsList(ctx, w, req, principal.ID)
+		case "openTasks/proposals/withdraw":
+			if !principal.Has(auth.ScopeOpenTaskProposalsWrite) {
+				writeRPCError(w, req.ID, codeForbidden, "openTasks/proposals/withdraw requires open_task_proposals:write", map[string]any{"code": domain.ErrPermissionDenied})
+				return
+			}
+			s.handleOpenTasksProposalsWithdraw(ctx, w, req, principal.ID)
+		case "openTasks/proposals/accept":
+			if !principal.Has(auth.ScopeOpenTasksWrite) {
+				writeRPCError(w, req.ID, codeForbidden, "openTasks/proposals/accept requires open_tasks:write", map[string]any{"code": domain.ErrPermissionDenied})
+				return
+			}
+			s.handleOpenTasksProposalsAccept(ctx, w, req, principal.ID)
 		default:
 			writeRPCError(w, req.ID, codeMethodNotFound, "unknown method "+req.Method, nil)
 		}

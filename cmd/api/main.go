@@ -253,7 +253,7 @@ func main() {
 		Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}
 	a2aServer := &a2a.Server{
-		Auth: authorization, Quotes: quotes, Jobs: jobs,
+		Auth: authorization, Quotes: quotes, Jobs: jobs, OpenTasks: openTasks,
 		Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}
 
