@@ -21,13 +21,11 @@ const (
 	ReasonSignerNotAuthorized        = "SIGNER_NOT_AUTHORIZED"
 	ReasonSignerRevoked              = "SIGNER_REVOKED"
 	// ReasonNativeNotSupported: Phase 4A implements Verified's identity/
-	// ownership/manifest/network guarantees only (atos-spec
-	// docs/IMPLEMENTATION_ROADMAP.md §8.1). Native additionally requires
-	// gateway-independent global resolution (§8's guarantee matrix,
-	// docs/PROOF_PROFILES.md §5) that no phase through 4A implements --
-	// granting native here would silently claim a guarantee this
-	// authority cannot back. Phase 4A's own scope boundary explicitly
-	// excludes Native activation.
+	// ownership/manifest/network guarantees only. Native additionally
+	// requires gateway-independent global resolution that no phase through
+	// 4A implements -- granting native here would silently claim a
+	// guarantee this authority cannot back. Phase 4A's own scope boundary
+	// explicitly excludes Native activation.
 	ReasonNativeNotSupported = "NATIVE_NOT_SUPPORTED"
 )
 
@@ -52,7 +50,7 @@ type TOSBackedActivationAuthority struct {
 
 // NewTOSBackedActivationAuthority constructs the production authority.
 // The trusted network identity is read from core.Network() at evaluation
-// time (single source of truth with whatever the underlying tos-protocol
+// time (single source of truth with whatever the underlying remote
 // connection is actually configured for) rather than a separately-supplied
 // value that could silently drift from it.
 func NewTOSBackedActivationAuthority(core toscore.Core, capabilities store.Capabilities, executionSigner *ExecutionSignerService) *TOSBackedActivationAuthority {
@@ -95,8 +93,8 @@ func (a *TOSBackedActivationAuthority) Evaluate(ctx context.Context, providerID,
 
 	// 2. Capability ownership + exact manifest/version commitment. The
 	// capability's OWN current ManifestCommitment (not a caller-supplied
-	// value) is what must still match tos-protocol's anchored digest --
-	// this is the manifest/version TOCTOU check: a provider who mutated a
+	// value) is what must still match the remote service's anchored digest
+	// -- this is the manifest/version TOCTOU check: a provider who mutated a
 	// capability's schema/pricing/bindings after committing must not keep
 	// an activation that was only ever valid for the OLD manifest.
 	cap, err := a.capabilities.Get(ctx, capabilityID)
@@ -126,9 +124,9 @@ func (a *TOSBackedActivationAuthority) Evaluate(ctx context.Context, providerID,
 	}
 
 	// 3. Execution-signer authorization: MUST be currently valid for this
-	// exact capability_id+version, re-verified live against tos-protocol
-	// (not merely "a signer operation completed at some point locally") --
-	// mirrors Phase 3B's own real-RPC verification discipline.
+	// exact capability_id+version, re-verified live against the remote
+	// service (not merely "a signer operation completed at some point
+	// locally") -- mirrors Phase 3B's own real-RPC verification discipline.
 	if a.executionSigner == nil {
 		return false, ReasonSignerNotAuthorized, nil
 	}

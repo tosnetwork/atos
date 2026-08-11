@@ -61,7 +61,10 @@ func (s *Server) handleBindIdentity(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, bindIdentityResponse{
 		PrincipalID: principalID, AgentID: binding.AgentID, Network: binding.Network,
-		BindingRef: binding.BindingRef, Created: op.Checkpoint == domain.IdentityBindingCheckpointCompleted,
+		// op.Created (not op.Checkpoint == Completed, which is true for BOTH
+		// a genuinely new bind and an idempotent replay of an existing one)
+		// -- see domain.IdentityBindingOperation.Created's doc comment.
+		BindingRef: binding.BindingRef, Created: op.Created,
 	})
 }
 

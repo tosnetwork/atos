@@ -52,6 +52,12 @@ CREATE TABLE IF NOT EXISTS identity_binding_operations (
     -- above), and ref_network carries the network component for both.
     binding_ref            TEXT NOT NULL DEFAULT '',
     ref_network            TEXT NOT NULL DEFAULT '',
+    -- created is type='bind'-only: whether CreatePrincipalBinding reported
+    -- a genuinely NEW binding versus an idempotent replay of an
+    -- already-existing same-principal/same-agent one (docs/API.md §9A's
+    -- documented created=false no-op case) -- distinct from checkpoint
+    -- reaching 'completed', which is true in both cases.
+    created                BOOLEAN NOT NULL DEFAULT FALSE,
     -- content_hash summarizes the identity fields that must never change
     -- once an operation is opened (principal_id/type/idempotency_key/
     -- agent_id/reason_code) -- mirrors execution_signer_operations'

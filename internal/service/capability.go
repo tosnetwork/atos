@@ -354,15 +354,28 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 		// concurrent Update has already superseded it, this anchor's
 		// Ownership fact no longer describes the CURRENT row and must not
 		// be force-written over whatever that concurrent write produced.
-		c, err = s.store.UpdateCapability(ctx, id, func(current domain.Capability, exists bool) (domain.Capability, error) {
+		// Only reassign c (this function's own return value) if the
+		// Ownership write actually applied to THIS caller's own row: if a
+		// concurrent Update already superseded it, UpdateCapability's
+		// closure correctly declines to overwrite that newer state, but it
+		// still returns the CURRENT (concurrently-written) row -- blindly
+		// reassigning c to that would make this call return a DIFFERENT
+		// caller's write instead of confirming the caller's own successful
+		// change (already durably committed by the first CAS write above).
+		ownershipApplied := false
+		updated, err := s.store.UpdateCapability(ctx, id, func(current domain.Capability, exists bool) (domain.Capability, error) {
 			if !exists || current.Version != anchored.Version {
 				return current, nil
 			}
 			current.Ownership = anchored.Ownership
+			ownershipApplied = true
 			return current, nil
 		})
 		if err != nil {
 			return domain.Capability{}, err
+		}
+		if ownershipApplied {
+			c = updated
 		}
 	}
 	if err := s.store.Finish(ctx, requestingProviderID, idempotencyKey, c.ID); err != nil {

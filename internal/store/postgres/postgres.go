@@ -206,12 +206,21 @@ func (s *Store) Search(ctx context.Context, query string, limit int) ([]domain.C
 // migration 003 already created for exactly this containment query shape --
 // no new index needed.
 func (s *Store) ActiveByMode(ctx context.Context, mode domain.TrustMode, limit int) ([]domain.Capability, error) {
+	// limit<=0 means unbounded, matching store/memory's ActiveByMode
+	// exactly -- passed as SQL NULL (LIMIT NULL is unbounded in Postgres,
+	// the same as omitting LIMIT) rather than the raw non-positive int,
+	// which LIMIT would otherwise take literally (LIMIT 0 returns zero
+	// rows, not "no limit").
+	var limitArg any
+	if limit > 0 {
+		limitArg = limit
+	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+capabilityColumns+` FROM capabilities
 		WHERE payload->'supported_trust_modes' @> $1::jsonb
 		ORDER BY updated_at ASC, id ASC
 		LIMIT $2
-	`, mustMarshal([]domain.TrustMode{mode}), limit)
+	`, mustMarshal([]domain.TrustMode{mode}), limitArg)
 	if err != nil {
 		return nil, err
 	}

@@ -225,7 +225,8 @@ func main() {
 	// simulation must never be presented as a real TOS guarantee (atos-spec
 	// docs/IMPLEMENTATION_ROADMAP.md §8.1).
 	var activationAuthority domain.ActivationAuthority = service.FailClosedActivationAuthority{}
-	if cfg.TOSBackend == config.TOSBackendRPC && cfg.TOSRPC.Network != "" {
+	tosBackedAuthorityWired := cfg.TOSBackend == config.TOSBackendRPC && cfg.TOSRPC.Network != ""
+	if tosBackedAuthorityWired {
 		activationAuthority = service.NewTOSBackedActivationAuthority(core, st, executionSigners)
 		logger.Info("using TOS-backed ActivationAuthority", "network", cfg.TOSRPC.Network)
 	} else {
@@ -288,10 +289,23 @@ func main() {
 	go identityBindings.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("identity-binding operation reconciliation pending", "error", reconcileErr)
 	})
-	identityEvidence := service.NewIdentityEvidenceReconciler(capabilities, activationAuthority)
-	go identityEvidence.RunReconciler(reconcileCtx, 5*time.Minute, 200, func(reconcileErr error) {
-		logger.Error("identity-evidence suspension sweep pending", "error", reconcileErr)
-	})
+	// Only run the suspension sweep when a REAL authority is wired.
+	// FailClosedActivationAuthority always returns granted=false with a nil
+	// error -- indistinguishable, from SweepVerified's perspective, from a
+	// real authority genuinely finding every active capability invalid.
+	// Running this sweep against the fail-closed placeholder would mass-
+	// suspend every already-active Verified capability on its very first
+	// (immediate, startup) sweep the moment this deployment lacks a real
+	// authority (e.g. ATOS_TOS_NETWORK accidentally unset, or a maintenance
+	// restart on the mock backend) -- turning a pure configuration gap into
+	// live suspensions of previously-legitimate capabilities, rather than
+	// just correctly blocking NEW activations the way fail-closed should.
+	if tosBackedAuthorityWired {
+		identityEvidence := service.NewIdentityEvidenceReconciler(capabilities, activationAuthority)
+		go identityEvidence.RunReconciler(reconcileCtx, 5*time.Minute, 200, func(reconcileErr error) {
+			logger.Error("identity-evidence suspension sweep pending", "error", reconcileErr)
+		})
+	}
 	go func() {
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()

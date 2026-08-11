@@ -45,7 +45,7 @@ func (s *Store) DeletePrincipalBinding(ctx context.Context, principalID string) 
 }
 
 const identityBindingOperationColumns = `id, principal_id, type, checkpoint, idempotency_key, agent_id, reason_code,
-	binding_ref, ref_network, content_hash, failure_reason, created_at, completed_at, updated_at`
+	binding_ref, ref_network, created, content_hash, failure_reason, created_at, completed_at, updated_at`
 
 // identityBindingOperationContentHash mirrors signerOperationContentHash's
 // role, simplified for identity binding's single-step operations. See
@@ -65,22 +65,22 @@ func identityBindingOperationContentHash(op domain.IdentityBindingOperation) str
 func identityBindingOperationWriteArgs(op domain.IdentityBindingOperation) []any {
 	return []any{
 		op.ID, op.PrincipalID, string(op.Type), string(op.Checkpoint), op.IdempotencyKey, op.AgentID, op.ReasonCode,
-		op.BindingRef, op.RefNetwork, identityBindingOperationContentHash(op), op.FailureReason,
+		op.BindingRef, op.RefNetwork, op.Created, identityBindingOperationContentHash(op), op.FailureReason,
 		op.CreatedAt, op.CompletedAt, op.UpdatedAt,
 	}
 }
 
 const insertIdentityBindingOperationSQL = `
 	INSERT INTO identity_binding_operations (` + identityBindingOperationColumns + `)
-	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 	ON CONFLICT (principal_id, idempotency_key) DO NOTHING
 `
 
 const upsertIdentityBindingOperationSQL = `
 	INSERT INTO identity_binding_operations (` + identityBindingOperationColumns + `)
-	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 	ON CONFLICT (id) DO UPDATE SET
-		checkpoint=$4, binding_ref=$8, ref_network=$9, failure_reason=$11, completed_at=$13, updated_at=$14
+		checkpoint=$4, binding_ref=$8, ref_network=$9, created=$10, failure_reason=$12, completed_at=$14, updated_at=$15
 `
 
 func scanIdentityBindingOperation(row pgx.Row) (domain.IdentityBindingOperation, error) {
@@ -88,7 +88,7 @@ func scanIdentityBindingOperation(row pgx.Row) (domain.IdentityBindingOperation,
 	var opType, checkpoint, contentHash string
 	if err := row.Scan(
 		&op.ID, &op.PrincipalID, &opType, &checkpoint, &op.IdempotencyKey, &op.AgentID, &op.ReasonCode,
-		&op.BindingRef, &op.RefNetwork, &contentHash, &op.FailureReason, &op.CreatedAt, &op.CompletedAt, &op.UpdatedAt,
+		&op.BindingRef, &op.RefNetwork, &op.Created, &contentHash, &op.FailureReason, &op.CreatedAt, &op.CompletedAt, &op.UpdatedAt,
 	); err != nil {
 		return domain.IdentityBindingOperation{}, err
 	}

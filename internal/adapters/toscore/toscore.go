@@ -93,8 +93,8 @@ type Core interface {
 	ReadReputation(ctx context.Context, providerID string) (domain.Trust, error)
 	// CommitCapabilityManifest anchors capability's exact
 	// manifest/version/ownership commitment (docs/CAPABILITIES.md §11) --
-	// idempotent and safe to call on every Register/Update, mirroring
-	// tos-protocol's own CommitCapabilityManifest idempotency (a replay
+	// idempotent and safe to call on every Register/Update, mirroring the
+	// remote service's own CommitCapabilityManifest idempotency (a replay
 	// with identical provider_id/manifest digest returns the existing
 	// commitment; a conflicting replay under the same capability_id+version
 	// errors). ownershipRef is opaque "network:reference" (this codebase's
@@ -111,8 +111,8 @@ type Core interface {
 	// TOCTOU check Phase 4A's ActivationAuthority requires (a provider
 	// mutating a capability after committing must not keep a stale
 	// activation valid). version="" means "whatever is currently latest",
-	// matching tos-protocol's own VerifyCapabilityOwnershipRequest.version
-	// default. reasonCode is non-empty whenever verified is false
+	// matching the remote service's own version-defaulting convention.
+	// reasonCode is non-empty whenever verified is false
 	// (NOT_FOUND/PROVIDER_MISMATCH/MANIFEST_MISMATCH).
 	VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID, version, expectedManifestDigest string) (verified bool, reasonCode string, err error)
 	UpdateReputationEvidence(ctx context.Context, providerID string, evidence string) error

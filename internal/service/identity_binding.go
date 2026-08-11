@@ -17,9 +17,9 @@ const (
 	defaultIdentityBindingReconcileInterval   = 15 * time.Second
 	defaultIdentityBindingReconcileStaleAfter = 30 * time.Second
 	defaultIdentityBindingReconcileBatch      = 100
-	// identityBindingCallerID identifies this operating ATOS backend to
-	// tos-protocol (RequestContext.caller_id), never the principal a
-	// binding is FOR -- see atos-spec docs/TOS_RPC.md §10.
+	// identityBindingCallerID identifies this operating ATOS backend to the
+	// remote identity service (RequestContext.caller_id), never the
+	// principal a binding is FOR.
 	identityBindingCallerID = "atos-gateway"
 )
 
@@ -29,8 +29,8 @@ const (
 // binding" deliverable). It mirrors ExecutionSignerService's
 // open-then-drive-then-reconcile shape, simplified for a single-step (not
 // multi-checkpoint) remote operation: CreatePrincipalBinding/
-// RevokePrincipalBinding are each ONE atomic, idempotent tos-protocol RPC
-// call, so there is no cutover sequence to walk -- only
+// RevokePrincipalBinding are each ONE atomic, idempotent remote RPC call,
+// so there is no cutover sequence to walk -- only
 // intent_persisted -> completed, with Reconciling as the transient
 // uncertain-outcome marker every checkpoint can pass through.
 type IdentityBindingService struct {
@@ -77,9 +77,8 @@ func (in BindIdentityInput) validate() error {
 
 // Bind establishes (or, on an idempotent replay, resumes/returns) the
 // durable binding from PrincipalID to AgentID. It does NOT itself verify
-// AgentID resolves -- tos-protocol's CreatePrincipalBinding is the sole
-// authority for that (see atos-spec docs/TOS_RPC.md §10: never trust a
-// caller-supplied Agent ID by itself).
+// AgentID resolves -- the remote CreatePrincipalBinding RPC is the sole
+// authority for that: never trust a caller-supplied Agent ID by itself.
 func (s *IdentityBindingService) Bind(ctx context.Context, in BindIdentityInput) (domain.IdentityBindingOperation, error) {
 	if err := in.validate(); err != nil {
 		return domain.IdentityBindingOperation{}, err
@@ -124,8 +123,8 @@ func (in RevokeIdentityBindingInput) validate() error {
 }
 
 // Revoke ends PrincipalID's current binding. A principal with no current
-// binding is not an error -- the operation still completes, mirroring
-// tos-protocol's own RevokePrincipalBinding "revoked=false, nil error"
+// binding is not an error -- the operation still completes, mirroring the
+// remote RevokePrincipalBinding RPC's own "revoked=false, nil error"
 // convention.
 func (s *IdentityBindingService) Revoke(ctx context.Context, in RevokeIdentityBindingInput) (domain.IdentityBindingOperation, error) {
 	if err := in.validate(); err != nil {
@@ -155,10 +154,9 @@ func (s *IdentityBindingService) Revoke(ctx context.Context, in RevokeIdentityBi
 }
 
 // CurrentBinding returns the durable current-state binding for
-// principalID, if any -- the local read path (does not itself call
-// tos-protocol; TOSBackedActivationAuthority re-resolves freshness
-// separately, since cached local state is never authority -- see the
-// Phase 4A brief's persistence/caching/freshness requirement).
+// principalID, if any -- the local read path (does not itself call the
+// remote identity service; TOSBackedActivationAuthority re-resolves
+// freshness separately, since cached local state is never authority).
 func (s *IdentityBindingService) CurrentBinding(ctx context.Context, principalID string) (domain.PrincipalIdentityBinding, bool, error) {
 	return s.store.CurrentPrincipalBinding(ctx, principalID)
 }
@@ -174,7 +172,7 @@ func (s *IdentityBindingService) drive(ctx context.Context, op domain.IdentityBi
 }
 
 func (s *IdentityBindingService) driveBind(ctx context.Context, op domain.IdentityBindingOperation) (domain.IdentityBindingOperation, error) {
-	binding, _, callErr := s.core.CreatePrincipalBinding(ctx, identityBindingCallerID, op.IdempotencyKey, op.PrincipalID, op.AgentID)
+	binding, created, callErr := s.core.CreatePrincipalBinding(ctx, identityBindingCallerID, op.IdempotencyKey, op.PrincipalID, op.AgentID)
 	if callErr != nil {
 		return s.handleAmbiguousOrFail(ctx, op, callErr)
 	}
@@ -185,7 +183,7 @@ func (s *IdentityBindingService) driveBind(ctx context.Context, op domain.Identi
 	}); err != nil {
 		return op, err
 	}
-	return s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointCompleted, binding.BindingRef, binding.Network, "")
+	return s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointCompleted, binding.BindingRef, binding.Network, created, "")
 }
 
 func (s *IdentityBindingService) driveRevoke(ctx context.Context, op domain.IdentityBindingOperation) (domain.IdentityBindingOperation, error) {
@@ -198,11 +196,12 @@ func (s *IdentityBindingService) driveRevoke(ctx context.Context, op domain.Iden
 	}
 	// A revoke with nothing to revoke (revocationRef=="") still completes
 	// the operation but leaves RefNetwork/BindingRef empty -- advance's
-	// bindingRef!="" guard already handles that as a no-op write.
-	return s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointCompleted, revocationRef, revocationNetwork, "")
+	// bindingRef!="" guard already handles that as a no-op write. `created`
+	// is bind-only and meaningless here, so it's passed as false.
+	return s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointCompleted, revocationRef, revocationNetwork, false, "")
 }
 
-func (s *IdentityBindingService) advance(ctx context.Context, id string, expectedFrom, checkpoint domain.IdentityBindingCheckpoint, bindingRef, refNetwork, failureReason string) (domain.IdentityBindingOperation, error) {
+func (s *IdentityBindingService) advance(ctx context.Context, id string, expectedFrom, checkpoint domain.IdentityBindingCheckpoint, bindingRef, refNetwork string, created bool, failureReason string) (domain.IdentityBindingOperation, error) {
 	return s.store.UpdateIdentityBindingOperation(ctx, id, func(current domain.IdentityBindingOperation, exists bool) (domain.IdentityBindingOperation, error) {
 		if !exists {
 			return domain.IdentityBindingOperation{}, domain.NewError(domain.ErrNotFound, "identity-binding operation not found", false)
@@ -214,6 +213,9 @@ func (s *IdentityBindingService) advance(ctx context.Context, id string, expecte
 		if bindingRef != "" {
 			current.BindingRef = bindingRef
 			current.RefNetwork = refNetwork
+			if current.Type == domain.IdentityBindingOperationBind {
+				current.Created = created
+			}
 		}
 		current.FailureReason = failureReason
 		current.UpdatedAt = time.Now().UTC()
@@ -239,13 +241,13 @@ func isAmbiguousIdentityBindingFailure(err error) bool {
 
 func (s *IdentityBindingService) handleAmbiguousOrFail(ctx context.Context, op domain.IdentityBindingOperation, callErr error) (domain.IdentityBindingOperation, error) {
 	if isAmbiguousIdentityBindingFailure(callErr) {
-		updated, err := s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointReconciling, "", "", callErr.Error())
+		updated, err := s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointReconciling, "", "", false, callErr.Error())
 		if err != nil {
 			return updated, err
 		}
 		return updated, domain.NewError(domain.ErrNetworkUnavailable, "identity-binding operation outcome is uncertain, retry", true)
 	}
-	updated, err := s.advance(ctx, op.ID, op.Checkpoint, op.Checkpoint, "", "", callErr.Error())
+	updated, err := s.advance(ctx, op.ID, op.Checkpoint, op.Checkpoint, "", "", false, callErr.Error())
 	if err != nil {
 		return updated, err
 	}

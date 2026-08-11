@@ -159,12 +159,19 @@ func DefaultConsumerScopes() []Scope {
 // administrator approved it." Scopes in this set additionally require
 // RequiresAdminApproval's stronger operator-secret gate at approval time
 // (see internal/httpapi/auth.go's DecideDevice callers) before a pending
-// grant can ever be approved. Currently just ScopeActivationEvaluate --
-// the only scope with zero ownership scoping at all -- not
-// ScopeSettlementWrite/ScopeDisputesReview, which is a deliberate,
-// separate decision this set makes easy to revisit later, not an oversight.
+// grant can ever be approved. The set is every scope with zero ownership
+// scoping at all -- not ScopeSettlementWrite/ScopeDisputesReview, which is
+// a deliberate, separate decision this set makes easy to revisit later,
+// not an oversight. ScopeIdentityBindingsRead is included alongside
+// ScopeIdentityBindingsWrite despite being read-only: it returns any
+// principal_id's TOS agent_id/network/binding_ref with the same zero
+// ownership precondition as the write side (see its declaration above),
+// which is exactly this set's inclusion criterion -- a read scope isn't
+// automatically less sensitive than a write one when it's the only thing
+// gating cross-tenant identity-binding data.
 var adminScopes = map[Scope]struct{}{
 	ScopeActivationEvaluate:    {},
+	ScopeIdentityBindingsRead:  {},
 	ScopeIdentityBindingsWrite: {},
 }
 

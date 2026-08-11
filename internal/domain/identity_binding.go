@@ -7,9 +7,9 @@ import "time"
 // namespace as principal_id, see CapabilityService.Register) is bound to a
 // global TOS Agent Identity. This is never caller-asserted: it exists only
 // as the result of a successful IdentityBindingService.Bind call, which
-// itself only succeeds after tos-protocol independently confirms agent_id
-// resolves to a real AgentIdentity before anchoring the binding (see
-// atos-spec docs/TOS_RPC.md §10's CreatePrincipalBinding).
+// itself only succeeds after the remote identity service independently
+// confirms agent_id resolves to a real AgentIdentity before anchoring the
+// binding.
 type PrincipalIdentityBinding struct {
 	PrincipalID string    `json:"principal_id"`
 	AgentID     string    `json:"agent_id"`
@@ -30,18 +30,17 @@ const (
 )
 
 // IdentityBindingCheckpoint is one step of the durable external-operation
-// journal (docs/IMPLEMENTATION_ROADMAP.md's "durable stable intent ->
-// external operation -> durable observed outcome" rule). Unlike Phase 3B's
-// SignerOperationCheckpoint, Bind/Revoke are each ONE atomic, idempotent
-// tos-protocol RPC call -- there is no multi-step cutover sequence to
-// checkpoint through, so only two real steps exist.
+// journal ("durable stable intent -> external operation -> durable observed
+// outcome"). Unlike Phase 3B's SignerOperationCheckpoint, Bind/Revoke are
+// each ONE atomic, idempotent remote RPC call -- there is no multi-step
+// cutover sequence to checkpoint through, so only two real steps exist.
 type IdentityBindingCheckpoint string
 
 const (
 	// IdentityBindingCheckpointIntentPersisted means this process is about
-	// to call, or has called and lost the response for, the tos-protocol
-	// RPC. A crash here is safe to resume: retrying with the SAME
-	// idempotency_key lets tos-protocol's own atomicMutation replay its
+	// to call, or has called and lost the response for, the remote RPC. A
+	// crash here is safe to resume: retrying with the SAME idempotency_key
+	// lets the remote service's own idempotent-mutation handling replay its
 	// original response rather than double-anchoring or double-revoking.
 	IdentityBindingCheckpointIntentPersisted IdentityBindingCheckpoint = "intent_persisted"
 	IdentityBindingCheckpointCompleted       IdentityBindingCheckpoint = "completed"
@@ -76,8 +75,14 @@ type IdentityBindingOperation struct {
 	// operation's anchored fact: for type="bind", CreatePrincipalBinding's
 	// binding_ref; for type="revoke", RevokePrincipalBinding's
 	// revocation_ref. Mutually exclusive by Type, like AgentID/ReasonCode.
-	BindingRef    string     `json:"binding_ref,omitempty"`
-	RefNetwork    string     `json:"ref_network,omitempty"`
+	BindingRef string `json:"binding_ref,omitempty"`
+	RefNetwork string `json:"ref_network,omitempty"`
+	// Created is type="bind"-only: whether CreatePrincipalBinding reported
+	// a genuinely NEW binding (true) versus an idempotent replay of an
+	// already-existing same-principal/same-agent binding (false, a
+	// documented no-op per docs/API.md §9A) -- distinct from Checkpoint
+	// reaching Completed, which is true in BOTH cases.
+	Created       bool       `json:"created,omitempty"`
 	ContentHash   string     `json:"content_hash"`
 	FailureReason string     `json:"failure_reason,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`
@@ -85,11 +90,11 @@ type IdentityBindingOperation struct {
 	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
-// OwnershipStatus is atos-spec docs/CAPABILITIES.md §1's
-// ownership.status: a Capability version starts unanchored (Managed-only,
-// self-asserted provider_id) and becomes anchored only once
-// CapabilityOwnershipService durably commits its manifest/ownership
-// through tos-protocol's CommitCapabilityManifest.
+// OwnershipStatus is the public ownership.status projection: a Capability
+// version starts unanchored (Managed-only, self-asserted provider_id) and
+// becomes anchored only once CapabilityOwnershipService durably commits its
+// manifest/ownership through the remote identity service's manifest
+// commitment RPC.
 type OwnershipStatus string
 
 const (

@@ -133,6 +133,46 @@ func TestHandleBindIdentity_RetryWithSameIdempotencyKeyReturnsIdenticalResponse(
 	}
 }
 
+// TestHandleBindIdentity_RebindSameAgentWithFreshKeyReportsCreatedFalse
+// proves Created reflects whether CreatePrincipalBinding reported a
+// genuinely NEW binding, not merely Checkpoint reaching Completed (which is
+// true for both a new bind AND an idempotent replay/no-op rebind of an
+// already-existing same-principal/same-agent binding under a DIFFERENT
+// idempotency key) -- docs/API.md §9A documents created:false as the real,
+// expected outcome for this exact case.
+func TestHandleBindIdentity_RebindSameAgentWithFreshKeyReportsCreatedFalse(t *testing.T) {
+	server, core, token := newIdentityBindingTestServer(t)
+	core.SeedAgentIdentity("agt_rest_rebind")
+	first := callBindIdentity(t, server, token, "prn_rest_rebind", "agt_rest_rebind", "bind-rest-rebind-1")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first call status = %d, body = %s", first.Code, first.Body.String())
+	}
+	var firstDecoded bindIdentityResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &firstDecoded); err != nil {
+		t.Fatal(err)
+	}
+	if !firstDecoded.Created {
+		t.Fatalf("first bind must report created=true: %+v", firstDecoded)
+	}
+
+	// A DIFFERENT idempotency key, rebinding to the SAME agent -- a
+	// documented no-op, not a fresh key replay of the original bind.
+	rebind := callBindIdentity(t, server, token, "prn_rest_rebind", "agt_rest_rebind", "bind-rest-rebind-2")
+	if rebind.Code != http.StatusOK {
+		t.Fatalf("rebind status = %d, body = %s", rebind.Code, rebind.Body.String())
+	}
+	var rebindDecoded bindIdentityResponse
+	if err := json.Unmarshal(rebind.Body.Bytes(), &rebindDecoded); err != nil {
+		t.Fatal(err)
+	}
+	if rebindDecoded.Created {
+		t.Fatalf("rebinding to the SAME agent under a fresh key must report created=false, not true: %+v", rebindDecoded)
+	}
+	if rebindDecoded.BindingRef != firstDecoded.BindingRef {
+		t.Fatalf("rebind must return the ORIGINAL binding_ref: first=%q rebind=%q", firstDecoded.BindingRef, rebindDecoded.BindingRef)
+	}
+}
+
 func TestHandleIdentityBindingStatus_NeverBound(t *testing.T) {
 	server, _, token := newIdentityBindingTestServer(t)
 	recorder := callIdentityBindingStatus(t, server, token, "prn_rest_never_bound")

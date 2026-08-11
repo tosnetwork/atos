@@ -35,17 +35,18 @@ type Core struct {
 	// meaningful authorize/revoke/idempotency-conflict behavior against
 	// this mock without needing the real tos-protocol RPC server.
 	signers map[string]toscore.ExecutionSignerAuthorization
-	// agentIdentities simulates tos-protocol's bucketIdentities: an
+	// agentIdentities simulates the remote service's identity store: an
 	// agent_id must be "seeded" (present here) before CreatePrincipalBinding
 	// will bind to it, mirroring the real server's identical requirement.
 	agentIdentities map[string]bool
-	// principalBindings/revokedBindings mirror tos-protocol's
-	// bucketPrincipalBindings/bucketPrincipalRevocations split exactly, for
-	// the same "never bound" vs "bound then revoked" distinction.
+	// principalBindings/revokedBindings mirror the remote service's own
+	// current-bindings/revocation-history split exactly, for the same
+	// "never bound" vs "bound then revoked" distinction.
 	principalBindings map[string]domain.PrincipalIdentityBinding
 	revokedBindings   map[string]revokedBindingRecord
 	// manifestCommitments is keyed by "capability_id@version", mirroring
-	// tos-protocol's own capabilityKey bucketing for CommitCapabilityManifest.
+	// the remote service's own capability-key bucketing for
+	// CommitCapabilityManifest.
 	manifestCommitments map[string]manifestCommitmentRecord
 }
 
@@ -55,7 +56,7 @@ type manifestCommitmentRecord struct {
 	ownershipRef   string
 }
 
-// revokedBindingRecord mirrors tos-protocol's principalBindingRevocation:
+// revokedBindingRecord mirrors the remote service's own revocation record:
 // storing the ref at write time (not recomputing on replay) so a retry
 // with a DIFFERENT idempotency_key -- the documented safe lost-response
 // retry pattern -- honestly replays the ORIGINAL revocation_ref, matching
@@ -110,8 +111,8 @@ func (c *Core) SetNetwork(network string) {
 	c.network = network
 }
 
-// CommitCapabilityManifest simulates tos-protocol's idempotent manifest
-// commitment: identical (capability_id, version, provider_id, manifest
+// CommitCapabilityManifest simulates the remote service's idempotent
+// manifest commitment: identical (capability_id, version, provider_id, manifest
 // digest) replays the same ownershipRef; a conflicting replay under the
 // same capability_id+version errors, mirroring the real
 // CommitCapabilityManifest's ALREADY_EXISTS behavior.
@@ -134,7 +135,7 @@ func (c *Core) CommitCapabilityManifest(ctx context.Context, capability domain.C
 }
 
 // SeedAgentIdentity registers agentID as an existing TOS Agent Identity,
-// mirroring tos-protocol's SeedIdentity bootstrap path -- tests must call
+// mirroring the remote service's identity bootstrap path -- tests must call
 // this before CreatePrincipalBinding will succeed, exactly like the real
 // server requires an identity to already resolve before it can be bound.
 func (c *Core) SeedAgentIdentity(agentID string) {
@@ -196,7 +197,7 @@ func (c *Core) RevokePrincipalBinding(ctx context.Context, callerID, idempotency
 		// revoked (e.g. a lost-response retry under a fresh idempotency_key,
 		// the documented safe retry pattern), honestly replay the ORIGINAL
 		// revocation_ref rather than reporting revoked=false, matching the
-		// real tos-protocol server's RevokePrincipalBinding exactly: a
+		// real remote server's RevokePrincipalBinding exactly: a
 		// caller must see the same "revoked=true" fact regardless of which
 		// attempt (original or retry) they're looking at.
 		if record, ok := c.revokedBindings[principalID]; ok {
@@ -222,7 +223,7 @@ func (c *Core) ReadReputation(ctx context.Context, providerID string) (domain.Tr
 	return domain.Trust{Score: 0.8, Level: domain.TrustSelfAsserted}, nil
 }
 
-// VerifyCapabilityOwnership mirrors tos-protocol's real semantics: a
+// VerifyCapabilityOwnership mirrors the remote service's real semantics: a
 // manifest digest can only verify if CommitCapabilityManifest actually
 // anchored it first -- comparing against the capability's own
 // locally-stored ManifestCommitment field (which Register/Update set

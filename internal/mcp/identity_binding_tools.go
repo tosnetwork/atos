@@ -43,7 +43,10 @@ func (s *Server) toolBindIdentity(ctx context.Context, principal auth.Principal,
 	}
 	return bindIdentityResult{
 		PrincipalID: principalID, AgentID: binding.AgentID, Network: binding.Network,
-		BindingRef: binding.BindingRef, Created: op.Checkpoint == domain.IdentityBindingCheckpointCompleted,
+		// op.Created, not op.Checkpoint == Completed -- see httpapi's
+		// identical fix and domain.IdentityBindingOperation.Created's doc
+		// comment.
+		BindingRef: binding.BindingRef, Created: op.Created,
 	}, nil
 }
 

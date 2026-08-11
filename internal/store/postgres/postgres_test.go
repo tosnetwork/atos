@@ -431,4 +431,15 @@ func TestCapability_ActiveByMode(t *testing.T) {
 	if containsID(active, managedOnly.ID) {
 		t.Errorf("ActiveByMode(verified) incorrectly returned managed-only capability %s", managedOnly.ID)
 	}
+
+	// limit<=0 means unbounded (matching store/memory's ActiveByMode
+	// exactly), not "return zero rows" -- a bare SQL LIMIT 0 would do the
+	// latter if passed through literally.
+	unbounded, err := s.ActiveByMode(ctx, domain.TrustModeVerified, 0)
+	if err != nil {
+		t.Fatalf("ActiveByMode(limit=0): %v", err)
+	}
+	if !containsID(unbounded, verified.ID) {
+		t.Errorf("ActiveByMode(verified, limit=0) must be unbounded, not return zero rows: got %d results", len(unbounded))
+	}
 }
