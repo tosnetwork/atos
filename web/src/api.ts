@@ -1,4 +1,4 @@
-import type { Acceptance, Job, OpenTask, Proposal, Session } from './types'
+import type { Acceptance, Job, OpenTask, Proposal, Quote, Session } from './types'
 
 const API_ROOT = (import.meta.env.VITE_API_ROOT || '/v1').replace(/\/$/, '')
 
@@ -27,6 +27,7 @@ export const api = {
   publish: (session: Session, body: object) => request<OpenTask>('/open-tasks', session, { method: 'POST', body: JSON.stringify(body) }),
   accept: (session: Session, taskId: string, proposalId: string, idempotencyKey: string) => request<{ open_task: OpenTask; acceptance: Acceptance }>(`/open-tasks/${encodeURIComponent(taskId)}/proposals/${encodeURIComponent(proposalId)}/accept`, session, { method: 'POST', body: JSON.stringify({ idempotency_key: idempotencyKey }) }),
   getJob: (session: Session, id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}`, session),
+  getQuote: (session: Session, id: string) => request<Quote>(`/quotes/${encodeURIComponent(id)}`, session),
 }
 
 export function idempotencyKey(action: 'publish' | 'accept') {

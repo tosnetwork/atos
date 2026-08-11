@@ -3,7 +3,7 @@ import { request } from './api'
 import type { Session } from './types'
 
 const KEY = 'atos.tasks.session.v1'
-const SCOPES = ['open_tasks:read', 'open_tasks:write', 'jobs:read']
+const SCOPES = ['open_tasks:read', 'open_tasks:write', 'jobs:read', 'quotes:read']
 type DeviceGrant = { device_code: string; user_code: string; verification_uri_complete: string; expires_in: number; interval: number }
 type TokenResponse = { access_token: string; refresh_token: string; expires_in: number; principal_id: string; scopes: string[]; error?: string }
 type AuthValue = { session: Session | null; login: () => Promise<void>; logout: () => Promise<void>; loggingIn: boolean; loginCode: string | null }

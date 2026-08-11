@@ -45,4 +45,15 @@ export type Acceptance = {
 export type ProofStatus = { quote: string; escrow: string; receipt: string; settlement: string }
 export type Job = { job_id: string; state: string; trust_mode: string; proof_status: ProofStatus; failure_reason?: string; output?: Record<string, unknown>; created_at: string; completed_at?: string }
 
+export type Quote = {
+  quote_id: string
+  capability_id: string
+  capability_version: string
+  provider_id: string
+  trust_mode: string
+  proof_profile?: string
+  price: { subtotal: string; fees: string; total_max: string; currency: string }
+  expires_at: string
+}
+
 export type Session = { accessToken: string; refreshToken: string; expiresAt: number; principalId: string; scopes: string[] }
