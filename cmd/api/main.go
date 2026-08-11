@@ -198,6 +198,10 @@ func main() {
 	artifacts := service.NewArtifactService(st, blobStorage)
 	disputes := service.NewDisputeService(st, jobs, earnings, accounts, artifacts)
 	executionSigners := service.NewExecutionSignerService(st, core, capabilities)
+	certifications := service.NewCertificationService(st, capabilities, providerResolver)
+	if remoteProber != nil {
+		certifications.WithRemoteProber(remoteProber)
+	}
 	// FailClosedActivationAuthority is the only domain.ActivationAuthority
 	// implementation that exists today -- see its own doc comment and
 	// atos-spec docs/IMPLEMENTATION_ROADMAP.md §7.2.1. A config-driven
@@ -235,6 +239,7 @@ func main() {
 
 	restServer := &httpapi.Server{
 		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,
+		Certifications:      certifications,
 		ActivationAuthority: activationAuthority, OpenTasks: openTasks, Quotes: quotes,
 		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts,
 		Earnings: earnings, Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
@@ -242,6 +247,7 @@ func main() {
 	}
 	mcpServer := &mcp.Server{
 		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,
+		Certifications:      certifications,
 		ActivationAuthority: activationAuthority, OpenTasks: openTasks, Quotes: quotes,
 		Jobs: jobs, Accounts: accounts, Receipts: receipts, Earnings: earnings,
 		Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,

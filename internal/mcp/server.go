@@ -22,6 +22,7 @@ type Server struct {
 	// service.CapabilityReadiness's doc comment).
 	Health           *service.HealthService
 	ExecutionSigners *service.ExecutionSignerService
+	Certifications   *service.CertificationService
 	// ActivationAuthority backs atos_evaluate_activation -- unlike Health,
 	// this is not optional: production wiring MUST always set it (see
 	// httpapi.Server.ActivationAuthority's identical doc comment).

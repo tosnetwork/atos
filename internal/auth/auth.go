@@ -82,6 +82,15 @@ const (
 	// other principals' tasks is a distinct trust-side effect class from
 	// managing one's own tasks.
 	ScopeOpenTaskProposalsWrite Scope = "open_task_proposals:write"
+	// ScopeCertificationsRead/Write authorize the Phase 3A sandbox
+	// certification workflow (service.CertificationService.Open, atos-spec
+	// docs/API.md §2.3) from the owning provider's side: triggering a
+	// certification attempt against one's own capability binding and
+	// reading its history. Provider-role and ownership-checked, mirroring
+	// ScopeExecutionSignersRead/Write's exact pattern -- never a default
+	// consumer scope (a consumer never certifies someone else's binding).
+	ScopeCertificationsRead  Scope = "certifications:read"
+	ScopeCertificationsWrite Scope = "certifications:write"
 )
 
 var allowedScopes = map[Scope]struct{}{
@@ -93,6 +102,7 @@ var allowedScopes = map[Scope]struct{}{
 	ScopeExecutionSignersRead: {}, ScopeExecutionSignersWrite: {},
 	ScopeActivationEvaluate: {},
 	ScopeOpenTasksRead:      {}, ScopeOpenTasksWrite: {}, ScopeOpenTaskProposalsWrite: {},
+	ScopeCertificationsRead: {}, ScopeCertificationsWrite: {},
 }
 
 var defaultConsumerScopes = []Scope{

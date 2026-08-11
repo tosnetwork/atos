@@ -201,3 +201,18 @@ func (s *CertificationService) Get(ctx context.Context, id string) (domain.Sandb
 func (s *CertificationService) ListByCapability(ctx context.Context, capabilityID string) ([]domain.SandboxCertification, error) {
 	return s.store.CertificationsByCapability(ctx, capabilityID)
 }
+
+// PublicStatus returns the certification history for capabilityID, newest
+// first, enforcing the same provider-ownership rule every other
+// provider-facing status read in this codebase enforces (mirrors
+// ExecutionSignerService.PublicStatus).
+func (s *CertificationService) PublicStatus(ctx context.Context, requestingProviderID, capabilityID string) ([]domain.SandboxCertification, error) {
+	cap, err := s.capabilities.Get(ctx, capabilityID)
+	if err != nil {
+		return nil, err
+	}
+	if cap.ProviderID != requestingProviderID {
+		return nil, domain.NewError(domain.ErrPermissionDenied, "not the owning provider", false)
+	}
+	return s.ListByCapability(ctx, capabilityID)
+}

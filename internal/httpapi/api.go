@@ -53,6 +53,7 @@ type Server struct {
 	// service.CapabilityReadiness's doc comment).
 	Health           *service.HealthService
 	ExecutionSigners *service.ExecutionSignerService
+	Certifications   *service.CertificationService
 	// ActivationAuthority backs POST /capabilities/{id}/activation/evaluate
 	// (atos-spec docs/API.md §2.2) -- unlike Health, this is not optional:
 	// production wiring MUST always set it (service.FailClosedActivationAuthority
@@ -109,6 +110,9 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("GET /v1/capabilities/{id}/execution-signer", s.withScopes(s.handleGetExecutionSignerStatus, auth.ScopeExecutionSignersRead))
 
 	mux.HandleFunc("POST /v1/capabilities/{id}/activation/evaluate", s.withScopes(s.handleEvaluateActivation, auth.ScopeActivationEvaluate))
+
+	mux.HandleFunc("POST /v1/capabilities/{id}/certification", s.withScopes(s.handleOpenCertification, auth.ScopeCertificationsWrite))
+	mux.HandleFunc("GET /v1/capabilities/{id}/certification", s.withScopes(s.handleGetCertificationStatus, auth.ScopeCertificationsRead))
 
 	mux.HandleFunc("POST /v1/quotes", s.withScopes(s.handleCreateQuote, auth.ScopeQuotesRead))
 	mux.HandleFunc("GET /v1/quotes/{id}", s.withScopes(s.handleGetQuote, auth.ScopeQuotesRead))

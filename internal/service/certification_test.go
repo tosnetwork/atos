@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -393,6 +394,66 @@ func TestCertificationOpen_CombinedReadinessSignalsStillDoNotActivate(t *testing
 	// docs/IMPLEMENTATION_ROADMAP.md §7.2.0/§7.2.1.
 	if after.ModeSupport.Entry(domain.TrustModeVerified).Status != domain.ModeSupportPending {
 		t.Fatalf("verified mode_support status = %s, want pending", after.ModeSupport.Entry(domain.TrustModeVerified).Status)
+	}
+}
+
+func TestCertificationPublicStatus_ReturnsHistoryNewestFirst(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(certifiableHTTPHandler())
+	defer srv.Close()
+
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	resolver := provideradapter.NewResolver(httpadapter.New(httpadapter.Config{Client: srv.Client()}))
+	certifications := service.NewCertificationService(st, capabilities, resolver)
+
+	cap := registerHTTPBoundCapability(t, capabilities, "agt_cert_status_1", srv.URL, []domain.TrustMode{domain.TrustModeVerified})
+	first, err := certifications.Open(ctx, service.OpenCertificationInput{
+		ProviderID: "agt_cert_status_1", CapabilityID: cap.ID, Transport: domain.AdapterHTTP, IdempotencyKey: "cert-status-1a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := certifications.Open(ctx, service.OpenCertificationInput{
+		ProviderID: "agt_cert_status_1", CapabilityID: cap.ID, Transport: domain.AdapterHTTP, IdempotencyKey: "cert-status-1b",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	history, err := certifications.PublicStatus(ctx, "agt_cert_status_1", cap.ID)
+	if err != nil {
+		t.Fatalf("PublicStatus: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("history length = %d, want 2", len(history))
+	}
+	if history[0].ID != second.ID || history[1].ID != first.ID {
+		t.Fatalf("history not newest-first: got [%s, %s], want [%s, %s]", history[0].ID, history[1].ID, second.ID, first.ID)
+	}
+}
+
+func TestCertificationPublicStatus_RejectsNonOwningProvider(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(certifiableHTTPHandler())
+	defer srv.Close()
+
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	resolver := provideradapter.NewResolver(httpadapter.New(httpadapter.Config{Client: srv.Client()}))
+	certifications := service.NewCertificationService(st, capabilities, resolver)
+
+	cap := registerHTTPBoundCapability(t, capabilities, "agt_cert_status_owner", srv.URL, []domain.TrustMode{domain.TrustModeVerified})
+	if _, err := certifications.Open(ctx, service.OpenCertificationInput{
+		ProviderID: "agt_cert_status_owner", CapabilityID: cap.ID, Transport: domain.AdapterHTTP, IdempotencyKey: "cert-status-owner-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := certifications.PublicStatus(ctx, "agt_cert_status_intruder", cap.ID)
+	var domainErr *domain.Error
+	if !errors.As(err, &domainErr) || domainErr.Code != domain.ErrPermissionDenied {
+		t.Fatalf("expected ErrPermissionDenied, got %v", err)
 	}
 }
 

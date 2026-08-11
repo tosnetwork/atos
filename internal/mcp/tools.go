@@ -38,6 +38,8 @@ func (s *Server) dispatch() map[string]toolHandler {
 		"atos_revoke_execution_signer":     s.toolRevokeExecutionSigner,
 		"atos_get_execution_signer_status": s.toolGetExecutionSignerStatus,
 		"atos_evaluate_activation":         s.toolEvaluateActivation,
+		"atos_open_certification":          s.toolOpenCertification,
+		"atos_get_certification_status":    s.toolGetCertificationStatus,
 		"atos_publish_open_task":           s.toolPublishOpenTask,
 		"atos_search_open_tasks":           s.toolSearchOpenTasks,
 		"atos_get_open_task":               s.toolGetOpenTask,

@@ -36,6 +36,8 @@ var orderedToolSpecs = []toolSpec{
 	{Definition: revokeExecutionSignerTool(), RequiredScopes: []auth.Scope{auth.ScopeExecutionSignersWrite}},
 	{Definition: getExecutionSignerStatusTool(), RequiredScopes: []auth.Scope{auth.ScopeExecutionSignersRead}},
 	{Definition: evaluateActivationTool(), RequiredScopes: []auth.Scope{auth.ScopeActivationEvaluate}},
+	{Definition: openCertificationTool(), RequiredScopes: []auth.Scope{auth.ScopeCertificationsWrite}},
+	{Definition: getCertificationStatusTool(), RequiredScopes: []auth.Scope{auth.ScopeCertificationsRead}},
 	{Definition: publishOpenTaskTool(), RequiredScopes: []auth.Scope{auth.ScopeOpenTasksWrite}},
 	{Definition: searchOpenTasksTool(), RequiredScopes: []auth.Scope{auth.ScopeOpenTasksRead}},
 	{Definition: getOpenTaskTool(), RequiredScopes: []auth.Scope{auth.ScopeOpenTasksRead}},
@@ -422,6 +424,30 @@ func evaluateActivationTool() map[string]any {
 			"capability_id":   map[string]any{"type": "string", "minLength": 1},
 			"mode":            map[string]any{"type": "string", "enum": []string{"verified", "native"}},
 			"idempotency_key": map[string]any{"type": "string", "minLength": 1},
+		}),
+		"outputSchema": map[string]any{"type": "object"},
+	}
+}
+
+func openCertificationTool() map[string]any {
+	return map[string]any{
+		"name":        "atos_open_certification",
+		"description": "Idempotently open (or recover) a Phase 3A sandbox certification attempt for one of the authenticated provider's own Capability transport bindings (docs/API.md §2.3). Read-only probe against the binding -- never dispatches a real invocation. A failed:false result is a normal outcome, not an error.",
+		"inputSchema": objectSchema([]string{"capability_id", "transport", "idempotency_key"}, map[string]any{
+			"capability_id":   map[string]any{"type": "string", "minLength": 1},
+			"transport":       map[string]any{"type": "string", "enum": []string{"http", "mcp", "a2a", "human", "tos-native"}},
+			"idempotency_key": map[string]any{"type": "string", "minLength": 1},
+		}),
+		"outputSchema": map[string]any{"type": "object"},
+	}
+}
+
+func getCertificationStatusTool() map[string]any {
+	return map[string]any{
+		"name":        "atos_get_certification_status",
+		"description": "Read-only: the certification history (newest first) for a Capability owned by the authenticated provider.",
+		"inputSchema": objectSchema([]string{"capability_id"}, map[string]any{
+			"capability_id": map[string]any{"type": "string", "minLength": 1},
 		}),
 		"outputSchema": map[string]any{"type": "object"},
 	}
