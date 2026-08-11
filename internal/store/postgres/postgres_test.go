@@ -390,3 +390,45 @@ func TestReserveConcurrentClaimHasSingleWinner(t *testing.T) {
 		t.Fatalf("concurrent idempotency winners = %d, want exactly 1", winners)
 	}
 }
+
+// TestCapability_ActiveByMode proves the query against the real payload
+// jsonb GIN index (migration 003) -- both that supported_trust_modes
+// containment matches, and that a capability NOT currently supporting the
+// queried mode is correctly excluded.
+func TestCapability_ActiveByMode(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+
+	verified := domain.Capability{
+		ID: "cap_active_verified_" + suffix, ProviderID: "agt_active_" + suffix,
+		Name: "Active Verified", Description: "for ActiveByMode",
+		Version: "1.0.0", DeliveryMode: domain.DeliveryInstant,
+		InputSchema: map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing:             domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
+		SupportedTrustModes: []domain.TrustMode{domain.TrustModeManaged, domain.TrustModeVerified},
+		Status:              domain.CapabilityActive,
+		UpdatedAt:           time.Now().UTC(),
+	}
+	managedOnly := verified
+	managedOnly.ID = "cap_active_managed_" + suffix
+	managedOnly.SupportedTrustModes = []domain.TrustMode{domain.TrustModeManaged}
+
+	if err := s.Put(ctx, verified); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(ctx, managedOnly); err != nil {
+		t.Fatal(err)
+	}
+
+	active, err := s.ActiveByMode(ctx, domain.TrustModeVerified, 100)
+	if err != nil {
+		t.Fatalf("ActiveByMode: %v", err)
+	}
+	if !containsID(active, verified.ID) {
+		t.Errorf("ActiveByMode(verified) did not return %s", verified.ID)
+	}
+	if containsID(active, managedOnly.ID) {
+		t.Errorf("ActiveByMode(verified) incorrectly returned managed-only capability %s", managedOnly.ID)
+	}
+}

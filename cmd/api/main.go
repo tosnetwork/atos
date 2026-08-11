@@ -287,6 +287,10 @@ func main() {
 	go identityBindings.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("identity-binding operation reconciliation pending", "error", reconcileErr)
 	})
+	identityEvidence := service.NewIdentityEvidenceReconciler(capabilities, activationAuthority)
+	go identityEvidence.RunReconciler(reconcileCtx, 5*time.Minute, 200, func(reconcileErr error) {
+		logger.Error("identity-evidence suspension sweep pending", "error", reconcileErr)
+	})
 	go func() {
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()

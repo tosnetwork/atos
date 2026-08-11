@@ -5,6 +5,7 @@ package memory
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -169,6 +170,30 @@ func (s *Store) ByProvider(ctx context.Context, providerID string) ([]domain.Cap
 		if c.ProviderID == providerID {
 			out = append(out, c)
 		}
+	}
+	return out, nil
+}
+
+func (s *Store) ActiveByMode(ctx context.Context, mode domain.TrustMode, limit int) ([]domain.Capability, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []domain.Capability
+	for _, c := range s.capabilities {
+		for _, supported := range c.SupportedTrustModes {
+			if supported == mode {
+				out = append(out, c)
+				break
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].UpdatedAt.Before(out[j].UpdatedAt)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }

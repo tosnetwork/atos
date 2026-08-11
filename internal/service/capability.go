@@ -365,6 +365,38 @@ func (s *CapabilityService) RecordReadinessEvidence(ctx context.Context, capabil
 // activation depended on is no longer valid for the Capability's CURRENT
 // version. reason is stored as the mode's ModeSupportEntry.Reason. A no-op
 // for a mode that isn't currently active.
+// ActiveByMode lists every Capability currently active for mode -- the
+// enumeration Phase 4A's post-activation identity/ownership reconciler
+// sweeps (see service.IdentityEvidenceReconciler).
+func (s *CapabilityService) ActiveByMode(ctx context.Context, mode domain.TrustMode, limit int) ([]domain.Capability, error) {
+	return s.store.ActiveByMode(ctx, mode, limit)
+}
+
+// SuspendMode is SuspendModeIfActive's mode-direct counterpart: it suspends
+// exactly the named mode, not every mode eligible for a transport binding.
+// Phase 4A's identity-evidence reconciler needs this because a stale
+// provider identity/ownership/signer fact invalidates a specific trust
+// mode's activation directly -- there is no transport-level health signal
+// to key off, unlike HealthService.CheckCapability's use of
+// SuspendModeIfActive. A no-op (mode already not active) is not an error.
+func (s *CapabilityService) SuspendMode(ctx context.Context, capabilityID string, mode domain.TrustMode, reason string) error {
+	_, err := s.store.UpdateCapability(ctx, capabilityID, func(current domain.Capability, exists bool) (domain.Capability, error) {
+		if !exists {
+			return domain.Capability{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability not found", false)
+		}
+		cap := normalizeCapability(current)
+		before := cap.ModeSupport.Entry(mode).Status
+		cap.ModeSupport = cap.ModeSupport.Suspend(mode, reason)
+		if cap.ModeSupport.Entry(mode).Status == before {
+			return current, nil
+		}
+		cap.SupportedTrustModes = cap.ModeSupport.ActiveModes()
+		cap.UpdatedAt = time.Now().UTC()
+		return cap, nil
+	})
+	return err
+}
+
 func (s *CapabilityService) SuspendModeIfActive(ctx context.Context, capabilityID string, transport domain.EndpointAdapterType, reason string) error {
 	_, err := s.store.UpdateCapability(ctx, capabilityID, func(current domain.Capability, exists bool) (domain.Capability, error) {
 		if !exists {

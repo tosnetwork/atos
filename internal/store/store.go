@@ -51,6 +51,15 @@ type Capabilities interface {
 	Get(ctx context.Context, id string) (domain.Capability, error)
 	Search(ctx context.Context, query string, limit int) ([]domain.Capability, error)
 	ByProvider(ctx context.Context, providerID string) ([]domain.Capability, error)
+	// ActiveByMode returns every Capability whose SupportedTrustModes
+	// currently includes mode, oldest-updated first, bounded to limit --
+	// the enumeration Phase 4A's post-activation suspension sweep needs
+	// (docs/IMPLEMENTATION_ROADMAP.md §8.1: "loss of current evidence
+	// suspends future Verified availability"). Ordering oldest-first, like
+	// every other reconciler sweep in this package, bounds staleness: a
+	// capability that keeps failing re-verification doesn't starve out
+	// capabilities newer in the scan order.
+	ActiveByMode(ctx context.Context, mode domain.TrustMode, limit int) ([]domain.Capability, error)
 	// UpdateCapability atomically applies fn to the capability's current
 	// stored state (or domain.Capability{} with exists=false if it isn't
 	// stored yet) and persists whatever fn returns -- the compare-and-swap
