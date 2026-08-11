@@ -365,6 +365,13 @@ func TestConcurrentReplicaSealersSerializeCompleteStateMachine(t *testing.T) {
 		err   error
 	}
 	results := make(chan sealResult, 2)
+	secondContended := make(chan struct{})
+	var contentionObserved sync.Once
+	repository2.sealingLockAttempted = func(acquired bool) {
+		if !acquired {
+			contentionObserved.Do(func() { close(secondContended) })
+		}
+	}
 	seal := func(repository *Repository) {
 		sealed, sealErr := repository.SealNext(ctx, chainLedger, signer, "kms-sealer-test", "ed25519", signer.public, retainer, publisher, 100)
 		results <- sealResult{batch: sealed, err: sealErr}
@@ -376,7 +383,11 @@ func TestConcurrentReplicaSealersSerializeCompleteStateMachine(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 	go seal(repository2)
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-secondContended:
+	case <-ctx.Done():
+		t.Fatal("second sealer never attempted the held advisory lock")
+	}
 	close(retainer.release)
 	for range 2 {
 		result := <-results
@@ -452,6 +463,13 @@ func TestLockSessionLossFencesStaleSealer(t *testing.T) {
 	}
 	firstResult := make(chan sealResult, 1)
 	secondResult := make(chan sealResult, 1)
+	secondAcquired := make(chan struct{})
+	var acquisitionObserved sync.Once
+	repository2.sealingLockAttempted = func(acquired bool) {
+		if acquired {
+			acquisitionObserved.Do(func() { close(secondAcquired) })
+		}
+	}
 	go func() {
 		sealed, sealErr := repository1.SealNext(ctx, chainLedger, signer, "kms-sealer-test", "ed25519", signer.public, retainer, publisher, 100)
 		firstResult <- sealResult{batch: sealed, err: sealErr}
@@ -470,7 +488,11 @@ func TestLockSessionLossFencesStaleSealer(t *testing.T) {
 		sealed, sealErr := repository2.SealNext(ctx, chainLedger, signer, "kms-sealer-test", "ed25519", signer.public, retainer, publisher, 100)
 		secondResult <- sealResult{batch: sealed, err: sealErr}
 	}()
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-secondAcquired:
+	case <-ctx.Done():
+		t.Fatal("replacement sealer never acquired the released advisory lock")
+	}
 	close(retainer.release)
 	stale := <-firstResult
 	recovered := <-secondResult

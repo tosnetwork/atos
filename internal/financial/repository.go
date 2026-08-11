@@ -24,6 +24,8 @@ type Repository struct {
 	gatewayID string
 	networkID string
 	now       func() time.Time
+	// sealingLockAttempted is a test-only observation hook set before use.
+	sealingLockAttempted func(bool)
 }
 
 const (
@@ -177,6 +179,9 @@ func (r *Repository) lockSealing(ctx context.Context) (*pgxpool.Conn, func(), er
 			_ = hijacked.Close(closeCtx)
 			closeCancel()
 			return nil, nil, err
+		}
+		if r.sealingLockAttempted != nil {
+			r.sealingLockAttempted(acquired)
 		}
 		if acquired {
 			break
