@@ -5,8 +5,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"syscall"
@@ -236,9 +236,9 @@ func main() {
 	// CIDR, so this only ever fails on a config/validate drift, not on
 	// anything an operator can trigger by misconfiguring
 	// ATOS_TRUSTED_PROXY_CIDRS at runtime.
-	trustedProxyCIDRs := make([]*net.IPNet, 0, len(cfg.TrustedProxyCIDRs))
+	trustedProxyCIDRs := make([]netip.Prefix, 0, len(cfg.TrustedProxyCIDRs))
 	for _, raw := range cfg.TrustedProxyCIDRs {
-		_, parsed, err := net.ParseCIDR(raw)
+		parsed, err := netip.ParsePrefix(raw)
 		if err != nil {
 			logger.Error("invalid trusted proxy CIDR", "cidr", raw, "error", err)
 			os.Exit(2)

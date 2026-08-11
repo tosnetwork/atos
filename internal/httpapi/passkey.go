@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -39,50 +40,88 @@ import (
 var passkeyFinishReadDeadline = 10 * time.Second
 
 // clientIP identifies the caller for rate-limiting purposes only -- never
-// as an identity or authorization signal. The forwarded-IP headers
-// (X-Real-IP, X-Forwarded-For) are trusted ONLY when the request's actual
-// TCP peer address falls inside s.TrustedProxyCIDRs (config
-// ATOS_TRUSTED_PROXY_CIDRS, empty/unset by default) -- an HTTP client
-// cannot spoof its own TCP source address, but it CAN set any header value
-// it likes, so trusting a header from an untrusted peer would let every
-// anonymous caller pick its own rate-limit bucket per request. The
-// opposite failure mode matters too: if ATOS actually runs behind a load
-// balancer/ingress/CDN and this is left unconfigured, every request
-// resolves to that proxy's own single address and shares one rate-limit
-// bucket -- set TrustedProxyCIDRs to the proxy's real address range to
-// avoid that. Single-hop only (the first/only forwarded value is used, no
-// X-Forwarded-For chain-walking) -- sufficient for one reverse proxy
-// directly in front of ATOS, not a multi-hop proxy chain.
+// as an identity or authorization signal. Forwarded-IP headers (X-Real-IP,
+// X-Forwarded-For) are consulted ONLY when the request's actual TCP peer
+// address falls inside s.TrustedProxyCIDRs (config ATOS_TRUSTED_PROXY_CIDRS,
+// empty/unset by default): an HTTP client cannot spoof its own TCP source
+// address, but it CAN set any header value it likes, so trusting a header
+// from an untrusted peer would let every anonymous caller pick its own
+// rate-limit bucket per request. The opposite failure mode matters too: if
+// ATOS actually runs behind a load balancer/ingress/CDN and this is left
+// unconfigured, every request resolves to that proxy's own single address
+// and shares one rate-limit bucket -- set TrustedProxyCIDRs to the proxy's
+// real address range to avoid that.
+//
+// A trusted TCP peer does not make every element of a forwarded header
+// trustworthy: common reverse-proxy configurations (nginx's default
+// `proxy_add_x_forwarded_for`, for example) APPEND to any X-Forwarded-For
+// the client already sent rather than overwriting it, so a client can
+// pre-seed `X-Forwarded-For: <anything>` and have the trusted proxy append
+// the real address after it -- naively taking the leftmost/first value
+// would return the client's own forged entry. X-Real-IP is different: a
+// correctly configured proxy SETS (overwrites) it to a single value, not a
+// chain, so it's trusted directly once the peer is trusted. X-Forwarded-For
+// is walked right-to-left, skipping any entry that is itself inside a
+// trusted CIDR (another hop this deployment also trusts), returning the
+// first entry that isn't -- the address the trust chain actually
+// terminates at. Every candidate is strictly parsed via net/netip; anything
+// that doesn't parse as an IP is skipped rather than trusted verbatim.
 func (s *Server) clientIP(r *http.Request) string {
-	peer, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		peer = r.RemoteAddr
+	peer := peerAddr(r.RemoteAddr)
+	if !peer.IsValid() || !s.addrIsTrustedProxy(peer) {
+		return peerString(peer, r.RemoteAddr)
 	}
-	if !s.peerIsTrustedProxy(peer) {
-		return peer
-	}
-	if ip := strings.TrimSpace(r.Header.Get("X-Real-IP")); ip != "" {
-		return ip
+	if raw := strings.TrimSpace(r.Header.Get("X-Real-IP")); raw != "" {
+		if addr, err := netip.ParseAddr(raw); err == nil {
+			return addr.String()
+		}
 	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if first, _, ok := strings.Cut(xff, ","); ok {
-			return strings.TrimSpace(first)
+		parts := strings.Split(xff, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			addr, err := netip.ParseAddr(strings.TrimSpace(parts[i]))
+			if err != nil {
+				continue
+			}
+			if !s.addrIsTrustedProxy(addr) {
+				return addr.String()
+			}
 		}
-		return strings.TrimSpace(xff)
 	}
-	return peer
+	return peerString(peer, r.RemoteAddr)
 }
 
-func (s *Server) peerIsTrustedProxy(peer string) bool {
+// peerAddr parses an http.Request.RemoteAddr's host portion as a
+// netip.Addr, returning the zero (invalid) Addr if it cannot be parsed --
+// callers must check IsValid() before use.
+func peerAddr(remoteAddr string) netip.Addr {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}
+	}
+	return addr
+}
+
+// peerString renders a parsed peer address canonically, or falls back to
+// the raw RemoteAddr verbatim if it never parsed at all (better than an
+// empty rate-limit key).
+func peerString(peer netip.Addr, rawRemoteAddr string) string {
+	if peer.IsValid() {
+		return peer.String()
+	}
+	return rawRemoteAddr
+}
+
+func (s *Server) addrIsTrustedProxy(addr netip.Addr) bool {
 	if len(s.TrustedProxyCIDRs) == 0 {
 		return false
 	}
-	parsed := net.ParseIP(peer)
-	if parsed == nil {
-		return false
-	}
-	for _, cidr := range s.TrustedProxyCIDRs {
-		if cidr.Contains(parsed) {
+	for _, prefix := range s.TrustedProxyCIDRs {
+		if prefix.Contains(addr) {
 			return true
 		}
 	}

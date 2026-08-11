@@ -4,7 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
-	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -233,7 +233,7 @@ func (c Config) Validate() error {
 		return errors.New("ATOS_PUBLIC_BASE_URL must not contain a path prefix")
 	}
 	for _, cidr := range c.TrustedProxyCIDRs {
-		if _, _, err := net.ParseCIDR(cidr); err != nil {
+		if _, err := netip.ParsePrefix(cidr); err != nil {
 			return fmt.Errorf("ATOS_TRUSTED_PROXY_CIDRS contains an invalid CIDR %q: %w", cidr, err)
 		}
 	}

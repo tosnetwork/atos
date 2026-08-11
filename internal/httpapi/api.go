@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 
 	"github.com/tosnetwork/atos/internal/auth"
@@ -88,7 +88,7 @@ type Server struct {
 	// once at startup -- see clientIP's doc comment (internal/httpapi/
 	// passkey.go) for why an unconfigured (nil) value means forwarded-IP
 	// headers are never trusted.
-	TrustedProxyCIDRs []*net.IPNet
+	TrustedProxyCIDRs []netip.Prefix
 }
 
 func (s *Server) Mux() *http.ServeMux {

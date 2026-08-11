@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -210,12 +210,21 @@ func TestClientIP_IgnoresForwardedHeaderWithoutTrustedProxyConfig(t *testing.T) 
 	}
 }
 
-func TestClientIP_TrustsForwardedHeaderOnlyFromConfiguredProxyCIDR(t *testing.T) {
-	_, trustedCIDR, err := net.ParseCIDR("192.0.2.0/24")
-	if err != nil {
-		t.Fatal(err)
+func trustedCIDRServer(t *testing.T, cidrs ...string) *Server {
+	t.Helper()
+	prefixes := make([]netip.Prefix, 0, len(cidrs))
+	for _, c := range cidrs {
+		prefix, err := netip.ParsePrefix(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prefixes = append(prefixes, prefix)
 	}
-	server := &Server{TrustedProxyCIDRs: []*net.IPNet{trustedCIDR}}
+	return &Server{TrustedProxyCIDRs: prefixes}
+}
+
+func TestClientIP_TrustsForwardedHeaderOnlyFromConfiguredProxyCIDR(t *testing.T) {
+	server := trustedCIDRServer(t, "192.0.2.0/24")
 
 	trusted := httptest.NewRequest(http.MethodPost, "/", nil)
 	trusted.RemoteAddr = "192.0.2.1:5555" // inside the trusted CIDR
@@ -232,17 +241,62 @@ func TestClientIP_TrustsForwardedHeaderOnlyFromConfiguredProxyCIDR(t *testing.T)
 	}
 }
 
-func TestClientIP_FallsBackToForwardedForWhenNoRealIP(t *testing.T) {
-	_, trustedCIDR, err := net.ParseCIDR("192.0.2.0/24")
-	if err != nil {
-		t.Fatal(err)
+// TestClientIP_XForwardedForAppendModeAttackIsRejected is a regression
+// test for a real P1: nginx's default proxy_add_x_forwarded_for (and many
+// other reverse proxies) APPENDS to an incoming X-Forwarded-For rather
+// than overwriting it, so a client can pre-seed an arbitrary value and
+// have the trusted proxy append the real address after it. Naively taking
+// the leftmost/first entry (the previous implementation) would return the
+// client's own forged value, letting an attacker pick a fresh rate-limit
+// bucket on every request just by varying that string. The fix walks
+// right-to-left, skipping entries that are themselves inside a trusted
+// CIDR (the proxy hops this deployment trusts), and returns the first one
+// that isn't -- correctly landing on the real client here despite the
+// attacker-controlled leftmost entry.
+func TestClientIP_XForwardedForAppendModeAttackIsRejected(t *testing.T) {
+	server := trustedCIDRServer(t, "192.0.2.0/24")
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "192.0.2.1:5555" // the trusted proxy's own peer address
+	// Attacker-forged leftmost entry, with the trusted proxy's own append
+	// (its own address, matching how nginx's $proxy_add_x_forwarded_for
+	// appends $remote_addr) landing right before the real client.
+	req.Header.Set("X-Forwarded-For", "203.0.113.250, 192.0.2.1, 203.0.113.7")
+	if got := server.clientIP(req); got != "203.0.113.7" {
+		t.Fatalf("clientIP = %q, want 203.0.113.7 (the real client, immediately left of the trusted proxy's own appended hop) -- not the attacker-forged leftmost entry 203.0.113.250", got)
 	}
-	server := &Server{TrustedProxyCIDRs: []*net.IPNet{trustedCIDR}}
+}
+
+func TestClientIP_FallsBackToForwardedForWhenNoRealIP(t *testing.T) {
+	server := trustedCIDRServer(t, "192.0.2.0/24")
 
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	req.RemoteAddr = "192.0.2.1:5555"
 	req.Header.Set("X-Forwarded-For", "203.0.113.7, 192.0.2.1")
 	if got := server.clientIP(req); got != "203.0.113.7" {
-		t.Fatalf("clientIP = %q, want the first X-Forwarded-For entry (203.0.113.7)", got)
+		t.Fatalf("clientIP = %q, want 203.0.113.7 -- the rightmost entry (192.0.2.1) is the trusted proxy's own appended hop and must be skipped", got)
+	}
+}
+
+func TestClientIP_RejectsUnparseableForwardedValues(t *testing.T) {
+	server := trustedCIDRServer(t, "192.0.2.0/24")
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "192.0.2.1:5555"
+	req.Header.Set("X-Real-IP", "not-an-ip")
+	req.Header.Set("X-Forwarded-For", "also-not-an-ip, 192.0.2.1")
+	if got := server.clientIP(req); got != "192.0.2.1" {
+		t.Fatalf("clientIP = %q, want the trusted peer address (192.0.2.1) as a safe fallback when nothing in either forwarded header parses as an IP", got)
+	}
+}
+
+func TestClientIP_TrustsIPv6Peer(t *testing.T) {
+	server := trustedCIDRServer(t, "2001:db8::/32")
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "[2001:db8::1]:5555"
+	req.Header.Set("X-Real-IP", "2001:db8:1::42")
+	if got := server.clientIP(req); got != "2001:db8:1::42" {
+		t.Fatalf("clientIP = %q, want the forwarded IPv6 address (2001:db8:1::42)", got)
 	}
 }
