@@ -232,7 +232,7 @@ func TestPhase1CleanClientAuthorizationSearchQuotePayInvoke(t *testing.T) {
 	quoteFor := func(capabilityID string) domain.Quote {
 		response := phase01Request(t, client, http.MethodPost, httpServer.URL+"/v1/quotes", tokens.AccessToken, map[string]any{
 			"capability_id": capabilityID, "requested_trust_mode": "auto",
-		}, nil)
+		}, map[string]string{"Idempotency-Key": "quote-" + capabilityID})
 		if response.Status != http.StatusCreated {
 			t.Fatalf("quote = %d %s", response.Status, response.Body)
 		}

@@ -76,7 +76,7 @@ type Quote struct {
 	// like domain.Job.IdempotencyKey -- see store.Quotes.QuoteByIdempotencyKey
 	// and QuoteService.Create's Reserve/Finish/Release wrapper. Internal
 	// bookkeeping only, never part of the public Quote contract.
-	IdempotencyKey string `json:"-"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 	// IdempotencyRequestHash is QuoteService.Create's own requestHash
 	// digest, persisted on the Quote itself (unlike IdempotencyKey, this
 	// one is NOT tagged json:"-" -- it must actually round-trip through
@@ -91,16 +91,18 @@ type Quote struct {
 	// record) -- without this field, a LATER call reusing the same key
 	// with genuinely different content would silently receive the old
 	// Quote back instead of being rejected as a conflicting reuse.
-	IdempotencyRequestHash string                     `json:"idempotency_request_hash,omitempty"`
-	NetworkID              string                     `json:"network_id,omitempty"`
-	CommitmentDomain       string                     `json:"commitment_domain,omitempty"`
-	RequesterAgentID       string                     `json:"requester_agent_id,omitempty"`
-	ManifestCommitment     string                     `json:"manifest_commitment,omitempty"`
-	OwnershipRef           string                     `json:"ownership_ref,omitempty"`
-	SignerAuthorizationID  string                     `json:"signer_authorization_id,omitempty"`
-	SignerAuthorizationRef string                     `json:"signer_authorization_ref,omitempty"`
-	AssetDecimals          uint32                     `json:"asset_decimals,omitempty"`
-	Commitment             *QuoteCommitmentProjection `json:"commitment,omitempty"`
+	IdempotencyRequestHash     string                     `json:"idempotency_request_hash,omitempty"`
+	NetworkID                  string                     `json:"network_id,omitempty"`
+	CommitmentDomain           string                     `json:"commitment_domain,omitempty"`
+	CommitmentVersion          string                     `json:"commitment_version,omitempty"`
+	CommitmentCanonicalization string                     `json:"commitment_canonicalization,omitempty"`
+	RequesterAgentID           string                     `json:"requester_agent_id,omitempty"`
+	ManifestCommitment         string                     `json:"manifest_commitment,omitempty"`
+	OwnershipRef               string                     `json:"ownership_ref,omitempty"`
+	SignerAuthorizationID      string                     `json:"signer_authorization_id,omitempty"`
+	SignerAuthorizationRef     string                     `json:"signer_authorization_ref,omitempty"`
+	AssetDecimals              uint32                     `json:"asset_decimals,omitempty"`
+	Commitment                 *QuoteCommitmentProjection `json:"commitment,omitempty"`
 }
 
 type QuoteCommitmentProjection struct {

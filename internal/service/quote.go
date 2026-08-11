@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/money"
 	"github.com/tosnetwork/atos/internal/store"
+	"github.com/tosnetwork/tos-protocol/pkg/quotecommitment"
 )
 
 const (
@@ -133,7 +135,7 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 			return domain.Quote{}, domain.NewError(domain.ErrIdempotencyConflict, "idempotency_key reused with a different request", false)
 		}
 		if rec.Status != store.IdempotencyCompleted {
-			return domain.Quote{}, domain.NewError(domain.ErrIdempotencyConflict, "a request with this idempotency_key is still in progress; retry shortly", true)
+			return s.awaitQuoteOperation(ctx, in.PrincipalID, in.IdempotencyKey, requestHash)
 		}
 		return s.store.GetQuote(ctx, rec.ResponseKey)
 	}
@@ -141,9 +143,23 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 	committed := false
 	defer func() {
 		if !committed {
-			_ = s.store.Release(context.Background(), in.PrincipalID, in.IdempotencyKey)
+			if _, lookupErr := s.store.QuoteCommitmentOperationByIdempotencyKey(context.Background(), in.PrincipalID, in.IdempotencyKey); lookupErr == store.ErrNotFound {
+				_ = s.store.Release(context.Background(), in.PrincipalID, in.IdempotencyKey)
+			}
 		}
 	}()
+	if op, lookupErr := s.store.QuoteCommitmentOperationByIdempotencyKey(ctx, in.PrincipalID, in.IdempotencyKey); lookupErr == nil {
+		if op.Quote.IdempotencyRequestHash != requestHash {
+			return domain.Quote{}, domain.NewError(domain.ErrIdempotencyConflict, "idempotency_key reused with a different request", false)
+		}
+		q, resumeErr := s.resumeQuoteCommitmentOperation(ctx, op)
+		if resumeErr == nil {
+			committed = true
+		}
+		return q, resumeErr
+	} else if lookupErr != store.ErrNotFound {
+		return domain.Quote{}, lookupErr
+	}
 
 	// Recover a process crash after the Quote commit but before Finish. The
 	// unique (principal_id,idempotency_key) index makes this unambiguous.
@@ -189,6 +205,99 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 	}
 	committed = true
 	return q, nil
+}
+
+// awaitQuoteOperation closes the small reservation-before-intent window seen
+// by a competing replica. It never invents a second Quote: it waits briefly
+// for the reservation owner to publish either the durable operation snapshot
+// or the completed Quote, then resumes that exact identity.
+func (s *QuoteService) awaitQuoteOperation(ctx context.Context, principalID, key, requestHash string) (domain.Quote, error) {
+	timer := time.NewTimer(500 * time.Millisecond)
+	defer timer.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if op, err := s.store.QuoteCommitmentOperationByIdempotencyKey(ctx, principalID, key); err == nil {
+			if op.Quote.IdempotencyRequestHash != requestHash {
+				return domain.Quote{}, domain.NewError(domain.ErrIdempotencyConflict, "idempotency_key reused with a different request", false)
+			}
+			return s.resumeQuoteCommitmentOperation(ctx, op)
+		} else if err != store.ErrNotFound {
+			return domain.Quote{}, err
+		}
+		if q, err := s.store.QuoteByIdempotencyKey(ctx, principalID, key); err == nil {
+			if q.IdempotencyRequestHash != requestHash {
+				return domain.Quote{}, domain.NewError(domain.ErrIdempotencyConflict, "idempotency_key reused with a different request", false)
+			}
+			return q, nil
+		} else if err != store.ErrNotFound {
+			return domain.Quote{}, err
+		}
+		select {
+		case <-ctx.Done():
+			return domain.Quote{}, ctx.Err()
+		case <-timer.C:
+			return domain.Quote{}, domain.NewError(domain.ErrIdempotencyConflict, "a request with this idempotency_key is still in progress; retry shortly", true)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *QuoteService) resumeQuoteCommitmentOperation(ctx context.Context, op domain.QuoteCommitmentOperation) (domain.Quote, error) {
+	q, err := s.commitVerifiedQuote(ctx, op.Quote)
+	if err != nil {
+		return domain.Quote{}, err
+	}
+	if err := s.store.PutQuote(ctx, q); err != nil {
+		return domain.Quote{}, err
+	}
+	if q.IdempotencyKey != "" {
+		if err := s.store.Finish(ctx, q.PrincipalID, q.IdempotencyKey, q.ID); err != nil {
+			return domain.Quote{}, err
+		}
+	}
+	return q, nil
+}
+
+func (s *QuoteService) ReconcileStaleOperations(ctx context.Context, cutoff time.Time, limit int) error {
+	ops, err := s.store.StaleQuoteCommitmentOperations(ctx, cutoff, limit)
+	if err != nil {
+		return err
+	}
+	var joined error
+	for _, op := range ops {
+		if _, driveErr := s.resumeQuoteCommitmentOperation(ctx, op); driveErr != nil {
+			joined = errors.Join(joined, driveErr)
+		}
+	}
+	return joined
+}
+func (s *QuoteService) RunReconciler(ctx context.Context, interval, staleAfter time.Duration, limit int, report func(error)) {
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	if staleAfter <= 0 {
+		staleAfter = 30 * time.Second
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	sweep := func() {
+		if err := s.ReconcileStaleOperations(ctx, time.Now().UTC().Add(-staleAfter), limit); err != nil && report != nil {
+			report(err)
+		}
+	}
+	sweep()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
 }
 
 // buildQuote performs every validation/pricing/freezing step and returns a
@@ -391,6 +500,7 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 			return domain.Quote{}, domain.NewError(domain.ErrNetworkUnavailable, "verified quote commitment authority is unavailable", true)
 		}
 		q.NetworkID, q.CommitmentDomain, q.AssetDecimals = s.core.Network(), s.commitmentDomain, quoteDecimals
+		q.CommitmentVersion, q.CommitmentCanonicalization = quotecommitment.Version, quotecommitment.Canonicalization
 		requester, bound, revoked, _, err := s.core.ResolvePrincipalBindingStatus(ctx, q.PrincipalID)
 		if err != nil {
 			return domain.Quote{}, err
@@ -449,11 +559,16 @@ func (s *QuoteService) commitVerifiedQuote(ctx context.Context, q domain.Quote) 
 	if err != nil {
 		return domain.Quote{}, err
 	}
-	if !created && op.ContentHash != contentHash {
-		return domain.Quote{}, domain.NewError(domain.ErrIdempotencyConflict, "quote commitment identity has different semantics", false)
+	if !created {
+		if q.IdempotencyKey != "" && op.Quote.PrincipalID == q.PrincipalID && op.Quote.IdempotencyKey == q.IdempotencyKey && op.Quote.IdempotencyRequestHash == q.IdempotencyRequestHash {
+			q = op.Quote
+			contentHash = op.ContentHash
+		} else if op.ContentHash != contentHash {
+			return domain.Quote{}, domain.NewError(domain.ErrIdempotencyConflict, "quote commitment identity has different semantics", false)
+		}
 	}
 	q = op.Quote
-	commitment, found, resolveErr := s.core.GetQuoteCommitment(ctx, q.ID)
+	commitment, found, resolveErr := s.core.GetQuoteCommitment(ctx, q)
 	if resolveErr != nil {
 		_, _ = s.store.UpdateQuoteCommitmentOperation(context.Background(), q.ID, func(current domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error) {
 			current.Checkpoint = domain.QuoteCommitmentReconciling
@@ -495,7 +610,7 @@ func (s *QuoteService) commitVerifiedQuote(ctx context.Context, q domain.Quote) 
 }
 
 func validateQuoteCommitment(q domain.Quote, c toscore.QuoteCommitment) error {
-	if c.Quote.ID != q.ID || c.Quote.TermsHash != q.TermsHash || c.Quote.PrincipalID != q.PrincipalID || c.Quote.ProviderID != q.ProviderID || c.Quote.CapabilityID != q.CapabilityID || c.Quote.CapabilityVersion != q.CapabilityVersion || c.Quote.TrustMode != q.TrustMode || c.Quote.ProofProfile != q.ProofProfile || c.Quote.NetworkID != q.NetworkID || c.Quote.CommitmentDomain != q.CommitmentDomain || c.Quote.RequesterAgentID != q.RequesterAgentID || c.Quote.ManifestCommitment != q.ManifestCommitment || c.Quote.OwnershipRef != q.OwnershipRef || c.Quote.SignerAuthorizationID != q.SignerAuthorizationID || c.Quote.SignerAuthorizationRef != q.SignerAuthorizationRef || c.Quote.Price.Subtotal != q.Price.Subtotal || c.Quote.Price.Fees != q.Price.Fees || c.Quote.Price.TotalMax != q.Price.TotalMax || c.Quote.Price.Currency != q.Price.Currency || c.Quote.AssetDecimals != q.AssetDecimals || !c.Quote.ExpiresAt.Equal(q.ExpiresAt) || !c.Quote.ExecutionDeadline.Equal(q.ExecutionDeadline) || c.Quote.DisputePolicyHash != q.DisputePolicyHash || c.Quote.ServiceQuoteID != q.ServiceQuoteID || c.Network != q.NetworkID || !c.Finalized || c.Reference == "" || c.Digest == "" {
+	if c.Quote.ID != q.ID || c.Quote.TermsHash != q.TermsHash || c.Quote.PrincipalID != q.PrincipalID || c.Quote.ProviderID != q.ProviderID || c.Quote.CapabilityID != q.CapabilityID || c.Quote.CapabilityVersion != q.CapabilityVersion || c.Quote.TrustMode != q.TrustMode || c.Quote.ProofProfile != q.ProofProfile || c.Quote.NetworkID != q.NetworkID || c.Quote.CommitmentDomain != q.CommitmentDomain || c.Quote.CommitmentVersion != quotecommitment.Version || c.Quote.CommitmentCanonicalization != quotecommitment.Canonicalization || c.Quote.RequesterAgentID != q.RequesterAgentID || c.Quote.ManifestCommitment != q.ManifestCommitment || c.Quote.OwnershipRef != q.OwnershipRef || c.Quote.SignerAuthorizationID != q.SignerAuthorizationID || c.Quote.SignerAuthorizationRef != q.SignerAuthorizationRef || c.Quote.Price.Subtotal != q.Price.Subtotal || c.Quote.Price.Fees != q.Price.Fees || c.Quote.Price.TotalMax != q.Price.TotalMax || c.Quote.Price.Currency != q.Price.Currency || c.Quote.AssetDecimals != q.AssetDecimals || !c.Quote.ExpiresAt.Equal(q.ExpiresAt) || !c.Quote.ExecutionDeadline.Equal(q.ExecutionDeadline) || c.Quote.DisputePolicyHash != q.DisputePolicyHash || c.Quote.ServiceQuoteID != q.ServiceQuoteID || c.Quote.Settlement.Backend != q.Settlement.Backend || c.Quote.Settlement.ProviderAsset != q.Settlement.ProviderAsset || c.Network != q.NetworkID || !c.Finalized || c.FinalizedCheckpoint == 0 || c.Reference == "" || c.Digest == "" || c.ExpectedDigest == "" || c.Digest != c.ExpectedDigest {
 		return domain.NewError(domain.ErrQuoteMismatch, "canonical quote commitment is absent, non-final, or mismatched", false)
 	}
 	return nil
@@ -535,7 +650,7 @@ func (s *QuoteService) Get(ctx context.Context, id string) (domain.Quote, error)
 		if s.core == nil || q.Commitment == nil || q.Commitment.State != "committed" {
 			return domain.Quote{}, domain.NewError(domain.ErrQuoteMismatch, "verified quote is not committed", false)
 		}
-		commitment, found, resolveErr := s.core.GetQuoteCommitment(ctx, q.ID)
+		commitment, found, resolveErr := s.core.GetQuoteCommitment(ctx, q)
 		if resolveErr != nil {
 			return domain.Quote{}, resolveErr
 		}

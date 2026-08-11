@@ -400,6 +400,9 @@ func main() {
 	go executionSigners.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("execution-signer operation reconciliation pending", "error", reconcileErr)
 	})
+	go quotes.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
+		logger.Error("verified quote commitment reconciliation pending", "error", reconcileErr)
+	})
 	go openTasks.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("open task acceptance reconciliation pending", "error", reconcileErr)
 	})

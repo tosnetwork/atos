@@ -19,6 +19,11 @@ type createQuoteRequest struct {
 }
 
 func (s *Server) handleCreateQuote(w http.ResponseWriter, r *http.Request) {
+	idempotencyKey := idempotencyKeyFrom(r)
+	if idempotencyKey == "" {
+		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "Idempotency-Key header is required", false)
+		return
+	}
 	var req createQuoteRequest
 	if err := decodeRequestJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, domain.ErrValidationFailed, "malformed quote request: "+err.Error(), false)
@@ -35,6 +40,7 @@ func (s *Server) handleCreateQuote(w http.ResponseWriter, r *http.Request) {
 		RequestedTrustMode: req.RequestedTrustMode,
 		ProofRequirements:  req.ProofRequirements,
 		MaxTotal:           req.Constraints.MaxTotal,
+		IdempotencyKey:     idempotencyKey,
 	})
 	if err != nil {
 		writeDomainErr(w, err)

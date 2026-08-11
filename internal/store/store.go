@@ -83,6 +83,8 @@ type Quotes interface {
 	OpenQuoteCommitment(ctx context.Context, op domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, bool, error)
 	GetQuoteCommitmentOperation(ctx context.Context, quoteID string) (domain.QuoteCommitmentOperation, error)
 	UpdateQuoteCommitmentOperation(ctx context.Context, quoteID string, fn func(domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error)) (domain.QuoteCommitmentOperation, error)
+	QuoteCommitmentOperationByIdempotencyKey(ctx context.Context, principalID, key string) (domain.QuoteCommitmentOperation, error)
+	StaleQuoteCommitmentOperations(ctx context.Context, cutoff time.Time, limit int) ([]domain.QuoteCommitmentOperation, error)
 }
 
 type Escrows interface {

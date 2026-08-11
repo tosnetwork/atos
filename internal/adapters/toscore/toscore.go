@@ -57,6 +57,7 @@ type QuoteCommitment struct {
 	Network             string
 	Reference           string
 	Digest              string
+	ExpectedDigest      string
 	Finalized           bool
 	FinalizedCheckpoint uint64
 }
@@ -138,7 +139,7 @@ type Core interface {
 
 	// Quote and execution-signer trust.
 	CommitQuote(ctx context.Context, quote domain.Quote) (QuoteCommitment, error)
-	GetQuoteCommitment(ctx context.Context, quoteID string) (QuoteCommitment, bool, error)
+	GetQuoteCommitment(ctx context.Context, quote domain.Quote) (QuoteCommitment, bool, error)
 	ResolveExecutionSignerAuthorization(ctx context.Context, providerID, capabilityID, capabilityVersion, signerID string, at time.Time) (ExecutionSignerAuthorization, bool, error)
 	// AuthorizeExecutionSigner and RevokeExecutionSigner are the only path
 	// permitted to mutate trust-side signer state -- ordinary ATOS provider

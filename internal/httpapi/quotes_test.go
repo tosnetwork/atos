@@ -92,6 +92,7 @@ func TestCreateQuote_DoesNotExposeInternalExecutionSnapshot(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/quotes", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "quote-public-view")
 	recorder := httptest.NewRecorder()
 	server.Mux().ServeHTTP(recorder, req)
 

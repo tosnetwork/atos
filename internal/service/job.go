@@ -811,7 +811,7 @@ func (s *JobService) getQuote(ctx context.Context, quoteID string) (domain.Quote
 		if quote.Commitment == nil || quote.Commitment.State != "committed" {
 			return domain.Quote{}, domain.NewError(domain.ErrQuoteMismatch, "verified quote is not committed", false)
 		}
-		commitment, found, resolveErr := s.core.GetQuoteCommitment(ctx, quote.ID)
+		commitment, found, resolveErr := s.core.GetQuoteCommitment(ctx, quote)
 		if resolveErr != nil {
 			return domain.Quote{}, resolveErr
 		}

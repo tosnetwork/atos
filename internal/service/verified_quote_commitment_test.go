@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -46,7 +47,7 @@ func verifiedQuoteHarness(t *testing.T) (*service.QuoteService, *service.Executi
 
 func TestVerifiedQuoteIsCommittedBeforeUsableAndAutoIsConcrete(t *testing.T) {
 	quotes, _, _, st, cap := verifiedQuoteHarness(t)
-	q, err := quotes.Create(context.Background(), service.CreateQuoteInput{PrincipalID: "requester", CapabilityID: cap.ID, RequestedTrustMode: domain.RequestedTrustAuto, ProofRequirements: domain.ProofRequirements{NetworkVerifiableReceipt: true}})
+	q, err := quotes.Create(context.Background(), service.CreateQuoteInput{PrincipalID: "requester", CapabilityID: cap.ID, RequestedTrustMode: domain.RequestedTrustAuto, ProofRequirements: domain.ProofRequirements{NetworkVerifiableReceipt: true}, IdempotencyKey: "verified-auto"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +66,7 @@ func TestVerifiedQuoteIsCommittedBeforeUsableAndAutoIsConcrete(t *testing.T) {
 
 func TestVerifiedQuoteChangedSemanticsConflictAndJobGate(t *testing.T) {
 	quotes, _, core, st, cap := verifiedQuoteHarness(t)
-	q, err := quotes.Create(context.Background(), service.CreateQuoteInput{PrincipalID: "requester", CapabilityID: cap.ID, RequestedTrustMode: domain.RequestedTrustVerified})
+	q, err := quotes.Create(context.Background(), service.CreateQuoteInput{PrincipalID: "requester", CapabilityID: cap.ID, RequestedTrustMode: domain.RequestedTrustVerified, IdempotencyKey: "verified-gate"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,5 +82,64 @@ func TestVerifiedQuoteChangedSemanticsConflictAndJobGate(t *testing.T) {
 	jobs := service.NewJobService(st, nil, core, service.NewAccountService(st))
 	if _, err := jobs.CreateJob(context.Background(), service.SubmitInput{PrincipalID: "requester", CapabilityID: cap.ID, QuoteID: q.ID, IdempotencyKey: "job-gate"}); err == nil {
 		t.Fatal("job started from uncommitted Verified Quote")
+	}
+}
+
+func TestVerifiedQuoteLostResponseResumesOriginalQuote(t *testing.T) {
+	quotes, _, core, st, cap := verifiedQuoteHarness(t)
+	in := service.CreateQuoteInput{PrincipalID: "requester", CapabilityID: cap.ID, RequestedTrustMode: domain.RequestedTrustVerified, IdempotencyKey: "lost-response"}
+	core.LoseNextCommitQuoteResponse()
+	if _, err := quotes.Create(context.Background(), in); err == nil {
+		t.Fatal("expected injected lost response")
+	}
+	op, err := st.QuoteCommitmentOperationByIdempotencyKey(context.Background(), in.PrincipalID, in.IdempotencyKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := quotes.Create(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.ID != op.QuoteID {
+		t.Fatalf("recovery minted %q, want original %q", recovered.ID, op.QuoteID)
+	}
+	if recovered.Commitment == nil || !recovered.Commitment.Finalized {
+		t.Fatalf("recovered Quote is not usable: %+v", recovered)
+	}
+}
+
+func TestVerifiedQuoteTwoServicesConvergeOnOneOperation(t *testing.T) {
+	quotesA, signers, core, st, cap := verifiedQuoteHarness(t)
+	quotesB := service.NewQuoteService(st).WithVerifiedCommitmentAuthority(core, signers, "atos.im")
+	in := service.CreateQuoteInput{PrincipalID: "requester", CapabilityID: cap.ID, RequestedTrustMode: domain.RequestedTrustVerified, IdempotencyKey: "replica-race"}
+	start := make(chan struct{})
+	results := make(chan domain.Quote, 2)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, quotes := range []*service.QuoteService{quotesA, quotesB} {
+		wg.Add(1)
+		go func(qs *service.QuoteService) {
+			defer wg.Done()
+			<-start
+			q, err := qs.Create(context.Background(), in)
+			results <- q
+			errs <- err
+		}(quotes)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+	var ids []string
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for q := range results {
+		ids = append(ids, q.ID)
+	}
+	if len(ids) != 2 || ids[0] != ids[1] {
+		t.Fatalf("replicas did not converge: %v", ids)
 	}
 }

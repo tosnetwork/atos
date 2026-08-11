@@ -57,7 +57,17 @@ type Core struct {
 	// manifestCommitments is keyed by "capability_id@version", mirroring
 	// the remote service's own capability-key bucketing for
 	// CommitCapabilityManifest.
-	manifestCommitments map[string]manifestCommitmentRecord
+	manifestCommitments     map[string]manifestCommitmentRecord
+	commitQuoteLostResponse bool
+}
+
+// LoseNextCommitQuoteResponse commits the Quote canonically, then returns a
+// retryable transport-style error once. It is only a deterministic fault
+// injection hook for crash/lost-response recovery tests.
+func (c *Core) LoseNextCommitQuoteResponse() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.commitQuoteLostResponse = true
 }
 
 type manifestCommitmentRecord struct {
@@ -294,9 +304,14 @@ func (c *Core) CommitQuote(ctx context.Context, quote domain.Quote) (toscore.Quo
 		return toscore.QuoteCommitment{}, domain.NewError(domain.ErrIdempotencyConflict, "quote ID is already committed to different terms", false)
 	}
 	c.quotes[quote.ID] = quote
+	lostResponse := c.commitQuoteLostResponse
+	c.commitQuoteLostResponse = false
 	c.mu.Unlock()
+	if lostResponse {
+		return toscore.QuoteCommitment{}, domain.NewError(domain.ErrNetworkUnavailable, "simulated lost CommitQuote response", true)
+	}
 	if c.simulated && quote.TrustMode != domain.TrustModeManaged {
-		return toscore.QuoteCommitment{Quote: quote, Network: quote.NetworkID, Reference: simulatedRef("quote", quote.TrustMode, quote.ID), Digest: quote.TermsHash, Finalized: true, FinalizedCheckpoint: 1}, nil
+		return toscore.QuoteCommitment{Quote: quote, Network: quote.NetworkID, Reference: simulatedRef("quote", quote.TrustMode, quote.ID), Digest: quote.TermsHash, ExpectedDigest: quote.TermsHash, Finalized: true, FinalizedCheckpoint: 1}, nil
 	}
 	return toscore.QuoteCommitment{Quote: quote}, nil
 }
@@ -309,14 +324,14 @@ func sameQuoteSemantics(a, b domain.Quote) bool {
 	return reflect.DeepEqual(a, b)
 }
 
-func (c *Core) GetQuoteCommitment(_ context.Context, quoteID string) (toscore.QuoteCommitment, bool, error) {
+func (c *Core) GetQuoteCommitment(_ context.Context, expected domain.Quote) (toscore.QuoteCommitment, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	q, ok := c.quotes[quoteID]
+	q, ok := c.quotes[expected.ID]
 	if !ok {
 		return toscore.QuoteCommitment{}, false, nil
 	}
-	return toscore.QuoteCommitment{Quote: q, Network: q.NetworkID, Reference: simulatedRef("quote", q.TrustMode, q.ID), Digest: q.TermsHash, Finalized: true, FinalizedCheckpoint: 1}, true, nil
+	return toscore.QuoteCommitment{Quote: q, Network: q.NetworkID, Reference: simulatedRef("quote", q.TrustMode, q.ID), Digest: q.TermsHash, ExpectedDigest: q.TermsHash, Finalized: true, FinalizedCheckpoint: 1}, true, nil
 }
 
 // ResolveExecutionSignerAuthorization scans the real, mutable signer
