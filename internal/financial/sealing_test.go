@@ -21,8 +21,16 @@ func TestHTTPRetainerAuthenticatesAndRequiresImmutableVersion(t *testing.T) {
 	digest := "sha256:" + hex.EncodeToString(hash[:])
 	var requests atomic.Int32
 	var omitVersion atomic.Bool
+	var lockMode atomic.Value
+	var retentionSeconds atomic.Int64
+	lockMode.Store("COMPLIANCE")
+	retentionSeconds.Store(int64((2 * time.Hour).Seconds()))
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		message := request.Header.Get("X-ATOS-Retention-Timestamp") + "\n" + request.Method + "\n" + request.URL.EscapedPath() + "\n" + request.Header.Get("X-Content-SHA256")
+		target := request.URL.EscapedPath()
+		if request.URL.RawQuery != "" {
+			target += "?" + request.URL.RawQuery
+		}
+		message := request.Header.Get("X-ATOS-Retention-Timestamp") + "\n" + request.Method + "\n" + target + "\n" + request.Header.Get("X-Content-SHA256")
 		mac := hmac.New(sha256.New, []byte(secret))
 		_, _ = mac.Write([]byte(message))
 		expected := "hmac-sha256=" + hex.EncodeToString(mac.Sum(nil))
@@ -45,16 +53,18 @@ func TestHTTPRetainerAuthenticatesAndRequiresImmutableVersion(t *testing.T) {
 			if !omitVersion.Load() {
 				writer.Header().Set("X-Object-Version-ID", "locked-version-1")
 			}
+			writer.Header().Set("X-Object-Lock-Mode", lockMode.Load().(string))
+			writer.Header().Set("X-Object-Retain-Until", time.Now().UTC().Add(time.Duration(retentionSeconds.Load())*time.Second).Format(time.RFC3339))
 			writer.WriteHeader(http.StatusOK)
 		default:
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	}))
 	defer server.Close()
-	if _, err := NewHTTPRetainer(server.URL, "short", time.Second); err == nil {
+	if _, err := NewHTTPRetainer(server.URL, "short", time.Second, time.Hour); err == nil {
 		t.Fatal("short unauthenticated retention credential was accepted")
 	}
-	retainer, err := NewHTTPRetainer(server.URL, secret, time.Second)
+	retainer, err := NewHTTPRetainer(server.URL, secret, time.Second, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,5 +75,18 @@ func TestHTTPRetainerAuthenticatesAndRequiresImmutableVersion(t *testing.T) {
 	omitVersion.Store(true)
 	if _, err := retainer.PutIfAbsent(context.Background(), "evidence/2.json", body, digest); err == nil {
 		t.Fatal("retention succeeded without an immutable object version")
+	}
+	omitVersion.Store(false)
+	if _, err := retainWithProof(context.Background(), retainer, "evidence/3.json", body, digest); err != nil {
+		t.Fatalf("valid COMPLIANCE retention was rejected: %v", err)
+	}
+	lockMode.Store("GOVERNANCE")
+	if _, err := retainWithProof(context.Background(), retainer, "evidence/4.json", body, digest); err == nil {
+		t.Fatal("production state transition accepted non-COMPLIANCE retention")
+	}
+	lockMode.Store("COMPLIANCE")
+	retentionSeconds.Store(int64((30 * time.Minute).Seconds()))
+	if _, err := retainWithProof(context.Background(), retainer, "evidence/5.json", body, digest); err == nil {
+		t.Fatal("production state transition accepted retention below configured minimum")
 	}
 }

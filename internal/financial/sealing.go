@@ -210,22 +210,27 @@ type EvidenceBundle struct {
 
 type Retainer interface {
 	PutIfAbsent(context.Context, string, []byte, string) (string, error)
+	ResolveRetention(context.Context, string, string, string) (RetentionProof, error)
+	MinimumRetention() time.Duration
 }
 
 type HTTPRetainer struct {
-	endpoint *url.URL
-	client   *http.Client
-	hmacKey  []byte
+	endpoint         *url.URL
+	client           *http.Client
+	hmacKey          []byte
+	minimumRetention time.Duration
 }
 
-func NewHTTPRetainer(endpoint, hmacKey string, timeout time.Duration) (*HTTPRetainer, error) {
+func NewHTTPRetainer(endpoint, hmacKey string, timeout, minimumRetention time.Duration) (*HTTPRetainer, error) {
 	parsed, err := url.Parse(endpoint)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" || timeout <= 0 || len(hmacKey) < 32 {
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || timeout <= 0 || len(hmacKey) < 32 || minimumRetention <= 0 {
 		return nil, errors.New("financial: invalid WORM endpoint")
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
-	return &HTTPRetainer{parsed, &http.Client{Timeout: timeout}, []byte(hmacKey)}, nil
+	return &HTTPRetainer{parsed, &http.Client{Timeout: timeout}, []byte(hmacKey), minimumRetention}, nil
 }
+
+func (r *HTTPRetainer) MinimumRetention() time.Duration { return r.minimumRetention }
 
 func (r *HTTPRetainer) authenticate(request *http.Request, digest string) {
 	timestamp := fmt.Sprint(time.Now().UTC().Unix())
@@ -378,6 +383,36 @@ func (r *FileRetainer) PutIfAbsent(_ context.Context, key string, body []byte, d
 	return digest, nil
 }
 
+// A local file can provide create-only test storage, but it cannot prove an
+// independently administered Object Lock boundary and therefore cannot drive
+// the production retained/anchored state machine.
+func (r *FileRetainer) ResolveRetention(context.Context, string, string, string) (RetentionProof, error) {
+	return RetentionProof{}, errors.New("financial: local file retention is not Object Lock evidence")
+}
+
+func (r *FileRetainer) MinimumRetention() time.Duration { return 0 }
+
+func retainWithProof(ctx context.Context, retainer Retainer, key string, body []byte, digest string) (RetentionProof, error) {
+	if retainer == nil || retainer.MinimumRetention() <= 0 {
+		return RetentionProof{}, errors.New("financial: positive minimum WORM retention is required")
+	}
+	// Truncate to the protocol's RFC3339-second precision before the PUT. A
+	// store applying exactly the configured duration at write time then passes,
+	// while any shorter lock fails closed.
+	minimumRetainUntil := time.Now().UTC().Truncate(time.Second).Add(retainer.MinimumRetention())
+	version, err := retainer.PutIfAbsent(ctx, key, body, digest)
+	if err != nil {
+		return RetentionProof{}, err
+	}
+	proof, err := retainer.ResolveRetention(ctx, key, version, digest)
+	if err != nil || proof.ObjectKey != key || proof.VersionID != version || proof.Digest != digest ||
+		proof.LockMode != "COMPLIANCE" || proof.RetainUntil.Before(minimumRetainUntil) {
+		return RetentionProof{}, errors.Join(ErrIdempotencyConflict, err,
+			errors.New("financial: exact object version lacks required COMPLIANCE retention"))
+	}
+	return proof, nil
+}
+
 func (r *Repository) RetainBatch(ctx context.Context, batch Batch, signature SignatureEnvelope, retainer Retainer) (string, string, error) {
 	if retainer == nil {
 		return "", "", errors.New("financial: retainer required")
@@ -392,19 +427,19 @@ func (r *Repository) RetainBatch(ctx context.Context, batch Batch, signature Sig
 	hash := sha256.Sum256(body)
 	digest := "sha256:" + hex.EncodeToString(hash[:])
 	key := fmt.Sprintf("atos-financial/v1/%s/%s/%d-%s.json", batch.Manifest.GatewayID, batch.Manifest.NetworkID, batch.Manifest.BatchSequence, batch.Manifest.BatchID)
-	version, err := retainer.PutIfAbsent(ctx, key, body, digest)
+	proof, err := retainWithProof(ctx, retainer, key, body, digest)
 	if err != nil {
 		return "", "", err
 	}
 	result, err := r.pool.Exec(ctx, `UPDATE financial_batches SET retained_object_key=$2,retained_version_id=$3,state='retained',updated_at=now()
- WHERE batch_id=$1 AND state IN ('signed','retained') AND (retained_object_key='' OR retained_object_key=$2)`, batch.Manifest.BatchID, key, version)
+ WHERE batch_id=$1 AND state IN ('signed','retained') AND (retained_object_key='' OR retained_object_key=$2)`, batch.Manifest.BatchID, key, proof.VersionID)
 	if err != nil {
 		return "", "", err
 	}
 	if result.RowsAffected() != 1 {
 		return "", "", ErrIdempotencyConflict
 	}
-	return key, version, nil
+	return key, proof.VersionID, nil
 }
 
 func (r *Repository) SealNext(ctx context.Context, ledger interface {

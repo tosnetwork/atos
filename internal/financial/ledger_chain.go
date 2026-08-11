@@ -15,7 +15,9 @@ import (
 
 const (
 	blnkChainVersionCBORV2 = 2
+	blnkChainVersionCBORV3 = 3
 	blnkChainDomainCBORV2  = "blnk.transaction-chain.v2"
+	blnkChainDomainCBORV3  = "blnk.transaction-chain.v3"
 )
 
 type LedgerChainState struct {
@@ -39,16 +41,18 @@ type LedgerChainRow struct {
 
 type ledgerChainWireRow struct {
 	Transaction struct {
-		TransactionID string      `json:"transaction_id"`
-		Source        string      `json:"source"`
-		Destination   string      `json:"destination"`
-		Amount        string      `json:"amount"`
-		PreciseAmount json.Number `json:"precise_amount"`
-		Currency      string      `json:"currency"`
-		Status        string      `json:"status"`
-		Reference     string      `json:"reference"`
-		Description   string      `json:"description"`
-		CreatedAt     time.Time   `json:"created_at"`
+		TransactionID        string      `json:"transaction_id"`
+		Source               string      `json:"source"`
+		Destination          string      `json:"destination"`
+		SourceIndicator      string      `json:"source_indicator"`
+		DestinationIndicator string      `json:"destination_indicator"`
+		Amount               string      `json:"amount"`
+		PreciseAmount        json.Number `json:"precise_amount"`
+		Currency             string      `json:"currency"`
+		Status               string      `json:"status"`
+		Reference            string      `json:"reference"`
+		Description          string      `json:"description"`
+		CreatedAt            time.Time   `json:"created_at"`
 	} `json:"transaction"`
 	ChainVersion      int    `json:"chain_version"`
 	ChainSequence     int64  `json:"chain_sequence"`
@@ -89,7 +93,8 @@ func (c *BlnkClient) ChainEvidence(ctx context.Context) (LedgerChainEvidence, er
 			}
 			evidence.Transactions = append(evidence.Transactions, LedgerChainRow{
 				Transaction: LedgerTransaction{TransactionID: row.Transaction.TransactionID, Source: row.Transaction.Source,
-					Destination: row.Transaction.Destination, Reference: row.Transaction.Reference,
+					Destination: row.Transaction.Destination, SourceIndicator: row.Transaction.SourceIndicator,
+					DestinationIndicator: row.Transaction.DestinationIndicator, Reference: row.Transaction.Reference,
 					PreciseAmount: row.Transaction.PreciseAmount, Currency: row.Transaction.Currency,
 					Description: row.Transaction.Description, Status: row.Transaction.Status, CreatedAt: row.Transaction.CreatedAt},
 				Amount: row.Transaction.Amount, ChainVersion: row.ChainVersion, ChainSequence: row.ChainSequence,
@@ -112,15 +117,27 @@ func (c *BlnkClient) ChainEvidence(ctx context.Context) (LedgerChainEvidence, er
 }
 
 func ledgerChainHash(previous string, row LedgerChainRow) (string, error) {
-	if row.ChainVersion != blnkChainVersionCBORV2 {
+	if row.ChainVersion != blnkChainVersionCBORV2 && row.ChainVersion != blnkChainVersionCBORV3 {
 		return "", errors.New("financial: unsupported Blnk chain canonicalization")
 	}
 	created := row.Transaction.CreatedAt.UTC()
-	canonical := []any{blnkChainDomainCBORV2, uint64(blnkChainVersionCBORV2), previous,
+	domain := blnkChainDomainCBORV2
+	if row.ChainVersion == blnkChainVersionCBORV3 {
+		domain = blnkChainDomainCBORV3
+	}
+	canonical := []any{domain, uint64(row.ChainVersion), previous,
 		row.Transaction.TransactionID, row.Transaction.Source, row.Transaction.Destination,
 		row.Amount, row.Transaction.PreciseAmount.String(), row.Transaction.Currency,
 		row.Transaction.Status, row.Transaction.Reference, row.Transaction.Description,
 		created.Unix(), int64(created.Nanosecond())}
+	if row.ChainVersion == blnkChainVersionCBORV3 {
+		canonical = []any{domain, uint64(row.ChainVersion), previous,
+			row.Transaction.TransactionID, row.Transaction.Source, row.Transaction.Destination,
+			row.Transaction.SourceIndicator, row.Transaction.DestinationIndicator,
+			row.Amount, row.Transaction.PreciseAmount.String(), row.Transaction.Currency,
+			row.Transaction.Status, row.Transaction.Reference, row.Transaction.Description,
+			created.Unix(), int64(created.Nanosecond())}
+	}
 	encoded, err := codec.Marshal(canonical)
 	if err != nil {
 		return "", err
@@ -168,6 +185,7 @@ func verifyLedgerChainEvidence(evidence LedgerChainEvidence, expected map[string
 			return fmt.Errorf("financial: unexpected_ledger_event at Blnk sequence %d", sequence)
 		}
 		if want.Source != row.Transaction.Source || want.Destination != row.Transaction.Destination ||
+			want.SourceIndicator != row.Transaction.SourceIndicator || want.DestinationIndicator != row.Transaction.DestinationIndicator ||
 			want.Reference != row.Transaction.Reference || want.PreciseAmount.String() != row.Transaction.PreciseAmount.String() ||
 			want.Currency != row.Transaction.Currency || want.Description != row.Transaction.Description || want.Status != row.Transaction.Status {
 			return fmt.Errorf("financial: Blnk chain semantic mismatch at sequence %d", sequence)
@@ -204,6 +222,7 @@ func makeLedgerBatchEvidence(ctx context.Context, ledger interface {
 		if err := ledger.Verify(ctx, event, transaction); err != nil {
 			return LedgerChainEvidence{}, err
 		}
+		transaction.SourceIndicator, transaction.DestinationIndicator = event.SourceIndicator, event.DestinationIndicator
 		expected[transaction.TransactionID] = transaction
 	}
 	for index, row := range full.Transactions {

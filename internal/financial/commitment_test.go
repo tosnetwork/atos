@@ -89,9 +89,13 @@ func testEvidence(t *testing.T) (EvidenceBundle, AnchorReceipt, VerifyOptions) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	source1, _ := AccountIndicator(e1.GatewayID, e1.NetworkID, e1.Postings[0].AccountCode, e1.Postings[0].AccountOwnerID, e1.Asset)
+	destination1, _ := AccountIndicator(e1.GatewayID, e1.NetworkID, e1.Postings[1].AccountCode, e1.Postings[1].AccountOwnerID, e1.Asset)
+	source2, _ := AccountIndicator(e2.GatewayID, e2.NetworkID, e2.Postings[0].AccountCode, e2.Postings[0].AccountOwnerID, e2.Asset)
+	destination2, _ := AccountIndicator(e2.GatewayID, e2.NetworkID, e2.Postings[1].AccountCode, e2.Postings[1].AccountOwnerID, e2.Asset)
 	ledgerRows := []LedgerChainRow{
-		{Transaction: LedgerTransaction{TransactionID: e1.LedgerTransactionIDs[0], Source: "bln_source_1", Destination: "bln_destination_1", Reference: e1.LedgerReference, PreciseAmount: json.Number(e1.AtomicAmount), Currency: e1.Asset, Description: "atos-financial-v1:" + e1.Digest, Status: "APPLIED", CreatedAt: at}, Amount: "1.25", ChainVersion: blnkChainVersionCBORV2, ChainSequence: 1},
-		{Transaction: LedgerTransaction{TransactionID: e2.LedgerTransactionIDs[0], Source: "bln_source_2", Destination: "bln_destination_2", Reference: e2.LedgerReference, PreciseAmount: json.Number(e2.AtomicAmount), Currency: e2.Asset, Description: "atos-financial-v1:" + e2.Digest, Status: "APPLIED", CreatedAt: at.Add(time.Second)}, Amount: "1.25", ChainVersion: blnkChainVersionCBORV2, ChainSequence: 2},
+		{Transaction: LedgerTransaction{TransactionID: e1.LedgerTransactionIDs[0], Source: "bln_source_1", Destination: "bln_destination_1", SourceIndicator: source1, DestinationIndicator: destination1, Reference: e1.LedgerReference, PreciseAmount: json.Number(e1.AtomicAmount), Currency: e1.Asset, Description: "atos-financial-v1:" + e1.Digest, Status: "APPLIED", CreatedAt: at}, Amount: "1.25", ChainVersion: blnkChainVersionCBORV3, ChainSequence: 1},
+		{Transaction: LedgerTransaction{TransactionID: e2.LedgerTransactionIDs[0], Source: "bln_source_2", Destination: "bln_destination_2", SourceIndicator: source2, DestinationIndicator: destination2, Reference: e2.LedgerReference, PreciseAmount: json.Number(e2.AtomicAmount), Currency: e2.Asset, Description: "atos-financial-v1:" + e2.Digest, Status: "APPLIED", CreatedAt: at.Add(time.Second)}, Amount: "1.25", ChainVersion: blnkChainVersionCBORV3, ChainSequence: 2},
 	}
 	chainHead := strings.Repeat("0", 64)
 	for index := range ledgerRows {
@@ -111,10 +115,10 @@ func testEvidence(t *testing.T) (EvidenceBundle, AnchorReceipt, VerifyOptions) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if batch.Manifest.BatchID != "fbat_e361e6609904daa5d6d87070aec4177bd4749ea853776a8defd02932c986f8ea" ||
-		batch.ManifestDigest != "sha256:a770f7d672a25bde06deb21faa0662bff17ff1ab003d17fff545d7e97c92b376" ||
-		base64.StdEncoding.EncodeToString(batch.ManifestCBOR) != "r2d2ZXJzaW9ud2F0b3NfZmluYW5jaWFsX2JhdGNoX3YyaGJhdGNoX2lkeEVmYmF0X2UzNjFlNjYwOTkwNGRhYTVkNmQ4NzA3MGFlYzQxNzdiZDQ3NDllYTg1Mzc3NmE4ZGVmZDAyOTMyYzk4NmY4ZWFqZ2F0ZXdheV9pZG9nYXRld2F5LmV4YW1wbGVqbmV0d29ya19pZG50b3MtbG9jYWxuZXQtMWttZXJrbGVfcm9vdHhHc2hhMjU2OjJjMjljY2QxZDM4Y2VmZjliNDFhMmIyODAzMTUzYzIwNTE1MDczNzkzODM1Njk3MWQ5MDQ3MTJkMjVmZGJkZWFtbGFzdF9zZXF1ZW5jZQJuYmF0Y2hfc2VxdWVuY2UBbmZpcnN0X3NlcXVlbmNlAXBjYW5vbmljYWxpemF0aW9ueB9yZmM4OTQ5X2NvcmVfZGV0ZXJtaW5pc3RpY19jYm9ycGNvbW1pdG1lbnRfY291bnQCcXByZXZpb3VzX2JhdGNoX2lkYHJjb21taXRtZW50X2RpZ2VzdHOCeEdzaGEyNTY6NmVhMWMwZmMwMzg4YzdjZjM1Y2MzNjc0MDlmMjUyY2I0NDc3M2E1ZDc4ODNhNjJiZmM1ZDdkYzhjOWI5MGVjOHhHc2hhMjU2Ojc5ZjNjZGVkNTY5OGM5N2VjMjY4YThiOGU5NmFiMzNmODYwOWZhNmI0ZWM0Nzc1YjlhM2RmZWFlNzM2NWM1MjZzY3JlYXRlZF91bml4X21pbGxpcxsAAAGf7voqAHRwcmV2aW91c19tZXJrbGVfcm9vdHhHc2hhMjU2OjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDB2bGVkZ2VyX2V2aWRlbmNlX2RpZ2VzdHhHc2hhMjU2OmM2ZjU4YWYyYTU0ZGI3NDhjNTI2MzlmYzEwNGY0OWFkM2NlNzQyYmQ2N2M4M2E3ZWI4MDkzMDQxY2RkNzJkMjU=" {
-		t.Fatal("financial batch V2 deterministic test vector changed")
+	if batch.Manifest.BatchID != "fbat_0ebac55bb30866d2a5326ef36f21aac90c3b9060928af43862cdc72bb79e4d7b" ||
+		batch.ManifestDigest != "sha256:1e3984bf5c3c54608e486202be5a21d3c826123d39f7fca72cd7e300385af3b0" ||
+		base64.StdEncoding.EncodeToString(batch.ManifestCBOR) != "r2d2ZXJzaW9ud2F0b3NfZmluYW5jaWFsX2JhdGNoX3YyaGJhdGNoX2lkeEVmYmF0XzBlYmFjNTViYjMwODY2ZDJhNTMyNmVmMzZmMjFhYWM5MGMzYjkwNjA5MjhhZjQzODYyY2RjNzJiYjc5ZTRkN2JqZ2F0ZXdheV9pZG9nYXRld2F5LmV4YW1wbGVqbmV0d29ya19pZG50b3MtbG9jYWxuZXQtMWttZXJrbGVfcm9vdHhHc2hhMjU2OjJjMjljY2QxZDM4Y2VmZjliNDFhMmIyODAzMTUzYzIwNTE1MDczNzkzODM1Njk3MWQ5MDQ3MTJkMjVmZGJkZWFtbGFzdF9zZXF1ZW5jZQJuYmF0Y2hfc2VxdWVuY2UBbmZpcnN0X3NlcXVlbmNlAXBjYW5vbmljYWxpemF0aW9ueB9yZmM4OTQ5X2NvcmVfZGV0ZXJtaW5pc3RpY19jYm9ycGNvbW1pdG1lbnRfY291bnQCcXByZXZpb3VzX2JhdGNoX2lkYHJjb21taXRtZW50X2RpZ2VzdHOCeEdzaGEyNTY6NmVhMWMwZmMwMzg4YzdjZjM1Y2MzNjc0MDlmMjUyY2I0NDc3M2E1ZDc4ODNhNjJiZmM1ZDdkYzhjOWI5MGVjOHhHc2hhMjU2Ojc5ZjNjZGVkNTY5OGM5N2VjMjY4YThiOGU5NmFiMzNmODYwOWZhNmI0ZWM0Nzc1YjlhM2RmZWFlNzM2NWM1MjZzY3JlYXRlZF91bml4X21pbGxpcxsAAAGf7voqAHRwcmV2aW91c19tZXJrbGVfcm9vdHhHc2hhMjU2OjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDB2bGVkZ2VyX2V2aWRlbmNlX2RpZ2VzdHhHc2hhMjU2OjIzMzhjN2M2YTE4YmM1NDZhZDU3N2UxY2FiOTQzNTJkNjIxN2U5YTNhOWUxNjUyZDlkNDU2N2ExYWQxOTU1MTQ=" {
+		t.Fatalf("financial batch V2 deterministic test vector changed: batch=%s digest=%s cbor=%s ledger=%s", batch.Manifest.BatchID, batch.ManifestDigest, base64.StdEncoding.EncodeToString(batch.ManifestCBOR), ledgerDigest)
 	}
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -135,7 +139,7 @@ func testEvidence(t *testing.T) (EvidenceBundle, AnchorReceipt, VerifyOptions) {
 	bundleDigest := "sha256:" + hex.EncodeToString(bundleHash[:])
 	objectKey := "atos-financial/v1/gateway.example/tos-localnet-1/1-" + batch.Manifest.BatchID + ".json"
 	retention := RetentionProof{ObjectKey: objectKey, VersionID: "locked-version-1", Digest: bundleDigest, LockMode: "COMPLIANCE", RetainUntil: time.Now().UTC().Add(24 * time.Hour)}
-	options := VerifyOptions{GatewayID: anchor.GatewayID, NetworkID: anchor.NetworkID, TrustedPublicKeys: map[string]string{"kms-key-1": envelope.PublicKey}, Resolver: fixedResolver{receipt}, RetentionResolver: fixedRetentionResolver{retention}, RetainedVersionID: retention.VersionID}
+	options := VerifyOptions{GatewayID: anchor.GatewayID, NetworkID: anchor.NetworkID, TrustedPublicKeys: map[string]string{"kms-key-1": envelope.PublicKey}, Resolver: fixedResolver{receipt}, RetentionResolver: fixedRetentionResolver{retention}, RetainedVersionID: retention.VersionID, MinimumRetention: time.Hour}
 	return bundle, receipt, options
 }
 
@@ -193,5 +197,28 @@ func TestIndependentVerifierRejectsTampering(t *testing.T) {
 				t.Fatal("tampering accepted")
 			}
 		})
+	}
+}
+
+func TestIndependentVerifierBindsLedgerAccountIndicators(t *testing.T) {
+	bundle, _, _ := testEvidence(t)
+	wrongSource, err := AccountIndicator(bundle.Commitments[0].GatewayID, bundle.Commitments[0].NetworkID,
+		ProviderPayable, "substituted-provider", bundle.Commitments[0].Asset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle.LedgerEvidence.Transactions[0].Transaction.SourceIndicator = wrongSource
+	previous := bundle.LedgerEvidence.State.GenesisHash
+	for index := range bundle.LedgerEvidence.Transactions {
+		bundle.LedgerEvidence.Transactions[index].ChainPreviousHash = previous
+		previous, err = ledgerChainHash(previous, bundle.LedgerEvidence.Transactions[index])
+		if err != nil {
+			t.Fatal(err)
+		}
+		bundle.LedgerEvidence.Transactions[index].ChainHash = previous
+	}
+	bundle.LedgerEvidence.State.HeadHash = previous
+	if err := verifyBundleLedgerEvidence(bundle.Commitments, bundle.LedgerEvidence); err == nil {
+		t.Fatal("verifier accepted a valid hash chain whose ledger source did not match the signed debit posting")
 	}
 }

@@ -300,7 +300,7 @@ func main() {
 			logger.Error("financial signer init failed", "error", signerErr)
 			os.Exit(2)
 		}
-		retainer, retainerErr := financial.NewHTTPRetainer(cfg.Financial.RetentionURL, cfg.Financial.RetentionHMACKey, cfg.Financial.Timeout)
+		retainer, retainerErr := financial.NewHTTPRetainer(cfg.Financial.RetentionURL, cfg.Financial.RetentionHMACKey, cfg.Financial.Timeout, cfg.Financial.MinimumRetention)
 		if retainerErr != nil {
 			logger.Error("financial WORM retainer init failed", "error", retainerErr)
 			os.Exit(2)

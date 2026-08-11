@@ -69,6 +69,7 @@ func (a *Adapter) auditIntegrity(ctx context.Context, db repositoryDB) (int, err
 		if err := a.ledger.Verify(ctx, event, transaction); err != nil {
 			return checked, fmt.Errorf("financial: finalized ledger transaction mismatch at sequence %d: %w", event.Sequence, err)
 		}
+		transaction.SourceIndicator, transaction.DestinationIndicator = event.SourceIndicator, event.DestinationIndicator
 		expectedTransactions[transaction.TransactionID] = transaction
 		finalized = append(finalized, event)
 		for _, posting := range event.Postings {

@@ -34,15 +34,17 @@ type BlnkClient struct {
 }
 
 type LedgerTransaction struct {
-	TransactionID string      `json:"transaction_id"`
-	Source        string      `json:"source"`
-	Destination   string      `json:"destination"`
-	Reference     string      `json:"reference"`
-	PreciseAmount json.Number `json:"precise_amount"`
-	Currency      string      `json:"currency"`
-	Description   string      `json:"description"`
-	Status        string      `json:"status"`
-	CreatedAt     time.Time   `json:"created_at"`
+	TransactionID        string      `json:"transaction_id"`
+	Source               string      `json:"source"`
+	Destination          string      `json:"destination"`
+	SourceIndicator      string      `json:"source_indicator"`
+	DestinationIndicator string      `json:"destination_indicator"`
+	Reference            string      `json:"reference"`
+	PreciseAmount        json.Number `json:"precise_amount"`
+	Currency             string      `json:"currency"`
+	Description          string      `json:"description"`
+	Status               string      `json:"status"`
+	CreatedAt            time.Time   `json:"created_at"`
 }
 
 type ledgerBalance struct {

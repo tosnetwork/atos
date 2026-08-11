@@ -122,6 +122,7 @@ type FinancialConfig struct {
 	SigningAlgorithm  string
 	RetentionURL      string
 	RetentionHMACKey  string
+	MinimumRetention  time.Duration
 	SealInterval      time.Duration
 	MaxAnchorLag      time.Duration
 	FullAuditInterval time.Duration
@@ -201,6 +202,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	minimumRetention, err := durationEnv("ATOS_FINANCIAL_MIN_RETENTION", 365*24*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
 	fullAuditInterval, err := durationEnv("ATOS_FINANCIAL_FULL_AUDIT_INTERVAL", 5*time.Minute)
 	if err != nil {
 		return Config{}, err
@@ -262,6 +267,7 @@ func Load() (Config, error) {
 			SigningAlgorithm:  strings.ToLower(envOr("ATOS_FINANCIAL_SIGNING_ALGORITHM", "ed25519")),
 			RetentionURL:      strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_RETENTION_URL")),
 			RetentionHMACKey:  os.Getenv("ATOS_FINANCIAL_RETENTION_HMAC_KEY"),
+			MinimumRetention:  minimumRetention,
 			SealInterval:      sealInterval,
 			MaxAnchorLag:      maxAnchorLag,
 			FullAuditInterval: fullAuditInterval,
@@ -351,8 +357,8 @@ func (c Config) Validate() error {
 		if !ok || initialBalance.Sign() < 0 || initialBalance.Sign() > 0 && issuanceLimit.Sign() <= 0 {
 			return errors.New("a positive managed initial balance requires a positive ATOS_FINANCIAL_ISSUANCE_LIMIT")
 		}
-		if c.Financial.SealInterval <= 0 || c.Financial.SealInterval > 24*time.Hour || c.Financial.MaxAnchorLag < c.Financial.SealInterval || c.Financial.MaxAnchorLag > 24*time.Hour || c.Financial.FullAuditInterval < 10*time.Second || c.Financial.FullAuditInterval > 24*time.Hour || c.Financial.BatchSize < 1 || c.Financial.BatchSize > 4096 {
-			return errors.New("ATOS financial seal, anchor lag, full audit interval, or batch size is outside the allowed range")
+		if c.Financial.SealInterval <= 0 || c.Financial.SealInterval > 24*time.Hour || c.Financial.MaxAnchorLag < c.Financial.SealInterval || c.Financial.MaxAnchorLag > 24*time.Hour || c.Financial.MinimumRetention <= 0 || c.Financial.MinimumRetention > 10*365*24*time.Hour || c.Financial.FullAuditInterval < 10*time.Second || c.Financial.FullAuditInterval > 24*time.Hour || c.Financial.BatchSize < 1 || c.Financial.BatchSize > 4096 {
+			return errors.New("ATOS financial seal, anchor lag, WORM retention, full audit interval, or batch size is outside the allowed range")
 		}
 		if c.Financial.SigningAlgorithm != "ed25519" && c.Financial.SigningAlgorithm != "ecdsa_p256_sha256" {
 			return errors.New("ATOS_FINANCIAL_SIGNING_ALGORITHM is unsupported")

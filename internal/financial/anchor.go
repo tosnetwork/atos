@@ -126,7 +126,7 @@ func (r *Repository) AnchorBatch(ctx context.Context, batch Batch, signature Sig
 	hash := sha256.Sum256(body)
 	digest := "sha256:" + hex.EncodeToString(hash[:])
 	key := "atos-financial/v1/" + anchor.GatewayID + "/" + anchor.NetworkID + "/anchors/" + anchor.AnchorID + ".json"
-	if _, err := retainer.PutIfAbsent(ctx, key, body, digest); err != nil {
+	if _, err := retainWithProof(ctx, retainer, key, body, digest); err != nil {
 		return AnchorReceipt{}, err
 	}
 	result, err := r.pool.Exec(ctx, `UPDATE financial_batches SET anchor_id=$2,state='anchored',updated_at=now() WHERE batch_id=$1 AND state IN ('retained','anchored') AND (anchor_id='' OR anchor_id=$2)`, batch.Manifest.BatchID, anchor.AnchorID)

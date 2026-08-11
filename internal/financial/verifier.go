@@ -28,6 +28,7 @@ type VerifyOptions struct {
 	Resolver                       AnchorPublisher
 	RetentionResolver              RetentionResolver
 	RetainedVersionID              string
+	MinimumRetention               time.Duration
 }
 
 func DecodeEvidenceBundle(data []byte) (EvidenceBundle, error) {
@@ -132,12 +133,13 @@ func VerifyEvidence(ctx context.Context, bundle EvidenceBundle, anchorReceipt An
 	bundleHash := sha256.Sum256(bundleBytes)
 	bundleDigest := "sha256:" + hex.EncodeToString(bundleHash[:])
 	objectKey := fmt.Sprintf("atos-financial/v1/%s/%s/%d-%s.json", manifest.GatewayID, manifest.NetworkID, manifest.BatchSequence, manifest.BatchID)
-	if options.RetentionResolver == nil || options.RetainedVersionID == "" {
+	if options.RetentionResolver == nil || options.RetainedVersionID == "" || options.MinimumRetention <= 0 {
 		return errors.New("financial verifier: immutable retention resolver and version are required")
 	}
 	retention, err := options.RetentionResolver.ResolveRetention(ctx, objectKey, options.RetainedVersionID, bundleDigest)
 	if err != nil || retention.ObjectKey != objectKey || retention.VersionID != options.RetainedVersionID ||
-		retention.Digest != bundleDigest || retention.LockMode != "COMPLIANCE" || !retention.RetainUntil.After(time.Now().UTC()) {
+		retention.Digest != bundleDigest || retention.LockMode != "COMPLIANCE" ||
+		retention.RetainUntil.Before(time.Now().UTC().Truncate(time.Second).Add(options.MinimumRetention)) {
 		return errors.New("financial verifier: immutable Object Lock evidence is missing, expired, or changed")
 	}
 
@@ -190,7 +192,16 @@ func verifyBundleLedgerEvidence(commitments []Commitment, evidence LedgerChainEv
 	seen := make(map[string]struct{}, len(commitments))
 	for _, row := range evidence.Transactions {
 		commitment, ok := expected[row.Transaction.TransactionID]
-		if !ok || row.Transaction.Source == "" || row.Transaction.Destination == "" || row.Transaction.Source == row.Transaction.Destination ||
+		if !ok || len(commitment.Postings) != 2 || commitment.Postings[0].Direction != "debit" || commitment.Postings[1].Direction != "credit" {
+			return errors.New("financial verifier: commitment has invalid ledger postings")
+		}
+		expectedSource, sourceErr := AccountIndicator(commitment.GatewayID, commitment.NetworkID,
+			commitment.Postings[0].AccountCode, commitment.Postings[0].AccountOwnerID, commitment.Asset)
+		expectedDestination, destinationErr := AccountIndicator(commitment.GatewayID, commitment.NetworkID,
+			commitment.Postings[1].AccountCode, commitment.Postings[1].AccountOwnerID, commitment.Asset)
+		if sourceErr != nil || destinationErr != nil || row.ChainVersion != blnkChainVersionCBORV3 ||
+			row.Transaction.Source == "" || row.Transaction.Destination == "" || row.Transaction.Source == row.Transaction.Destination ||
+			row.Transaction.SourceIndicator != expectedSource || row.Transaction.DestinationIndicator != expectedDestination ||
 			row.Transaction.Reference != commitment.LedgerReference || row.Transaction.PreciseAmount.String() != commitment.AtomicAmount ||
 			row.Transaction.Currency != commitment.Asset || row.Transaction.Description != "atos-financial-v1:"+commitmentDigest(commitment) ||
 			row.Transaction.Status != "APPLIED" {

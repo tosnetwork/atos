@@ -281,7 +281,7 @@ func (c Commitment) Validate() error {
 	if len(c.LedgerTransactionIDs) == 0 || !sort.StringsAreSorted(c.LedgerTransactionIDs) {
 		return errors.New("financial: ledger transaction IDs must be nonempty and sorted")
 	}
-	if len(c.Postings) < 2 {
+	if len(c.Postings) != 2 || c.Postings[0].Direction != "debit" || c.Postings[1].Direction != "credit" {
 		return errors.New("financial: commitment must contain balanced postings")
 	}
 	debits, credits := new(big.Int), new(big.Int)
