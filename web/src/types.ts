@@ -42,6 +42,7 @@ export type Acceptance = {
   job_id?: string
 }
 
-export type Job = { job_id: string; state: string; trust_mode: string; proof_status: string; failure_reason?: string; output?: Record<string, unknown>; created_at: string; completed_at?: string }
+export type ProofStatus = { quote: string; escrow: string; receipt: string; settlement: string }
+export type Job = { job_id: string; state: string; trust_mode: string; proof_status: ProofStatus; failure_reason?: string; output?: Record<string, unknown>; created_at: string; completed_at?: string }
 
 export type Session = { accessToken: string; refreshToken: string; expiresAt: number; principalId: string; scopes: string[] }
