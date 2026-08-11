@@ -840,6 +840,13 @@ type IdentityBindings interface {
 	// operations (checkpoint <> completed) last updated before cutoff,
 	// oldest first -- the reconciler's sweep query.
 	StaleIdentityBindingOperations(ctx context.Context, cutoff time.Time, limit int) ([]domain.IdentityBindingOperation, error)
+	// LatestCompletedIdentityBindingOperation returns the most recently
+	// completed bind-or-revoke operation for principalID (by completed_at),
+	// regardless of type -- the only way to distinguish "this principal was
+	// bound, then revoked" from "this principal was never bound at all"
+	// once PrincipalIdentityBindings' current-state row has been deleted by
+	// a revoke, since that row carries no history of its own.
+	LatestCompletedIdentityBindingOperation(ctx context.Context, principalID string) (domain.IdentityBindingOperation, bool, error)
 	// UpdateIdentityBindingOperation atomically applies fn to the
 	// operation's current stored state. Implementations MUST reject
 	// (domain.ErrIdempotencyConflict) a returned value whose ID or

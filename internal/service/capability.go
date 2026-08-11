@@ -306,6 +306,22 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 		}
 		if termsChanged {
 			c.Version = bumpMinorVersion(c.Version)
+			// A version bump invalidates the PREVIOUS version's activation
+			// decision: ActivationAuthority.Evaluate was only ever run
+			// against the old manifest/schemas/pricing, so an already-Active
+			// stronger mode must not silently keep advertising "active" for
+			// content that was never evaluated -- the same manifest/version
+			// TOCTOU concern TOSBackedActivationAuthority.Evaluate already
+			// guards per-call, applied here to the cached mode_support state
+			// itself. Suspend (not a hard reset) so EvaluateActivation's own
+			// legality check (pending/suspended only) accepts it directly --
+			// re-activation requires a fresh, explicit evaluation, exactly
+			// like any other suspension.
+			for _, mode := range []domain.TrustMode{domain.TrustModeVerified, domain.TrustModeNative} {
+				if c.ModeSupport.Active(mode) {
+					c.ModeSupport = c.ModeSupport.Suspend(mode, "capability version changed; re-evaluation required")
+				}
+			}
 		}
 
 		// Validated against the fully-built candidate, after every patched

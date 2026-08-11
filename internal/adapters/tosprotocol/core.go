@@ -31,9 +31,7 @@ func (c *Client) Network() string {
 // commitment; a conflicting replay under the same capability_id+version
 // errors).
 func (c *Client) CommitCapabilityManifest(ctx context.Context, capability domain.Capability) (string, error) {
-	if capability.ID == "" || capability.ProviderID == "" || capability.Version == "" {
-		return "", domain.NewError(domain.ErrValidationFailed, "capability identity is incomplete", false)
-	}
+	// capability identity is validated inside commitCapability below.
 	identity, err := c.commitCapability(ctx, capability)
 	if err != nil {
 		return "", err

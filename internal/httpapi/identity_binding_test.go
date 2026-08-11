@@ -234,6 +234,16 @@ func TestHandleIdentityBindingStatus_BoundThenRevoked(t *testing.T) {
 	if afterDecoded.Bound {
 		t.Fatalf("expected unbound status after revoke: %+v", afterDecoded)
 	}
+	// docs/API.md §9A's frozen contract distinguishes "revoked" from
+	// "never bound" (status="revoked" + revocation_reason_code) -- both
+	// bound=false, so this can only be told apart from a never-bound
+	// principal via these two fields.
+	if afterDecoded.Status != "revoked" {
+		t.Fatalf("status after a real revoke must be %q, got %q: %+v", "revoked", afterDecoded.Status, afterDecoded)
+	}
+	if afterDecoded.RevocationReasonCode != "test" {
+		t.Fatalf("revocation_reason_code = %q, want the reason_code the revoke request carried (%q): %+v", afterDecoded.RevocationReasonCode, "test", afterDecoded)
+	}
 }
 
 // TestHandleRevokeIdentity_RetryWithFreshKeyIsInternallyConsistent proves a

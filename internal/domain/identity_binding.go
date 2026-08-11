@@ -82,7 +82,15 @@ type IdentityBindingOperation struct {
 	// already-existing same-principal/same-agent binding (false, a
 	// documented no-op per docs/API.md §9A) -- distinct from Checkpoint
 	// reaching Completed, which is true in BOTH cases.
-	Created       bool       `json:"created,omitempty"`
+	Created bool `json:"created,omitempty"`
+	// Revoked is type="revoke"-only: RevokePrincipalBinding's own
+	// authoritative revoked bool, stored directly rather than inferred from
+	// BindingRef being non-empty -- the RPC's revoked/revocation_ref are two
+	// independent response fields with no wire-level guarantee they always
+	// agree, so a caller-visible Revoked flag must reflect what the RPC
+	// actually reported, not a secondary signal that happens to usually
+	// correlate with it.
+	Revoked       bool       `json:"revoked,omitempty"`
 	ContentHash   string     `json:"content_hash"`
 	FailureReason string     `json:"failure_reason,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`

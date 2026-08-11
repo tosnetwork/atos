@@ -130,7 +130,7 @@ func (a *TOSBackedActivationAuthority) Evaluate(ctx context.Context, providerID,
 	if a.executionSigner == nil {
 		return false, ReasonSignerNotAuthorized, nil
 	}
-	_, signerID, signerFound, err := a.executionSigner.CurrentSigner(ctx, capabilityID)
+	_, signerID, signerFound, err := a.executionSigner.SignerAt(ctx, capabilityID, capabilityVersion)
 	if err != nil {
 		return false, "", err
 	}

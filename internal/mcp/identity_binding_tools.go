@@ -34,19 +34,13 @@ func (s *Server) toolBindIdentity(ctx context.Context, principal auth.Principal,
 	if err != nil {
 		return nil, err
 	}
-	binding, found, err := s.IdentityBindings.CurrentBinding(ctx, principalID)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return nil, domain.NewError(domain.ErrValidationFailed, "binding operation completed but is not yet locally consistent; retry", true)
-	}
+	// Built directly from op -- see httpapi.handleBindIdentity's identical
+	// fix/comment: a successful Bind() call's returned operation is already
+	// the authoritative, self-consistent source for everything this result
+	// needs, without a separate CurrentBinding re-read's own race window.
 	return bindIdentityResult{
-		PrincipalID: principalID, AgentID: binding.AgentID, Network: binding.Network,
-		// op.Created, not op.Checkpoint == Completed -- see httpapi's
-		// identical fix and domain.IdentityBindingOperation.Created's doc
-		// comment.
-		BindingRef: binding.BindingRef, Created: op.Created,
+		PrincipalID: principalID, AgentID: op.AgentID, Network: op.RefNetwork,
+		BindingRef: op.BindingRef, Created: op.Created,
 	}, nil
 }
 
@@ -70,14 +64,11 @@ func (s *Server) toolRevokeIdentity(ctx context.Context, principal auth.Principa
 	if err != nil {
 		return nil, err
 	}
-	// Revoked is derived from the operation's own outcome, not a local
-	// pre-call CurrentBinding check -- see httpapi.handleRevokeIdentity's
-	// identical comment: a fresh-idempotency-key retry after a lost
-	// response would otherwise report revoked:false alongside a populated
-	// network/revocation_ref, since tos-protocol honestly replays the
-	// original revocation for the retry even though this principal's local
-	// binding row was already deleted by the original successful call.
-	return revokeIdentityResult{Revoked: op.BindingRef != "", Network: op.RefNetwork, RevocationRef: op.BindingRef}, nil
+	// Revoked comes from op.Revoked, the remote RPC's own authoritative
+	// signal -- see httpapi.handleRevokeIdentity's identical comment for
+	// why neither a local pre-call check nor op.BindingRef non-emptiness is
+	// the right source.
+	return revokeIdentityResult{Revoked: op.Revoked, Network: op.RefNetwork, RevocationRef: op.BindingRef}, nil
 }
 
 type identityBindingStatusResult struct {
@@ -100,6 +91,13 @@ func (s *Server) toolIdentityBindingStatus(ctx context.Context, principal auth.P
 		return nil, err
 	}
 	if !found {
+		reasonCode, wasRevoked, err := s.IdentityBindings.RevocationHistory(ctx, principalID)
+		if err != nil {
+			return nil, err
+		}
+		if wasRevoked {
+			return identityBindingStatusResult{PrincipalID: principalID, Bound: false, Status: "revoked", RevocationReasonCode: reasonCode}, nil
+		}
 		return identityBindingStatusResult{PrincipalID: principalID, Bound: false, Status: "unspecified"}, nil
 	}
 	return identityBindingStatusResult{

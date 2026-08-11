@@ -46,25 +46,18 @@ func (s *Server) handleBindIdentity(w http.ResponseWriter, r *http.Request) {
 		writeIdentityBindingErr(w, err)
 		return
 	}
-	binding, found, err := s.IdentityBindings.CurrentBinding(r.Context(), principalID)
-	if err != nil {
-		writeDomainErr(w, err)
-		return
-	}
-	if !found {
-		// The operation completed but the local projection isn't durably
-		// consistent yet (a crash between advance() and this read) -- a
-		// genuine, if rare, transient state; report it as such rather than
-		// fabricating a response from the (possibly stale) operation record.
-		writeError(w, http.StatusConflict, domain.ErrValidationFailed, "binding operation completed but is not yet locally consistent; retry", true)
-		return
-	}
+	// Built directly from op -- a successful Bind() call's returned
+	// operation already carries AgentID/RefNetwork/BindingRef/Created,
+	// populated together in the SAME advance() transaction that completed
+	// it. A separate CurrentBinding re-read would introduce its own race
+	// (a crash between driveBind's PutPrincipalBinding and advance() calls
+	// could leave the local projection not yet consistent with the just-
+	// completed operation) for no benefit, since op is already the
+	// authoritative, self-consistent source for everything this response
+	// needs.
 	writeJSON(w, http.StatusOK, bindIdentityResponse{
-		PrincipalID: principalID, AgentID: binding.AgentID, Network: binding.Network,
-		// op.Created (not op.Checkpoint == Completed, which is true for BOTH
-		// a genuinely new bind and an idempotent replay of an existing one)
-		// -- see domain.IdentityBindingOperation.Created's doc comment.
-		BindingRef: binding.BindingRef, Created: op.Created,
+		PrincipalID: principalID, AgentID: op.AgentID, Network: op.RefNetwork,
+		BindingRef: op.BindingRef, Created: op.Created,
 	})
 }
 
@@ -101,19 +94,16 @@ func (s *Server) handleRevokeIdentity(w http.ResponseWriter, r *http.Request) {
 		writeIdentityBindingErr(w, err)
 		return
 	}
-	// Revoked is derived from the operation's own outcome (op.BindingRef
-	// populated means tos-protocol reported a real revocation_ref), NOT a
-	// local pre-call CurrentBinding check: a lost-response retry under a
-	// fresh idempotency_key finds this principal's LOCAL binding row
-	// already deleted by the original successful call, but tos-protocol
-	// still honestly reports revoked=true with the ORIGINAL ref for the
-	// retry -- basing Revoked on the local pre-check would then report
-	// revoked:false alongside a populated network/revocation_ref, an
-	// internally inconsistent response that violates this endpoint's own
-	// frozen contract (network/revocation_ref must be empty when
-	// revoked:false).
+	// Revoked comes from op.Revoked -- the remote RPC's own authoritative
+	// signal, NOT a local pre-call CurrentBinding check (a lost-response
+	// retry under a fresh idempotency_key finds this principal's LOCAL
+	// binding row already deleted by the original successful call, but the
+	// remote service still honestly reports revoked=true for the retry) NOR
+	// inferred from op.BindingRef being non-empty (revoked/revocation_ref
+	// are independent RPC response fields with no wire-level guarantee they
+	// always agree).
 	writeJSON(w, http.StatusOK, revokeIdentityResponse{
-		Revoked: op.BindingRef != "", Network: op.RefNetwork, RevocationRef: op.BindingRef,
+		Revoked: op.Revoked, Network: op.RefNetwork, RevocationRef: op.BindingRef,
 	})
 }
 
@@ -140,6 +130,17 @@ func (s *Server) handleIdentityBindingStatus(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if !found {
+		reasonCode, wasRevoked, err := s.IdentityBindings.RevocationHistory(r.Context(), principalID)
+		if err != nil {
+			writeDomainErr(w, err)
+			return
+		}
+		if wasRevoked {
+			writeJSON(w, http.StatusOK, identityBindingStatusResponse{
+				PrincipalID: principalID, Bound: false, Status: "revoked", RevocationReasonCode: reasonCode,
+			})
+			return
+		}
 		writeJSON(w, http.StatusOK, identityBindingStatusResponse{
 			PrincipalID: principalID, Bound: false, Status: "unspecified",
 		})

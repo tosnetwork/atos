@@ -106,6 +106,23 @@ func (s *Store) StaleIdentityBindingOperations(ctx context.Context, cutoff time.
 	return out, nil
 }
 
+func (s *Store) LatestCompletedIdentityBindingOperation(ctx context.Context, principalID string) (domain.IdentityBindingOperation, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var latest domain.IdentityBindingOperation
+	found := false
+	for _, op := range s.identityBindingOps {
+		if op.PrincipalID != principalID || op.Checkpoint != domain.IdentityBindingCheckpointCompleted || op.CompletedAt == nil {
+			continue
+		}
+		if !found || op.CompletedAt.After(*latest.CompletedAt) {
+			latest = op
+			found = true
+		}
+	}
+	return latest, found, nil
+}
+
 func (s *Store) UpdateIdentityBindingOperation(ctx context.Context, id string, fn func(domain.IdentityBindingOperation, bool) (domain.IdentityBindingOperation, error)) (domain.IdentityBindingOperation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

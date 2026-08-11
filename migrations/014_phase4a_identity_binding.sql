@@ -58,6 +58,11 @@ CREATE TABLE IF NOT EXISTS identity_binding_operations (
     -- documented created=false no-op case) -- distinct from checkpoint
     -- reaching 'completed', which is true in both cases.
     created                BOOLEAN NOT NULL DEFAULT FALSE,
+    -- revoked is type='revoke'-only: RevokePrincipalBinding's own
+    -- authoritative revoked bool, stored directly rather than inferred from
+    -- binding_ref being non-empty (revoked/revocation_ref are independent
+    -- RPC response fields with no wire-level guarantee they always agree).
+    revoked                BOOLEAN NOT NULL DEFAULT FALSE,
     -- content_hash summarizes the identity fields that must never change
     -- once an operation is opened (principal_id/type/idempotency_key/
     -- agent_id/reason_code) -- mirrors execution_signer_operations'

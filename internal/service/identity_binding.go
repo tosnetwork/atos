@@ -161,6 +161,27 @@ func (s *IdentityBindingService) CurrentBinding(ctx context.Context, principalID
 	return s.store.CurrentPrincipalBinding(ctx, principalID)
 }
 
+// RevocationHistory reports whether principalID's most recent completed
+// bind-or-revoke operation was a genuine revocation, for callers that
+// already know (via CurrentBinding returning found=false) that no binding
+// is currently active and need to distinguish "revoked" from "never bound"
+// -- PrincipalIdentityBindings' current-state row carries no history of its
+// own once deleted by a revoke, so this is the only source for that
+// distinction. wasRevoked=false (with no error) covers BOTH "never bound"
+// and "the latest completed operation was itself a bind" -- the latter
+// should be unreachable in practice (CurrentBinding would have found an
+// active row), but this function makes no assumption about why.
+func (s *IdentityBindingService) RevocationHistory(ctx context.Context, principalID string) (reasonCode string, wasRevoked bool, err error) {
+	op, found, err := s.store.LatestCompletedIdentityBindingOperation(ctx, principalID)
+	if err != nil {
+		return "", false, err
+	}
+	if !found || op.Type != domain.IdentityBindingOperationRevoke || !op.Revoked {
+		return "", false, nil
+	}
+	return op.ReasonCode, true, nil
+}
+
 func (s *IdentityBindingService) drive(ctx context.Context, op domain.IdentityBindingOperation) (domain.IdentityBindingOperation, error) {
 	if op.Checkpoint == domain.IdentityBindingCheckpointCompleted {
 		return op, nil
@@ -183,25 +204,24 @@ func (s *IdentityBindingService) driveBind(ctx context.Context, op domain.Identi
 	}); err != nil {
 		return op, err
 	}
-	return s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointCompleted, binding.BindingRef, binding.Network, created, "")
+	return s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointCompleted, binding.BindingRef, binding.Network, created, false, "")
 }
 
 func (s *IdentityBindingService) driveRevoke(ctx context.Context, op domain.IdentityBindingOperation) (domain.IdentityBindingOperation, error) {
-	_, revocationNetwork, revocationRef, callErr := s.core.RevokePrincipalBinding(ctx, identityBindingCallerID, op.IdempotencyKey, op.PrincipalID, op.ReasonCode)
+	revoked, revocationNetwork, revocationRef, callErr := s.core.RevokePrincipalBinding(ctx, identityBindingCallerID, op.IdempotencyKey, op.PrincipalID, op.ReasonCode)
 	if callErr != nil {
 		return s.handleAmbiguousOrFail(ctx, op, callErr)
 	}
 	if err := s.store.DeletePrincipalBinding(ctx, op.PrincipalID); err != nil {
 		return op, err
 	}
-	// A revoke with nothing to revoke (revocationRef=="") still completes
-	// the operation but leaves RefNetwork/BindingRef empty -- advance's
-	// bindingRef!="" guard already handles that as a no-op write. `created`
-	// is bind-only and meaningless here, so it's passed as false.
-	return s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointCompleted, revocationRef, revocationNetwork, false, "")
+	// revoked is the RPC's own authoritative signal, threaded through as-is
+	// (see IdentityBindingOperation.Revoked's doc comment) -- `created` is
+	// bind-only and meaningless here, so it's passed as false.
+	return s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointCompleted, revocationRef, revocationNetwork, false, revoked, "")
 }
 
-func (s *IdentityBindingService) advance(ctx context.Context, id string, expectedFrom, checkpoint domain.IdentityBindingCheckpoint, bindingRef, refNetwork string, created bool, failureReason string) (domain.IdentityBindingOperation, error) {
+func (s *IdentityBindingService) advance(ctx context.Context, id string, expectedFrom, checkpoint domain.IdentityBindingCheckpoint, bindingRef, refNetwork string, created, revoked bool, failureReason string) (domain.IdentityBindingOperation, error) {
 	return s.store.UpdateIdentityBindingOperation(ctx, id, func(current domain.IdentityBindingOperation, exists bool) (domain.IdentityBindingOperation, error) {
 		if !exists {
 			return domain.IdentityBindingOperation{}, domain.NewError(domain.ErrNotFound, "identity-binding operation not found", false)
@@ -213,8 +233,20 @@ func (s *IdentityBindingService) advance(ctx context.Context, id string, expecte
 		if bindingRef != "" {
 			current.BindingRef = bindingRef
 			current.RefNetwork = refNetwork
-			if current.Type == domain.IdentityBindingOperationBind {
+		}
+		// Created/Revoked reflect the RPC's own authoritative outcome, set
+		// exactly when the operation reaches its final Completed transition
+		// -- NOT gated on bindingRef being non-empty, since a genuine
+		// revoked=true response can legitimately pair with an empty ref
+		// (the RPC contract doesn't guarantee they always co-occur) and a
+		// caller-visible Revoked flag must reflect what was actually
+		// reported, not be inferred from a secondary field.
+		if checkpoint == domain.IdentityBindingCheckpointCompleted {
+			switch current.Type {
+			case domain.IdentityBindingOperationBind:
 				current.Created = created
+			case domain.IdentityBindingOperationRevoke:
+				current.Revoked = revoked
 			}
 		}
 		current.FailureReason = failureReason
@@ -241,13 +273,13 @@ func isAmbiguousIdentityBindingFailure(err error) bool {
 
 func (s *IdentityBindingService) handleAmbiguousOrFail(ctx context.Context, op domain.IdentityBindingOperation, callErr error) (domain.IdentityBindingOperation, error) {
 	if isAmbiguousIdentityBindingFailure(callErr) {
-		updated, err := s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointReconciling, "", "", false, callErr.Error())
+		updated, err := s.advance(ctx, op.ID, op.Checkpoint, domain.IdentityBindingCheckpointReconciling, "", "", false, false, callErr.Error())
 		if err != nil {
 			return updated, err
 		}
 		return updated, domain.NewError(domain.ErrNetworkUnavailable, "identity-binding operation outcome is uncertain, retry", true)
 	}
-	updated, err := s.advance(ctx, op.ID, op.Checkpoint, op.Checkpoint, "", "", false, callErr.Error())
+	updated, err := s.advance(ctx, op.ID, op.Checkpoint, op.Checkpoint, "", "", false, false, callErr.Error())
 	if err != nil {
 		return updated, err
 	}
