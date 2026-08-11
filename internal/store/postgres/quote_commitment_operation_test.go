@@ -29,7 +29,9 @@ func TestQuoteCommitmentOperationTwoPostgresReplicasConvergeByCallerKey(t *testi
 	}
 	defer b.Close()
 	suffix := randSuffix()
-	now := time.Now().UTC().Add(-time.Minute)
+	// Sort ahead of unrelated historical stale rows when a developer repeats
+	// this test against the same integration database.
+	now := time.Unix(1, 0).UTC()
 	makeOp := func(id string) domain.QuoteCommitmentOperation {
 		q := domain.Quote{ID: id, PrincipalID: "prn_quote_" + suffix, IdempotencyKey: "idem_" + suffix, IdempotencyRequestHash: "sha256:request"}
 		return domain.QuoteCommitmentOperation{QuoteID: id, Quote: q, ContentHash: "sha256:" + id, Checkpoint: domain.QuoteCommitmentIntentPersisted, CreatedAt: now, UpdatedAt: now}
@@ -65,7 +67,7 @@ func TestQuoteCommitmentOperationTwoPostgresReplicasConvergeByCallerKey(t *testi
 	if creators.Load() != 1 {
 		t.Fatalf("creators=%d, want 1", creators.Load())
 	}
-	stale, err := b.StaleQuoteCommitmentOperations(ctx, time.Now().UTC(), 10)
+	stale, err := b.StaleQuoteCommitmentOperations(ctx, time.Now().UTC(), 10_000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,5 +77,20 @@ func TestQuoteCommitmentOperationTwoPostgresReplicasConvergeByCallerKey(t *testi
 	}
 	if !found {
 		t.Fatalf("canonical pending operation %q was not recoverable by stale scan", canonical)
+	}
+	terminal, err := a.UpdateQuoteCommitmentOperation(ctx, canonical, func(current domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error) {
+		current.Checkpoint = domain.QuoteCommitmentCompleted
+		return current, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err = b.UpdateQuoteCommitmentOperation(ctx, canonical, func(current domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error) {
+		current.Checkpoint = domain.QuoteCommitmentReconciling
+		current.FailureReason = "stale replica"
+		return current, nil
+	})
+	if err != nil || terminal.Checkpoint != domain.QuoteCommitmentCompleted || terminal.FailureReason != "" {
+		t.Fatalf("terminal operation regressed: %+v err=%v", terminal, err)
 	}
 }

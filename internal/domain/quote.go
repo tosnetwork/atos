@@ -172,9 +172,10 @@ func (q Quote) Public() PublicQuote {
 type QuoteCommitmentCheckpoint string
 
 const (
-	QuoteCommitmentIntentPersisted QuoteCommitmentCheckpoint = "intent_persisted"
-	QuoteCommitmentReconciling     QuoteCommitmentCheckpoint = "reconciling"
-	QuoteCommitmentCompleted       QuoteCommitmentCheckpoint = "completed"
+	QuoteCommitmentIntentPersisted    QuoteCommitmentCheckpoint = "intent_persisted"
+	QuoteCommitmentReconciling        QuoteCommitmentCheckpoint = "reconciling"
+	QuoteCommitmentAuthorityCommitted QuoteCommitmentCheckpoint = "authority_committed"
+	QuoteCommitmentCompleted          QuoteCommitmentCheckpoint = "completed"
 )
 
 type QuoteCommitmentOperation struct {

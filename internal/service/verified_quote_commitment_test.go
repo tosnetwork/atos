@@ -62,6 +62,14 @@ func TestVerifiedQuoteIsCommittedBeforeUsableAndAutoIsConcrete(t *testing.T) {
 	if err != nil || op.Checkpoint != domain.QuoteCommitmentCompleted {
 		t.Fatalf("op=%+v err=%v", op, err)
 	}
+	op, err = st.UpdateQuoteCommitmentOperation(context.Background(), q.ID, func(current domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error) {
+		current.Checkpoint = domain.QuoteCommitmentReconciling
+		current.FailureReason = "stale replica"
+		return current, nil
+	})
+	if err != nil || op.Checkpoint != domain.QuoteCommitmentCompleted || op.FailureReason != "" {
+		t.Fatalf("terminal operation regressed: %+v err=%v", op, err)
+	}
 }
 
 func TestVerifiedQuoteChangedSemanticsConflictAndJobGate(t *testing.T) {
@@ -141,5 +149,44 @@ func TestVerifiedQuoteTwoServicesConvergeOnOneOperation(t *testing.T) {
 	}
 	if len(ids) != 2 || ids[0] != ids[1] {
 		t.Fatalf("replicas did not converge: %v", ids)
+	}
+}
+
+func TestVerifiedQuoteReconcilerProjectsAuthorityCommittedOperation(t *testing.T) {
+	quotes, _, core, st, cap := verifiedQuoteHarness(t)
+	seed, err := quotes.Create(context.Background(), service.CreateQuoteInput{PrincipalID: "requester", CapabilityID: cap.ID, RequestedTrustMode: domain.RequestedTrustVerified, IdempotencyKey: "projection-seed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := seed
+	q.ID = "q_projection_crash"
+	q.IdempotencyKey = "projection-crash"
+	q.IdempotencyRequestHash = "projection-request-hash"
+	q.Commitment = nil
+	commitment, err := core.CommitQuote(context.Background(), q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.Commitment = &domain.QuoteCommitmentProjection{State: "committed", Network: commitment.Network, Reference: commitment.Reference, Digest: commitment.Digest, Finalized: commitment.Finalized, FinalizedCheckpoint: commitment.FinalizedCheckpoint}
+	if _, reserved, err := st.Reserve(context.Background(), q.PrincipalID, q.IdempotencyKey, q.IdempotencyRequestHash, time.Now().Add(time.Hour)); err != nil || !reserved {
+		t.Fatalf("reserve=%v err=%v", reserved, err)
+	}
+	old := time.Now().UTC().Add(-time.Minute)
+	if _, created, err := st.OpenQuoteCommitment(context.Background(), domain.QuoteCommitmentOperation{QuoteID: q.ID, Quote: q, ContentHash: "projection-content", Checkpoint: domain.QuoteCommitmentAuthorityCommitted, CreatedAt: old, UpdatedAt: old}); err != nil || !created {
+		t.Fatalf("open created=%v err=%v", created, err)
+	}
+	if _, err := st.GetQuote(context.Background(), q.ID); err == nil {
+		t.Fatal("test setup unexpectedly has a public Quote projection")
+	}
+	if err := quotes.ReconcileStaleOperations(context.Background(), time.Now().UTC(), 100); err != nil {
+		t.Fatal(err)
+	}
+	projected, err := st.GetQuote(context.Background(), q.ID)
+	if err != nil || projected.Commitment == nil {
+		t.Fatalf("Quote projection was not recovered: %+v err=%v", projected, err)
+	}
+	op, err := st.GetQuoteCommitmentOperation(context.Background(), q.ID)
+	if err != nil || op.Checkpoint != domain.QuoteCommitmentCompleted {
+		t.Fatalf("operation did not become terminal after projection: %+v err=%v", op, err)
 	}
 }

@@ -350,6 +350,9 @@ func (s *Store) UpdateQuoteCommitmentOperation(ctx context.Context, quoteID stri
 	if err := json.Unmarshal(payload, &op); err != nil {
 		return op, err
 	}
+	if op.Checkpoint == domain.QuoteCommitmentCompleted {
+		return op, nil
+	}
 	next, err := fn(op)
 	if err != nil {
 		return op, err

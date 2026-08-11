@@ -114,6 +114,9 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 		if err != nil {
 			return domain.Quote{}, err
 		}
+		if q.TrustMode == domain.TrustModeVerified {
+			return s.projectVerifiedQuote(ctx, q)
+		}
 		if err := s.store.PutQuote(ctx, q); err != nil {
 			return domain.Quote{}, err
 		}
@@ -197,11 +200,18 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 	if err != nil {
 		return domain.Quote{}, err
 	}
-	if err := s.store.PutQuote(ctx, q); err != nil {
-		return domain.Quote{}, err
-	}
-	if err := s.store.Finish(ctx, in.PrincipalID, in.IdempotencyKey, q.ID); err != nil {
-		return domain.Quote{}, err
+	if q.TrustMode == domain.TrustModeVerified {
+		q, err = s.projectVerifiedQuote(ctx, q)
+		if err != nil {
+			return domain.Quote{}, err
+		}
+	} else {
+		if err := s.store.PutQuote(ctx, q); err != nil {
+			return domain.Quote{}, err
+		}
+		if err := s.store.Finish(ctx, in.PrincipalID, in.IdempotencyKey, q.ID); err != nil {
+			return domain.Quote{}, err
+		}
 	}
 	committed = true
 	return q, nil
@@ -248,6 +258,10 @@ func (s *QuoteService) resumeQuoteCommitmentOperation(ctx context.Context, op do
 	if err != nil {
 		return domain.Quote{}, err
 	}
+	return s.projectVerifiedQuote(ctx, q)
+}
+
+func (s *QuoteService) projectVerifiedQuote(ctx context.Context, q domain.Quote) (domain.Quote, error) {
 	if err := s.store.PutQuote(ctx, q); err != nil {
 		return domain.Quote{}, err
 	}
@@ -256,7 +270,22 @@ func (s *QuoteService) resumeQuoteCommitmentOperation(ctx context.Context, op do
 			return domain.Quote{}, err
 		}
 	}
-	return q, nil
+	completed := time.Now().UTC()
+	op, err := s.store.UpdateQuoteCommitmentOperation(ctx, q.ID, func(current domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error) {
+		if current.Checkpoint == domain.QuoteCommitmentCompleted {
+			return current, nil
+		}
+		current.Quote = q
+		current.Checkpoint = domain.QuoteCommitmentCompleted
+		current.FailureReason = ""
+		current.UpdatedAt = completed
+		current.CompletedAt = &completed
+		return current, nil
+	})
+	if err != nil {
+		return domain.Quote{}, err
+	}
+	return op.Quote, nil
 }
 
 func (s *QuoteService) ReconcileStaleOperations(ctx context.Context, cutoff time.Time, limit int) error {
@@ -568,25 +597,40 @@ func (s *QuoteService) commitVerifiedQuote(ctx context.Context, q domain.Quote) 
 		}
 	}
 	q = op.Quote
+	if op.Checkpoint == domain.QuoteCommitmentCompleted {
+		return op.Quote, nil
+	}
 	commitment, found, resolveErr := s.core.GetQuoteCommitment(ctx, q)
 	if resolveErr != nil {
-		_, _ = s.store.UpdateQuoteCommitmentOperation(context.Background(), q.ID, func(current domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error) {
+		current, updateErr := s.store.UpdateQuoteCommitmentOperation(context.Background(), q.ID, func(current domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error) {
+			if current.Checkpoint == domain.QuoteCommitmentCompleted {
+				return current, nil
+			}
 			current.Checkpoint = domain.QuoteCommitmentReconciling
 			current.FailureReason = resolveErr.Error()
 			current.UpdatedAt = time.Now().UTC()
 			return current, nil
 		})
+		if updateErr == nil && current.Checkpoint == domain.QuoteCommitmentCompleted {
+			return current.Quote, nil
+		}
 		return domain.Quote{}, resolveErr
 	}
 	if !found {
 		commitment, err = s.core.CommitQuote(ctx, q)
 		if err != nil {
-			_, _ = s.store.UpdateQuoteCommitmentOperation(context.Background(), q.ID, func(current domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error) {
+			current, updateErr := s.store.UpdateQuoteCommitmentOperation(context.Background(), q.ID, func(current domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error) {
+				if current.Checkpoint == domain.QuoteCommitmentCompleted {
+					return current, nil
+				}
 				current.Checkpoint = domain.QuoteCommitmentReconciling
 				current.FailureReason = err.Error()
 				current.UpdatedAt = time.Now().UTC()
 				return current, nil
 			})
+			if updateErr == nil && current.Checkpoint == domain.QuoteCommitmentCompleted {
+				return current.Quote, nil
+			}
 			return domain.Quote{}, err
 		}
 	}
@@ -594,19 +638,21 @@ func (s *QuoteService) commitVerifiedQuote(ctx context.Context, q domain.Quote) 
 		return domain.Quote{}, err
 	}
 	q.Commitment = &domain.QuoteCommitmentProjection{State: "committed", Network: commitment.Network, Reference: commitment.Reference, Digest: commitment.Digest, Finalized: commitment.Finalized, FinalizedCheckpoint: commitment.FinalizedCheckpoint}
-	completed := time.Now().UTC()
-	_, err = s.store.UpdateQuoteCommitmentOperation(ctx, q.ID, func(current domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error) {
+	committedAt := time.Now().UTC()
+	op, err = s.store.UpdateQuoteCommitmentOperation(ctx, q.ID, func(current domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error) {
 		if current.ContentHash != contentHash {
 			return current, domain.NewError(domain.ErrIdempotencyConflict, "quote commitment operation changed", false)
 		}
+		if current.Checkpoint == domain.QuoteCommitmentCompleted {
+			return current, nil
+		}
 		current.Quote = q
-		current.Checkpoint = domain.QuoteCommitmentCompleted
+		current.Checkpoint = domain.QuoteCommitmentAuthorityCommitted
 		current.FailureReason = ""
-		current.UpdatedAt = completed
-		current.CompletedAt = &completed
+		current.UpdatedAt = committedAt
 		return current, nil
 	})
-	return q, err
+	return op.Quote, err
 }
 
 func validateQuoteCommitment(q domain.Quote, c toscore.QuoteCommitment) error {

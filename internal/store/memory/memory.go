@@ -258,6 +258,9 @@ func (s *Store) UpdateQuoteCommitmentOperation(_ context.Context, quoteID string
 	if !ok {
 		return domain.QuoteCommitmentOperation{}, store.ErrNotFound
 	}
+	if op.Checkpoint == domain.QuoteCommitmentCompleted {
+		return op, nil
+	}
 	next, err := fn(op)
 	if err != nil {
 		return domain.QuoteCommitmentOperation{}, err

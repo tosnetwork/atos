@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tosnetwork/atos/internal/adapters/tosai"
 	"github.com/tosnetwork/atos/internal/adapters/tosprotocol"
 	"github.com/tosnetwork/atos/internal/auth"
 	"github.com/tosnetwork/atos/internal/domain"
@@ -52,13 +53,23 @@ func (a *quoteAcceptanceAuthority) ResolveCommitment(_ context.Context, kind, id
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	reference, ok := a.refs[kind+"\x00"+id+"\x00"+digest]
-	if !ok || expected == nil || expected.Network != a.Network() || expected.Reference != reference {
-		return nil, errors.New("canonical commitment not found")
+	if !ok {
+		return nil, atosrpc.ErrCommitmentNotFound
+	}
+	if expected != nil && (expected.Network != a.Network() || expected.Reference != reference) {
+		return nil, errors.New("canonical commitment mismatch")
 	}
 	return &atosrpc.NetworkReference{Network: a.Network(), Reference: reference, Finalized: true, FinalizedCheckpoint: 42}, nil
 }
 
 type quoteAcceptanceEconomy struct{}
+
+type quoteAcceptanceQuoter struct{}
+
+func (quoteAcceptanceQuoter) QuoteExecution(_ context.Context, req tosai.QuoteExecutionRequest) (tosai.ServiceExecutionQuote, error) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	return tosai.ServiceExecutionQuote{ID: "service-quote-phase4b1", Reference: "service:quote:phase4b1", ExpiresAt: now.Add(5 * time.Minute), ExecutionDeadline: req.ExecutionDeadline.UTC().Truncate(time.Millisecond)}, nil
+}
 
 func (quoteAcceptanceEconomy) Network() string { return "tos-test" }
 func (quoteAcceptanceEconomy) Supports(m economic.TrustMode) bool {
@@ -171,7 +182,7 @@ func TestVerifiedQuoteRealHTTPPostgresProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	quotes := service.NewQuoteService(st).WithVerifiedCommitmentAuthority(client, signers, "atos.im")
+	quotes := service.NewQuoteService(st, quoteAcceptanceQuoter{}).WithVerifiedCommitmentAuthority(client, signers, "atos.im")
 	api := httptest.NewServer((&Server{Auth: authorization, Capabilities: capabilities, Quotes: quotes}).Mux())
 	defer api.Close()
 	body, _ := json.Marshal(map[string]any{"capability_id": cap.ID, "requested_trust_mode": "verified"})
