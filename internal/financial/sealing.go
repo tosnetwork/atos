@@ -157,13 +157,13 @@ func (r *Repository) SignBatch(ctx context.Context, batch Batch, signer External
 		return SignatureEnvelope{}, err
 	}
 	if response.KeyID != keyID || response.Algorithm != algorithm || subtle.ConstantTimeCompare([]byte(response.PublicKey), []byte(trustedPublicKey)) != 1 {
-		return SignatureEnvelope{}, errors.New("financial: signer substituted key or algorithm")
+		return SignatureEnvelope{}, errors.Join(ErrIdempotencyConflict, errors.New("financial: signer substituted key or algorithm"))
 	}
-	envelope := SignatureEnvelope{"atos_financial_batch_signature_v1", batch.Manifest.BatchID, batch.ManifestDigest, digest,
+	envelope := SignatureEnvelope{"atos_financial_batch_signature_v2", batch.Manifest.BatchID, batch.ManifestDigest, digest,
 		batch.Manifest.GatewayID, batch.Manifest.NetworkID, response.KeyID, response.Algorithm,
 		response.Signature, response.PublicKey, response.SignedUnixMillis}
 	if err := VerifySignature(envelope); err != nil {
-		return SignatureEnvelope{}, err
+		return SignatureEnvelope{}, errors.Join(ErrIdempotencyConflict, err)
 	}
 	raw, _ := json.Marshal(envelope)
 	result, err := r.pool.Exec(ctx, `UPDATE financial_batches SET signing_key_id=$2,signature_envelope=$3,state='signed',updated_at=now()
@@ -177,12 +177,35 @@ func (r *Repository) SignBatch(ctx context.Context, batch Batch, signer External
 	return envelope, nil
 }
 
+func (r *Repository) EnforceSealingHealth(ctx context.Context, maximumLag time.Duration, cause error) (bool, error) {
+	if maximumLag <= 0 || maximumLag > 24*time.Hour {
+		return false, errors.New("financial: invalid maximum anchor lag")
+	}
+	var lagSeconds float64
+	err := r.pool.QueryRow(ctx, `SELECT COALESCE(EXTRACT(EPOCH FROM now()-min(created_at)),0)
+ FROM (SELECT created_at FROM financial_batches WHERE state<>'anchored'
+       UNION ALL SELECT created_at FROM financial_events WHERE state='finalized' AND batch_id='') pending`).Scan(&lagSeconds)
+	if err != nil {
+		return false, err
+	}
+	if !errors.Is(cause, ErrIdempotencyConflict) && lagSeconds < maximumLag.Seconds() {
+		return false, nil
+	}
+	classification := "integrity_sealing_mismatch"
+	if !errors.Is(cause, ErrIdempotencyConflict) {
+		classification = "integrity_anchor_lag_exceeded"
+	}
+	_, err = r.EnterSafeMode(ctx, classification, map[string]any{"maximum_lag_seconds": maximumLag.Seconds()}, map[string]any{"pending_lag_seconds": lagSeconds})
+	return true, err
+}
+
 type EvidenceBundle struct {
-	Version      string            `json:"version"`
-	Manifest     BatchManifest     `json:"manifest"`
-	ManifestCBOR string            `json:"manifest_cbor"`
-	Commitments  []Commitment      `json:"commitments"`
-	Signature    SignatureEnvelope `json:"signature"`
+	Version        string              `json:"version"`
+	Manifest       BatchManifest       `json:"manifest"`
+	ManifestCBOR   string              `json:"manifest_cbor"`
+	Commitments    []Commitment        `json:"commitments"`
+	LedgerEvidence LedgerChainEvidence `json:"ledger_evidence"`
+	Signature      SignatureEnvelope   `json:"signature"`
 }
 
 type Retainer interface {
@@ -206,12 +229,57 @@ func NewHTTPRetainer(endpoint, hmacKey string, timeout time.Duration) (*HTTPReta
 
 func (r *HTTPRetainer) authenticate(request *http.Request, digest string) {
 	timestamp := fmt.Sprint(time.Now().UTC().Unix())
-	message := timestamp + "\n" + request.Method + "\n" + request.URL.EscapedPath() + "\n" + digest
+	target := request.URL.EscapedPath()
+	if request.URL.RawQuery != "" {
+		target += "?" + request.URL.RawQuery
+	}
+	message := timestamp + "\n" + request.Method + "\n" + target + "\n" + digest
 	mac := hmac.New(sha256.New, r.hmacKey)
 	_, _ = mac.Write([]byte(message))
 	request.Header.Set("X-Content-SHA256", digest)
 	request.Header.Set("X-ATOS-Retention-Timestamp", timestamp)
 	request.Header.Set("X-ATOS-Retention-Signature", "hmac-sha256="+hex.EncodeToString(mac.Sum(nil)))
+}
+
+type RetentionProof struct {
+	ObjectKey   string
+	VersionID   string
+	Digest      string
+	LockMode    string
+	RetainUntil time.Time
+}
+
+type RetentionResolver interface {
+	ResolveRetention(context.Context, string, string, string) (RetentionProof, error)
+}
+
+func (r *HTTPRetainer) ResolveRetention(ctx context.Context, key, versionID, digest string) (RetentionProof, error) {
+	if key == "" || versionID == "" || digest == "" {
+		return RetentionProof{}, errors.New("financial: incomplete immutable retention identity")
+	}
+	endpoint := *r.endpoint
+	endpoint.Path += "/" + strings.TrimLeft(key, "/")
+	query := endpoint.Query()
+	query.Set("version_id", versionID)
+	endpoint.RawQuery = query.Encode()
+	request, err := http.NewRequestWithContext(ctx, http.MethodHead, endpoint.String(), nil)
+	if err != nil {
+		return RetentionProof{}, err
+	}
+	r.authenticate(request, digest)
+	response, err := r.client.Do(request)
+	if err != nil {
+		return RetentionProof{}, err
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	retainUntil, timeErr := time.Parse(time.RFC3339, response.Header.Get("X-Object-Retain-Until"))
+	proof := RetentionProof{ObjectKey: key, VersionID: response.Header.Get("X-Object-Version-ID"),
+		Digest: response.Header.Get("X-Content-SHA256"), LockMode: response.Header.Get("X-Object-Lock-Mode"), RetainUntil: retainUntil}
+	if response.StatusCode != http.StatusOK || timeErr != nil || proof.VersionID != versionID || proof.Digest != digest || proof.LockMode != "COMPLIANCE" {
+		return RetentionProof{}, ErrIdempotencyConflict
+	}
+	return proof, nil
 }
 
 func (r *HTTPRetainer) resolve(ctx context.Context, endpoint string, digest string) (string, error) {
@@ -314,8 +382,9 @@ func (r *Repository) RetainBatch(ctx context.Context, batch Batch, signature Sig
 	if retainer == nil {
 		return "", "", errors.New("financial: retainer required")
 	}
-	bundle := EvidenceBundle{"atos_financial_evidence_bundle_v1", batch.Manifest,
-		base64.StdEncoding.EncodeToString(batch.ManifestCBOR), batch.Commitments, signature}
+	bundle := EvidenceBundle{Version: "atos_financial_evidence_bundle_v2", Manifest: batch.Manifest,
+		ManifestCBOR: base64.StdEncoding.EncodeToString(batch.ManifestCBOR), Commitments: batch.Commitments,
+		LedgerEvidence: batch.LedgerEvidence, Signature: signature}
 	body, err := json.Marshal(bundle)
 	if err != nil {
 		return "", "", err
@@ -338,10 +407,13 @@ func (r *Repository) RetainBatch(ctx context.Context, batch Batch, signature Sig
 	return key, version, nil
 }
 
-func (r *Repository) SealNext(ctx context.Context, signer ExternalSigner, keyID, algorithm, trustedPublicKey string, retainer Retainer, publisher AnchorPublisher, limit int) (Batch, error) {
+func (r *Repository) SealNext(ctx context.Context, ledger interface {
+	ledgerClient
+	ledgerChainReader
+}, signer ExternalSigner, keyID, algorithm, trustedPublicKey string, retainer Retainer, publisher AnchorPublisher, limit int) (Batch, error) {
 	batch, signature, err := r.PendingBatch(ctx)
 	if errors.Is(err, pgx.ErrNoRows) {
-		batch, err = r.CreateBatch(ctx, limit)
+		batch, err = r.CreateBatch(ctx, limit, ledger)
 	}
 	if err != nil {
 		return Batch{}, err

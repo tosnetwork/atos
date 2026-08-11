@@ -108,22 +108,24 @@ const (
 )
 
 type FinancialConfig struct {
-	Backend          FinancialBackend
-	BlnkURL          string
-	BlnkKey          string
-	Timeout          time.Duration
-	GatewayID        string
-	NetworkID        string
-	IssuanceLimit    string
-	SignerURL        string
-	SignerToken      string
-	SigningKeyID     string
-	SigningPublicKey string
-	SigningAlgorithm string
-	RetentionURL     string
-	RetentionHMACKey string
-	SealInterval     time.Duration
-	BatchSize        int
+	Backend           FinancialBackend
+	BlnkURL           string
+	BlnkKey           string
+	Timeout           time.Duration
+	GatewayID         string
+	NetworkID         string
+	IssuanceLimit     string
+	SignerURL         string
+	SignerToken       string
+	SigningKeyID      string
+	SigningPublicKey  string
+	SigningAlgorithm  string
+	RetentionURL      string
+	RetentionHMACKey  string
+	SealInterval      time.Duration
+	MaxAnchorLag      time.Duration
+	FullAuditInterval time.Duration
+	BatchSize         int
 }
 
 type Config struct {
@@ -195,6 +197,14 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	maxAnchorLag, err := durationEnv("ATOS_FINANCIAL_MAX_ANCHOR_LAG", 15*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	fullAuditInterval, err := durationEnv("ATOS_FINANCIAL_FULL_AUDIT_INTERVAL", 5*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
 	batchSize, err := intEnv("ATOS_FINANCIAL_BATCH_SIZE", 4096)
 	if err != nil {
 		return Config{}, err
@@ -238,21 +248,24 @@ func Load() (Config, error) {
 			DailyLimit:     envOr("ATOS_MANAGED_DAILY_LIMIT", "20.00"),
 		},
 		Financial: FinancialConfig{
-			Backend:          FinancialBackend(strings.ToLower(envOr("ATOS_FINANCIAL_BACKEND", string(FinancialBackendDisabled)))),
-			BlnkURL:          strings.TrimSpace(os.Getenv("ATOS_BLNK_URL")),
-			BlnkKey:          strings.TrimSpace(os.Getenv("ATOS_BLNK_KEY")),
-			Timeout:          financialTimeout,
-			GatewayID:        strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_GATEWAY_ID")),
-			NetworkID:        strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_NETWORK_ID")),
-			IssuanceLimit:    envOr("ATOS_FINANCIAL_ISSUANCE_LIMIT", "0.00"),
-			SignerURL:        strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_SIGNER_URL")),
-			SignerToken:      os.Getenv("ATOS_FINANCIAL_SIGNER_TOKEN"),
-			SigningKeyID:     strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_SIGNING_KEY_ID")),
-			SigningPublicKey: strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_SIGNING_PUBLIC_KEY")),
-			SigningAlgorithm: strings.ToLower(envOr("ATOS_FINANCIAL_SIGNING_ALGORITHM", "ed25519")),
-			RetentionURL:     strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_RETENTION_URL")),
-			RetentionHMACKey: os.Getenv("ATOS_FINANCIAL_RETENTION_HMAC_KEY"),
-			SealInterval:     sealInterval, BatchSize: batchSize,
+			Backend:           FinancialBackend(strings.ToLower(envOr("ATOS_FINANCIAL_BACKEND", string(FinancialBackendDisabled)))),
+			BlnkURL:           strings.TrimSpace(os.Getenv("ATOS_BLNK_URL")),
+			BlnkKey:           strings.TrimSpace(os.Getenv("ATOS_BLNK_KEY")),
+			Timeout:           financialTimeout,
+			GatewayID:         strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_GATEWAY_ID")),
+			NetworkID:         strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_NETWORK_ID")),
+			IssuanceLimit:     envOr("ATOS_FINANCIAL_ISSUANCE_LIMIT", "0.00"),
+			SignerURL:         strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_SIGNER_URL")),
+			SignerToken:       os.Getenv("ATOS_FINANCIAL_SIGNER_TOKEN"),
+			SigningKeyID:      strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_SIGNING_KEY_ID")),
+			SigningPublicKey:  strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_SIGNING_PUBLIC_KEY")),
+			SigningAlgorithm:  strings.ToLower(envOr("ATOS_FINANCIAL_SIGNING_ALGORITHM", "ed25519")),
+			RetentionURL:      strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_RETENTION_URL")),
+			RetentionHMACKey:  os.Getenv("ATOS_FINANCIAL_RETENTION_HMAC_KEY"),
+			SealInterval:      sealInterval,
+			MaxAnchorLag:      maxAnchorLag,
+			FullAuditInterval: fullAuditInterval,
+			BatchSize:         batchSize,
 		},
 		TOSBackend: TOSBackend(strings.ToLower(envOr("ATOS_TOS_BACKEND", string(TOSBackendMock)))),
 		TOSRPC: TOSRPCConfig{
@@ -338,8 +351,8 @@ func (c Config) Validate() error {
 		if !ok || initialBalance.Sign() < 0 || initialBalance.Sign() > 0 && issuanceLimit.Sign() <= 0 {
 			return errors.New("a positive managed initial balance requires a positive ATOS_FINANCIAL_ISSUANCE_LIMIT")
 		}
-		if c.Financial.SealInterval <= 0 || c.Financial.SealInterval > 24*time.Hour || c.Financial.BatchSize < 1 || c.Financial.BatchSize > 4096 {
-			return errors.New("ATOS financial seal interval or batch size is outside the allowed range")
+		if c.Financial.SealInterval <= 0 || c.Financial.SealInterval > 24*time.Hour || c.Financial.MaxAnchorLag < c.Financial.SealInterval || c.Financial.MaxAnchorLag > 24*time.Hour || c.Financial.FullAuditInterval < 10*time.Second || c.Financial.FullAuditInterval > 24*time.Hour || c.Financial.BatchSize < 1 || c.Financial.BatchSize > 4096 {
+			return errors.New("ATOS financial seal, anchor lag, full audit interval, or batch size is outside the allowed range")
 		}
 		if c.Financial.SigningAlgorithm != "ed25519" && c.Financial.SigningAlgorithm != "ecdsa_p256_sha256" {
 			return errors.New("ATOS_FINANCIAL_SIGNING_ALGORITHM is unsupported")

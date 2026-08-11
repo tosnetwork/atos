@@ -386,6 +386,58 @@ func TestReconciliationMismatchEntersSafeMode(t *testing.T) {
 	}
 }
 
+func TestSafeModeObservesCommittedPendingButNeverSubmitsAbsentTransaction(t *testing.T) {
+	ctx := context.Background()
+	pool := financialTestPool(t)
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	repository, _ := NewRepository(pool, "gw-"+suffix, "net-"+suffix)
+	ledger := newTestLedger()
+	adapter, _ := NewAdapter(repository, ledger)
+	principal := "p-" + suffix
+
+	absentRequest := requestFor("safe-absent-"+suffix, EventAccountGenesis, GatewayCreditIssuance, PrincipalAvailable, "_", principal)
+	absentRequest.AllowOverdraft = true
+	absent, err := repository.OpenIntent(ctx, absentRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.EnterSafeMode(ctx, "test_safe_mode", map[string]any{"expected": true}, map[string]any{"observed": false}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.ProvisionAccount(ctx, absentRequest); !errors.Is(err, ErrSafeMode) {
+		t.Fatalf("safe mode absent transaction error=%v", err)
+	}
+	if _, found, err := ledger.Lookup(ctx, absent.LedgerReference); err != nil || found {
+		t.Fatalf("safe mode created absent ledger transaction: found=%t err=%v", found, err)
+	}
+	if result, err := adapter.Reconcile(ctx, 100); err != nil || !result.SafeMode || result.Retried != 0 {
+		t.Fatalf("safe-mode reconcile submitted pending transaction: result=%+v err=%v", result, err)
+	}
+
+	committedRequest := requestFor("safe-committed-"+suffix, EventAccountGenesis, GatewayCreditIssuance, PrincipalAvailable, "_", "committed-"+principal)
+	committedRequest.AllowOverdraft = true
+	// Safe mode forbids opening a new intent, so create this pending intent by
+	// temporarily using the migration credential to model a pre-incident intent.
+	if _, err := pool.Exec(ctx, `UPDATE financial_integrity_state SET safe_mode=FALSE,reason='',incident_id='',entered_at=NULL`); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := repository.OpenIntent(ctx, committedRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction, err := ledger.Submit(ctx, committed, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.EnterSafeMode(ctx, "test_safe_mode_again", map[string]any{"expected": true}, map[string]any{"observed": false}); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := adapter.ProvisionAccount(ctx, committedRequest)
+	if err != nil || observed.State != "finalized" || observed.LedgerTransactionID != transaction.TransactionID {
+		t.Fatalf("safe mode did not observe already committed outcome: event=%+v err=%v", observed, err)
+	}
+}
+
 func TestReconciliationSerializesMutationAndPersistsCrashCursor(t *testing.T) {
 	ctx := context.Background()
 	pool := financialTestPool(t)

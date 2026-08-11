@@ -463,6 +463,12 @@ func (s *DisputeService) Resolve(ctx context.Context, in ResolveDisputeInput) (d
 						if err != nil {
 							return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
 						}
+					} else {
+						var err error
+						nextAccount, err = s.accounts.creditPolicyValue(a, d.ChargedAmount.Amount, d.ChargedAmount.Currency)
+						if err != nil {
+							return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
+						}
 					}
 					e.Status = domain.EarningReversed
 					d.EconomicState = domain.DisputeEconomicRefunded

@@ -16,7 +16,7 @@ aws s3api get-object-lock-configuration --bucket "$ATOS_WORM_BUCKET" >/dev/null 
   aws s3api put-object-lock-configuration --bucket "$ATOS_WORM_BUCKET" --object-lock-configuration \
   "ObjectLockEnabled=Enabled,Rule={DefaultRetention={Mode=COMPLIANCE,Days=$ATOS_WORM_RETENTION_DAYS}}"
 configuration="$(aws s3api get-object-lock-configuration --bucket "$ATOS_WORM_BUCKET" --output json)"
-python3 -c 'import json,sys; c=json.load(sys.stdin); assert c["ObjectLockConfiguration"]["ObjectLockEnabled"]=="Enabled"; assert c["ObjectLockConfiguration"]["Rule"]["DefaultRetention"]["Mode"]=="COMPLIANCE"' <<<"$configuration"
+python3 -c 'import json,sys; c=json.load(sys.stdin); r=c["ObjectLockConfiguration"]["Rule"]["DefaultRetention"]; assert c["ObjectLockConfiguration"]["ObjectLockEnabled"]=="Enabled"; assert r["Mode"]=="COMPLIANCE"; assert int(r.get("Days",0))>=int(sys.argv[1])' "$ATOS_WORM_RETENTION_DAYS" <<<"$configuration"
 
 probe_file="$(mktemp "${TMPDIR:-/tmp}/atos-worm-probe.XXXXXX")"
 download_file="${probe_file}.download"
@@ -32,7 +32,7 @@ version_id="$(aws s3api put-object --bucket "$ATOS_WORM_BUCKET" --key "$probe_ke
   --metadata "content-sha256=$probe_digest" --query VersionId --output text)"
 test -n "$version_id" && test "$version_id" != None || { echo "probe upload returned no version ID" >&2; exit 1; }
 head_json="$(aws s3api head-object --bucket "$ATOS_WORM_BUCKET" --key "$probe_key" --version-id "$version_id" --output json)"
-python3 -c 'import json,sys; h=json.load(sys.stdin); assert h["VersionId"]==sys.argv[1]; assert h["ObjectLockMode"]=="COMPLIANCE"; assert h["Metadata"]["content-sha256"]==sys.argv[2]; assert h["ServerSideEncryption"]=="aws:kms"; assert h["SSEKMSKeyId"]==sys.argv[3]' "$version_id" "$probe_digest" "$ATOS_WORM_KMS_KEY_ARN" <<<"$head_json"
+python3 -c 'import datetime,json,sys; h=json.load(sys.stdin); parse=lambda x: datetime.datetime.fromisoformat(x.replace("Z","+00:00")); assert h["VersionId"]==sys.argv[1]; assert h["ObjectLockMode"]=="COMPLIANCE"; assert parse(h["ObjectLockRetainUntilDate"])>=parse(sys.argv[4]); assert h["Metadata"]["content-sha256"]==sys.argv[2]; assert h["ServerSideEncryption"]=="aws:kms"; assert h["SSEKMSKeyId"]==sys.argv[3]' "$version_id" "$probe_digest" "$ATOS_WORM_KMS_KEY_ARN" "$retain_until" <<<"$head_json"
 if aws s3api put-object --bucket "$ATOS_WORM_BUCKET" --key "$probe_key" --body "$probe_file" --if-none-match '*' >/dev/null 2>&1; then
   echo "create-only overwrite protection failed" >&2
   exit 1

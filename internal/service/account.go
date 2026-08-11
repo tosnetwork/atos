@@ -259,6 +259,62 @@ func (s *AccountService) debitAccountValue(a domain.Account, amountStr, currency
 	return a, nil
 }
 
+// debitPolicyValue consumes only the autonomous-spend policy projection. With
+// Blnk enabled, account.Balance is read-only and authoritative in Blnk, while
+// RemainingToday remains ATOS business policy state. Callers must update it in
+// the same store transaction as a durable economic checkpoint.
+func (s *AccountService) debitPolicyValue(a domain.Account, amountStr, currency string) (domain.Account, error) {
+	amount, err := money.Parse(amountStr, currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, domain.NewError(domain.ErrValidationFailed, "invalid amount", false)
+	}
+	a = s.normalizeAccount(a)
+	remaining, err := money.Parse(a.SpendPolicy.RemainingToday.Amount, a.SpendPolicy.RemainingToday.Currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	if amount.Currency != remaining.Currency {
+		return domain.Account{}, domain.NewError(domain.ErrValidationFailed, "currency mismatch with spend policy", false)
+	}
+	newRemaining, err := remaining.Sub(amount)
+	if err != nil {
+		return domain.Account{}, domain.NewError(domain.ErrSpendLimitExceeded, "daily autonomous spend limit exceeded", false)
+	}
+	a.SpendPolicy.RemainingToday = domain.Money{Amount: newRemaining.String(), Currency: newRemaining.Currency}
+	return a, nil
+}
+
+func (s *AccountService) creditPolicyValue(a domain.Account, amountStr, currency string) (domain.Account, error) {
+	amount, err := money.Parse(amountStr, currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, domain.NewError(domain.ErrValidationFailed, "invalid amount", false)
+	}
+	a = s.normalizeAccount(a)
+	if amount.IsZero() {
+		return a, nil
+	}
+	remaining, err := money.Parse(a.SpendPolicy.RemainingToday.Amount, a.SpendPolicy.RemainingToday.Currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	dailyLimit, err := money.Parse(a.SpendPolicy.DailyLimit.Amount, a.SpendPolicy.DailyLimit.Currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	if amount.Currency != remaining.Currency || amount.Currency != dailyLimit.Currency {
+		return domain.Account{}, domain.NewError(domain.ErrValidationFailed, "currency mismatch with spend policy", false)
+	}
+	newRemaining, err := remaining.Add(amount)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	if newRemaining.Cmp(dailyLimit) > 0 {
+		newRemaining = dailyLimit
+	}
+	a.SpendPolicy.RemainingToday = domain.Money{Amount: newRemaining.String(), Currency: newRemaining.Currency}
+	return a, nil
+}
+
 func (s *AccountService) creditAccountValue(a domain.Account, amountStr, currency string) (domain.Account, error) {
 	amount, err := money.Parse(amountStr, currency, accountDecimals)
 	if err != nil {

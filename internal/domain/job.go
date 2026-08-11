@@ -20,6 +20,7 @@ type EconomicState string
 
 const (
 	EconomicNone              EconomicState = ""
+	EconomicPolicyPending     EconomicState = "policy_pending"
 	EconomicDebited           EconomicState = "debited"
 	EconomicEscrowPending     EconomicState = "escrow_pending"
 	EconomicEscrowReserved    EconomicState = "escrow_reserved"

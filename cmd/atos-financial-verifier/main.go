@@ -102,15 +102,24 @@ func main() {
 	previousAnchor := flag.String("previous-anchor", "", "expected previous anchor ID for non-genesis batch")
 	previousRoot := flag.String("previous-root", "", "expected previous Merkle root for non-genesis batch")
 	previousCommitment := flag.String("previous-commitment", "", "expected prior commitment digest for non-genesis batch")
+	previousLedgerHead := flag.String("previous-ledger-head", "", "expected prior Blnk chain head for non-genesis batch")
+	previousLedgerSequence := flag.Int64("previous-ledger-sequence", 0, "expected prior Blnk chain sequence for non-genesis batch")
+	retentionURL := flag.String("retention-url", "", "independent immutable-retention verification endpoint")
+	retainedVersion := flag.String("retained-version", "", "exact immutable object version ID")
 	flag.Parse()
-	if *evidencePath == "" || *anchorPath == "" || *keysPath == "" || *tosURL == "" || *gateway == "" || *network == "" {
-		fmt.Fprintln(os.Stderr, "all evidence, anchor, trusted-keys, tos-url, gateway and network flags are required")
+	if *evidencePath == "" || *anchorPath == "" || *keysPath == "" || *tosURL == "" || *gateway == "" || *network == "" || *retentionURL == "" || *retainedVersion == "" {
+		fmt.Fprintln(os.Stderr, "all evidence, anchor, trusted-keys, tos-url, gateway, network, retention-url and retained-version flags are required")
 		os.Exit(2)
 	}
 	token := os.Getenv("ATOS_VERIFIER_TOS_TOKEN")
 	if token == "" {
 		fmt.Fprintln(os.Stderr, "ATOS_VERIFIER_TOS_TOKEN is required")
 		os.Exit(2)
+	}
+	retentionKey := os.Getenv("ATOS_VERIFIER_RETENTION_HMAC_KEY")
+	retentionResolver, err := financial.NewHTTPRetainer(*retentionURL, retentionKey, 30*time.Second)
+	if err != nil {
+		fail(err)
 	}
 	evidenceBytes, err := os.ReadFile(*evidencePath)
 	if err != nil {
@@ -131,7 +140,7 @@ func main() {
 	client := atostosv1connect.NewFinancialIntegrityServiceClient(http.DefaultClient, *tosURL)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	err = financial.VerifyEvidence(ctx, bundle, anchor, financial.VerifyOptions{GatewayID: *gateway, NetworkID: *network, TrustedPublicKeys: keys, ExpectedPreviousAnchorID: *previousAnchor, ExpectedPreviousRoot: *previousRoot, ExpectedPreviousCommitment: *previousCommitment, Resolver: resolver{client: client, token: token, gateway: *gateway}})
+	err = financial.VerifyEvidence(ctx, bundle, anchor, financial.VerifyOptions{GatewayID: *gateway, NetworkID: *network, TrustedPublicKeys: keys, ExpectedPreviousAnchorID: *previousAnchor, ExpectedPreviousRoot: *previousRoot, ExpectedPreviousCommitment: *previousCommitment, ExpectedPreviousLedgerHead: *previousLedgerHead, ExpectedPreviousLedgerSequence: *previousLedgerSequence, Resolver: resolver{client: client, token: token, gateway: *gateway}, RetentionResolver: retentionResolver, RetainedVersionID: *retainedVersion})
 	if err != nil {
 		fail(err)
 	}

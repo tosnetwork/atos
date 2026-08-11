@@ -2,6 +2,7 @@ package financial
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -260,8 +262,16 @@ func TestRealBlnkTwoReplicaLifecycleAndLostResponse(t *testing.T) {
 	if _, err := lostAdapter.ProvisionAccount(ctx, lost); err != nil {
 		t.Fatalf("real Blnk lost response did not converge: %v", err)
 	}
-	if result, err := a1.Reconcile(ctx, 100); err != nil || result.SafeMode || result.Mismatches != 0 {
-		t.Fatalf("real Blnk reconciliation result=%+v err=%v", result, err)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		result, reconcileErr := a1.Reconcile(ctx, 100)
+		if reconcileErr == nil && !result.SafeMode && result.Mismatches == 0 {
+			break
+		}
+		if !errors.Is(reconcileErr, ErrLedgerUncertain) || time.Now().After(deadline) {
+			t.Fatalf("real Blnk reconciliation result=%+v err=%v", result, reconcileErr)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	overLimit := lost
 	overLimit.IdempotencyIdentity = "principal:p-over-limit-" + suffix + ":genesis:v1"
@@ -270,5 +280,33 @@ func TestRealBlnkTwoReplicaLifecycleAndLostResponse(t *testing.T) {
 	overLimit.AtomicAmount = "51"
 	if _, err := a1.ProvisionAccount(ctx, overLimit); err == nil {
 		t.Fatal("Blnk accepted genesis beyond the configured aggregate issuance limit")
+	}
+
+	// Insert an unauthorized balanced pair through the real Blnk API. Final
+	// balances return to their legitimate values, so only journal-completeness
+	// verification can detect this attack.
+	availableIndicator, _ := AccountIndicator(gateway, network, PrincipalAvailable, principal, "USD")
+	payableIndicator, _ := AccountIndicator(gateway, network, ProviderPayable, provider, "USD")
+	postAttack := func(id, source, destination string) {
+		t.Helper()
+		payload := map[string]any{"transaction_id": id, "precise_amount": json.Number("1"), "precision": 100,
+			"allow_overdraft": false, "overdraft_limit": json.Number("0"), "skip_queue": true, "atomic": true,
+			"source": source, "destination": destination, "reference": id, "description": "unauthorized-balanced-pair", "currency": "USD"}
+		if _, attackErr := client.request(ctx, http.MethodPost, "/transactions", payload, nil); attackErr != nil {
+			t.Fatal(attackErr)
+		}
+	}
+	postAttack("txn_attack_forward_"+suffix, availableIndicator, payableIndicator)
+	postAttack("txn_attack_reverse_"+suffix, payableIndicator, availableIndicator)
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		result, reconcileErr := a1.Reconcile(ctx, 100)
+		if result.SafeMode && reconcileErr != nil && strings.Contains(reconcileErr.Error(), "unexpected_ledger_event") {
+			break
+		}
+		if reconcileErr != nil && !errors.Is(reconcileErr, ErrLedgerUncertain) || time.Now().After(deadline) {
+			t.Fatalf("balanced unauthorized journal pair escaped detection: result=%+v err=%v", result, reconcileErr)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }

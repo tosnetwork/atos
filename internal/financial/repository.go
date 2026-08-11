@@ -213,9 +213,26 @@ func (r *Repository) openIntentWith(ctx context.Context, db repositoryDB, reques
 		if existing.SemanticDigest != semantic {
 			return Event{}, ErrIdempotencyConflict
 		}
+		if existing.State == "finalized" {
+			return existing, nil
+		}
+		safeMode, _, safeErr := r.safeModeWith(ctx, db)
+		if safeErr != nil {
+			return Event{}, safeErr
+		}
+		if safeMode {
+			return existing, ErrSafeMode
+		}
 		return existing, nil
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return Event{}, err
+	}
+	safeMode, _, err := r.safeModeWith(ctx, db)
+	if err != nil {
+		return Event{}, err
+	}
+	if safeMode {
+		return Event{}, ErrSafeMode
 	}
 
 	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
@@ -223,11 +240,11 @@ func (r *Repository) openIntentWith(ctx context.Context, db repositoryDB, reques
 		return Event{}, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	var safeMode bool
-	if err := tx.QueryRow(ctx, `SELECT safe_mode FROM financial_integrity_state WHERE singleton=TRUE`).Scan(&safeMode); err != nil {
+	var transactionSafeMode bool
+	if err := tx.QueryRow(ctx, `SELECT safe_mode FROM financial_integrity_state WHERE singleton=TRUE`).Scan(&transactionSafeMode); err != nil {
 		return Event{}, err
 	}
-	if safeMode {
+	if transactionSafeMode {
 		return Event{}, ErrSafeMode
 	}
 	var sequence int64
@@ -392,7 +409,15 @@ func (r *Repository) pendingWith(ctx context.Context, db repositoryDB, limit int
 }
 
 func (r *Repository) EnterSafeMode(ctx context.Context, classification string, expected, observed any) (string, error) {
-	return r.enterSafeModeWith(ctx, r.pool, classification, expected, observed)
+	// Establish safe mode on the exclusive side of the mutation/audit lock.
+	// This waits for any ledger submission already inside its critical section
+	// and prevents a request that read the old flag from submitting afterward.
+	db, unlock, err := r.LockReconciliation(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	return r.enterSafeModeWith(ctx, db, classification, expected, observed)
 }
 
 func (r *Repository) enterSafeModeWith(ctx context.Context, db repositoryDB, classification string, expected, observed any) (string, error) {

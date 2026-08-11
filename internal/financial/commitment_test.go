@@ -4,7 +4,11 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,12 +56,22 @@ func TestTransferRequestRejectsPostingOwnerIdentitySubstitution(t *testing.T) {
 }
 
 type fixedResolver struct{ receipt AnchorReceipt }
+type fixedRetentionResolver struct{ proof RetentionProof }
+
+func (r fixedRetentionResolver) ResolveRetention(_ context.Context, key, version, digest string) (RetentionProof, error) {
+	if key != r.proof.ObjectKey || version != r.proof.VersionID || digest != r.proof.Digest {
+		return RetentionProof{}, ErrIdempotencyConflict
+	}
+	return r.proof, nil
+}
 
 func (r fixedResolver) PublishManagedFinancialAnchor(context.Context, ManagedAnchor) (AnchorReceipt, error) {
 	return r.receipt, nil
 }
 func (r fixedResolver) ResolveManagedFinancialAnchor(context.Context, ManagedAnchor) (AnchorReceipt, bool, error) {
-	return r.receipt, true, nil
+	receipt := r.receipt
+	receipt.FinalizedCheckpoint++
+	return receipt, true, nil
 }
 
 func testEvidence(t *testing.T) (EvidenceBundle, AnchorReceipt, VerifyOptions) {
@@ -75,9 +89,32 @@ func testEvidence(t *testing.T) (EvidenceBundle, AnchorReceipt, VerifyOptions) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	batch, err := makeBatchManifest("gateway.example", "tos-localnet-1", 1, "", GenesisDigest, []Commitment{e1.Commitment, e2.Commitment}, at)
+	ledgerRows := []LedgerChainRow{
+		{Transaction: LedgerTransaction{TransactionID: e1.LedgerTransactionIDs[0], Source: "bln_source_1", Destination: "bln_destination_1", Reference: e1.LedgerReference, PreciseAmount: json.Number(e1.AtomicAmount), Currency: e1.Asset, Description: "atos-financial-v1:" + e1.Digest, Status: "APPLIED", CreatedAt: at}, Amount: "1.25", ChainVersion: blnkChainVersionCBORV2, ChainSequence: 1},
+		{Transaction: LedgerTransaction{TransactionID: e2.LedgerTransactionIDs[0], Source: "bln_source_2", Destination: "bln_destination_2", Reference: e2.LedgerReference, PreciseAmount: json.Number(e2.AtomicAmount), Currency: e2.Asset, Description: "atos-financial-v1:" + e2.Digest, Status: "APPLIED", CreatedAt: at.Add(time.Second)}, Amount: "1.25", ChainVersion: blnkChainVersionCBORV2, ChainSequence: 2},
+	}
+	chainHead := strings.Repeat("0", 64)
+	for index := range ledgerRows {
+		ledgerRows[index].ChainPreviousHash = chainHead
+		chainHead, err = ledgerChainHash(chainHead, ledgerRows[index])
+		if err != nil {
+			t.Fatal(err)
+		}
+		ledgerRows[index].ChainHash = chainHead
+	}
+	ledgerEvidence := LedgerChainEvidence{State: LedgerChainState{ChainKey: "global", FirstSequence: 1, LastSequence: 2, PreviousHash: strings.Repeat("0", 64), HeadHash: chainHead, GenesisHash: strings.Repeat("0", 64)}, Transactions: ledgerRows}
+	ledgerDigest, err := codec.Digest("tos.atos.financial.blnk-evidence.v1", ledgerEvidence)
 	if err != nil {
 		t.Fatal(err)
+	}
+	batch, err := makeBatchManifest("gateway.example", "tos-localnet-1", 1, "", GenesisDigest, ledgerDigest, []Commitment{e1.Commitment, e2.Commitment}, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.Manifest.BatchID != "fbat_e361e6609904daa5d6d87070aec4177bd4749ea853776a8defd02932c986f8ea" ||
+		batch.ManifestDigest != "sha256:a770f7d672a25bde06deb21faa0662bff17ff1ab003d17fff545d7e97c92b376" ||
+		base64.StdEncoding.EncodeToString(batch.ManifestCBOR) != "r2d2ZXJzaW9ud2F0b3NfZmluYW5jaWFsX2JhdGNoX3YyaGJhdGNoX2lkeEVmYmF0X2UzNjFlNjYwOTkwNGRhYTVkNmQ4NzA3MGFlYzQxNzdiZDQ3NDllYTg1Mzc3NmE4ZGVmZDAyOTMyYzk4NmY4ZWFqZ2F0ZXdheV9pZG9nYXRld2F5LmV4YW1wbGVqbmV0d29ya19pZG50b3MtbG9jYWxuZXQtMWttZXJrbGVfcm9vdHhHc2hhMjU2OjJjMjljY2QxZDM4Y2VmZjliNDFhMmIyODAzMTUzYzIwNTE1MDczNzkzODM1Njk3MWQ5MDQ3MTJkMjVmZGJkZWFtbGFzdF9zZXF1ZW5jZQJuYmF0Y2hfc2VxdWVuY2UBbmZpcnN0X3NlcXVlbmNlAXBjYW5vbmljYWxpemF0aW9ueB9yZmM4OTQ5X2NvcmVfZGV0ZXJtaW5pc3RpY19jYm9ycGNvbW1pdG1lbnRfY291bnQCcXByZXZpb3VzX2JhdGNoX2lkYHJjb21taXRtZW50X2RpZ2VzdHOCeEdzaGEyNTY6NmVhMWMwZmMwMzg4YzdjZjM1Y2MzNjc0MDlmMjUyY2I0NDc3M2E1ZDc4ODNhNjJiZmM1ZDdkYzhjOWI5MGVjOHhHc2hhMjU2Ojc5ZjNjZGVkNTY5OGM5N2VjMjY4YThiOGU5NmFiMzNmODYwOWZhNmI0ZWM0Nzc1YjlhM2RmZWFlNzM2NWM1MjZzY3JlYXRlZF91bml4X21pbGxpcxsAAAGf7voqAHRwcmV2aW91c19tZXJrbGVfcm9vdHhHc2hhMjU2OjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDB2bGVkZ2VyX2V2aWRlbmNlX2RpZ2VzdHhHc2hhMjU2OmM2ZjU4YWYyYTU0ZGI3NDhjNTI2MzlmYzEwNGY0OWFkM2NlNzQyYmQ2N2M4M2E3ZWI4MDkzMDQxY2RkNzJkMjU=" {
+		t.Fatal("financial batch V2 deterministic test vector changed")
 	}
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -85,15 +122,20 @@ func testEvidence(t *testing.T) (EvidenceBundle, AnchorReceipt, VerifyOptions) {
 	}
 	signing, _ := signingDigest(batch.Manifest)
 	raw, _ := DigestBytes(signing)
-	envelope := SignatureEnvelope{Version: "atos_financial_batch_signature_v1", BatchID: batch.Manifest.BatchID, ManifestDigest: batch.ManifestDigest, SigningDigest: signing, GatewayID: batch.Manifest.GatewayID, NetworkID: batch.Manifest.NetworkID, SigningKeyID: "kms-key-1", SigningAlgorithm: "ed25519", Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(private, raw)), PublicKey: base64.StdEncoding.EncodeToString(public), SignedUnixMillis: at.UnixMilli()}
+	envelope := SignatureEnvelope{Version: "atos_financial_batch_signature_v2", BatchID: batch.Manifest.BatchID, ManifestDigest: batch.ManifestDigest, SigningDigest: signing, GatewayID: batch.Manifest.GatewayID, NetworkID: batch.Manifest.NetworkID, SigningKeyID: "kms-key-1", SigningAlgorithm: "ed25519", Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(private, raw)), PublicKey: base64.StdEncoding.EncodeToString(public), SignedUnixMillis: at.UnixMilli()}
 	anchor, err := BuildManagedAnchor(batch, envelope, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	payload, _ := AnchorPayloadDigest(anchor)
 	receipt := AnchorReceipt{Anchor: anchor, PayloadDigest: payload, NetworkReferenceID: "tos:anchor:1", NetworkID: anchor.NetworkID, Finalized: true, FinalizedCheckpoint: 42}
-	bundle := EvidenceBundle{"atos_financial_evidence_bundle_v1", batch.Manifest, base64.StdEncoding.EncodeToString(batch.ManifestCBOR), batch.Commitments, envelope}
-	options := VerifyOptions{GatewayID: anchor.GatewayID, NetworkID: anchor.NetworkID, TrustedPublicKeys: map[string]string{"kms-key-1": envelope.PublicKey}, Resolver: fixedResolver{receipt}}
+	bundle := EvidenceBundle{Version: "atos_financial_evidence_bundle_v2", Manifest: batch.Manifest, ManifestCBOR: base64.StdEncoding.EncodeToString(batch.ManifestCBOR), Commitments: batch.Commitments, LedgerEvidence: ledgerEvidence, Signature: envelope}
+	bundleBytes, _ := json.Marshal(bundle)
+	bundleHash := sha256.Sum256(bundleBytes)
+	bundleDigest := "sha256:" + hex.EncodeToString(bundleHash[:])
+	objectKey := "atos-financial/v1/gateway.example/tos-localnet-1/1-" + batch.Manifest.BatchID + ".json"
+	retention := RetentionProof{ObjectKey: objectKey, VersionID: "locked-version-1", Digest: bundleDigest, LockMode: "COMPLIANCE", RetainUntil: time.Now().UTC().Add(24 * time.Hour)}
+	options := VerifyOptions{GatewayID: anchor.GatewayID, NetworkID: anchor.NetworkID, TrustedPublicKeys: map[string]string{"kms-key-1": envelope.PublicKey}, Resolver: fixedResolver{receipt}, RetentionResolver: fixedRetentionResolver{retention}, RetainedVersionID: retention.VersionID}
 	return bundle, receipt, options
 }
 
@@ -127,6 +169,13 @@ func TestIndependentVerifierRejectsTampering(t *testing.T) {
 			b.Commitments[0].Canonicalization = "unknown"
 		},
 		"sequence": func(b *EvidenceBundle, _ *AnchorReceipt, _ *VerifyOptions) { b.Commitments[1].Sequence = 4 },
+		"ledger_deletion": func(b *EvidenceBundle, _ *AnchorReceipt, _ *VerifyOptions) {
+			b.LedgerEvidence.Transactions = b.LedgerEvidence.Transactions[1:]
+		},
+		"ledger_mutation": func(b *EvidenceBundle, _ *AnchorReceipt, _ *VerifyOptions) {
+			b.LedgerEvidence.Transactions[0].Transaction.PreciseAmount = "999"
+		},
+		"retention_version": func(_ *EvidenceBundle, _ *AnchorReceipt, o *VerifyOptions) { o.RetainedVersionID = "substituted" },
 		"previous_commitment": func(b *EvidenceBundle, _ *AnchorReceipt, _ *VerifyOptions) {
 			b.Commitments[1].PreviousCommitment = GenesisDigest
 		},

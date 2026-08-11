@@ -35,6 +35,7 @@ func (a *Adapter) auditIntegrity(ctx context.Context, db repositoryDB) (int, err
 	previous := GenesisDigest
 	expectedSequence := int64(1)
 	expected := make(map[projectionKey]projectionValue)
+	expectedTransactions := make(map[string]LedgerTransaction)
 	finalized := make([]Event, 0)
 	checked := 0
 	for rows.Next() {
@@ -68,6 +69,7 @@ func (a *Adapter) auditIntegrity(ctx context.Context, db repositoryDB) (int, err
 		if err := a.ledger.Verify(ctx, event, transaction); err != nil {
 			return checked, fmt.Errorf("financial: finalized ledger transaction mismatch at sequence %d: %w", event.Sequence, err)
 		}
+		expectedTransactions[transaction.TransactionID] = transaction
 		finalized = append(finalized, event)
 		for _, posting := range event.Postings {
 			key := projectionKey{posting.AccountCode, posting.AccountOwnerID, event.Asset}
@@ -100,6 +102,23 @@ func (a *Adapter) auditIntegrity(ctx context.Context, db repositoryDB) (int, err
 	if nextSequence != expectedSequence || lastCommitment != previous {
 		return checked, errors.New("financial: chain checkpoint does not match rebuilt commitment chain")
 	}
+	if chainReader, ok := a.ledger.(ledgerChainReader); ok {
+		evidence, chainErr := chainReader.ChainEvidence(ctx)
+		if chainErr != nil {
+			return checked, errors.Join(ErrLedgerUncertain, chainErr)
+		}
+		// The production Blnk database is dedicated to this ATOS financial
+		// authority. Consequently every chained transaction must have an exact
+		// ATOS commitment; transactions on attacker-created balances are not a
+		// permissible namespace to ignore.
+		if chainErr := verifyLedgerChainEvidence(evidence, expectedTransactions); chainErr != nil {
+			return checked, chainErr
+		}
+	}
+	// Run the supplementary float-based Blnk matching engine only after the
+	// exact journal snapshot is complete and chain-valid. This avoids creating
+	// repeated reconciliation jobs while the hash chainer is merely catching
+	// up and keeps precise_amount/chain checks authoritative.
 	if reconciler, ok := a.ledger.(ledgerReconciler); ok {
 		for offset := 0; offset < len(finalized); offset += 10000 {
 			end := min(offset+10000, len(finalized))

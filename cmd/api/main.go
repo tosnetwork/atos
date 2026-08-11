@@ -175,6 +175,7 @@ func main() {
 	accounts := service.NewAccountService(st, accountDefaults)
 	var financialAdapter *financial.Adapter
 	var financialRepository *financial.Repository
+	var financialBlnk *financial.BlnkClient
 	if cfg.Financial.Backend == config.FinancialBackendBlnk {
 		if pgStore == nil {
 			logger.Error("Blnk financial backend requires PostgreSQL")
@@ -199,6 +200,7 @@ func main() {
 			os.Exit(2)
 		}
 		financialRepository = repository
+		financialBlnk = blnkClient
 		accounts.WithFinancialAuthority(financialAdapter)
 		logger.Info("using Blnk as authoritative managed financial ledger", "gateway_id", cfg.Financial.GatewayID, "network_id", cfg.Financial.NetworkID)
 	}
@@ -311,9 +313,14 @@ func main() {
 				case <-reconcileCtx.Done():
 					return
 				case <-ticker.C:
-					batch, sealErr := financialRepository.SealNext(reconcileCtx, signer, cfg.Financial.SigningKeyID, cfg.Financial.SigningAlgorithm, cfg.Financial.SigningPublicKey, retainer, anchorPublisher, cfg.Financial.BatchSize)
+					batch, sealErr := financialRepository.SealNext(reconcileCtx, financialBlnk, signer, cfg.Financial.SigningKeyID, cfg.Financial.SigningAlgorithm, cfg.Financial.SigningPublicKey, retainer, anchorPublisher, cfg.Financial.BatchSize)
 					if sealErr != nil && !errors.Is(sealErr, pgx.ErrNoRows) {
 						logger.Error("financial batch sealing failed", "error", sealErr)
+						if entered, healthErr := financialRepository.EnforceSealingHealth(reconcileCtx, cfg.Financial.MaxAnchorLag, sealErr); healthErr != nil {
+							logger.Error("financial sealing health enforcement failed", "error", healthErr)
+						} else if entered {
+							logger.Error("financial safe mode entered after sealing integrity/lag failure")
+						}
 					}
 					if sealErr == nil {
 						logger.Info("financial batch externally sealed and anchored", "batch_id", batch.Manifest.BatchID, "merkle_root", batch.Manifest.MerkleRoot)
@@ -324,19 +331,33 @@ func main() {
 	}
 	if financialAdapter != nil {
 		go func() {
-			ticker := time.NewTicker(10 * time.Second)
-			defer ticker.Stop()
+			recoveryTicker := time.NewTicker(10 * time.Second)
+			fullAuditTicker := time.NewTicker(cfg.Financial.FullAuditInterval)
+			defer recoveryTicker.Stop()
+			defer fullAuditTicker.Stop()
+			run := func(full bool) {
+				var result financial.ReconcileResult
+				var reconcileErr error
+				if full {
+					result, reconcileErr = financialAdapter.Reconcile(reconcileCtx, 100)
+				} else {
+					result, reconcileErr = financialAdapter.RecoverPending(reconcileCtx, 100)
+				}
+				if reconcileErr != nil {
+					logger.Error("financial reconciliation failed", "full_audit", full, "error", reconcileErr)
+				} else if result.Mismatches > 0 || result.SafeMode {
+					logger.Error("financial integrity safe mode", "full_audit", full, "mismatches", result.Mismatches, "safe_mode", result.SafeMode)
+				}
+			}
+			run(true)
 			for {
 				select {
 				case <-reconcileCtx.Done():
 					return
-				case <-ticker.C:
-					result, reconcileErr := financialAdapter.Reconcile(reconcileCtx, 100)
-					if reconcileErr != nil {
-						logger.Error("financial reconciliation failed", "error", reconcileErr)
-					} else if result.Mismatches > 0 || result.SafeMode {
-						logger.Error("financial integrity safe mode", "mismatches", result.Mismatches, "safe_mode", result.SafeMode)
-					}
+				case <-recoveryTicker.C:
+					run(false)
+				case <-fullAuditTicker.C:
+					run(true)
 				}
 			}
 		}()

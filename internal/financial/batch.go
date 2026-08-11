@@ -14,41 +14,43 @@ import (
 )
 
 const (
-	BatchVersion         = "atos_financial_batch_v1"
-	BatchDomain          = "tos.atos.financial.batch.v1"
-	BatchSignatureDomain = "tos.atos.financial.batch-signature.v1"
+	BatchVersion         = "atos_financial_batch_v2"
+	BatchDomain          = "tos.atos.financial.batch.v2"
+	BatchSignatureDomain = "tos.atos.financial.batch-signature.v2"
 )
 
 type BatchManifest struct {
-	Version            string   `json:"version"`
-	Canonicalization   string   `json:"canonicalization"`
-	GatewayID          string   `json:"gateway_id"`
-	NetworkID          string   `json:"network_id"`
-	BatchSequence      int64    `json:"batch_sequence"`
-	BatchID            string   `json:"batch_id"`
-	FirstSequence      int64    `json:"first_sequence"`
-	LastSequence       int64    `json:"last_sequence"`
-	CommitmentCount    int      `json:"commitment_count"`
-	PreviousBatchID    string   `json:"previous_batch_id"`
-	PreviousMerkleRoot string   `json:"previous_merkle_root"`
-	MerkleRoot         string   `json:"merkle_root"`
-	CommitmentDigests  []string `json:"commitment_digests"`
-	CreatedUnixMillis  int64    `json:"created_unix_millis"`
+	Version              string   `json:"version"`
+	Canonicalization     string   `json:"canonicalization"`
+	GatewayID            string   `json:"gateway_id"`
+	NetworkID            string   `json:"network_id"`
+	BatchSequence        int64    `json:"batch_sequence"`
+	BatchID              string   `json:"batch_id"`
+	FirstSequence        int64    `json:"first_sequence"`
+	LastSequence         int64    `json:"last_sequence"`
+	CommitmentCount      int      `json:"commitment_count"`
+	PreviousBatchID      string   `json:"previous_batch_id"`
+	PreviousMerkleRoot   string   `json:"previous_merkle_root"`
+	MerkleRoot           string   `json:"merkle_root"`
+	CommitmentDigests    []string `json:"commitment_digests"`
+	LedgerEvidenceDigest string   `json:"ledger_evidence_digest"`
+	CreatedUnixMillis    int64    `json:"created_unix_millis"`
 }
 
 type batchIdentity struct {
-	Version            string   `json:"version"`
-	Canonicalization   string   `json:"canonicalization"`
-	GatewayID          string   `json:"gateway_id"`
-	NetworkID          string   `json:"network_id"`
-	BatchSequence      int64    `json:"batch_sequence"`
-	FirstSequence      int64    `json:"first_sequence"`
-	LastSequence       int64    `json:"last_sequence"`
-	CommitmentCount    int      `json:"commitment_count"`
-	PreviousBatchID    string   `json:"previous_batch_id"`
-	PreviousMerkleRoot string   `json:"previous_merkle_root"`
-	MerkleRoot         string   `json:"merkle_root"`
-	CommitmentDigests  []string `json:"commitment_digests"`
+	Version              string   `json:"version"`
+	Canonicalization     string   `json:"canonicalization"`
+	GatewayID            string   `json:"gateway_id"`
+	NetworkID            string   `json:"network_id"`
+	BatchSequence        int64    `json:"batch_sequence"`
+	FirstSequence        int64    `json:"first_sequence"`
+	LastSequence         int64    `json:"last_sequence"`
+	CommitmentCount      int      `json:"commitment_count"`
+	PreviousBatchID      string   `json:"previous_batch_id"`
+	PreviousMerkleRoot   string   `json:"previous_merkle_root"`
+	MerkleRoot           string   `json:"merkle_root"`
+	CommitmentDigests    []string `json:"commitment_digests"`
+	LedgerEvidenceDigest string   `json:"ledger_evidence_digest"`
 }
 
 type Batch struct {
@@ -56,18 +58,23 @@ type Batch struct {
 	ManifestDigest string
 	ManifestCBOR   []byte
 	Commitments    []Commitment
+	LedgerEvidence LedgerChainEvidence
 	State          string
 }
 
 func (r *Repository) PendingBatch(ctx context.Context) (Batch, *SignatureEnvelope, error) {
 	var batch Batch
 	var manifestRaw, signatureRaw []byte
-	err := r.pool.QueryRow(ctx, `SELECT manifest,manifest_digest,manifest_cbor,state,COALESCE(signature_envelope,'null'::jsonb)
- FROM financial_batches WHERE state<>'anchored' ORDER BY batch_sequence LIMIT 1`).Scan(&manifestRaw, &batch.ManifestDigest, &batch.ManifestCBOR, &batch.State, &signatureRaw)
+	var ledgerEvidenceRaw []byte
+	err := r.pool.QueryRow(ctx, `SELECT manifest,manifest_digest,manifest_cbor,ledger_evidence,state,COALESCE(signature_envelope,'null'::jsonb)
+ FROM financial_batches WHERE state<>'anchored' ORDER BY batch_sequence LIMIT 1`).Scan(&manifestRaw, &batch.ManifestDigest, &batch.ManifestCBOR, &ledgerEvidenceRaw, &batch.State, &signatureRaw)
 	if err != nil {
 		return Batch{}, nil, err
 	}
 	if err := json.Unmarshal(manifestRaw, &batch.Manifest); err != nil {
+		return Batch{}, nil, err
+	}
+	if err := json.Unmarshal(ledgerEvidenceRaw, &batch.LedgerEvidence); err != nil {
 		return Batch{}, nil, err
 	}
 	rows, err := r.pool.Query(ctx, `SELECT commitment FROM financial_events WHERE batch_id=$1 ORDER BY sequence`, batch.Manifest.BatchID)
@@ -131,7 +138,7 @@ func MerkleRoot(digests []string) (string, error) {
 	return "sha256:" + hex.EncodeToString(level[0]), nil
 }
 
-func makeBatchManifest(gatewayID, networkID string, batchSequence int64, previousBatchID, previousRoot string, commitments []Commitment, created time.Time) (Batch, error) {
+func makeBatchManifest(gatewayID, networkID string, batchSequence int64, previousBatchID, previousRoot, ledgerEvidenceDigest string, commitments []Commitment, created time.Time) (Batch, error) {
 	digests := make([]string, len(commitments))
 	for i, commitment := range commitments {
 		if commitment.Sequence != commitments[0].Sequence+int64(i) {
@@ -147,17 +154,19 @@ func makeBatchManifest(gatewayID, networkID string, batchSequence int64, previou
 	if err != nil {
 		return Batch{}, err
 	}
-	identity := batchIdentity{BatchVersion, Canonicalization, gatewayID, networkID, batchSequence,
-		commitments[0].Sequence, commitments[len(commitments)-1].Sequence, len(commitments),
-		previousBatchID, previousRoot, root, digests}
+	identity := batchIdentity{Version: BatchVersion, Canonicalization: Canonicalization, GatewayID: gatewayID, NetworkID: networkID, BatchSequence: batchSequence,
+		FirstSequence: commitments[0].Sequence, LastSequence: commitments[len(commitments)-1].Sequence, CommitmentCount: len(commitments),
+		PreviousBatchID: previousBatchID, PreviousMerkleRoot: previousRoot, MerkleRoot: root, CommitmentDigests: digests,
+		LedgerEvidenceDigest: ledgerEvidenceDigest}
 	identityBytes, err := codec.Marshal(identity)
 	if err != nil {
 		return Batch{}, err
 	}
 	idHash := sha256.Sum256(identityBytes)
-	manifest := BatchManifest{BatchVersion, Canonicalization, gatewayID, networkID, batchSequence,
-		"fbat_" + hex.EncodeToString(idHash[:]), identity.FirstSequence, identity.LastSequence,
-		len(commitments), previousBatchID, previousRoot, root, digests, created.UTC().UnixMilli()}
+	manifest := BatchManifest{Version: BatchVersion, Canonicalization: Canonicalization, GatewayID: gatewayID, NetworkID: networkID, BatchSequence: batchSequence,
+		BatchID: "fbat_" + hex.EncodeToString(idHash[:]), FirstSequence: identity.FirstSequence, LastSequence: identity.LastSequence,
+		CommitmentCount: len(commitments), PreviousBatchID: previousBatchID, PreviousMerkleRoot: previousRoot,
+		MerkleRoot: root, CommitmentDigests: digests, LedgerEvidenceDigest: ledgerEvidenceDigest, CreatedUnixMillis: created.UTC().UnixMilli()}
 	canonical, err := codec.Marshal(manifest)
 	if err != nil {
 		return Batch{}, err
@@ -169,7 +178,10 @@ func makeBatchManifest(gatewayID, networkID string, batchSequence int64, previou
 	return Batch{Manifest: manifest, ManifestDigest: digest, ManifestCBOR: canonical, Commitments: commitments, State: "created"}, nil
 }
 
-func (r *Repository) CreateBatch(ctx context.Context, limit int) (Batch, error) {
+func (r *Repository) CreateBatch(ctx context.Context, limit int, ledger interface {
+	ledgerClient
+	ledgerChainReader
+}) (Batch, error) {
 	if limit < 1 || limit > 4096 {
 		return Batch{}, errors.New("financial: batch limit must be 1-4096")
 	}
@@ -183,23 +195,22 @@ func (r *Repository) CreateBatch(ctx context.Context, limit int) (Batch, error) 
 	if err := tx.QueryRow(ctx, `SELECT next_batch_sequence,last_batch_id,last_batch_root FROM financial_chain_state WHERE singleton=TRUE FOR UPDATE`).Scan(&batchSequence, &previousBatchID, &previousRoot); err != nil {
 		return Batch{}, err
 	}
-	rows, err := tx.Query(ctx, `SELECT commitment FROM financial_events WHERE state='finalized' AND batch_id='' ORDER BY sequence LIMIT $1 FOR UPDATE`, limit)
+	rows, err := tx.Query(ctx, `SELECT commitment,commitment_digest,canonical_cbor,semantic_digest,
+ ledger_transaction_id,source_indicator,destination_indicator,decimals,allow_overdraft,state,attempts,last_error,finalized_at
+ FROM financial_events WHERE state='finalized' AND batch_id='' ORDER BY sequence LIMIT $1 FOR UPDATE`, limit)
 	if err != nil {
 		return Batch{}, err
 	}
 	var commitments []Commitment
+	var events []Event
 	for rows.Next() {
-		var raw []byte
-		if err := rows.Scan(&raw); err != nil {
+		event, scanErr := scanEvent(rows)
+		if scanErr != nil {
 			rows.Close()
-			return Batch{}, err
+			return Batch{}, scanErr
 		}
-		var commitment Commitment
-		if err := json.Unmarshal(raw, &commitment); err != nil {
-			rows.Close()
-			return Batch{}, err
-		}
-		commitments = append(commitments, commitment)
+		events = append(events, event)
+		commitments = append(commitments, event.Commitment)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -208,28 +219,51 @@ func (r *Repository) CreateBatch(ctx context.Context, limit int) (Batch, error) 
 	if len(commitments) == 0 {
 		return Batch{}, pgx.ErrNoRows
 	}
+	if ledger == nil {
+		return Batch{}, errors.New("financial: Blnk chain evidence source is required")
+	}
+	ledgerEvidence, err := makeLedgerBatchEvidence(ctx, ledger, events)
+	if err != nil {
+		return Batch{}, err
+	}
+	ledgerEvidenceDigest, err := codec.Digest("tos.atos.financial.blnk-evidence.v1", ledgerEvidence)
+	if err != nil {
+		return Batch{}, err
+	}
 	if batchSequence > 1 {
 		var expected int64
-		if err := tx.QueryRow(ctx, `SELECT last_sequence+1 FROM financial_batches WHERE batch_sequence=$1`, batchSequence-1).Scan(&expected); err != nil {
+		var previousLedgerSequence int64
+		var previousLedgerHead string
+		if err := tx.QueryRow(ctx, `SELECT last_sequence+1,
+ (ledger_evidence->'state'->>'last_sequence')::bigint,
+ ledger_evidence->'state'->>'head_hash'
+ FROM financial_batches WHERE batch_sequence=$1`, batchSequence-1).Scan(&expected, &previousLedgerSequence, &previousLedgerHead); err != nil {
 			return Batch{}, err
 		}
 		if commitments[0].Sequence != expected {
 			return Batch{}, errors.New("financial: batch sequence gap")
 		}
+		if ledgerEvidence.State.FirstSequence != previousLedgerSequence+1 || ledgerEvidence.State.PreviousHash != previousLedgerHead {
+			return Batch{}, errors.New("financial: Blnk chain gap or unexpected transaction between batches")
+		}
 	} else if commitments[0].Sequence != 1 {
 		return Batch{}, errors.New("financial: first batch must begin at commitment sequence 1")
+	} else if ledgerEvidence.State.FirstSequence != 1 || ledgerEvidence.State.PreviousHash != ledgerEvidence.State.GenesisHash {
+		return Batch{}, errors.New("financial: first batch does not begin at the Blnk genesis link")
 	}
-	batch, err := makeBatchManifest(r.gatewayID, r.networkID, batchSequence, previousBatchID, previousRoot, commitments, r.now())
+	batch, err := makeBatchManifest(r.gatewayID, r.networkID, batchSequence, previousBatchID, previousRoot, ledgerEvidenceDigest, commitments, r.now())
 	if err != nil {
 		return Batch{}, err
 	}
 	manifestJSON, _ := json.Marshal(batch.Manifest)
+	ledgerEvidenceJSON, _ := json.Marshal(ledgerEvidence)
+	batch.LedgerEvidence = ledgerEvidence
 	_, err = tx.Exec(ctx, `INSERT INTO financial_batches(batch_id,batch_sequence,first_sequence,last_sequence,commitment_count,
- previous_batch_id,previous_merkle_root,merkle_root,manifest_digest,manifest_cbor,manifest,created_at)
- VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, batch.Manifest.BatchID, batch.Manifest.BatchSequence,
+ previous_batch_id,previous_merkle_root,merkle_root,manifest_digest,manifest_cbor,manifest,ledger_evidence,created_at)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, batch.Manifest.BatchID, batch.Manifest.BatchSequence,
 		batch.Manifest.FirstSequence, batch.Manifest.LastSequence, batch.Manifest.CommitmentCount,
 		batch.Manifest.PreviousBatchID, batch.Manifest.PreviousMerkleRoot, batch.Manifest.MerkleRoot,
-		batch.ManifestDigest, batch.ManifestCBOR, manifestJSON, time.UnixMilli(batch.Manifest.CreatedUnixMillis))
+		batch.ManifestDigest, batch.ManifestCBOR, manifestJSON, ledgerEvidenceJSON, time.UnixMilli(batch.Manifest.CreatedUnixMillis))
 	if err != nil {
 		return Batch{}, err
 	}

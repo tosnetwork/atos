@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -38,6 +39,9 @@ func (a *finalizedFinancialAuthority) Close() error                     { return
 func (a *finalizedFinancialAuthority) Commit(_ context.Context, kind, id, digest string) (atosrpc.NetworkReference, error) {
 	hash := sha256.Sum256([]byte(kind + "\x00" + id + "\x00" + digest))
 	return atosrpc.NetworkReference{Network: a.network, Reference: "tos:tx:v1:" + hex.EncodeToString(hash[:]), Finalized: true, FinalizedCheckpoint: 91}, nil
+}
+func (a *finalizedFinancialAuthority) ResolveCommitment(_ context.Context, _, _, _ string, reference *atosrpc.NetworkReference) (*atosrpc.NetworkReference, error) {
+	return &atosrpc.NetworkReference{Network: reference.Network, Reference: reference.Reference, Finalized: reference.Finalized, FinalizedCheckpoint: reference.FinalizedCheckpoint}, nil
 }
 
 type retainedObject struct {
@@ -129,7 +133,11 @@ func TestFinancialBatchExternalSignerWORMRPCAndVerifier(t *testing.T) {
 			return
 		}
 		digest := request.Header.Get("X-Content-SHA256")
-		message := timestamp + "\n" + request.Method + "\n" + request.URL.EscapedPath() + "\n" + digest
+		target := request.URL.EscapedPath()
+		if request.URL.RawQuery != "" {
+			target += "?" + request.URL.RawQuery
+		}
+		message := timestamp + "\n" + request.Method + "\n" + target + "\n" + digest
 		mac := hmac.New(sha256.New, []byte(retentionHMACKey))
 		_, _ = mac.Write([]byte(message))
 		expectedAuth := "hmac-sha256=" + hex.EncodeToString(mac.Sum(nil))
@@ -174,6 +182,8 @@ func TestFinancialBatchExternalSignerWORMRPCAndVerifier(t *testing.T) {
 			}
 			writer.Header().Set("X-Content-SHA256", object.digest)
 			writer.Header().Set("X-Object-Version-ID", object.version)
+			writer.Header().Set("X-Object-Lock-Mode", "COMPLIANCE")
+			writer.Header().Set("X-Object-Retain-Until", time.Now().UTC().Add(24*time.Hour).Format(time.RFC3339))
 			writer.WriteHeader(http.StatusOK)
 		default:
 			writer.WriteHeader(http.StatusMethodNotAllowed)
@@ -196,7 +206,13 @@ func TestFinancialBatchExternalSignerWORMRPCAndVerifier(t *testing.T) {
 	}
 
 	trustedPublicKey := base64.StdEncoding.EncodeToString(publicKey)
-	batch, err := repository.SealNext(ctx, signer, "kms-key-2026-08", "ed25519", trustedPublicKey, retainer, protocolClient, 100)
+	var batch financial.Batch
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		batch, err = repository.SealNext(ctx, blnk, signer, "kms-key-2026-08", "ed25519", trustedPublicKey, retainer, protocolClient, 100)
+		if err == nil || time.Now().After(deadline) || !errors.Is(err, financial.ErrLedgerUncertain) {
+			break
+		}
+	}
 	if err != nil || batch.State != "anchored" {
 		t.Fatalf("seal batch=%+v err=%v", batch, err)
 	}
@@ -228,13 +244,14 @@ func TestFinancialBatchExternalSignerWORMRPCAndVerifier(t *testing.T) {
 		t.Fatal(err)
 	}
 	trusted := map[string]string{"kms-key-2026-08": trustedPublicKey}
-	if err := financial.VerifyEvidence(ctx, bundle, receipt, financial.VerifyOptions{GatewayID: gateway, NetworkID: network, TrustedPublicKeys: trusted, Resolver: protocolClient}); err != nil {
+	verifyOptions := financial.VerifyOptions{GatewayID: gateway, NetworkID: network, TrustedPublicKeys: trusted, Resolver: protocolClient, RetentionResolver: retainer, RetainedVersionID: "locked-v1"}
+	if err := financial.VerifyEvidence(ctx, bundle, receipt, verifyOptions); err != nil {
 		t.Fatal(err)
 	}
 	tampered := bundle
 	tampered.Commitments = append([]financial.Commitment(nil), bundle.Commitments...)
 	tampered.Commitments[0].AtomicAmount = "999"
-	if err := financial.VerifyEvidence(ctx, tampered, receipt, financial.VerifyOptions{GatewayID: gateway, NetworkID: network, TrustedPublicKeys: trusted, Resolver: protocolClient}); err == nil {
+	if err := financial.VerifyEvidence(ctx, tampered, receipt, verifyOptions); err == nil {
 		t.Fatal("independent verifier accepted a changed sealed amount")
 	}
 }

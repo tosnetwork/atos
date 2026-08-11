@@ -21,6 +21,10 @@ type ledgerReconciler interface {
 	ReconcileLedger(context.Context, []Event) (string, error)
 }
 
+type ledgerChainReader interface {
+	ChainEvidence(context.Context) (LedgerChainEvidence, error)
+}
+
 type Adapter struct {
 	repository *Repository
 	ledger     ledgerClient
@@ -44,6 +48,19 @@ func (a *Adapter) execute(ctx context.Context, request TransferRequest) (Event, 
 	}
 	defer unlock()
 	event, err := a.repository.openIntentWith(ctx, mutationDB, request)
+	if errors.Is(err, ErrSafeMode) {
+		if event.LedgerReference == "" {
+			return Event{}, ErrSafeMode
+		}
+		transaction, found, lookupErr := a.ledger.Lookup(ctx, event.LedgerReference)
+		if lookupErr != nil {
+			return Event{}, errors.Join(ErrLedgerUncertain, lookupErr)
+		}
+		if !found {
+			return Event{}, ErrSafeMode
+		}
+		return a.observe(ctx, mutationDB, event, transaction)
+	}
 	if err != nil || event.State == "finalized" {
 		return event, err
 	}
@@ -58,6 +75,31 @@ func (a *Adapter) execute(ctx context.Context, request TransferRequest) (Event, 
 	if lookupErr != nil {
 		_ = a.repository.markUncertainWith(ctx, mutationDB, request.IdempotencyIdentity, lookupErr)
 		return Event{}, errors.Join(ErrLedgerUncertain, lookupErr)
+	}
+	// Blnk's authoritative journal chain must advance in the same order as
+	// ATOS commitment sequence. A later intent may be allocated concurrently,
+	// but it cannot submit until every lower sequence is durably finalized.
+	// This makes adjacent retained Blnk chain segments gap-free.
+	orderTicker := time.NewTicker(10 * time.Millisecond)
+	defer orderTicker.Stop()
+	for {
+		var safeMode, priorPending bool
+		if orderErr := mutationDB.QueryRow(ctx, `SELECT safe_mode,
+ EXISTS(SELECT 1 FROM financial_events WHERE sequence<$1 AND state<>'finalized')
+ FROM financial_integrity_state WHERE singleton=TRUE`, event.Sequence).Scan(&safeMode, &priorPending); orderErr != nil {
+			return Event{}, orderErr
+		}
+		if safeMode {
+			return Event{}, ErrSafeMode
+		}
+		if !priorPending {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return Event{}, errors.Join(ErrLedgerUncertain, ctx.Err())
+		case <-orderTicker.C:
+		}
 	}
 	if err := a.repository.markSubmittingWith(ctx, mutationDB, request.IdempotencyIdentity); err != nil {
 		return Event{}, err
@@ -263,6 +305,17 @@ func (a *Adapter) Lookup(ctx context.Context, identity string) (Event, error) {
 }
 
 func (a *Adapter) Reconcile(ctx context.Context, limit int) (ReconcileResult, error) {
+	return a.reconcile(ctx, limit, true)
+}
+
+// RecoverPending converges durable intents without performing an O(history)
+// integrity audit. The API process runs this frequently for lost responses;
+// Reconcile remains the less-frequent, full-snapshot integrity boundary.
+func (a *Adapter) RecoverPending(ctx context.Context, limit int) (ReconcileResult, error) {
+	return a.reconcile(ctx, limit, false)
+}
+
+func (a *Adapter) reconcile(ctx context.Context, limit int, fullAudit bool) (ReconcileResult, error) {
 	reconciliationDB, unlockReconciliation, err := a.repository.LockReconciliation(ctx)
 	if err != nil {
 		return ReconcileResult{}, err
@@ -273,7 +326,8 @@ func (a *Adapter) Reconcile(ctx context.Context, limit int) (ReconcileResult, er
 		return ReconcileResult{}, fmt.Errorf("financial: create reconciliation owner: %w", err)
 	}
 	owner := "frecon_" + hex.EncodeToString(ownerBytes)
-	if _, err := a.repository.claimReconciliationWith(ctx, reconciliationDB, owner, 15*time.Minute); err != nil {
+	cursor, err := a.repository.claimReconciliationWith(ctx, reconciliationDB, owner, 15*time.Minute)
+	if err != nil {
 		return ReconcileResult{}, err
 	}
 	completed := false
@@ -289,6 +343,10 @@ func (a *Adapter) Reconcile(ctx context.Context, limit int) (ReconcileResult, er
 		return ReconcileResult{}, err
 	}
 	result := ReconcileResult{Checked: len(pending)}
+	safeMode, _, err := a.repository.safeModeWith(ctx, reconciliationDB)
+	if err != nil {
+		return result, err
+	}
 	for _, event := range pending {
 		current, currentErr := a.repository.lookupWith(ctx, reconciliationDB, event.IdempotencyIdentity)
 		if currentErr != nil || current.State == "finalized" {
@@ -301,6 +359,9 @@ func (a *Adapter) Reconcile(ctx context.Context, limit int) (ReconcileResult, er
 			continue
 		}
 		if !found {
+			if safeMode {
+				continue
+			}
 			result.Retried++
 			transaction, lookupErr = a.ledger.Submit(ctx, event, event.AllowOverdraft)
 			if lookupErr != nil {
@@ -311,30 +372,32 @@ func (a *Adapter) Reconcile(ctx context.Context, limit int) (ReconcileResult, er
 		if _, observeErr := a.observe(ctx, reconciliationDB, event, transaction); observeErr != nil {
 			if errors.Is(observeErr, ErrIdempotencyConflict) {
 				result.Mismatches++
+				safeMode = true
 			}
 			continue
 		}
 		result.Finalized++
 	}
-	audited, auditErr := a.auditIntegrity(ctx, reconciliationDB)
-	result.Checked += audited
-	if auditErr != nil {
-		// Availability uncertainty is recoverable; it is not positive evidence
-		// of corruption and therefore does not itself enter safe mode.
-		if errors.Is(auditErr, ErrLedgerUncertain) {
-			return result, auditErr
+	if fullAudit {
+		audited, auditErr := a.auditIntegrity(ctx, reconciliationDB)
+		result.Checked += audited
+		if auditErr != nil {
+			// Availability uncertainty is recoverable; it is not positive evidence
+			// of corruption and therefore does not itself enter safe mode.
+			if errors.Is(auditErr, ErrLedgerUncertain) {
+				return result, auditErr
+			}
+			result.Mismatches++
+			_, incidentErr := a.repository.enterSafeModeWith(ctx, reconciliationDB, "financial_reconciliation_mismatch", map[string]any{"authority": "blnk"}, map[string]any{"error": auditErr.Error()})
+			result.SafeMode = true
+			return result, errors.Join(auditErr, incidentErr)
 		}
-		result.Mismatches++
-		_, incidentErr := a.repository.enterSafeModeWith(ctx, reconciliationDB, "financial_reconciliation_mismatch", map[string]any{"authority": "blnk"}, map[string]any{"error": auditErr.Error()})
-		result.SafeMode = true
-		return result, errors.Join(auditErr, incidentErr)
+		if err = reconciliationDB.QueryRow(ctx, `SELECT next_sequence-1 FROM financial_chain_state WHERE singleton=TRUE`).Scan(&cursor); err != nil {
+			return result, err
+		}
 	}
 	result.SafeMode, _, err = a.repository.safeModeWith(ctx, reconciliationDB)
 	if err != nil {
-		return result, err
-	}
-	var cursor int64
-	if err = reconciliationDB.QueryRow(ctx, `SELECT next_sequence-1 FROM financial_chain_state WHERE singleton=TRUE`).Scan(&cursor); err != nil {
 		return result, err
 	}
 	if err = a.repository.completeReconciliationWith(ctx, reconciliationDB, owner, cursor); err != nil {

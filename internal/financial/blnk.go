@@ -81,7 +81,12 @@ func (c *BlnkClient) request(ctx context.Context, method, path string, input, ou
 		body = bytes.NewReader(encoded)
 	}
 	endpoint := *c.baseURL
-	endpoint.Path = c.baseURL.Path + path
+	relative, err := url.Parse(path)
+	if err != nil || relative.IsAbs() || relative.Host != "" {
+		return 0, errors.New("financial: invalid Blnk request path")
+	}
+	endpoint.Path = c.baseURL.Path + relative.Path
+	endpoint.RawQuery = relative.RawQuery
 	req, err := http.NewRequestWithContext(ctx, method, endpoint.String(), body)
 	if err != nil {
 		return 0, err
@@ -223,8 +228,8 @@ func (c *BlnkClient) ReconcileLedger(ctx context.Context, events []Event) (strin
 		hashInput.WriteString(event.Digest)
 		hashInput.WriteByte(0)
 		atomicAmount, ok := new(big.Int).SetString(event.AtomicAmount, 10)
-		if !ok {
-			return "", errors.New("financial: invalid reconciliation amount")
+		if !ok || atomicAmount.Sign() < 0 || atomicAmount.BitLen() > 53 {
+			return "", errors.New("financial: reconciliation amount exceeds the exact float64 integer boundary")
 		}
 		scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(event.Decimals)), nil)
 		amount, _ := new(big.Rat).SetFrac(atomicAmount, scale).Float64()

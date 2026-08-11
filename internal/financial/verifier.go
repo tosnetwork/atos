@@ -3,8 +3,10 @@ package financial
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,13 +17,17 @@ import (
 )
 
 type VerifyOptions struct {
-	GatewayID                  string
-	NetworkID                  string
-	TrustedPublicKeys          map[string]string
-	ExpectedPreviousAnchorID   string
-	ExpectedPreviousRoot       string
-	ExpectedPreviousCommitment string
-	Resolver                   AnchorPublisher
+	GatewayID                      string
+	NetworkID                      string
+	TrustedPublicKeys              map[string]string
+	ExpectedPreviousAnchorID       string
+	ExpectedPreviousRoot           string
+	ExpectedPreviousCommitment     string
+	ExpectedPreviousLedgerHead     string
+	ExpectedPreviousLedgerSequence int64
+	Resolver                       AnchorPublisher
+	RetentionResolver              RetentionResolver
+	RetainedVersionID              string
 }
 
 func DecodeEvidenceBundle(data []byte) (EvidenceBundle, error) {
@@ -38,7 +44,7 @@ func DecodeEvidenceBundle(data []byte) (EvidenceBundle, error) {
 }
 
 func VerifyEvidence(ctx context.Context, bundle EvidenceBundle, anchorReceipt AnchorReceipt, options VerifyOptions) error {
-	if bundle.Version != "atos_financial_evidence_bundle_v1" || options.GatewayID == "" || options.NetworkID == "" {
+	if bundle.Version != "atos_financial_evidence_bundle_v2" || options.GatewayID == "" || options.NetworkID == "" {
 		return errors.New("financial verifier: invalid version or expected domain")
 	}
 	manifest := bundle.Manifest
@@ -59,6 +65,22 @@ func VerifyEvidence(ctx context.Context, bundle EvidenceBundle, anchorReceipt An
 	manifestDigest, err := codec.Digest(BatchDomain, manifest)
 	if err != nil || manifestDigest != bundle.Signature.ManifestDigest {
 		return errors.New("financial verifier: manifest digest mismatch")
+	}
+	ledgerEvidenceDigest, err := codec.Digest("tos.atos.financial.blnk-evidence.v1", bundle.LedgerEvidence)
+	if err != nil || ledgerEvidenceDigest != manifest.LedgerEvidenceDigest {
+		return errors.New("financial verifier: Blnk ledger evidence digest mismatch")
+	}
+	if err := verifyBundleLedgerEvidence(bundle.Commitments, bundle.LedgerEvidence); err != nil {
+		return err
+	}
+	if manifest.BatchSequence == 1 {
+		if bundle.LedgerEvidence.State.FirstSequence != 1 || bundle.LedgerEvidence.State.PreviousHash != bundle.LedgerEvidence.State.GenesisHash {
+			return errors.New("financial verifier: genesis batch does not begin at Blnk genesis")
+		}
+	} else if options.ExpectedPreviousLedgerSequence < 1 || options.ExpectedPreviousLedgerHead == "" ||
+		bundle.LedgerEvidence.State.FirstSequence != options.ExpectedPreviousLedgerSequence+1 ||
+		bundle.LedgerEvidence.State.PreviousHash != options.ExpectedPreviousLedgerHead {
+		return errors.New("financial verifier: previous Blnk chain checkpoint is missing or discontinuous")
 	}
 	previous := GenesisDigest
 	if manifest.FirstSequence > 1 {
@@ -85,11 +107,11 @@ func VerifyEvidence(ctx context.Context, bundle EvidenceBundle, anchorReceipt An
 	if err != nil || root != manifest.MerkleRoot {
 		return errors.New("financial verifier: Merkle root mismatch")
 	}
-	rebuilt, err := makeBatchManifest(manifest.GatewayID, manifest.NetworkID, manifest.BatchSequence, manifest.PreviousBatchID, manifest.PreviousMerkleRoot, bundle.Commitments, time.UnixMilli(manifest.CreatedUnixMillis))
+	rebuilt, err := makeBatchManifest(manifest.GatewayID, manifest.NetworkID, manifest.BatchSequence, manifest.PreviousBatchID, manifest.PreviousMerkleRoot, manifest.LedgerEvidenceDigest, bundle.Commitments, time.UnixMilli(manifest.CreatedUnixMillis))
 	if err != nil || rebuilt.Manifest.BatchID != manifest.BatchID || rebuilt.ManifestDigest != manifestDigest {
 		return errors.New("financial verifier: batch identity mismatch")
 	}
-	if bundle.Signature.BatchID != manifest.BatchID || bundle.Signature.GatewayID != options.GatewayID || bundle.Signature.NetworkID != options.NetworkID {
+	if bundle.Signature.Version != "atos_financial_batch_signature_v2" || bundle.Signature.BatchID != manifest.BatchID || bundle.Signature.GatewayID != options.GatewayID || bundle.Signature.NetworkID != options.NetworkID {
 		return errors.New("financial verifier: signature envelope domain mismatch")
 	}
 	expectedSigningDigest, err := signingDigest(manifest)
@@ -102,6 +124,21 @@ func VerifyEvidence(ctx context.Context, bundle EvidenceBundle, anchorReceipt An
 	}
 	if err := VerifySignature(bundle.Signature); err != nil {
 		return err
+	}
+	bundleBytes, err := json.Marshal(bundle)
+	if err != nil {
+		return err
+	}
+	bundleHash := sha256.Sum256(bundleBytes)
+	bundleDigest := "sha256:" + hex.EncodeToString(bundleHash[:])
+	objectKey := fmt.Sprintf("atos-financial/v1/%s/%s/%d-%s.json", manifest.GatewayID, manifest.NetworkID, manifest.BatchSequence, manifest.BatchID)
+	if options.RetentionResolver == nil || options.RetainedVersionID == "" {
+		return errors.New("financial verifier: immutable retention resolver and version are required")
+	}
+	retention, err := options.RetentionResolver.ResolveRetention(ctx, objectKey, options.RetainedVersionID, bundleDigest)
+	if err != nil || retention.ObjectKey != objectKey || retention.VersionID != options.RetainedVersionID ||
+		retention.Digest != bundleDigest || retention.LockMode != "COMPLIANCE" || !retention.RetainUntil.After(time.Now().UTC()) {
+		return errors.New("financial verifier: immutable Object Lock evidence is missing, expired, or changed")
 	}
 
 	if manifest.BatchSequence == 1 {
@@ -128,8 +165,46 @@ func VerifyEvidence(ctx context.Context, bundle EvidenceBundle, anchorReceipt An
 		return errors.New("financial verifier: independent live anchor resolver is required")
 	}
 	live, found, err := options.Resolver.ResolveManagedFinancialAnchor(ctx, expectedAnchor)
-	if err != nil || !found || live != anchorReceipt {
+	if err != nil || !found || live.Anchor != expectedAnchor || live.PayloadDigest != anchorReceipt.PayloadDigest ||
+		live.NetworkReferenceID != anchorReceipt.NetworkReferenceID || live.NetworkID != anchorReceipt.NetworkID ||
+		!live.Finalized || live.FinalizedCheckpoint < anchorReceipt.FinalizedCheckpoint {
 		return errors.New("financial verifier: finalized TOS anchor does not resolve independently")
 	}
 	return nil
+}
+
+func verifyBundleLedgerEvidence(commitments []Commitment, evidence LedgerChainEvidence) error {
+	if err := verifyLedgerChainLinks(evidence); err != nil {
+		return fmt.Errorf("financial verifier: Blnk chain: %w", err)
+	}
+	if len(evidence.Transactions) != len(commitments) {
+		return errors.New("financial verifier: unexpected or missing Blnk ledger transaction")
+	}
+	expected := make(map[string]Commitment, len(commitments))
+	for _, commitment := range commitments {
+		if len(commitment.LedgerTransactionIDs) != 1 {
+			return errors.New("financial verifier: commitment has invalid Blnk transaction identity")
+		}
+		expected[commitment.LedgerTransactionIDs[0]] = commitment
+	}
+	seen := make(map[string]struct{}, len(commitments))
+	for _, row := range evidence.Transactions {
+		commitment, ok := expected[row.Transaction.TransactionID]
+		if !ok || row.Transaction.Source == "" || row.Transaction.Destination == "" || row.Transaction.Source == row.Transaction.Destination ||
+			row.Transaction.Reference != commitment.LedgerReference || row.Transaction.PreciseAmount.String() != commitment.AtomicAmount ||
+			row.Transaction.Currency != commitment.Asset || row.Transaction.Description != "atos-financial-v1:"+commitmentDigest(commitment) ||
+			row.Transaction.Status != "APPLIED" {
+			return errors.New("financial verifier: Blnk transaction does not match its financial commitment")
+		}
+		if _, duplicate := seen[row.Transaction.TransactionID]; duplicate {
+			return errors.New("financial verifier: duplicate Blnk transaction")
+		}
+		seen[row.Transaction.TransactionID] = struct{}{}
+	}
+	return nil
+}
+
+func commitmentDigest(commitment Commitment) string {
+	digest, _ := codec.Digest(CommitmentDomain, commitment)
+	return digest
 }
