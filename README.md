@@ -241,10 +241,11 @@ Before enabling this in production:
   If this cannot be guaranteed, remove `X-Real-IP` from the trusted proxy's config
   entirely and rely on `X-Forwarded-For` alone (walked right-to-left, skipping
   trusted-proxy hops — see `internal/httpapi/passkey.go`'s `clientIP`).
-- Decide the anonymous-signup initial balance policy: `ATOS_MANAGED_INITIAL_BALANCE`
-  defaults to `25.00` and is granted to every new passkey account with no invite
-  code/KYC/promotional gating yet. Set it to `0` (no code change required) or add a
-  gating policy before opening signup publicly.
+- `ATOS_MANAGED_INITIAL_BALANCE` defaults to `0.00` — new passkey accounts get no
+  free signup balance until an operator deliberately opts in, since there is still
+  no invite code/KYC/promotional gating on account creation. Raising it above `0`
+  before opening signup publicly requires a real anti-Sybil policy alongside it
+  (e.g. invite codes, per-device/per-payment-method gating), not just the env var.
 - Use a durable Postgres database (`ATOS_DATABASE_URL`) — the in-memory store loses
   all passkey accounts, credentials and rate-limit state on restart.
 

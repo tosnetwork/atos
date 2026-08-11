@@ -184,7 +184,7 @@ func Load() (Config, error) {
 		},
 		ManagedAccount: ManagedAccountConfig{
 			Currency:       strings.ToUpper(envOr("ATOS_MANAGED_CURRENCY", "USD")),
-			InitialBalance: envOr("ATOS_MANAGED_INITIAL_BALANCE", "25.00"),
+			InitialBalance: envOr("ATOS_MANAGED_INITIAL_BALANCE", "0.00"),
 			PerCallLimit:   envOr("ATOS_MANAGED_PER_CALL_LIMIT", "2.00"),
 			DailyLimit:     envOr("ATOS_MANAGED_DAILY_LIMIT", "20.00"),
 		},

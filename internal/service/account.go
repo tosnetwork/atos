@@ -26,8 +26,12 @@ func DefaultAccountDefaults() AccountDefaults {
 }
 
 func ValidateAccountDefaults(defaults AccountDefaults) error {
+	// Zero is a deliberately supported value here (ATOS_MANAGED_INITIAL_BALANCE
+	// defaults to it): granting no free signup balance is a legitimate
+	// anti-Sybil policy, not a misconfiguration. money.Parse still rejects a
+	// negative or malformed amount.
 	balance, err := money.Parse(defaults.InitialBalance.Amount, defaults.InitialBalance.Currency, accountDecimals)
-	if err != nil || balance.IsZero() {
+	if err != nil {
 		return domain.NewError(domain.ErrValidationFailed, "invalid managed initial balance", false)
 	}
 	perCall, err := money.Parse(defaults.PerCallLimit.Amount, defaults.PerCallLimit.Currency, accountDecimals)
