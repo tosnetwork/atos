@@ -136,8 +136,9 @@ func quoteTool() map[string]any {
 	return map[string]any{
 		"name":        "atos_quote",
 		"description": "Create a short-lived executable Quote and freeze one concrete trust mode and proof profile.",
-		"inputSchema": objectSchema([]string{"capability_id"}, map[string]any{
+		"inputSchema": objectSchema([]string{"capability_id", "idempotency_key"}, map[string]any{
 			"capability_id":        map[string]any{"type": "string", "minLength": 1},
+			"idempotency_key":      map[string]any{"type": "string", "minLength": 1},
 			"input_summary":        map[string]any{"type": "object"},
 			"requested_trust_mode": requestedModeSchema(),
 			"proof_requirements":   proofRequirementsSchema(),

@@ -18,6 +18,7 @@ type Store struct {
 	mu                         sync.Mutex
 	capabilities               map[string]domain.Capability
 	quotes                     map[string]domain.Quote
+	quoteCommitmentOps         map[string]domain.QuoteCommitmentOperation
 	escrows                    map[string]domain.Escrow
 	receipts                   map[string]domain.Receipt
 	receiptsByJob              map[string]string // jobID -> receiptID
@@ -58,6 +59,7 @@ func New() *Store {
 	return &Store{
 		capabilities:               make(map[string]domain.Capability),
 		quotes:                     make(map[string]domain.Quote),
+		quoteCommitmentOps:         make(map[string]domain.QuoteCommitmentOperation),
 		escrows:                    make(map[string]domain.Escrow),
 		receipts:                   make(map[string]domain.Receipt),
 		receiptsByJob:              make(map[string]string),
@@ -224,6 +226,71 @@ func (s *Store) QuoteByIdempotencyKey(ctx context.Context, principalID, key stri
 		}
 	}
 	return domain.Quote{}, store.ErrNotFound
+}
+
+func (s *Store) OpenQuoteCommitment(_ context.Context, op domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.quoteCommitmentOps {
+		if op.Quote.IdempotencyKey != "" && existing.Quote.PrincipalID == op.Quote.PrincipalID && existing.Quote.IdempotencyKey == op.Quote.IdempotencyKey {
+			return existing, false, nil
+		}
+	}
+	if existing, ok := s.quoteCommitmentOps[op.QuoteID]; ok {
+		return existing, false, nil
+	}
+	s.quoteCommitmentOps[op.QuoteID] = op
+	return op, true, nil
+}
+func (s *Store) GetQuoteCommitmentOperation(_ context.Context, quoteID string) (domain.QuoteCommitmentOperation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	op, ok := s.quoteCommitmentOps[quoteID]
+	if !ok {
+		return domain.QuoteCommitmentOperation{}, store.ErrNotFound
+	}
+	return op, nil
+}
+func (s *Store) UpdateQuoteCommitmentOperation(_ context.Context, quoteID string, fn func(domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error)) (domain.QuoteCommitmentOperation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	op, ok := s.quoteCommitmentOps[quoteID]
+	if !ok {
+		return domain.QuoteCommitmentOperation{}, store.ErrNotFound
+	}
+	if op.Checkpoint == domain.QuoteCommitmentCompleted {
+		return op, nil
+	}
+	next, err := fn(op)
+	if err != nil {
+		return domain.QuoteCommitmentOperation{}, err
+	}
+	s.quoteCommitmentOps[quoteID] = next
+	return next, nil
+}
+func (s *Store) QuoteCommitmentOperationByIdempotencyKey(_ context.Context, principalID, key string) (domain.QuoteCommitmentOperation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, op := range s.quoteCommitmentOps {
+		if op.Quote.PrincipalID == principalID && op.Quote.IdempotencyKey == key {
+			return op, nil
+		}
+	}
+	return domain.QuoteCommitmentOperation{}, store.ErrNotFound
+}
+func (s *Store) StaleQuoteCommitmentOperations(_ context.Context, cutoff time.Time, limit int) ([]domain.QuoteCommitmentOperation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]domain.QuoteCommitmentOperation, 0)
+	for _, op := range s.quoteCommitmentOps {
+		if op.Checkpoint != domain.QuoteCommitmentCompleted && !op.UpdatedAt.After(cutoff) {
+			out = append(out, op)
+			if limit > 0 && len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out, nil
 }
 
 func (s *Store) PutEscrow(ctx context.Context, e domain.Escrow) error {

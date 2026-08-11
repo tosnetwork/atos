@@ -134,6 +134,7 @@ func (s *Server) toolQuote(ctx context.Context, principal auth.Principal, args m
 		CapabilityID:       argString(args, "capability_id"),
 		InputSummary:       argObject(args, "input_summary"),
 		RequestedTrustMode: domain.RequestedTrustMode(argString(args, "requested_trust_mode")),
+		IdempotencyKey:     argString(args, "idempotency_key"),
 	}
 	if raw := args["proof_requirements"]; raw != nil {
 		if err := decodeValue(raw, &input.ProofRequirements); err != nil {

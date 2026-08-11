@@ -807,6 +807,24 @@ func (s *JobService) getQuote(ctx context.Context, quoteID string) (domain.Quote
 		quote.TrustMode = domain.TrustModeManaged
 		quote.Settlement, quote.Proof = quoteGuarantees(quote.TrustMode, quote.Price.Currency)
 	}
+	if quote.TrustMode == domain.TrustModeVerified {
+		if quote.Commitment == nil || quote.Commitment.State != "committed" {
+			return domain.Quote{}, domain.NewError(domain.ErrQuoteMismatch, "verified quote is not committed", false)
+		}
+		commitment, found, resolveErr := s.core.GetQuoteCommitment(ctx, quote)
+		if resolveErr != nil {
+			return domain.Quote{}, resolveErr
+		}
+		if !found {
+			return domain.Quote{}, domain.NewError(domain.ErrQuoteMismatch, "verified quote commitment is missing", false)
+		}
+		if err := validateQuoteCommitment(quote, commitment); err != nil {
+			return domain.Quote{}, err
+		}
+		if quote.Commitment.Reference != commitment.Reference || quote.Commitment.Digest != commitment.Digest {
+			return domain.Quote{}, domain.NewError(domain.ErrQuoteMismatch, "verified quote commitment projection is mismatched", false)
+		}
+	}
 	return quote, nil
 }
 

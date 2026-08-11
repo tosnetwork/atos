@@ -52,6 +52,16 @@ type ExecutionSignerAuthorization struct {
 	RevocationRef     string
 }
 
+type QuoteCommitment struct {
+	Quote               domain.Quote
+	Network             string
+	Reference           string
+	Digest              string
+	ExpectedDigest      string
+	Finalized           bool
+	FinalizedCheckpoint uint64
+}
+
 // AuthorizeExecutionSignerRequest mirrors
 // atos.tos.v1.ExecutionSignerAuthorizationInput (already normative and
 // version-bound in atos-spec's trust.proto). AuthorizationID is the stable
@@ -128,7 +138,8 @@ type Core interface {
 	RevokePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, reasonCode string) (revoked bool, revocationNetwork, revocationRef string, err error)
 
 	// Quote and execution-signer trust.
-	CommitQuote(ctx context.Context, quote domain.Quote) (proofRef string, err error)
+	CommitQuote(ctx context.Context, quote domain.Quote) (QuoteCommitment, error)
+	GetQuoteCommitment(ctx context.Context, quote domain.Quote) (QuoteCommitment, bool, error)
 	ResolveExecutionSignerAuthorization(ctx context.Context, providerID, capabilityID, capabilityVersion, signerID string, at time.Time) (ExecutionSignerAuthorization, bool, error)
 	// AuthorizeExecutionSigner and RevokeExecutionSigner are the only path
 	// permitted to mutate trust-side signer state -- ordinary ATOS provider

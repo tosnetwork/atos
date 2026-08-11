@@ -303,6 +303,108 @@ func (s *Store) QuoteByIdempotencyKey(ctx context.Context, principalID, key stri
 	return q, nil
 }
 
+func (s *Store) OpenQuoteCommitment(ctx context.Context, op domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, bool, error) {
+	tag, err := s.pool.Exec(ctx, `INSERT INTO quote_commitment_operations (quote_id,principal_id,idempotency_key,content_hash,checkpoint,payload,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`, op.QuoteID, op.Quote.PrincipalID, op.Quote.IdempotencyKey, op.ContentHash, op.Checkpoint, mustMarshal(op), op.CreatedAt, op.UpdatedAt)
+	if err != nil {
+		return domain.QuoteCommitmentOperation{}, false, err
+	}
+	if tag.RowsAffected() == 1 {
+		return op, true, nil
+	}
+	existing, err := s.GetQuoteCommitmentOperation(ctx, op.QuoteID)
+	if err == store.ErrNotFound && op.Quote.IdempotencyKey != "" {
+		existing, err = s.QuoteCommitmentOperationByIdempotencyKey(ctx, op.Quote.PrincipalID, op.Quote.IdempotencyKey)
+	}
+	return existing, false, err
+}
+
+func (s *Store) GetQuoteCommitmentOperation(ctx context.Context, quoteID string) (domain.QuoteCommitmentOperation, error) {
+	var payload []byte
+	err := s.pool.QueryRow(ctx, `SELECT payload FROM quote_commitment_operations WHERE quote_id=$1`, quoteID).Scan(&payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.QuoteCommitmentOperation{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.QuoteCommitmentOperation{}, err
+	}
+	var op domain.QuoteCommitmentOperation
+	if err := json.Unmarshal(payload, &op); err != nil {
+		return op, err
+	}
+	return op, nil
+}
+
+func (s *Store) UpdateQuoteCommitmentOperation(ctx context.Context, quoteID string, fn func(domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error)) (domain.QuoteCommitmentOperation, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.QuoteCommitmentOperation{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var payload []byte
+	if err := tx.QueryRow(ctx, `SELECT payload FROM quote_commitment_operations WHERE quote_id=$1 FOR UPDATE`, quoteID).Scan(&payload); errors.Is(err, pgx.ErrNoRows) {
+		return domain.QuoteCommitmentOperation{}, store.ErrNotFound
+	} else if err != nil {
+		return domain.QuoteCommitmentOperation{}, err
+	}
+	var op domain.QuoteCommitmentOperation
+	if err := json.Unmarshal(payload, &op); err != nil {
+		return op, err
+	}
+	if op.Checkpoint == domain.QuoteCommitmentCompleted {
+		return op, nil
+	}
+	next, err := fn(op)
+	if err != nil {
+		return op, err
+	}
+	_, err = tx.Exec(ctx, `UPDATE quote_commitment_operations SET content_hash=$2,checkpoint=$3,payload=$4,updated_at=$5 WHERE quote_id=$1`, quoteID, next.ContentHash, next.Checkpoint, mustMarshal(next), next.UpdatedAt)
+	if err != nil {
+		return op, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return op, err
+	}
+	return next, nil
+}
+func (s *Store) QuoteCommitmentOperationByIdempotencyKey(ctx context.Context, principalID, key string) (domain.QuoteCommitmentOperation, error) {
+	var payload []byte
+	err := s.pool.QueryRow(ctx, `SELECT payload FROM quote_commitment_operations WHERE principal_id=$1 AND idempotency_key=$2 ORDER BY created_at LIMIT 1`, principalID, key).Scan(&payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.QuoteCommitmentOperation{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.QuoteCommitmentOperation{}, err
+	}
+	var op domain.QuoteCommitmentOperation
+	if err := json.Unmarshal(payload, &op); err != nil {
+		return op, err
+	}
+	return op, nil
+}
+func (s *Store) StaleQuoteCommitmentOperations(ctx context.Context, cutoff time.Time, limit int) ([]domain.QuoteCommitmentOperation, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.pool.Query(ctx, `SELECT payload FROM quote_commitment_operations WHERE checkpoint <> $1 AND updated_at <= $2 ORDER BY updated_at,quote_id LIMIT $3`, domain.QuoteCommitmentCompleted, cutoff, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.QuoteCommitmentOperation
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var op domain.QuoteCommitmentOperation
+		if err := json.Unmarshal(payload, &op); err != nil {
+			return nil, err
+		}
+		out = append(out, op)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) GetQuote(ctx context.Context, id string) (domain.Quote, error) {
 	var q domain.Quote
 	var price, payload []byte

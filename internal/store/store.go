@@ -80,6 +80,11 @@ type Quotes interface {
 	// commit that crashed before Finish ran, without minting a second
 	// Quote for the same caller-supplied idempotency key.
 	QuoteByIdempotencyKey(ctx context.Context, principalID, key string) (domain.Quote, error)
+	OpenQuoteCommitment(ctx context.Context, op domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, bool, error)
+	GetQuoteCommitmentOperation(ctx context.Context, quoteID string) (domain.QuoteCommitmentOperation, error)
+	UpdateQuoteCommitmentOperation(ctx context.Context, quoteID string, fn func(domain.QuoteCommitmentOperation) (domain.QuoteCommitmentOperation, error)) (domain.QuoteCommitmentOperation, error)
+	QuoteCommitmentOperationByIdempotencyKey(ctx context.Context, principalID, key string) (domain.QuoteCommitmentOperation, error)
+	StaleQuoteCommitmentOperations(ctx context.Context, cutoff time.Time, limit int) ([]domain.QuoteCommitmentOperation, error)
 }
 
 type Escrows interface {

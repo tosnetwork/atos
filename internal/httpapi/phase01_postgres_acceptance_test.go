@@ -136,7 +136,7 @@ func TestPhase1PublicHTTPFlowAgainstPostgres(t *testing.T) {
 	for _, mode := range []string{"verified", "native"} {
 		response := phase01Request(t, client, http.MethodPost, httpServer.URL+"/v1/quotes", tokens.AccessToken, map[string]any{
 			"capability_id": capability.ID, "requested_trust_mode": mode,
-		}, nil)
+		}, map[string]string{"Idempotency-Key": "postgres-explicit-" + mode})
 		if response.Status == http.StatusCreated || !bytes.Contains(response.Body, []byte("trust_mode_unavailable")) {
 			t.Fatalf("explicit %s did not fail closed: %d %s", mode, response.Status, response.Body)
 		}
@@ -144,7 +144,7 @@ func TestPhase1PublicHTTPFlowAgainstPostgres(t *testing.T) {
 
 	quoteResponse := phase01Request(t, client, http.MethodPost, httpServer.URL+"/v1/quotes", tokens.AccessToken, map[string]any{
 		"capability_id": capability.ID, "requested_trust_mode": "auto",
-	}, nil)
+	}, map[string]string{"Idempotency-Key": "postgres-auto"})
 	if quoteResponse.Status != http.StatusCreated {
 		t.Fatalf("auto quote = %d %s", quoteResponse.Status, quoteResponse.Body)
 	}
