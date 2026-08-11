@@ -315,6 +315,22 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 	if err != nil {
 		return domain.Capability{}, err
 	}
+	// Anchoring runs AFTER the CAS write commits, never inside the
+	// UpdateCapability closure -- unlike EvaluateActivation's staleness
+	// concern (applying a DECISION made against state that has since
+	// moved on), anchoring a specific id@version's manifest is immutable
+	// and version-scoped: anchoring c's exact version is still correct
+	// and useful even if a concurrent Update has already superseded it
+	// with a newer version, exactly like Register's own commitment for a
+	// version that may later be bumped away. A failure here (deferred
+	// Release still fires since committed stays false) lets a retry
+	// re-run the whole Update -- the CAS closure recomputes against
+	// whatever is NOW current, so termsChanged correctly becomes a no-op
+	// if this attempt's fields already match, rather than double-bumping
+	// the version.
+	if err := s.anchorManifestIfRequested(ctx, c); err != nil {
+		return domain.Capability{}, err
+	}
 	if err := s.store.Finish(ctx, requestingProviderID, idempotencyKey, c.ID); err != nil {
 		return domain.Capability{}, err
 	}

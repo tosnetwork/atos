@@ -112,7 +112,7 @@ func (a *TOSBackedActivationAuthority) Evaluate(ctx context.Context, providerID,
 	if cap.ManifestCommitment == "" {
 		return false, ReasonManifestNotCommitted, nil
 	}
-	verified, ownershipReason, err := a.core.VerifyCapabilityOwnership(ctx, capabilityID, providerID, cap.ManifestCommitment)
+	verified, ownershipReason, err := a.core.VerifyCapabilityOwnership(ctx, capabilityID, providerID, capabilityVersion, cap.ManifestCommitment)
 	if err != nil {
 		return false, "", err
 	}

@@ -203,13 +203,13 @@ func (c *Client) readReputation(ctx context.Context, providerID, capabilityID st
 	}, nil
 }
 
-func (c *Client) VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID, expectedManifestDigest string) (bool, string, error) {
+func (c *Client) VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID, version, expectedManifestDigest string) (bool, string, error) {
 	if capabilityID == "" || providerID == "" {
 		return false, "", domain.NewError(domain.ErrValidationFailed, "capability_id and provider_id are required", false)
 	}
 	req := &atostosv1.VerifyCapabilityOwnershipRequest{
 		Context:      c.requestContext(ctx, providerID, "", time.Time{}),
-		CapabilityId: capabilityID, ProviderId: providerID,
+		CapabilityId: capabilityID, ProviderId: providerID, Version: version,
 	}
 	if expectedManifestDigest != "" {
 		d, err := digest(expectedManifestDigest)

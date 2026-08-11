@@ -101,15 +101,20 @@ type Core interface {
 	// standing convention for TOS reference fields).
 	CommitCapabilityManifest(ctx context.Context, capability domain.Capability) (ownershipRef string, err error)
 	// VerifyCapabilityOwnership checks that providerID owns capabilityID
-	// and, when expectedManifestDigest is non-empty ("sha256:<hex>",
-	// matching capabilityManifestCommitment's format), that it matches the
-	// digest anchored at commit time -- this is the manifest/version TOCTOU
-	// check Phase 4A's ActivationAuthority requires (a provider changing a
-	// capability's schema/pricing/bindings after committing its manifest
-	// must invalidate the anchored commitment, not silently keep it
-	// current). reasonCode is non-empty whenever verified is false
+	// at EXACTLY version (never "whatever is current now" -- a Job/Quote
+	// executing against an older version, or a re-anchoring race with a
+	// concurrent Update, both need to verify a specific historical
+	// version's commitment, not silently default to latest) and, when
+	// expectedManifestDigest is non-empty ("sha256:<hex>", matching
+	// capabilityManifestCommitment's format), that it matches the digest
+	// anchored for that exact version -- this is the manifest/version
+	// TOCTOU check Phase 4A's ActivationAuthority requires (a provider
+	// mutating a capability after committing must not keep a stale
+	// activation valid). version="" means "whatever is currently latest",
+	// matching tos-protocol's own VerifyCapabilityOwnershipRequest.version
+	// default. reasonCode is non-empty whenever verified is false
 	// (NOT_FOUND/PROVIDER_MISMATCH/MANIFEST_MISMATCH).
-	VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID, expectedManifestDigest string) (verified bool, reasonCode string, err error)
+	VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID, version, expectedManifestDigest string) (verified bool, reasonCode string, err error)
 	UpdateReputationEvidence(ctx context.Context, providerID string, evidence string) error
 
 	// Phase 4A identity binding (docs/IMPLEMENTATION_ROADMAP.md §8.1).

@@ -207,7 +207,7 @@ func (c *Core) ReadReputation(ctx context.Context, providerID string) (domain.Tr
 // unconditionally, anchored or not) would trivially "verify" a capability
 // that was never anchored at all, defeating the whole point of the
 // manifest/version TOCTOU check this method exists for.
-func (c *Core) VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID, expectedManifestDigest string) (bool, string, error) {
+func (c *Core) VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID, version, expectedManifestDigest string) (bool, string, error) {
 	cap, err := c.store.Get(ctx, capabilityID)
 	if errors.Is(err, store.ErrNotFound) {
 		return false, "NOT_FOUND", nil
@@ -218,11 +218,14 @@ func (c *Core) VerifyCapabilityOwnership(ctx context.Context, capabilityID, prov
 	if cap.ProviderID != providerID {
 		return false, "PROVIDER_MISMATCH", nil
 	}
+	if version == "" {
+		version = cap.Version
+	}
 	if expectedManifestDigest == "" {
 		return true, "", nil
 	}
 	c.mu.Lock()
-	commitment, found := c.manifestCommitments[capabilityID+"@"+cap.Version]
+	commitment, found := c.manifestCommitments[capabilityID+"@"+version]
 	c.mu.Unlock()
 	if !found {
 		return false, "MANIFEST_MISMATCH", nil
