@@ -300,6 +300,20 @@ func main() {
 	httpServer := &http.Server{
 		Addr: cfg.Addr, Handler: observability.Middleware(logger, mux),
 		ReadHeaderTimeout: 5 * time.Second,
+		// IdleTimeout bounds how long a keep-alive connection may sit idle
+		// between requests -- safe to set unconditionally, since it only
+		// applies between requests, never during one. A blanket
+		// ReadTimeout/WriteTimeout is deliberately NOT set here: this
+		// server also handles GET /v1/jobs/{id}/stream (a genuine SSE
+		// endpoint with its own 5-minute internal bound, internal/httpapi/
+		// stream.go's streamMaxWait) and blob uploads with a 15-minute
+		// upload TTL (internal/adapters/storage/local's uploadTTL) --
+		// either timeout would need a careful per-route audit to avoid
+		// silently truncating those, which is out of scope for the
+		// specific anonymous-body-size fix this hardens (see
+		// internal/httpapi/passkey.go's http.MaxBytesReader on the two
+		// truly anonymous passkey finish routes instead).
+		IdleTimeout: 120 * time.Second,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

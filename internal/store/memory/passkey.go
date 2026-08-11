@@ -8,7 +8,7 @@ import (
 	"github.com/tosnetwork/atos/internal/store"
 )
 
-func (s *Store) CreatePasskeyAccount(ctx context.Context, a domain.PasskeyAccount) error {
+func (s *Store) CreatePasskeyAccountWithCredential(ctx context.Context, a domain.PasskeyAccount, c domain.WebAuthnCredentialRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.passkeyAccounts[a.PrincipalID]; exists {
@@ -17,8 +17,12 @@ func (s *Store) CreatePasskeyAccount(ctx context.Context, a domain.PasskeyAccoun
 	if _, exists := s.passkeyHandles[a.DisplayHandle]; exists {
 		return store.ErrConflict
 	}
+	// The whole-store mutex already held for the duration of this method
+	// is what makes this atomic -- both writes commit together or (on the
+	// conflict checks above) neither does.
 	s.passkeyAccounts[a.PrincipalID] = a
 	s.passkeyHandles[a.DisplayHandle] = a.PrincipalID
+	s.passkeyCredentials[c.ID] = c
 	return nil
 }
 

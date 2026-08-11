@@ -10,6 +10,19 @@ import (
 	"github.com/tosnetwork/atos/internal/store"
 )
 
+// testCredentialRecord builds a fresh, unique credential record for
+// principalID -- CredentialID must be globally unique (a real DB unique
+// index enforces this), so every call mints its own suffix.
+func testCredentialRecord(principalID string) domain.WebAuthnCredentialRecord {
+	return domain.WebAuthnCredentialRecord{
+		ID: "pkcred_pg_" + randSuffix(), PrincipalID: principalID,
+		CredentialID: []byte("cred-id-bytes-" + randSuffix()), PublicKey: []byte("public-key-bytes"),
+		AttestationType: "none", AttestationFormat: "packed", Transports: "internal,hybrid",
+		AAGUID: []byte("0123456789abcdef"), Flags: 5, SignCount: 1,
+		Nickname: "My Passkey", CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
+	}
+}
+
 func TestPasskeyAccountCRUD(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
@@ -17,8 +30,8 @@ func TestPasskeyAccountCRUD(t *testing.T) {
 	principalID := "prn_pg_" + randSuffix()
 	handle := "HANDLE" + randSuffix()
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	if err := s.CreatePasskeyAccount(ctx, domain.PasskeyAccount{PrincipalID: principalID, DisplayHandle: handle, CreatedAt: now}); err != nil {
-		t.Fatalf("CreatePasskeyAccount: %v", err)
+	if err := s.CreatePasskeyAccountWithCredential(ctx, domain.PasskeyAccount{PrincipalID: principalID, DisplayHandle: handle, CreatedAt: now}, testCredentialRecord(principalID)); err != nil {
+		t.Fatalf("CreatePasskeyAccountWithCredential: %v", err)
 	}
 
 	byID, err := s.PasskeyAccountByPrincipalID(ctx, principalID)
@@ -40,6 +53,16 @@ func TestPasskeyAccountCRUD(t *testing.T) {
 	if _, err := s.PasskeyAccountByPrincipalID(ctx, "prn_does_not_exist_"+randSuffix()); err != store.ErrNotFound {
 		t.Fatalf("expected ErrNotFound for unknown principal, got %v", err)
 	}
+
+	// The credential committed atomically alongside the account must be
+	// readable too.
+	credentials, err := s.WebAuthnCredentialsByPrincipalID(ctx, principalID)
+	if err != nil {
+		t.Fatalf("WebAuthnCredentialsByPrincipalID: %v", err)
+	}
+	if len(credentials) != 1 {
+		t.Fatalf("credentials = %+v, want exactly 1", credentials)
+	}
 }
 
 func TestPasskeyAccount_DisplayHandleCollisionConflicts(t *testing.T) {
@@ -47,12 +70,24 @@ func TestPasskeyAccount_DisplayHandleCollisionConflicts(t *testing.T) {
 	s := openTestStore(t)
 
 	handle := "DUPHANDLE" + randSuffix()
-	if err := s.CreatePasskeyAccount(ctx, domain.PasskeyAccount{PrincipalID: "prn_pg_a_" + randSuffix(), DisplayHandle: handle, CreatedAt: time.Now().UTC()}); err != nil {
-		t.Fatalf("first CreatePasskeyAccount: %v", err)
+	firstPrincipal := "prn_pg_a_" + randSuffix()
+	if err := s.CreatePasskeyAccountWithCredential(ctx, domain.PasskeyAccount{PrincipalID: firstPrincipal, DisplayHandle: handle, CreatedAt: time.Now().UTC()}, testCredentialRecord(firstPrincipal)); err != nil {
+		t.Fatalf("first CreatePasskeyAccountWithCredential: %v", err)
 	}
-	err := s.CreatePasskeyAccount(ctx, domain.PasskeyAccount{PrincipalID: "prn_pg_b_" + randSuffix(), DisplayHandle: handle, CreatedAt: time.Now().UTC()})
+	secondPrincipal := "prn_pg_b_" + randSuffix()
+	err := s.CreatePasskeyAccountWithCredential(ctx, domain.PasskeyAccount{PrincipalID: secondPrincipal, DisplayHandle: handle, CreatedAt: time.Now().UTC()}, testCredentialRecord(secondPrincipal))
 	if err != store.ErrConflict {
 		t.Fatalf("expected ErrConflict for a duplicate display_handle, got %v", err)
+	}
+
+	// The rejected attempt's credential must not have been committed
+	// either -- the whole write is one transaction.
+	credentials, credErr := s.WebAuthnCredentialsByPrincipalID(ctx, secondPrincipal)
+	if credErr != nil {
+		t.Fatalf("WebAuthnCredentialsByPrincipalID: %v", credErr)
+	}
+	if len(credentials) != 0 {
+		t.Fatalf("credentials = %+v, want none committed for the rejected account", credentials)
 	}
 }
 
@@ -61,16 +96,19 @@ func TestWebAuthnCredential_SaveAndTouch(t *testing.T) {
 	s := openTestStore(t)
 
 	principalID := "prn_pg_cred_" + randSuffix()
-	if err := s.CreatePasskeyAccount(ctx, domain.PasskeyAccount{PrincipalID: principalID, DisplayHandle: "CREDH" + randSuffix(), CreatedAt: time.Now().UTC()}); err != nil {
-		t.Fatalf("CreatePasskeyAccount: %v", err)
+	if err := s.CreatePasskeyAccountWithCredential(ctx, domain.PasskeyAccount{PrincipalID: principalID, DisplayHandle: "CREDH" + randSuffix(), CreatedAt: time.Now().UTC()}, testCredentialRecord(principalID)); err != nil {
+		t.Fatalf("CreatePasskeyAccountWithCredential: %v", err)
 	}
 
+	// A second credential added to the same, already-existing account
+	// (the "add another passkey" case) still goes through the standalone
+	// SaveWebAuthnCredential path.
 	record := domain.WebAuthnCredentialRecord{
 		ID: "pkcred_pg_" + randSuffix(), PrincipalID: principalID,
 		CredentialID: []byte("cred-id-bytes-" + randSuffix()), PublicKey: []byte("public-key-bytes"),
 		AttestationType: "none", AttestationFormat: "packed", Transports: "internal,hybrid",
 		AAGUID: []byte("0123456789abcdef"), Flags: 5, SignCount: 1,
-		Nickname: "My Passkey", CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
+		Nickname: "My Second Passkey", CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
 	}
 	if err := s.SaveWebAuthnCredential(ctx, record); err != nil {
 		t.Fatalf("SaveWebAuthnCredential: %v", err)
@@ -80,19 +118,34 @@ func TestWebAuthnCredential_SaveAndTouch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WebAuthnCredentialsByPrincipalID: %v", err)
 	}
-	if len(records) != 1 || records[0].Nickname != "My Passkey" || records[0].SignCount != 1 {
-		t.Fatalf("records = %+v", records)
+	if len(records) != 2 {
+		t.Fatalf("records = %+v, want 2 (one from signup, one added)", records)
+	}
+	var second domain.WebAuthnCredentialRecord
+	for _, r := range records {
+		if r.Nickname == "My Second Passkey" {
+			second = r
+		}
+	}
+	if second.ID == "" {
+		t.Fatalf("did not find the second credential among %+v", records)
 	}
 
-	if err := s.TouchWebAuthnCredential(ctx, record.ID, 7, true, true); err != nil {
+	if err := s.TouchWebAuthnCredential(ctx, second.ID, 7, true, true); err != nil {
 		t.Fatalf("TouchWebAuthnCredential: %v", err)
 	}
 	touched, err := s.WebAuthnCredentialsByPrincipalID(ctx, principalID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if touched[0].SignCount != 7 || !touched[0].CloneWarning || !touched[0].BackupState || touched[0].LastUsedAt == nil {
-		t.Fatalf("after touch: %+v", touched[0])
+	var touchedRecord domain.WebAuthnCredentialRecord
+	for _, r := range touched {
+		if r.ID == second.ID {
+			touchedRecord = r
+		}
+	}
+	if touchedRecord.SignCount != 7 || !touchedRecord.CloneWarning || !touchedRecord.BackupState || touchedRecord.LastUsedAt == nil {
+		t.Fatalf("after touch: %+v", touchedRecord)
 	}
 
 	if err := s.TouchWebAuthnCredential(ctx, "pkcred_does_not_exist_"+randSuffix(), 1, false, false); err != store.ErrNotFound {

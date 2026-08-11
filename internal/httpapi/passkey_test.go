@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	vwa "github.com/descope/virtualwebauthn"
@@ -129,5 +130,43 @@ func TestPasskeyHTTP_NotConfiguredReturns503(t *testing.T) {
 	server.Mux().ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 when passkey auth is unconfigured: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestPasskeyHTTP_UnclassifiedFailureDoesNotLeakInternals is a regression
+// test for a real P2: an unclassified error (here, go-webauthn's own
+// internal parse failure against a garbage attestation body) used to be
+// forwarded to the anonymous caller verbatim via err.Error(), and mapped to
+// a misleading 401 "authentication" status regardless of it actually being
+// a malformed-request/internal condition.
+func TestPasskeyHTTP_UnclassifiedFailureDoesNotLeakInternals(t *testing.T) {
+	server := newPasskeyHTTPTestServer(t)
+
+	beginReq := httptest.NewRequest(http.MethodPost, "/v1/auth/passkey/register/begin", nil)
+	beginRecorder := httptest.NewRecorder()
+	server.Mux().ServeHTTP(beginRecorder, beginReq)
+	if beginRecorder.Code != http.StatusOK {
+		t.Fatalf("register/begin status = %d, body = %s", beginRecorder.Code, beginRecorder.Body.String())
+	}
+	var begin ceremonyBeginResponse
+	if err := json.Unmarshal(beginRecorder.Body.Bytes(), &begin); err != nil {
+		t.Fatalf("decode register/begin response: %v", err)
+	}
+
+	// Garbage, not a valid WebAuthn attestation response -- go-webauthn's
+	// FinishRegistration will fail with its own internal parse error.
+	finishReq := httptest.NewRequest(http.MethodPost, "/v1/auth/passkey/register/finish/"+begin.CeremonyID, bytes.NewReader([]byte(`{"not":"a valid attestation response"}`)))
+	finishReq.Header.Set("Content-Type", "application/json")
+	finishRecorder := httptest.NewRecorder()
+	server.Mux().ServeHTTP(finishRecorder, finishReq)
+
+	if finishRecorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 for an unclassified internal failure: %s", finishRecorder.Code, finishRecorder.Body.String())
+	}
+	body := finishRecorder.Body.String()
+	for _, leaky := range []string{"webauthn", "cbor", "json:", "unmarshal", "parse error"} {
+		if strings.Contains(strings.ToLower(body), leaky) {
+			t.Fatalf("response body leaks internal error detail (%q): %s", leaky, body)
+		}
 	}
 }

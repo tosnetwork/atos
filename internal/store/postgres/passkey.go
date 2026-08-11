@@ -11,8 +11,20 @@ import (
 	"github.com/tosnetwork/atos/internal/store"
 )
 
-func (s *Store) CreatePasskeyAccount(ctx context.Context, a domain.PasskeyAccount) error {
-	tag, err := s.pool.Exec(ctx, `
+// CreatePasskeyAccountWithCredential inserts the account and its first
+// credential in one transaction -- an account row must never durably exist
+// without a credential able to authenticate it (see the interface doc
+// comment in internal/store/store.go). Either both rows commit or neither
+// does; a mid-transaction failure (including the credential_id unique
+// constraint) rolls the account insert back too.
+func (s *Store) CreatePasskeyAccountWithCredential(ctx context.Context, a domain.PasskeyAccount, c domain.WebAuthnCredentialRecord) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO passkey_accounts (principal_id, display_handle, created_at)
 		VALUES ($1,$2,$3)
 		ON CONFLICT DO NOTHING
@@ -23,7 +35,16 @@ func (s *Store) CreatePasskeyAccount(ctx context.Context, a domain.PasskeyAccoun
 	if tag.RowsAffected() == 0 {
 		return store.ErrConflict
 	}
-	return nil
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO passkey_credentials (`+webAuthnCredentialColumns+`)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+	`, c.ID, c.PrincipalID, c.CredentialID, c.PublicKey, c.AttestationType, c.AttestationFormat, c.Transports,
+		c.AAGUID, int16(c.Flags), c.SignCount, c.CloneWarning, c.BackupEligible, c.BackupState, c.Nickname, c.CreatedAt, c.LastUsedAt); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
 }
 
 func scanPasskeyAccount(row pgx.Row) (domain.PasskeyAccount, error) {

@@ -43,7 +43,7 @@ func newPasskeyTestService(t *testing.T) *service.PasskeyService {
 func registerPasskeyAccount(t *testing.T, s *service.PasskeyService) (vwa.Authenticator, auth.TokenPair) {
 	t.Helper()
 	ctx := context.Background()
-	ceremonyID, options, err := s.BeginRegistration(ctx)
+	ceremonyID, options, err := s.BeginRegistration(ctx, "192.0.2.1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestPasskeyLogin_SucceedsWithRegisteredCredential(t *testing.T) {
 	ctx := context.Background()
 	authenticator, signupPair := registerPasskeyAccount(t, s)
 
-	ceremonyID, assertion, err := s.BeginLogin(ctx)
+	ceremonyID, assertion, err := s.BeginLogin(ctx, "192.0.2.1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestPasskeyLogin_FailsWithUnregisteredCredential(t *testing.T) {
 	ctx := context.Background()
 	registerPasskeyAccount(t, s) // an unrelated account exists, but the login below uses a different, unregistered authenticator
 
-	ceremonyID, assertion, err := s.BeginLogin(ctx)
+	ceremonyID, assertion, err := s.BeginLogin(ctx, "192.0.2.1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,10 +189,48 @@ func TestPasskeyNotConfigured_FailsClosed(t *testing.T) {
 	}
 	s := service.NewPasskeyService(st, nil, authorization)
 
-	if _, _, err := s.BeginRegistration(context.Background()); !errors.Is(err, service.ErrPasskeyNotConfigured) {
+	if _, _, err := s.BeginRegistration(context.Background(), "192.0.2.1"); !errors.Is(err, service.ErrPasskeyNotConfigured) {
 		t.Fatalf("BeginRegistration error = %v, want ErrPasskeyNotConfigured", err)
 	}
-	if _, _, err := s.BeginLogin(context.Background()); !errors.Is(err, service.ErrPasskeyNotConfigured) {
+	if _, _, err := s.BeginLogin(context.Background(), "192.0.2.1"); !errors.Is(err, service.ErrPasskeyNotConfigured) {
 		t.Fatalf("BeginLogin error = %v, want ErrPasskeyNotConfigured", err)
+	}
+}
+
+// TestPasskeyBeginRegistration_RateLimited is a regression test for a real
+// P1: BeginRegistration was fully anonymous with no rate limiting at all,
+// so a scripted flood could write unbounded rows to passkey_ceremonies and
+// mint unlimited principal_ids (each carrying the full default scope
+// bundle) without ever completing a real WebAuthn ceremony.
+func TestPasskeyBeginRegistration_RateLimited(t *testing.T) {
+	s := newPasskeyTestService(t)
+	ctx := context.Background()
+	const limit = 10 // must match passkeyBeginRateLimit
+	for i := 0; i < limit; i++ {
+		if _, _, err := s.BeginRegistration(ctx, "203.0.113.5"); err != nil {
+			t.Fatalf("attempt %d: unexpected error %v", i, err)
+		}
+	}
+	if _, _, err := s.BeginRegistration(ctx, "203.0.113.5"); !errors.Is(err, service.ErrPasskeyRateLimited) {
+		t.Fatalf("attempt %d: error = %v, want ErrPasskeyRateLimited", limit, err)
+	}
+	// A different remote subject is a separate bucket, unaffected by the
+	// first one's exhausted quota.
+	if _, _, err := s.BeginRegistration(ctx, "203.0.113.9"); err != nil {
+		t.Fatalf("a different IP must not be rate limited by another IP's attempts: %v", err)
+	}
+}
+
+func TestPasskeyBeginLogin_RateLimited(t *testing.T) {
+	s := newPasskeyTestService(t)
+	ctx := context.Background()
+	const limit = 10 // must match passkeyBeginRateLimit
+	for i := 0; i < limit; i++ {
+		if _, _, err := s.BeginLogin(ctx, "203.0.113.6"); err != nil {
+			t.Fatalf("attempt %d: unexpected error %v", i, err)
+		}
+	}
+	if _, _, err := s.BeginLogin(ctx, "203.0.113.6"); !errors.Is(err, service.ErrPasskeyRateLimited) {
+		t.Fatalf("attempt %d: error = %v, want ErrPasskeyRateLimited", limit, err)
 	}
 }

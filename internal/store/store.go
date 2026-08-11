@@ -379,7 +379,14 @@ type Certifications interface {
 // identity primitive Device Authorization's /activate page always assumed
 // existed elsewhere. Modeled on tosnetwork/atos-aidrop's proven schema.
 type PasskeyAccounts interface {
-	CreatePasskeyAccount(ctx context.Context, a domain.PasskeyAccount) error
+	// CreatePasskeyAccountWithCredential atomically creates the account row
+	// and its first credential in one transaction -- an account MUST NEVER
+	// durably exist without at least one credential able to authenticate
+	// it (a partial failure between the two, e.g. a mid-transaction crash
+	// or a credential_id collision, must roll back the account too, not
+	// strand it forever unauthenticatable). This is the ONLY way to create
+	// a PasskeyAccount; there is no standalone CreatePasskeyAccount.
+	CreatePasskeyAccountWithCredential(ctx context.Context, a domain.PasskeyAccount, c domain.WebAuthnCredentialRecord) error
 	PasskeyAccountByPrincipalID(ctx context.Context, principalID string) (domain.PasskeyAccount, error)
 	// PasskeyAccountByDisplayHandle exists purely to detect a display-handle
 	// collision before insert (see service.generateDisplayHandle) -- never

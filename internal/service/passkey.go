@@ -42,6 +42,16 @@ const displayHandleLength = 12
 var (
 	ErrPasskeyNotConfigured = errors.New("passkey sign-in is not configured")
 	ErrNoPasskeyCredentials = errors.New("no passkeys are registered for this account")
+	ErrPasskeyRateLimited   = errors.New("too many attempts, please try again shortly")
+)
+
+// passkeyBeginRateLimit/Window bound how many ceremony-begin calls one
+// remote subject (IP) may make -- see passkeyRateLimiter's doc comment for
+// why this exists at all (BeginRegistration/BeginLogin are the only two
+// genuinely anonymous, unauthenticated entry points in this service).
+const (
+	passkeyBeginRateLimit  = 10
+	passkeyBeginRateWindow = time.Minute
 )
 
 // passkeyDefaultScopes is the fixed v1 scope bundle every passkey-issued
@@ -74,9 +84,10 @@ func (u *webauthnUser) WebAuthnDisplayName() string                { return u.di
 func (u *webauthnUser) WebAuthnCredentials() []webauthn.Credential { return u.credentials }
 
 type PasskeyService struct {
-	store    store.Store
-	webAuthn *webauthn.WebAuthn
-	auth     *auth.Service
+	store       store.Store
+	webAuthn    *webauthn.WebAuthn
+	auth        *auth.Service
+	rateLimiter *passkeyRateLimiter
 }
 
 // NewPasskeyService returns nil webAuthn safely -- every method below
@@ -84,7 +95,7 @@ type PasskeyService struct {
 // atos-aidrop's own "not configured" fallback, so a deployment that hasn't
 // set ATOS_WEBAUTHN_RP_ID yet fails closed rather than panicking.
 func NewPasskeyService(s store.Store, webAuthn *webauthn.WebAuthn, authService *auth.Service) *PasskeyService {
-	return &PasskeyService{store: s, webAuthn: webAuthn, auth: authService}
+	return &PasskeyService{store: s, webAuthn: webAuthn, auth: authService, rateLimiter: newPasskeyRateLimiter()}
 }
 
 func toWebAuthnCredentials(records []domain.WebAuthnCredentialRecord) []webauthn.Credential {
@@ -150,9 +161,12 @@ type signupCeremonyPayload struct {
 // creation challenge for a not-yet-created account. There is no email step
 // at all -- this and a successful passkey attestation are the entire
 // signup flow.
-func (s *PasskeyService) BeginRegistration(ctx context.Context) (string, *protocol.CredentialCreation, error) {
+func (s *PasskeyService) BeginRegistration(ctx context.Context, remoteSubject string) (string, *protocol.CredentialCreation, error) {
 	if s.webAuthn == nil {
 		return "", nil, ErrPasskeyNotConfigured
+	}
+	if !s.rateLimiter.allow("register:"+remoteSubject, passkeyBeginRateLimit, passkeyBeginRateWindow, time.Now().UTC()) {
+		return "", nil, ErrPasskeyRateLimited
 	}
 	principalID := "prn_" + uuid.NewString()
 	displayHandle, err := s.generateDisplayHandle(ctx)
@@ -199,18 +213,29 @@ func (s *PasskeyService) FinishRegistration(ctx context.Context, ceremonyID stri
 		return auth.TokenPair{}, err
 	}
 	now := time.Now().UTC()
-	if err := s.store.CreatePasskeyAccount(ctx, domain.PasskeyAccount{
-		PrincipalID: payload.PrincipalID, DisplayHandle: payload.DisplayHandle, CreatedAt: now,
-	}); err != nil {
-		return auth.TokenPair{}, err
-	}
-	if err := s.saveCredential(ctx, payload.PrincipalID, credential, "Passkey"); err != nil {
+	record := buildCredentialRecord(payload.PrincipalID, credential, "Passkey")
+	// One transaction: an account row must never durably exist without a
+	// credential able to authenticate it (see
+	// store.PasskeyAccounts.CreatePasskeyAccountWithCredential's doc
+	// comment) -- a partial failure here (crash, credential_id collision)
+	// rolls both writes back together rather than stranding an
+	// unauthenticatable account.
+	if err := s.store.CreatePasskeyAccountWithCredential(ctx,
+		domain.PasskeyAccount{PrincipalID: payload.PrincipalID, DisplayHandle: payload.DisplayHandle, CreatedAt: now},
+		record,
+	); err != nil {
 		return auth.TokenPair{}, err
 	}
 	return s.auth.IssueForPrincipal(payload.PrincipalID, passkeyDefaultScopes(), "web", "atos.im")
 }
 
-func (s *PasskeyService) saveCredential(ctx context.Context, principalID string, credential *webauthn.Credential, nickname string) error {
+// buildCredentialRecord translates a just-attested go-webauthn Credential
+// into the durable record shape, without persisting it -- callers decide
+// how the write is committed (FinishRegistration commits it atomically
+// alongside the new account; a future "add another passkey" flow would
+// call SaveWebAuthnCredential directly against an already-existing
+// account).
+func buildCredentialRecord(principalID string, credential *webauthn.Credential, nickname string) domain.WebAuthnCredentialRecord {
 	transports := make([]string, len(credential.Transport))
 	for i, t := range credential.Transport {
 		transports[i] = string(t)
@@ -222,7 +247,7 @@ func (s *PasskeyService) saveCredential(ctx context.Context, principalID string,
 	if len(nickname) > 100 {
 		nickname = nickname[:100]
 	}
-	return s.store.SaveWebAuthnCredential(ctx, domain.WebAuthnCredentialRecord{
+	return domain.WebAuthnCredentialRecord{
 		ID: "pkcred_" + uuid.NewString(), PrincipalID: principalID,
 		CredentialID: credential.ID, PublicKey: credential.PublicKey,
 		AttestationType: credential.AttestationType, AttestationFormat: credential.AttestationFormat,
@@ -230,16 +255,19 @@ func (s *PasskeyService) saveCredential(ctx context.Context, principalID string,
 		Flags: credential.Flags.MsgpByte(), SignCount: credential.Authenticator.SignCount,
 		BackupEligible: credential.Flags.BackupEligible, BackupState: credential.Flags.BackupState,
 		Nickname: nickname, CreatedAt: time.Now().UTC(),
-	})
+	}
 }
 
 // BeginLogin issues a usernameless, discoverable-credential login
 // challenge: the browser's own passkey picker resolves which account is
 // signing in, so no principal_id or other identifier is submitted here at
 // all.
-func (s *PasskeyService) BeginLogin(ctx context.Context) (string, *protocol.CredentialAssertion, error) {
+func (s *PasskeyService) BeginLogin(ctx context.Context, remoteSubject string) (string, *protocol.CredentialAssertion, error) {
 	if s.webAuthn == nil {
 		return "", nil, ErrPasskeyNotConfigured
+	}
+	if !s.rateLimiter.allow("login:"+remoteSubject, passkeyBeginRateLimit, passkeyBeginRateWindow, time.Now().UTC()) {
+		return "", nil, ErrPasskeyRateLimited
 	}
 	options, session, err := s.webAuthn.BeginDiscoverableLogin()
 	if err != nil {
@@ -294,11 +322,29 @@ func (s *PasskeyService) FinishLogin(ctx context.Context, ceremonyID string, r *
 	if err != nil {
 		return auth.TokenPair{}, err
 	}
+	// The sign counter/clone-warning/backup-state update MUST succeed
+	// before a token is issued -- silently discarding this error would let
+	// go-webauthn's clone-detection signal (a counter that fails to
+	// advance, or regresses, across logins) go unrecorded, weakening every
+	// later login's ability to notice a cloned authenticator. A failed
+	// write here means the caller genuinely could not durably confirm this
+	// login, so it must not proceed as if it had.
+	touched := false
 	for _, record := range resolvedRecords {
 		if string(record.CredentialID) == string(matched.ID) {
-			_ = s.store.TouchWebAuthnCredential(ctx, record.ID, matched.Authenticator.SignCount, matched.Authenticator.CloneWarning, matched.Flags.BackupState)
+			if err := s.store.TouchWebAuthnCredential(ctx, record.ID, matched.Authenticator.SignCount, matched.Authenticator.CloneWarning, matched.Flags.BackupState); err != nil {
+				return auth.TokenPair{}, err
+			}
+			touched = true
 			break
 		}
+	}
+	if !touched {
+		// The assertion verified against a credential this resolve() call
+		// itself supplied, so failing to find it back by ID here would be
+		// an internal inconsistency, not a caller-facing auth failure --
+		// fail closed rather than issuing a token for an untouched credential.
+		return auth.TokenPair{}, errors.New("matched credential not found among resolved records")
 	}
 	return s.auth.IssueForPrincipal(resolvedPrincipalID, passkeyDefaultScopes(), "web", "atos.im")
 }

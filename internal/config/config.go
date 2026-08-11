@@ -185,18 +185,16 @@ func Load() (Config, error) {
 		PayoutBackend:             PayoutBackend(strings.ToLower(envOr("ATOS_PAYOUT_BACKEND", string(PayoutBackendDisabled)))),
 		RemoteThirdPartyExecution: remoteThirdParty,
 	}
-	// WebAuthn RPID/RPOrigins default from PublicBaseURL when unset, the
-	// same way atos-aidrop derives its own RP config from PublicHostname/
-	// PublicURL -- passkey auth is opt-in (cmd/api/main.go skips wiring it
-	// entirely when RPID is empty), so this only matters once an operator
-	// sets ATOS_WEBAUTHN_RP_ID or ATOS_WEBAUTHN_RP_ORIGINS explicitly, or
-	// relies on this default alongside them.
-	if cfg.WebAuthn.RPID == "" {
-		if parsed, err := url.Parse(cfg.PublicBaseURL); err == nil {
-			cfg.WebAuthn.RPID = parsed.Hostname()
-		}
-	}
-	if len(cfg.WebAuthn.RPOrigins) == 0 {
+	// Passkey auth is opt-in: cmd/api/main.go only constructs a webauthn.WebAuthn
+	// instance when RPID is non-empty. Deliberately NOT defaulted from
+	// PublicBaseURL -- PublicBaseURL always has a non-empty fallback
+	// ("http://localhost:8080"), so defaulting RPID from it would make
+	// RPID non-empty on every deployment, silently turning "opt-in" into
+	// "always on" for any operator who never set ATOS_WEBAUTHN_RP_ID at
+	// all. RPOrigins/RPDisplayName only get a default once RPID is
+	// explicitly set, for the same reason (RPDisplayName's own default is
+	// harmless either way -- it's inert unless RPID is also set).
+	if cfg.WebAuthn.RPID != "" && len(cfg.WebAuthn.RPOrigins) == 0 {
 		cfg.WebAuthn.RPOrigins = []string{cfg.PublicBaseURL}
 	}
 	if err := cfg.Validate(); err != nil {

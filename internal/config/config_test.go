@@ -165,7 +165,44 @@ func clearEnvironment(t *testing.T) {
 		"ATOS_TOS_RPC_TIMEOUT", "ATOS_TOS_RPC_MAX_MESSAGE_BYTES", "ATOS_TOS_RPC_SERVER_NAME",
 		"ATOS_TOS_RPC_CA_FILE", "ATOS_TOS_RPC_CLIENT_CERT_FILE", "ATOS_TOS_RPC_CLIENT_KEY_FILE",
 		"ATOS_PAYOUT_BACKEND",
+		"ATOS_WEBAUTHN_RP_ID", "ATOS_WEBAUTHN_RP_NAME", "ATOS_WEBAUTHN_RP_ORIGINS",
 	} {
 		t.Setenv(name, "")
+	}
+}
+
+// TestLoadDefaultsWebAuthnDisabled is a regression test for a real P1: RPID
+// used to be defaulted from PublicBaseURL (which always has a non-empty
+// fallback), which silently turned "passkey auth is opt-in" into "always
+// on" for any deployment that never set ATOS_WEBAUTHN_RP_ID. RPID must stay
+// empty -- and RPOrigins must stay unset -- when the operator never
+// explicitly configured it.
+func TestLoadDefaultsWebAuthnDisabled(t *testing.T) {
+	clearEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WebAuthn.RPID != "" {
+		t.Fatalf("WebAuthn.RPID = %q, want empty (passkey auth must default to disabled)", cfg.WebAuthn.RPID)
+	}
+	if len(cfg.WebAuthn.RPOrigins) != 0 {
+		t.Fatalf("WebAuthn.RPOrigins = %v, want empty when RPID was never set", cfg.WebAuthn.RPOrigins)
+	}
+}
+
+func TestLoadWebAuthnEnabledDerivesOriginFromPublicBaseURL(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ATOS_WEBAUTHN_RP_ID", "atos.im")
+	t.Setenv("ATOS_PUBLIC_BASE_URL", "https://atos.im")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WebAuthn.RPID != "atos.im" {
+		t.Fatalf("WebAuthn.RPID = %q, want atos.im", cfg.WebAuthn.RPID)
+	}
+	if len(cfg.WebAuthn.RPOrigins) != 1 || cfg.WebAuthn.RPOrigins[0] != "https://atos.im" {
+		t.Fatalf("WebAuthn.RPOrigins = %v, want [https://atos.im]", cfg.WebAuthn.RPOrigins)
 	}
 }
