@@ -429,17 +429,6 @@ func (s *JobService) prepareExecutionUnderLock(ctx context.Context, jobID string
 		if err != nil {
 			return job, capability, err
 		}
-		if quote.TrustMode == domain.TrustModeVerified {
-			_, err = s.store.UpdateEscrowOperation(ctx, job.ID, domain.EscrowOperationReserve, func(current domain.EscrowOperation) (domain.EscrowOperation, error) {
-				current.Checkpoint = domain.EscrowOperationCompleted
-				current.UpdatedAt = time.Now().UTC()
-				current.Escrow.OperationCheckpoint = domain.EscrowOperationCompleted
-				return current, nil
-			})
-			if err != nil {
-				return job, capability, err
-			}
-		}
 	}
 	if job.EconomicState == domain.EconomicEscrowReserved && quote.TrustMode == domain.TrustModeVerified {
 		escrow, found, liveErr := s.core.GetEscrow(ctx, toscore.GetEscrowRequest{Quote: quote, JobID: job.ID, EscrowID: job.EscrowID})
@@ -448,6 +437,21 @@ func (s *JobService) prepareExecutionUnderLock(ctx context.Context, jobID string
 				liveErr = domain.NewError(domain.ErrSettlementFailed, "canonical verified escrow is not executable", true)
 			}
 			return s.markEconomicReconciliationUnderLock(ctx, job.ID, job.EconomicState, domain.JobFailed, domain.ErrSettlementFailed, "live verified escrow gate failed"), capability, liveErr
+		}
+		// The operation becomes terminal only after both the public Job
+		// projection and a fresh canonical observation are durable. Keeping
+		// this outside the EconomicEscrowPending block also closes the crash
+		// window where the Job update commits but the operation update does
+		// not: a later replica repeats the live observation and finishes the
+		// exact same operation without another mutation.
+		_, err = s.store.UpdateEscrowOperation(ctx, job.ID, domain.EscrowOperationReserve, func(current domain.EscrowOperation) (domain.EscrowOperation, error) {
+			current.Checkpoint = domain.EscrowOperationCompleted
+			current.UpdatedAt = time.Now().UTC()
+			current.Escrow.OperationCheckpoint = domain.EscrowOperationCompleted
+			return current, nil
+		})
+		if err != nil {
+			return job, capability, err
 		}
 	}
 	if job.EconomicState == domain.EconomicEscrowReserved && job.EscrowID != "" && job.State != domain.JobWorking {
@@ -1167,6 +1171,61 @@ func (s *JobService) ReconcileStaleJobs(ctx context.Context, updatedBefore time.
 	return len(jobs), joined
 }
 
+// ReconcileStaleEscrowOperations closes operation/projection crash windows
+// that are deliberately invisible to JobsForRecovery. In particular, a Job
+// may already be terminal after a finalized release while its release
+// operation is still projection_persisted. ReconcileJob correctly treats the
+// Job as terminal, so the operation requires its own durable sweep.
+func (s *JobService) ReconcileStaleEscrowOperations(ctx context.Context, updatedBefore time.Time, limit int) (int, error) {
+	operations, err := s.store.StaleEscrowOperations(ctx, updatedBefore, limit)
+	if err != nil {
+		return 0, err
+	}
+	var joined error
+	for _, operation := range operations {
+		job, getErr := s.store.GetJob(ctx, operation.JobID)
+		if getErr != nil {
+			s.touchEscrowOperationFailure(ctx, operation, getErr)
+			joined = errors.Join(joined, fmt.Errorf("load escrow operation job %s: %w", operation.JobID, getErr))
+			continue
+		}
+		if operation.Kind == domain.EscrowOperationRelease && job.State.Terminal() && job.EconomicState == domain.EconomicReleased {
+			escrow, projectionErr := s.store.EscrowByJob(ctx, job.ID)
+			if projectionErr == nil && (escrow.Status != domain.EscrowReleased || !escrow.Finalized || escrow.FinalizedCheckpoint == 0 || escrow.ReleaseRef == "" || escrow.ReleaseActionID == "" || escrow.ReleaseDigest == "") {
+				projectionErr = domain.NewError(domain.ErrSettlementFailed, "terminal release projection is incomplete", false)
+			}
+			if projectionErr == nil {
+				_, projectionErr = s.store.UpdateEscrowOperation(ctx, job.ID, operation.Kind, func(current domain.EscrowOperation) (domain.EscrowOperation, error) {
+					current.Escrow = escrow
+					current.Escrow.OperationCheckpoint = domain.EscrowOperationCompleted
+					current.Checkpoint = domain.EscrowOperationCompleted
+					current.UpdatedAt = time.Now().UTC()
+					return current, nil
+				})
+			}
+			if projectionErr != nil {
+				s.touchEscrowOperationFailure(ctx, operation, projectionErr)
+				joined = errors.Join(joined, fmt.Errorf("finish release operation %s: %w", operation.ID, projectionErr))
+			}
+			continue
+		}
+		if _, reconcileErr := s.ReconcileJob(ctx, operation.JobID); reconcileErr != nil {
+			s.touchEscrowOperationFailure(ctx, operation, reconcileErr)
+			joined = errors.Join(joined, fmt.Errorf("reconcile escrow operation %s: %w", operation.ID, reconcileErr))
+		}
+	}
+	return len(operations), joined
+}
+
+func (s *JobService) touchEscrowOperationFailure(ctx context.Context, operation domain.EscrowOperation, cause error) {
+	_, _ = s.store.UpdateEscrowOperation(ctx, operation.JobID, operation.Kind, func(current domain.EscrowOperation) (domain.EscrowOperation, error) {
+		current.LastErrorCode = errCode(cause)
+		current.LastError = cause.Error()
+		current.UpdatedAt = time.Now().UTC()
+		return current, nil
+	})
+}
+
 func (s *JobService) RunReconciler(ctx context.Context, interval, staleAfter time.Duration, limit int, report func(error)) {
 	if interval <= 0 {
 		interval = defaultReconcileInterval
@@ -1178,8 +1237,10 @@ func (s *JobService) RunReconciler(ctx context.Context, interval, staleAfter tim
 		limit = defaultReconcileBatch
 	}
 	sweep := func() {
-		_, err := s.ReconcileStaleJobs(ctx, time.Now().UTC().Add(-staleAfter), limit)
-		if err != nil && report != nil {
+		cutoff := time.Now().UTC().Add(-staleAfter)
+		_, jobsErr := s.ReconcileStaleJobs(ctx, cutoff, limit)
+		_, operationsErr := s.ReconcileStaleEscrowOperations(ctx, cutoff, limit)
+		if err := errors.Join(jobsErr, operationsErr); err != nil && report != nil {
 			report(err)
 		}
 	}
