@@ -3,10 +3,11 @@ import { request } from './api'
 import type { Session } from './types'
 
 const KEY = 'atos.tasks.session.v1'
-const SCOPES = ['open_tasks:read', 'open_tasks:write', 'open_task_proposals:write', 'capabilities:write', 'jobs:read', 'quotes:read']
+const SCOPES = ['open_tasks:read', 'open_tasks:write', 'jobs:read', 'quotes:read']
+const PROVIDER_SCOPES = [...SCOPES, 'open_task_proposals:write', 'capabilities:write']
 type DeviceGrant = { device_code: string; user_code: string; verification_uri_complete: string; expires_in: number; interval: number }
 type TokenResponse = { access_token: string; refresh_token: string; expires_in: number; principal_id: string; scopes: string[]; error?: string }
-type AuthValue = { session: Session | null; login: () => Promise<void>; logout: () => Promise<void>; loggingIn: boolean; loginCode: string | null }
+type AuthValue = { session: Session | null; login: () => Promise<void>; authorizeProvider: () => Promise<void>; logout: () => Promise<void>; loggingIn: boolean; loginCode: string | null }
 
 const AuthContext = createContext<AuthValue | null>(null)
 const readSession = () => {
@@ -38,10 +39,10 @@ export function AuthProvider({ children }: PropsWithChildren) {
     return () => { active = false }
   }, [session, save])
 
-  const login = useCallback(async () => {
+  const authorize = useCallback(async (requestedScopes: string[], clientName: string) => {
     setLoggingIn(true)
     try {
-      const grant = await request<DeviceGrant>('/auth/device', null, { method: 'POST', body: JSON.stringify({ client_type: 'web', client_name: 'ATOS Task Marketplace', requested_scopes: SCOPES }) })
+      const grant = await request<DeviceGrant>('/auth/device', null, { method: 'POST', body: JSON.stringify({ client_type: 'web', client_name: clientName, requested_scopes: requestedScopes }) })
       setLoginCode(grant.user_code)
       const popup = window.open(grant.verification_uri_complete, 'atos-consent', 'popup,width=720,height=760')
       if (!popup) throw new Error('Allow pop-ups to continue secure sign in.')
@@ -65,12 +66,15 @@ export function AuthProvider({ children }: PropsWithChildren) {
     } finally { setLoggingIn(false); setLoginCode(null) }
   }, [save])
 
+  const login = useCallback(() => authorize(SCOPES, 'ATOS Task Marketplace'), [authorize])
+  const authorizeProvider = useCallback(() => authorize(PROVIDER_SCOPES, 'ATOS Provider Tools'), [authorize])
+
   const logout = useCallback(async () => {
     if (session) await request<void>('/auth/revoke', session, { method: 'POST' }).catch(() => undefined)
     save(null)
   }, [session, save])
 
-  const value = useMemo(() => ({ session, login, logout, loggingIn, loginCode }), [session, login, logout, loggingIn, loginCode])
+  const value = useMemo(() => ({ session, login, authorizeProvider, logout, loggingIn, loginCode }), [session, login, authorizeProvider, logout, loggingIn, loginCode])
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
 

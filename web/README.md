@@ -19,12 +19,15 @@ origin. Production should route SPA requests under `/tasks` back to
 ## Authentication
 
 The marketplace is a Device Authorization client, not a replacement consent
-page. It requests requester scopes (`open_tasks:read`, `open_tasks:write`,
-`jobs:read`, `quotes:read`) plus the explicit Provider scopes
-`open_task_proposals:write` and `capabilities:write`, opens the server-issued
-`verification_uri_complete`, and polls the token endpoint at the server-provided
-interval. The existing trusted login/reverse-proxy boundary on `/activate`
-authenticates the human and injects the approval headers.
+page. Its normal login requests only requester scopes (`open_tasks:read`,
+`open_tasks:write`, `jobs:read`, `quotes:read`). Provider tools trigger a
+separate, explicit Device Authorization grant that adds
+`open_task_proposals:write` and `capabilities:write`; the latter is required by
+the frozen `GET /capabilities/mine` contract and is never given to an ordinary
+marketplace session. Both flows open the server-issued
+`verification_uri_complete` and poll at the server-provided interval. The
+existing trusted login/reverse-proxy boundary on `/activate` authenticates the
+human and injects the approval headers.
 
 Tokens are kept in `sessionStorage`, so they are scoped to the current browser
 tab and are not made into a long-lived Web credential. Expired access tokens

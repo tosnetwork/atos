@@ -21,6 +21,7 @@ export function ProviderProposalForm({ session, taskId, onSubmitted }: Props) {
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
   }, [session])
+  const activeCapabilities = capabilities.filter(capability => capability.status === 'active')
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -44,8 +45,8 @@ export function ProviderProposalForm({ session, taskId, onSubmitted }: Props) {
 
   return <section className="proposal-form panel"><p className="eyebrow">Provider application</p><h2>Submit a proposal</h2><p className="muted">Offer one of your capabilities to fulfill this task. ATOS freezes its current version when you submit.</p>
     {error ? <ErrorNotice error={error} /> : null}
-    {loading ? <p className="muted">Loading your capabilities…</p> : capabilities.length === 0 ? <Empty>You do not have a capability available for this proposal.</Empty> : <form onSubmit={submit}>
-      <label>Capability<select name="capability_id" required defaultValue=""><option value="" disabled>Select your capability</option>{capabilities.map(capability => <option value={capability.id} key={capability.id}>{capability.name} · v{capability.version} · {capability.status}</option>)}</select></label>
+    {loading ? <p className="muted">Loading your capabilities…</p> : activeCapabilities.length === 0 ? <Empty>You do not have an active capability available for this proposal.</Empty> : <form onSubmit={submit}>
+      <label>Capability<select name="capability_id" required defaultValue=""><option value="" disabled>Select an active capability</option>{activeCapabilities.map(capability => <option value={capability.id} key={capability.id}>{capability.name} · v{capability.version}</option>)}</select></label>
       <label>Message <span className="hint">Optional</span><textarea name="message" rows={4} placeholder="Explain your approach and fit…" /></label>
       <div className="row"><label>Reference price <span className="hint">Optional, non-binding</span><input name="amount" inputMode="decimal" pattern="[0-9]+(\.[0-9]+)?" placeholder="4.50" /></label><label>Currency<select name="currency" defaultValue="USD"><option>USD</option><option>EUR</option><option>TOS</option></select></label></div>
       <div className="principle proposal-hint"><span>i</span><p>This price is only a reference hint. The task owner’s final Quote is recalculated by ATOS when a winner is accepted.</p></div>
