@@ -205,7 +205,7 @@ func TestPasskeyNotConfigured_FailsClosed(t *testing.T) {
 func TestPasskeyBeginRegistration_RateLimited(t *testing.T) {
 	s := newPasskeyTestService(t)
 	ctx := context.Background()
-	const limit = 10 // must match passkeyBeginRateLimit
+	const limit = 5 // must match passkeyRegisterRateLimit
 	for i := 0; i < limit; i++ {
 		if _, _, err := s.BeginRegistration(ctx, "203.0.113.5"); err != nil {
 			t.Fatalf("attempt %d: unexpected error %v", i, err)
@@ -224,7 +224,7 @@ func TestPasskeyBeginRegistration_RateLimited(t *testing.T) {
 func TestPasskeyBeginLogin_RateLimited(t *testing.T) {
 	s := newPasskeyTestService(t)
 	ctx := context.Background()
-	const limit = 10 // must match passkeyBeginRateLimit
+	const limit = 10 // must match passkeyLoginRateLimit
 	for i := 0; i < limit; i++ {
 		if _, _, err := s.BeginLogin(ctx, "203.0.113.6"); err != nil {
 			t.Fatalf("attempt %d: unexpected error %v", i, err)

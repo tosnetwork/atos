@@ -45,13 +45,25 @@ var (
 	ErrPasskeyRateLimited   = errors.New("too many attempts, please try again shortly")
 )
 
-// passkeyBeginRateLimit/Window bound how many ceremony-begin calls one
-// remote subject (IP) may make -- see passkeyRateLimiter's doc comment for
-// why this exists at all (BeginRegistration/BeginLogin are the only two
-// genuinely anonymous, unauthenticated entry points in this service).
+// passkeyBeginRateWindow is shared by both entry points; the limit itself
+// is NOT, deliberately: signup and login carry different stakes.
+// BeginRegistration mints a brand-new principal (a fresh scope-bundled
+// identity, eventually a lazily-created ManagedAccount initial balance --
+// see AccountService.Get) purely from an unauthenticated HTTP call with no
+// credential involved yet, so it gets the stricter bound.
+// BeginLogin only re-authenticates an ALREADY-existing account and
+// completing it successfully requires possessing a real private key an
+// attacker cannot bulk-generate, so a more lenient bound (a legitimate
+// user retrying a failed scan/tap a few times) is reasonable. This bounds
+// scripted-flood *velocity* from a small number of IPs; it does not by
+// itself decide whether signup additionally needs CAPTCHA/invite-gating or
+// a smaller/deferred initial balance -- see passkeyRateLimiter's doc
+// comment and docs/AUTH.md's explicit scope boundary for that separate,
+// still-open product/threat-model decision.
 const (
-	passkeyBeginRateLimit  = 10
-	passkeyBeginRateWindow = time.Minute
+	passkeyRegisterRateLimit = 5
+	passkeyLoginRateLimit    = 10
+	passkeyBeginRateWindow   = time.Minute
 )
 
 // passkeyDefaultScopes is the fixed v1 scope bundle every passkey-issued
@@ -165,7 +177,7 @@ func (s *PasskeyService) BeginRegistration(ctx context.Context, remoteSubject st
 	if s.webAuthn == nil {
 		return "", nil, ErrPasskeyNotConfigured
 	}
-	if !s.rateLimiter.allow("register:"+remoteSubject, passkeyBeginRateLimit, passkeyBeginRateWindow, time.Now().UTC()) {
+	if !s.rateLimiter.allow("register:"+remoteSubject, passkeyRegisterRateLimit, passkeyBeginRateWindow, time.Now().UTC()) {
 		return "", nil, ErrPasskeyRateLimited
 	}
 	principalID := "prn_" + uuid.NewString()
@@ -266,7 +278,7 @@ func (s *PasskeyService) BeginLogin(ctx context.Context, remoteSubject string) (
 	if s.webAuthn == nil {
 		return "", nil, ErrPasskeyNotConfigured
 	}
-	if !s.rateLimiter.allow("login:"+remoteSubject, passkeyBeginRateLimit, passkeyBeginRateWindow, time.Now().UTC()) {
+	if !s.rateLimiter.allow("login:"+remoteSubject, passkeyLoginRateLimit, passkeyBeginRateWindow, time.Now().UTC()) {
 		return "", nil, ErrPasskeyRateLimited
 	}
 	options, session, err := s.webAuthn.BeginDiscoverableLogin()
