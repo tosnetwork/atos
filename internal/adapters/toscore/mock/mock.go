@@ -5,6 +5,7 @@ package mock
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -148,12 +149,21 @@ func (c *Core) ReadReputation(ctx context.Context, providerID string) (domain.Tr
 	return domain.Trust{Score: 0.8, Level: domain.TrustSelfAsserted}, nil
 }
 
-func (c *Core) VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID string) (bool, error) {
+func (c *Core) VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID, expectedManifestDigest string) (bool, string, error) {
 	cap, err := c.store.Get(ctx, capabilityID)
-	if err != nil {
-		return false, err
+	if errors.Is(err, store.ErrNotFound) {
+		return false, "NOT_FOUND", nil
 	}
-	return cap.ProviderID == providerID, nil
+	if err != nil {
+		return false, "", err
+	}
+	if cap.ProviderID != providerID {
+		return false, "PROVIDER_MISMATCH", nil
+	}
+	if expectedManifestDigest != "" && cap.ManifestCommitment != expectedManifestDigest {
+		return false, "MANIFEST_MISMATCH", nil
+	}
+	return true, "", nil
 }
 
 func (c *Core) UpdateReputationEvidence(ctx context.Context, providerID string, evidence string) error {

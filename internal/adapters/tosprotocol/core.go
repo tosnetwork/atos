@@ -180,22 +180,33 @@ func (c *Client) readReputation(ctx context.Context, providerID, capabilityID st
 	}, nil
 }
 
-func (c *Client) VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID string) (bool, error) {
+func (c *Client) VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID, expectedManifestDigest string) (bool, string, error) {
 	if capabilityID == "" || providerID == "" {
-		return false, domain.NewError(domain.ErrValidationFailed, "capability_id and provider_id are required", false)
+		return false, "", domain.NewError(domain.ErrValidationFailed, "capability_id and provider_id are required", false)
+	}
+	req := &atostosv1.VerifyCapabilityOwnershipRequest{
+		Context:      c.requestContext(ctx, providerID, "", time.Time{}),
+		CapabilityId: capabilityID, ProviderId: providerID,
+	}
+	if expectedManifestDigest != "" {
+		d, err := digest(expectedManifestDigest)
+		if err != nil {
+			return false, "", err
+		}
+		req.ExpectedManifestDigest = d
 	}
 	callCtx, cancel := c.callContext(ctx, time.Time{})
 	defer cancel()
-	request := connect.NewRequest(&atostosv1.VerifyCapabilityOwnershipRequest{
-		Context:      c.requestContext(ctx, providerID, "", time.Time{}),
-		CapabilityId: capabilityID, ProviderId: providerID,
-	})
+	request := connect.NewRequest(req)
 	decorateRequest(c, ctx, request)
 	response, err := c.capability.VerifyCapabilityOwnership(callCtx, request)
 	if err != nil {
-		return false, rpcError(err)
+		return false, "", rpcError(err)
 	}
-	return response.Msg != nil && response.Msg.Verified, nil
+	if response.Msg == nil {
+		return false, "NOT_FOUND", nil
+	}
+	return response.Msg.Verified, response.Msg.ReasonCode, nil
 }
 
 func (c *Client) UpdateReputationEvidence(context.Context, string, string) error {
