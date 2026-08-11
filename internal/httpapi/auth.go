@@ -70,7 +70,15 @@ func (s *Server) handleAuthDeviceToken(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeTokenPair(w, http.StatusOK, pair)
+}
+
+// writeTokenPair renders the token response shape common to every issuance
+// path (device-code exchange, refresh, passkey register/login) -- one
+// shape, one place it's built, per docs/AUTH.md's own token-response
+// examples.
+func writeTokenPair(w http.ResponseWriter, status int, pair auth.TokenPair) {
+	writeJSON(w, status, map[string]any{
 		"access_token":  pair.AccessToken,
 		"token_type":    "Bearer",
 		"expires_in":    pair.ExpiresIn,
@@ -294,15 +302,7 @@ func (s *Server) handleAuthTokenRefresh(w http.ResponseWriter, r *http.Request) 
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_grant", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"access_token":  pair.AccessToken,
-		"token_type":    "Bearer",
-		"expires_in":    pair.ExpiresIn,
-		"refresh_token": pair.RefreshToken,
-		"principal_id":  pair.Principal.ID,
-		"device_id":     pair.Principal.DeviceID,
-		"scopes":        pair.Principal.ScopeStrings(),
-	})
+	writeTokenPair(w, http.StatusOK, pair)
 }
 
 func (s *Server) handleAuthRevoke(w http.ResponseWriter, r *http.Request) {

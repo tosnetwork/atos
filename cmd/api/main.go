@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-webauthn/webauthn/webauthn"
+
 	"github.com/tosnetwork/atos/internal/a2a"
 	"github.com/tosnetwork/atos/internal/adapters/payout"
 	payoutmock "github.com/tosnetwork/atos/internal/adapters/payout/mock"
@@ -211,6 +213,24 @@ func main() {
 	activationAuthority := service.FailClosedActivationAuthority{}
 	openTasks := service.NewOpenTaskService(st, quotes, jobs)
 
+	// Passkey/WebAuthn human account authentication (atos-spec
+	// docs/AUTH.md's "Human Account Authentication (Passkey/WebAuthn)"
+	// section) is opt-in: a deployment that hasn't set ATOS_WEBAUTHN_RP_ID
+	// gets a PasskeyService with a nil webAuthn instance, which every
+	// method already fails closed against (ErrPasskeyNotConfigured) rather
+	// than this process refusing to start.
+	var webAuthnInstance *webauthn.WebAuthn
+	if cfg.WebAuthn.RPID != "" {
+		webAuthnInstance, err = webauthn.New(&webauthn.Config{
+			RPID: cfg.WebAuthn.RPID, RPDisplayName: cfg.WebAuthn.RPDisplayName, RPOrigins: cfg.WebAuthn.RPOrigins,
+		})
+		if err != nil {
+			logger.Error("initialize WebAuthn failed", "error", err)
+			os.Exit(1)
+		}
+	}
+	passkeys := service.NewPasskeyService(st, webAuthnInstance, authorization)
+
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
 	defer reconcileCancel()
 	go jobs.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
@@ -231,6 +251,20 @@ func main() {
 	go openTasks.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("open task acceptance reconciliation pending", "error", reconcileErr)
 	})
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-reconcileCtx.Done():
+				return
+			case <-ticker.C:
+				if _, err := passkeys.PurgeExpiredCeremonies(reconcileCtx); err != nil {
+					logger.Error("passkey ceremony purge failed", "error", err)
+				}
+			}
+		}
+	}()
 
 	if err := seedDemoCapability(capabilities, cfg.TOSBackend); err != nil {
 		logger.Error("failed to seed demo capability", "error", err)
@@ -240,6 +274,7 @@ func main() {
 	restServer := &httpapi.Server{
 		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,
 		Certifications:      certifications,
+		Passkeys:            passkeys,
 		ActivationAuthority: activationAuthority, OpenTasks: openTasks, Quotes: quotes,
 		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts,
 		Earnings: earnings, Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,

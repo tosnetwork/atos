@@ -54,6 +54,12 @@ type Server struct {
 	Health           *service.HealthService
 	ExecutionSigners *service.ExecutionSignerService
 	Certifications   *service.CertificationService
+	// Passkeys backs POST /v1/auth/passkey/... -- production wiring MUST
+	// always set it (service.NewPasskeyService is nil-webAuthn-safe: every
+	// method fails closed with ErrPasskeyNotConfigured when
+	// ATOS_WEBAUTHN_RP_ID is unset, rather than the Server itself needing a
+	// nil check per handler).
+	Passkeys *service.PasskeyService
 	// ActivationAuthority backs POST /capabilities/{id}/activation/evaluate
 	// (atos-spec docs/API.md §2.2) -- unlike Health, this is not optional:
 	// production wiring MUST always set it (service.FailClosedActivationAuthority
@@ -96,6 +102,11 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("POST /v1/auth/revoke", s.withScopes(s.handleAuthRevoke))
 	mux.HandleFunc("GET /v1/auth/devices", s.withScopes(s.handleListDevices))
 	mux.HandleFunc("DELETE /v1/auth/devices/{id}", s.withScopes(s.handleRevokeDevice))
+
+	mux.HandleFunc("POST /v1/auth/passkey/register/begin", s.handleBeginPasskeyRegistration)
+	mux.HandleFunc("POST /v1/auth/passkey/register/finish/{ceremony_id}", s.handleFinishPasskeyRegistration)
+	mux.HandleFunc("POST /v1/auth/passkey/login/begin", s.handleBeginPasskeyLogin)
+	mux.HandleFunc("POST /v1/auth/passkey/login/finish/{ceremony_id}", s.handleFinishPasskeyLogin)
 
 	mux.HandleFunc("GET /v1/capabilities", s.withScopes(s.handleSearchCapabilities, auth.ScopeCapabilitiesRead))
 	mux.HandleFunc("GET /v1/capabilities/mine", s.withScopes(s.handleListMyCapabilities, auth.ScopeCapabilitiesWrite))

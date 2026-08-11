@@ -70,6 +70,18 @@ type AuthConfig struct {
 	PollInterval       time.Duration
 }
 
+// WebAuthnConfig backs the passkey/WebAuthn human-account authentication
+// system (atos-spec docs/AUTH.md's "Human Account Authentication
+// (Passkey/WebAuthn)" section) -- deliberately separate from AuthConfig,
+// which governs the pre-existing Device Authorization mechanism these
+// passkey ceremonies issue tokens through (see
+// auth.Service.IssueForPrincipal), not a parallel token system.
+type WebAuthnConfig struct {
+	RPID          string
+	RPDisplayName string
+	RPOrigins     []string
+}
+
 type ManagedAccountConfig struct {
 	Currency       string
 	InitialBalance string
@@ -84,6 +96,7 @@ type Config struct {
 	BlobDir        string
 	PublicBaseURL  string
 	Auth           AuthConfig
+	WebAuthn       WebAuthnConfig
 	ManagedAccount ManagedAccountConfig
 	TOSBackend     TOSBackend
 	TOSRPC         TOSRPCConfig
@@ -148,6 +161,11 @@ func Load() (Config, error) {
 			AdminApprovalToken: strings.TrimSpace(os.Getenv("ATOS_ADMIN_APPROVAL_TOKEN")),
 			TokenTTL:           tokenTTL, DeviceTTL: deviceTTL, PollInterval: pollInterval,
 		},
+		WebAuthn: WebAuthnConfig{
+			RPID:          strings.TrimSpace(os.Getenv("ATOS_WEBAUTHN_RP_ID")),
+			RPDisplayName: envOr("ATOS_WEBAUTHN_RP_NAME", "ATOS"),
+			RPOrigins:     webAuthnOrigins(strings.TrimSpace(os.Getenv("ATOS_WEBAUTHN_RP_ORIGINS"))),
+		},
 		ManagedAccount: ManagedAccountConfig{
 			Currency:       strings.ToUpper(envOr("ATOS_MANAGED_CURRENCY", "USD")),
 			InitialBalance: envOr("ATOS_MANAGED_INITIAL_BALANCE", "25.00"),
@@ -166,6 +184,20 @@ func Load() (Config, error) {
 		},
 		PayoutBackend:             PayoutBackend(strings.ToLower(envOr("ATOS_PAYOUT_BACKEND", string(PayoutBackendDisabled)))),
 		RemoteThirdPartyExecution: remoteThirdParty,
+	}
+	// WebAuthn RPID/RPOrigins default from PublicBaseURL when unset, the
+	// same way atos-aidrop derives its own RP config from PublicHostname/
+	// PublicURL -- passkey auth is opt-in (cmd/api/main.go skips wiring it
+	// entirely when RPID is empty), so this only matters once an operator
+	// sets ATOS_WEBAUTHN_RP_ID or ATOS_WEBAUTHN_RP_ORIGINS explicitly, or
+	// relies on this default alongside them.
+	if cfg.WebAuthn.RPID == "" {
+		if parsed, err := url.Parse(cfg.PublicBaseURL); err == nil {
+			cfg.WebAuthn.RPID = parsed.Hostname()
+		}
+	}
+	if len(cfg.WebAuthn.RPOrigins) == 0 {
+		cfg.WebAuthn.RPOrigins = []string{cfg.PublicBaseURL}
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -252,6 +284,23 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// webAuthnOrigins splits a comma-separated ATOS_WEBAUTHN_RP_ORIGINS value,
+// trimming whitespace around each entry. An empty input yields an empty
+// slice -- the caller defaults it from PublicBaseURL afterward.
+func webAuthnOrigins(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func envOr(name, fallback string) string {
