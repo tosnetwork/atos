@@ -24,7 +24,8 @@ import (
 const (
 	quoteTTL            = 10 * time.Minute
 	quoteDecimals       = 2
-	defaultFeeRate      = 0.05
+	verifiedTOSDecimals = 9
+	defaultFeePerMille  = int64(50)
 	defaultExecutionTTL = 15 * time.Minute
 	defaultMaxOutput    = 1 << 20
 )
@@ -372,7 +373,14 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 		return domain.Quote{}, domain.NewError(domain.ErrProofProfileUnavailable, err.Error(), false)
 	}
 
-	subtotal, err := money.Parse(cap.Pricing.PriceHint.Amount, cap.Pricing.PriceHint.Currency, quoteDecimals)
+	priceDecimals := quoteDecimals
+	if mode == domain.TrustModeVerified {
+		if cap.Pricing.PriceHint.Currency != "TOS" {
+			return domain.Quote{}, domain.NewError(domain.ErrCapabilityUnavailable, "verified capabilities must be priced directly in TOS", false)
+		}
+		priceDecimals = verifiedTOSDecimals
+	}
+	subtotal, err := money.Parse(cap.Pricing.PriceHint.Amount, cap.Pricing.PriceHint.Currency, priceDecimals)
 	if err != nil {
 		return domain.Quote{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability has an invalid price_hint", false)
 	}
@@ -384,7 +392,7 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 	if err := validatePricing(cap.Pricing); err != nil {
 		return domain.Quote{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability has invalid metered pricing: "+err.Error(), false)
 	}
-	fees, err := applyFeeRate(subtotal, defaultFeeRate)
+	fees, err := applyFeeRate(subtotal, defaultFeePerMille)
 	if err != nil {
 		return domain.Quote{}, err
 	}
@@ -409,7 +417,7 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 			return domain.Quote{}, domain.NewError(domain.ErrValidationFailed,
 				fmt.Sprintf("constraints.max_total is in %s but this capability prices in %s", in.MaxTotal.Currency, subtotal.Currency), false)
 		}
-		bound, err := money.Parse(in.MaxTotal.Amount, subtotal.Currency, quoteDecimals)
+		bound, err := money.Parse(in.MaxTotal.Amount, subtotal.Currency, priceDecimals)
 		if err != nil {
 			return domain.Quote{}, domain.NewError(domain.ErrValidationFailed, "invalid constraints.max_total.amount", false)
 		}
@@ -528,7 +536,7 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 		if s.core == nil || s.signers == nil || s.core.Network() == "" {
 			return domain.Quote{}, domain.NewError(domain.ErrNetworkUnavailable, "verified quote commitment authority is unavailable", true)
 		}
-		q.NetworkID, q.CommitmentDomain, q.AssetDecimals = s.core.Network(), s.commitmentDomain, quoteDecimals
+		q.NetworkID, q.CommitmentDomain, q.AssetDecimals = s.core.Network(), s.commitmentDomain, uint32(priceDecimals)
 		q.CommitmentVersion, q.CommitmentCanonicalization = quotecommitment.Version, quotecommitment.Canonicalization
 		requester, bound, revoked, _, err := s.core.ResolvePrincipalBindingStatus(ctx, q.PrincipalID)
 		if err != nil {
@@ -713,9 +721,12 @@ func (s *QuoteService) Get(ctx context.Context, id string) (domain.Quote, error)
 	return q, nil
 }
 
-func applyFeeRate(amount money.Amount, rate float64) (money.Amount, error) {
-	ratePerMille := big.NewInt(int64(rate * 1000))
-	scaled := new(big.Int).Mul(amount.Minor, ratePerMille)
+func applyFeeRate(amount money.Amount, ratePerMille int64) (money.Amount, error) {
+	if ratePerMille < 0 {
+		return money.Amount{}, domain.NewError(domain.ErrValidationFailed, "fee rate cannot be negative", false)
+	}
+	rate := big.NewInt(ratePerMille)
+	scaled := new(big.Int).Mul(amount.Minor, rate)
 	scaled.Div(scaled, big.NewInt(1000))
 	return money.Amount{Minor: scaled, Currency: amount.Currency, Decimals: amount.Decimals}, nil
 }

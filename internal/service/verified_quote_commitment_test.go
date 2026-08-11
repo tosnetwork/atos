@@ -27,7 +27,7 @@ func verifiedQuoteHarness(t *testing.T) (*service.QuoteService, *service.Executi
 	if _, _, err := core.CreatePrincipalBinding(ctx, "gateway", "bind-provider", "provider", "provider-agent"); err != nil {
 		t.Fatal(err)
 	}
-	cap := domain.Capability{ID: "cap-verified", ProviderID: "provider", Name: "Verified", Description: "test", Version: "1.0.0", ManifestCommitment: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Status: domain.CapabilityActive, DeliveryMode: domain.DeliveryInstant, InputSchema: map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"}, Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}}, ModeSupport: domain.ModeSupport{domain.TrustModeVerified: {Status: domain.ModeSupportActive, ProofProfile: domain.ProofProfileTOSVerifiedV1}}, SupportedTrustModes: []domain.TrustMode{domain.TrustModeVerified}}
+	cap := domain.Capability{ID: "cap-verified", ProviderID: "provider", Name: "Verified", Description: "test", Version: "1.0.0", ManifestCommitment: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Status: domain.CapabilityActive, DeliveryMode: domain.DeliveryInstant, InputSchema: map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"}, Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.000000000", Currency: "TOS"}}, ModeSupport: domain.ModeSupport{domain.TrustModeVerified: {Status: domain.ModeSupportActive, ProofProfile: domain.ProofProfileTOSVerifiedV1}}, SupportedTrustModes: []domain.TrustMode{domain.TrustModeVerified}}
 	ref, err := core.CommitCapabilityManifest(ctx, cap)
 	if err != nil {
 		t.Fatal(err)
@@ -53,6 +53,9 @@ func TestVerifiedQuoteIsCommittedBeforeUsableAndAutoIsConcrete(t *testing.T) {
 	}
 	if q.TrustMode != domain.TrustModeVerified || q.Commitment == nil || !q.Commitment.Finalized || q.Commitment.State != "committed" {
 		t.Fatalf("quote not canonically committed: %+v", q)
+	}
+	if q.Price.Subtotal != "1.000000000" || q.Price.Fees != "0.050000000" || q.Price.TotalMax != "1.050000000" || q.AssetDecimals != 9 {
+		t.Fatalf("non-canonical nanoTOS quote arithmetic: %+v", q.Price)
 	}
 	stored, err := st.GetQuote(context.Background(), q.ID)
 	if err != nil || stored.Commitment.Reference != q.Commitment.Reference {

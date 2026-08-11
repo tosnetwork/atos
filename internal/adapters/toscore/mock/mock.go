@@ -420,6 +420,17 @@ func (c *Core) RevokeExecutionSigner(ctx context.Context, req toscore.RevokeExec
 }
 
 func (c *Core) CreateEscrow(ctx context.Context, req toscore.CreateEscrowRequest) (domain.Escrow, error) {
+	if req.Quote.ID != "" {
+		req.QuoteID = req.Quote.ID
+		req.CapabilityID = req.Quote.CapabilityID
+		req.CapabilityVersion = req.Quote.CapabilityVersion
+		req.PrincipalID = req.Quote.PrincipalID
+		req.ProviderID = req.Quote.ProviderID
+		req.TrustMode = req.Quote.TrustMode
+		req.ProofProfile = req.Quote.ProofProfile
+		req.Settlement = req.Quote.Settlement
+		req.Reserved = domain.Money{Amount: req.Quote.Price.TotalMax, Currency: req.Quote.Price.Currency}
+	}
 	if req.TrustMode == "" {
 		req.TrustMode = domain.TrustModeManaged
 	}
@@ -463,6 +474,15 @@ func (c *Core) CreateEscrow(ctx context.Context, req toscore.CreateEscrowRequest
 	}
 	if c.simulated && req.TrustMode != domain.TrustModeManaged {
 		e.NetworkProofRef = simulatedRef("escrow", req.TrustMode, e.ID)
+		if req.Quote.Commitment != nil {
+			e.QuoteCommitmentDigest = req.Quote.Commitment.Digest
+			e.QuoteCommitmentRef = req.Quote.Commitment.Reference
+		}
+		e.ReservationDigest = "sha256:mock-reservation"
+		e.ReservationActionID = "action:mock:" + e.ID
+		e.ContractCodeHash = "sha256:mock-task-escrow-code"
+		e.Finalized = true
+		e.FinalizedCheckpoint = 1
 	}
 	if err := c.store.PutEscrow(ctx, e); err != nil {
 		return domain.Escrow{}, err
@@ -470,32 +490,53 @@ func (c *Core) CreateEscrow(ctx context.Context, req toscore.CreateEscrowRequest
 	return e, nil
 }
 
-func (c *Core) ReleaseEscrow(ctx context.Context, escrowID string) (domain.Receipt, error) {
+func (c *Core) GetEscrow(ctx context.Context, req toscore.GetEscrowRequest) (domain.Escrow, bool, error) {
+	e, err := c.store.EscrowByJob(ctx, req.JobID)
+	if err == store.ErrNotFound {
+		return domain.Escrow{}, false, nil
+	}
+	if err != nil {
+		return domain.Escrow{}, false, err
+	}
+	if req.EscrowID != "" && e.ID != req.EscrowID {
+		return domain.Escrow{}, false, domain.NewError(domain.ErrQuoteMismatch, "escrow assertion mismatch", false)
+	}
+	return e, true, nil
+}
+
+func (c *Core) ReleaseEscrow(ctx context.Context, req toscore.ReleaseEscrowRequest) (toscore.ReleaseEscrowResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	e, err := c.store.GetEscrow(ctx, escrowID)
+	e, err := c.store.GetEscrow(ctx, req.EscrowID)
 	if err != nil {
-		return domain.Receipt{}, err
+		return toscore.ReleaseEscrowResult{}, err
 	}
 	if e.Status == domain.EscrowReleased {
 		if receipt, replayErr := c.store.ReceiptByJob(ctx, e.JobID); replayErr == nil && receipt.EscrowID == e.ID && receipt.Status == domain.ReceiptReleased {
-			return receipt, nil
+			return toscore.ReleaseEscrowResult{Escrow: e, Receipt: receipt}, nil
 		}
 	}
 	if e.Status.Terminal() {
-		return domain.Receipt{}, domain.NewError(domain.ErrSettlementFailed, "escrow already in a terminal state", false)
+		return toscore.ReleaseEscrowResult{}, domain.NewError(domain.ErrSettlementFailed, "escrow already in a terminal state", false)
 	}
 	now := time.Now().UTC()
 	e.Status = domain.EscrowReleased
 	e.SettledAt = &now
+	if e.TrustMode == domain.TrustModeVerified {
+		e.ReleaseReason = req.ReasonCode
+		e.ReleaseDigest = "sha256:mock-release"
+		e.ReleaseActionID = "action:mock:release:" + e.ID
+		e.ReleaseRef = simulatedRef("escrow-release", e.TrustMode, e.ID)
+		e.NetworkProofRef = e.ReleaseRef
+	}
 	if e.TrustMode == domain.TrustModeManaged {
 		e.NetworkProofRef = ""
 	}
 	if err := c.store.PutEscrow(ctx, e); err != nil {
-		return domain.Receipt{}, err
+		return toscore.ReleaseEscrowResult{}, err
 	}
-	delete(c.verified, escrowID)
+	delete(c.verified, req.EscrowID)
 
 	receipt := domain.Receipt{
 		ID:           "rcpt_release_" + e.ID,
@@ -512,9 +553,9 @@ func (c *Core) ReleaseEscrow(ctx context.Context, escrowID string) (domain.Recei
 		CreatedAt:    now,
 	}
 	if err := c.store.PutReceipt(ctx, receipt); err != nil {
-		return domain.Receipt{}, err
+		return toscore.ReleaseEscrowResult{}, err
 	}
-	return receipt, nil
+	return toscore.ReleaseEscrowResult{Escrow: e, Receipt: receipt}, nil
 }
 
 func (c *Core) CommitExecutionReceipt(ctx context.Context, receipt domain.ExecutionReceipt) (string, error) {

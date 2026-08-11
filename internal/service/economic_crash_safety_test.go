@@ -207,13 +207,13 @@ type loseReleaseResponseCore struct {
 	lost bool
 }
 
-func (c *loseReleaseResponseCore) ReleaseEscrow(ctx context.Context, escrowID string) (domain.Receipt, error) {
-	receipt, err := c.Core.ReleaseEscrow(ctx, escrowID)
+func (c *loseReleaseResponseCore) ReleaseEscrow(ctx context.Context, req toscore.ReleaseEscrowRequest) (toscore.ReleaseEscrowResult, error) {
+	result, err := c.Core.ReleaseEscrow(ctx, req)
 	if err == nil && !c.lost {
 		c.lost = true
-		return domain.Receipt{}, domain.NewError(domain.ErrNetworkUnavailable, "injected lost ReleaseEscrow response", true)
+		return toscore.ReleaseEscrowResult{}, domain.NewError(domain.ErrNetworkUnavailable, "injected lost ReleaseEscrow response", true)
 	}
-	return receipt, err
+	return result, err
 }
 
 type terminalFailureProvider struct{ tosai.Provider }

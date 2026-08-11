@@ -187,9 +187,12 @@ func (s *JobService) submit(ctx context.Context, in SubmitInput, waitInline bool
 		return SubmitResult{}, domain.NewError(domain.ErrQuoteModeMismatch, "quote proof profile does not match trust mode", false)
 	}
 
-	needsConfirmation, err := s.accounts.RequiresConfirmation(ctx, in.PrincipalID, quote.Price.TotalMax, quote.Price.Currency)
-	if err != nil {
-		return SubmitResult{}, err
+	needsConfirmation := false
+	if quote.TrustMode != domain.TrustModeVerified {
+		needsConfirmation, err = s.accounts.RequiresConfirmation(ctx, in.PrincipalID, quote.Price.TotalMax, quote.Price.Currency)
+		if err != nil {
+			return SubmitResult{}, err
+		}
 	}
 	state := domain.JobSubmitted
 	proofStatus := domain.InitialProofStatus(quote.TrustMode)

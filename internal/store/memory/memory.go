@@ -20,6 +20,7 @@ type Store struct {
 	quotes                     map[string]domain.Quote
 	quoteCommitmentOps         map[string]domain.QuoteCommitmentOperation
 	escrows                    map[string]domain.Escrow
+	escrowOperations           map[string]domain.EscrowOperation
 	receipts                   map[string]domain.Receipt
 	receiptsByJob              map[string]string // jobID -> receiptID
 	jobs                       map[string]domain.Job
@@ -61,6 +62,7 @@ func New() *Store {
 		quotes:                     make(map[string]domain.Quote),
 		quoteCommitmentOps:         make(map[string]domain.QuoteCommitmentOperation),
 		escrows:                    make(map[string]domain.Escrow),
+		escrowOperations:           make(map[string]domain.EscrowOperation),
 		receipts:                   make(map[string]domain.Receipt),
 		receiptsByJob:              make(map[string]string),
 		jobs:                       make(map[string]domain.Job),
@@ -296,6 +298,9 @@ func (s *Store) StaleQuoteCommitmentOperations(_ context.Context, cutoff time.Ti
 func (s *Store) PutEscrow(ctx context.Context, e domain.Escrow) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if current, ok := s.escrows[e.ID]; ok && current.Status.Terminal() && e.Status != current.Status {
+		return store.ErrConflict
+	}
 	s.escrows[e.ID] = e
 	return nil
 }
@@ -319,6 +324,70 @@ func (s *Store) EscrowByJob(ctx context.Context, jobID string) (domain.Escrow, e
 		}
 	}
 	return domain.Escrow{}, store.ErrNotFound
+}
+
+func escrowOperationKey(jobID string, kind domain.EscrowOperationKind) string {
+	return jobID + ":" + string(kind)
+}
+func (s *Store) OpenEscrowOperation(_ context.Context, op domain.EscrowOperation) (domain.EscrowOperation, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := escrowOperationKey(op.JobID, op.Kind)
+	if current, ok := s.escrowOperations[k]; ok {
+		return current, false, nil
+	}
+	s.escrowOperations[k] = op
+	return op, true, nil
+}
+func (s *Store) GetEscrowOperation(_ context.Context, jobID string, kind domain.EscrowOperationKind) (domain.EscrowOperation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	op, ok := s.escrowOperations[escrowOperationKey(jobID, kind)]
+	if !ok {
+		return op, store.ErrNotFound
+	}
+	return op, nil
+}
+func (s *Store) UpdateEscrowOperation(_ context.Context, jobID string, kind domain.EscrowOperationKind, fn func(domain.EscrowOperation) (domain.EscrowOperation, error)) (domain.EscrowOperation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := escrowOperationKey(jobID, kind)
+	current, ok := s.escrowOperations[k]
+	if !ok {
+		return current, store.ErrNotFound
+	}
+	if current.Checkpoint.Terminal() {
+		return current, nil
+	}
+	next, err := fn(current)
+	if err != nil {
+		return current, err
+	}
+	if !current.Checkpoint.CanAdvance(next.Checkpoint, kind) {
+		return current, store.ErrConflict
+	}
+	s.escrowOperations[k] = next
+	return next, nil
+}
+func (s *Store) StaleEscrowOperations(_ context.Context, cutoff time.Time, limit int) ([]domain.EscrowOperation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []domain.EscrowOperation
+	for _, op := range s.escrowOperations {
+		if !op.Checkpoint.Terminal() && !op.UpdatedAt.After(cutoff) {
+			out = append(out, op)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].UpdatedAt.Before(out[j].UpdatedAt)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 func (s *Store) PutReceipt(ctx context.Context, r domain.Receipt) error {
