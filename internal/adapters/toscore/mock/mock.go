@@ -33,6 +33,15 @@ type Core struct {
 	// meaningful authorize/revoke/idempotency-conflict behavior against
 	// this mock without needing the real tos-protocol RPC server.
 	signers map[string]toscore.ExecutionSignerAuthorization
+	// agentIdentities simulates tos-protocol's bucketIdentities: an
+	// agent_id must be "seeded" (present here) before CreatePrincipalBinding
+	// will bind to it, mirroring the real server's identical requirement.
+	agentIdentities map[string]bool
+	// principalBindings/revokedBindings mirror tos-protocol's
+	// bucketPrincipalBindings/bucketPrincipalRevocations split exactly, for
+	// the same "never bound" vs "bound then revoked" distinction.
+	principalBindings map[string]domain.PrincipalIdentityBinding
+	revokedBindings   map[string]string // principalID -> reason_code
 }
 
 func New(s store.Store) *Core {
@@ -54,8 +63,21 @@ func newCore(s store.Store, simulated bool, modes ...domain.TrustMode) *Core {
 	return &Core{
 		store: s, verified: make(map[string]domain.ExecutionReceipt),
 		quotes: make(map[string]domain.Quote), modes: allowed, simulated: simulated,
-		signers: make(map[string]toscore.ExecutionSignerAuthorization),
+		signers:           make(map[string]toscore.ExecutionSignerAuthorization),
+		agentIdentities:   make(map[string]bool),
+		principalBindings: make(map[string]domain.PrincipalIdentityBinding),
+		revokedBindings:   make(map[string]string),
 	}
+}
+
+// SeedAgentIdentity registers agentID as an existing TOS Agent Identity,
+// mirroring tos-protocol's SeedIdentity bootstrap path -- tests must call
+// this before CreatePrincipalBinding will succeed, exactly like the real
+// server requires an identity to already resolve before it can be bound.
+func (c *Core) SeedAgentIdentity(agentID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.agentIdentities[agentID] = true
 }
 
 func (c *Core) supports(mode domain.TrustMode) bool {
@@ -68,6 +90,50 @@ func simulatedRef(kind string, mode domain.TrustMode, id string) string {
 
 func (c *Core) ResolveAgent(ctx context.Context, principalID string) (string, error) {
 	return principalID, nil
+}
+
+func (c *Core) ResolvePrincipalBindingStatus(ctx context.Context, principalID string) (domain.PrincipalIdentityBinding, bool, bool, string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if b, ok := c.principalBindings[principalID]; ok {
+		return b, true, false, "", nil
+	}
+	if reason, ok := c.revokedBindings[principalID]; ok {
+		return domain.PrincipalIdentityBinding{}, false, true, reason, nil
+	}
+	return domain.PrincipalIdentityBinding{}, false, false, "", nil
+}
+
+func (c *Core) CreatePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, agentID string) (domain.PrincipalIdentityBinding, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.agentIdentities[agentID] {
+		return domain.PrincipalIdentityBinding{}, false, domain.NewError(domain.ErrNotFound, "agent identity does not exist; it must be established before it can be bound", false)
+	}
+	if existing, ok := c.principalBindings[principalID]; ok {
+		if existing.AgentID != agentID {
+			return domain.PrincipalIdentityBinding{}, false, domain.NewError(domain.ErrIdempotencyConflict, "principal is already bound to a different TOS Agent Identity; revoke the existing binding first", false)
+		}
+		return existing, false, nil
+	}
+	binding := domain.PrincipalIdentityBinding{
+		PrincipalID: principalID, AgentID: agentID, Network: "tos-mock",
+		BindingRef: simulatedRef("principal-binding", domain.TrustModeManaged, principalID+":"+agentID),
+	}
+	c.principalBindings[principalID] = binding
+	delete(c.revokedBindings, principalID)
+	return binding, true, nil
+}
+
+func (c *Core) RevokePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, reasonCode string) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.principalBindings[principalID]; !ok {
+		return false, nil
+	}
+	delete(c.principalBindings, principalID)
+	c.revokedBindings[principalID] = reasonCode
+	return true, nil
 }
 
 func (c *Core) ResolveCapability(ctx context.Context, capabilityID string) (domain.Trust, error) {

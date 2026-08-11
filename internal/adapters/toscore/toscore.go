@@ -87,6 +87,16 @@ type Core interface {
 	VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID string) (bool, error)
 	UpdateReputationEvidence(ctx context.Context, providerID string, evidence string) error
 
+	// Phase 4A identity binding (docs/IMPLEMENTATION_ROADMAP.md §8.1).
+	// Deliberately separate from ResolveAgent above, which silently falls
+	// back to treating principal_id itself as the agent identity for
+	// Managed-compatible callers -- a Phase 4A authority decision must
+	// never accept that fallback silently, so it uses
+	// ResolvePrincipalBindingStatus instead.
+	ResolvePrincipalBindingStatus(ctx context.Context, principalID string) (binding domain.PrincipalIdentityBinding, bound, revoked bool, revocationReasonCode string, err error)
+	CreatePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, agentID string) (domain.PrincipalIdentityBinding, bool, error)
+	RevokePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, reasonCode string) (revoked bool, err error)
+
 	// Quote and execution-signer trust.
 	CommitQuote(ctx context.Context, quote domain.Quote) (proofRef string, err error)
 	ResolveExecutionSignerAuthorization(ctx context.Context, providerID, capabilityID, capabilityVersion, signerID string, at time.Time) (ExecutionSignerAuthorization, bool, error)
