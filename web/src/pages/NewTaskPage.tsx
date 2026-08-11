@@ -17,7 +17,15 @@ export function NewTaskPage() {
   const [error, setError] = useState<unknown>()
   const [submitting, setSubmitting] = useState(false)
   const [trust, setTrust] = useState('managed')
-  const minimum = useMemo(() => { const d = new Date(Date.now() + 60_000); d.setSeconds(0, 0); return d.toISOString().slice(0, 16) }, [])
+  // datetime-local's value/min/max are timezone-naive local wall-clock
+  // strings (HTML spec) -- toISOString() would emit UTC, which silently
+  // shifts the minimum by the browser's UTC offset for anyone not in UTC+0.
+  const minimum = useMemo(() => {
+    const d = new Date(Date.now() + 60_000)
+    d.setSeconds(0, 0)
+    const pad = (n: number) => String(n).padStart(2, '0')
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+  }, [])
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
