@@ -33,6 +33,15 @@ export type Proposal = {
   updated_at: string
 }
 
+export type Capability = {
+  id: string
+  provider_id: string
+  name: string
+  description: string
+  version: string
+  status: string
+}
+
 export type Acceptance = {
   id: string
   task_id: string
@@ -56,4 +65,4 @@ export type Quote = {
   expires_at: string
 }
 
-export type Session = { accessToken: string; refreshToken: string; expiresAt: number; principalId: string; scopes: string[] }
+export type Session = { accessToken: string; refreshToken: string; expiresAt: number; principalId: string; deviceId?: string; scopes: string[] }
