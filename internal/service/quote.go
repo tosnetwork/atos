@@ -125,7 +125,7 @@ func (s *QuoteService) Create(ctx context.Context, in CreateQuoteInput) (domain.
 
 	requestHash := hashRequest("atos-quote-v1", in.CapabilityID, in.InputSummary,
 		string(in.RequestedTrustMode), in.ProofRequirements, in.MaxTotal, in.ExpectedCapabilityVersion)
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Millisecond)
 	rec, reserved, err := s.store.Reserve(ctx, in.PrincipalID, in.IdempotencyKey, requestHash, now.Add(idempotencyLease))
 	if err != nil {
 		return domain.Quote{}, err
@@ -390,7 +390,7 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 	}
 
 	settlement, proof := quoteGuarantees(mode, subtotal.Currency)
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Millisecond)
 	executionDeadline := now.Add(defaultExecutionTTL)
 	if cap.SLA.TimeoutMS > 0 {
 		executionDeadline = now.Add(time.Duration(cap.SLA.TimeoutMS) * time.Millisecond)
@@ -415,7 +415,7 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 		if serviceQuote.ID == "" || serviceQuote.ExpiresAt.IsZero() || serviceQuote.ExecutionDeadline.IsZero() {
 			return domain.Quote{}, domain.NewError(domain.ErrProviderFailed, "tos-protocol returned an incomplete service execution quote", true)
 		}
-		executionDeadline = serviceQuote.ExecutionDeadline
+		executionDeadline = serviceQuote.ExecutionDeadline.UTC().Truncate(time.Millisecond)
 	}
 	disputePolicyHash := termsHash("atos-dispute-policy", "v0.2", "72h")
 	// Frozen here, at the same Capability snapshot ("cap") already used
@@ -466,7 +466,7 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 		q.ServiceQuoteID = serviceQuote.ID
 		q.UnderlyingServiceQuoteRef = serviceQuote.Reference
 		if serviceQuote.ExpiresAt.Before(q.ExpiresAt) {
-			q.ExpiresAt = serviceQuote.ExpiresAt
+			q.ExpiresAt = serviceQuote.ExpiresAt.UTC().Truncate(time.Millisecond)
 		}
 	}
 	q.TermsHash = termsHash(
