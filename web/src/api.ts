@@ -1,4 +1,4 @@
-import type { Acceptance, Job, OpenTask, Proposal, Quote, Session } from './types'
+import type { Acceptance, Capability, Job, Money, OpenTask, Proposal, Quote, Session } from './types'
 
 const API_ROOT = (import.meta.env.VITE_API_ROOT || '/v1').replace(/\/$/, '')
 
@@ -24,12 +24,15 @@ export const api = {
   listTasks: (session: Session, limit = 100) => request<{ open_tasks: OpenTask[] }>(`/open-tasks?limit=${limit}`, session),
   getTask: (session: Session, id: string) => request<OpenTask>(`/open-tasks/${encodeURIComponent(id)}`, session),
   getProposals: (session: Session, id: string) => request<{ proposals: Proposal[] }>(`/open-tasks/${encodeURIComponent(id)}/proposals`, session),
+  listMyCapabilities: (session: Session) => request<{ capabilities: Capability[] }>('/capabilities/mine', session),
   publish: (session: Session, body: object) => request<OpenTask>('/open-tasks', session, { method: 'POST', body: JSON.stringify(body) }),
+  propose: (session: Session, taskId: string, body: { capability_id: string; message?: string; proposed_price?: Money; idempotency_key: string }) => request<Proposal>(`/open-tasks/${encodeURIComponent(taskId)}/proposals`, session, { method: 'POST', body: JSON.stringify(body) }),
+  withdrawProposal: (session: Session, taskId: string, proposalId: string) => request<Proposal>(`/open-tasks/${encodeURIComponent(taskId)}/proposals/${encodeURIComponent(proposalId)}/withdraw`, session, { method: 'POST' }),
   accept: (session: Session, taskId: string, proposalId: string, idempotencyKey: string) => request<{ open_task: OpenTask; acceptance: Acceptance }>(`/open-tasks/${encodeURIComponent(taskId)}/proposals/${encodeURIComponent(proposalId)}/accept`, session, { method: 'POST', body: JSON.stringify({ idempotency_key: idempotencyKey }) }),
   getJob: (session: Session, id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}`, session),
   getQuote: (session: Session, id: string) => request<Quote>(`/quotes/${encodeURIComponent(id)}`, session),
 }
 
-export function idempotencyKey(action: 'publish' | 'accept') {
+export function idempotencyKey(action: 'publish' | 'propose' | 'accept') {
   return `task-${action}-${crypto.randomUUID()}`
 }
