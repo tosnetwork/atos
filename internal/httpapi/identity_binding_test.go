@@ -196,6 +196,50 @@ func TestHandleIdentityBindingStatus_BoundThenRevoked(t *testing.T) {
 	}
 }
 
+// TestHandleRevokeIdentity_RetryWithFreshKeyIsInternallyConsistent proves a
+// lost-response retry under a DIFFERENT Idempotency-Key (the documented
+// safe retry pattern) reports revoked:true with the ORIGINAL network/
+// revocation_ref -- not revoked:false alongside a populated network/
+// revocation_ref, which would violate this endpoint's own contract that
+// those fields are only ever populated when revoked:true.
+func TestHandleRevokeIdentity_RetryWithFreshKeyIsInternallyConsistent(t *testing.T) {
+	server, core, token := newIdentityBindingTestServer(t)
+	core.SeedAgentIdentity("agt_rest_retry")
+	if r := callBindIdentity(t, server, token, "prn_rest_retry", "agt_rest_retry", "bind-rest-retry"); r.Code != http.StatusOK {
+		t.Fatalf("bind failed: %s", r.Body.String())
+	}
+
+	first := callRevokeIdentity(t, server, token, "prn_rest_retry", "revoke-rest-retry-1")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first revoke status = %d, body = %s", first.Code, first.Body.String())
+	}
+	var firstDecoded revokeIdentityResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &firstDecoded); err != nil {
+		t.Fatal(err)
+	}
+	if !firstDecoded.Revoked || firstDecoded.Network == "" || firstDecoded.RevocationRef == "" {
+		t.Fatalf("unexpected first revoke response: %+v", firstDecoded)
+	}
+
+	// Simulates the response being lost and the caller retrying under a
+	// DIFFERENT Idempotency-Key -- this principal's local binding row is
+	// already gone, but the response must still be internally consistent.
+	retry := callRevokeIdentity(t, server, token, "prn_rest_retry", "revoke-rest-retry-2")
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retry revoke status = %d, body = %s", retry.Code, retry.Body.String())
+	}
+	var retryDecoded revokeIdentityResponse
+	if err := json.Unmarshal(retry.Body.Bytes(), &retryDecoded); err != nil {
+		t.Fatal(err)
+	}
+	if !retryDecoded.Revoked {
+		t.Fatalf("retry must report revoked=true (consistent with the original outcome), got: %+v", retryDecoded)
+	}
+	if retryDecoded.Network != firstDecoded.Network || retryDecoded.RevocationRef != firstDecoded.RevocationRef {
+		t.Fatalf("retry must return the ORIGINAL network/revocation_ref: first=%+v retry=%+v", firstDecoded, retryDecoded)
+	}
+}
+
 func TestHandleRevokeIdentity_NothingToRevokeIsNotAnError(t *testing.T) {
 	server, _, token := newIdentityBindingTestServer(t)
 	recorder := callRevokeIdentity(t, server, token, "prn_rest_revoke_noop", "revoke-rest-noop")

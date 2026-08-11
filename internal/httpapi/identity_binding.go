@@ -91,15 +91,6 @@ func (s *Server) handleRevokeIdentity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	principalID := r.PathValue("principal_id")
-	// Captured BEFORE calling Revoke: op.Checkpoint alone can't distinguish
-	// "this call actually revoked something" from "there was nothing to
-	// revoke" (both complete the operation identically), and re-checking
-	// CurrentBinding AFTER the call is always false in both cases.
-	_, wasBound, err := s.IdentityBindings.CurrentBinding(r.Context(), principalID)
-	if err != nil {
-		writeDomainErr(w, err)
-		return
-	}
 	op, err := s.IdentityBindings.Revoke(r.Context(), service.RevokeIdentityBindingInput{
 		PrincipalID: principalID, ReasonCode: req.ReasonCode, IdempotencyKey: idempotencyKey,
 	})
@@ -107,8 +98,19 @@ func (s *Server) handleRevokeIdentity(w http.ResponseWriter, r *http.Request) {
 		writeIdentityBindingErr(w, err)
 		return
 	}
+	// Revoked is derived from the operation's own outcome (op.BindingRef
+	// populated means tos-protocol reported a real revocation_ref), NOT a
+	// local pre-call CurrentBinding check: a lost-response retry under a
+	// fresh idempotency_key finds this principal's LOCAL binding row
+	// already deleted by the original successful call, but tos-protocol
+	// still honestly reports revoked=true with the ORIGINAL ref for the
+	// retry -- basing Revoked on the local pre-check would then report
+	// revoked:false alongside a populated network/revocation_ref, an
+	// internally inconsistent response that violates this endpoint's own
+	// frozen contract (network/revocation_ref must be empty when
+	// revoked:false).
 	writeJSON(w, http.StatusOK, revokeIdentityResponse{
-		Revoked: wasBound, Network: op.RefNetwork, RevocationRef: op.BindingRef,
+		Revoked: op.BindingRef != "", Network: op.RefNetwork, RevocationRef: op.BindingRef,
 	})
 }
 

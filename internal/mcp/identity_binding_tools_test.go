@@ -115,6 +115,42 @@ func TestToolRevokeIdentity_GoldenPathReturnsRevocationRef(t *testing.T) {
 	}
 }
 
+// TestToolRevokeIdentity_RetryWithFreshKeyIsInternallyConsistent mirrors
+// httpapi's identical test: a lost-response retry under a DIFFERENT
+// idempotency_key must report revoked:true with the ORIGINAL network/
+// revocation_ref, not revoked:false alongside populated ref fields.
+func TestToolRevokeIdentity_RetryWithFreshKeyIsInternallyConsistent(t *testing.T) {
+	server, core, token := newIdentityBindingToolTestServer(t, auth.ScopeIdentityBindingsWrite)
+	core.SeedAgentIdentity("agt_mcp_retry")
+	if resp := callTool(t, server, token, "atos_bind_identity", map[string]any{
+		"principal_id": "prn_mcp_retry", "agent_id": "agt_mcp_retry", "idempotency_key": "bind-mcp-retry",
+	}); toolCallFailed(t, resp) {
+		t.Fatalf("bind failed: %+v", resp)
+	}
+
+	first := callTool(t, server, token, "atos_revoke_identity", map[string]any{
+		"principal_id": "prn_mcp_retry", "idempotency_key": "revoke-mcp-retry-1",
+	})
+	if toolCallFailed(t, first) {
+		t.Fatalf("first revoke failed: %+v", first)
+	}
+	firstStructured := first.Result.(map[string]any)["structuredContent"].(map[string]any)
+
+	retry := callTool(t, server, token, "atos_revoke_identity", map[string]any{
+		"principal_id": "prn_mcp_retry", "idempotency_key": "revoke-mcp-retry-2",
+	})
+	if toolCallFailed(t, retry) {
+		t.Fatalf("retry revoke failed: %+v", retry)
+	}
+	retryStructured := retry.Result.(map[string]any)["structuredContent"].(map[string]any)
+	if retryStructured["revoked"] != true {
+		t.Fatalf("retry must report revoked=true, got: %+v", retryStructured)
+	}
+	if retryStructured["network"] != firstStructured["network"] || retryStructured["revocation_ref"] != firstStructured["revocation_ref"] {
+		t.Fatalf("retry must return the ORIGINAL network/revocation_ref: first=%+v retry=%+v", firstStructured, retryStructured)
+	}
+}
+
 func TestToolRevokeIdentity_NothingToRevokeIsNotAnError(t *testing.T) {
 	server, _, token := newIdentityBindingToolTestServer(t, auth.ScopeIdentityBindingsWrite)
 	resp := callTool(t, server, token, "atos_revoke_identity", map[string]any{

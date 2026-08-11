@@ -43,7 +43,7 @@ type Core struct {
 	// bucketPrincipalBindings/bucketPrincipalRevocations split exactly, for
 	// the same "never bound" vs "bound then revoked" distinction.
 	principalBindings map[string]domain.PrincipalIdentityBinding
-	revokedBindings   map[string]string // principalID -> reason_code
+	revokedBindings   map[string]revokedBindingRecord
 	// manifestCommitments is keyed by "capability_id@version", mirroring
 	// tos-protocol's own capabilityKey bucketing for CommitCapabilityManifest.
 	manifestCommitments map[string]manifestCommitmentRecord
@@ -53,6 +53,17 @@ type manifestCommitmentRecord struct {
 	providerID     string
 	manifestDigest string
 	ownershipRef   string
+}
+
+// revokedBindingRecord mirrors tos-protocol's principalBindingRevocation:
+// storing the ref at write time (not recomputing on replay) so a retry
+// with a DIFFERENT idempotency_key -- the documented safe lost-response
+// retry pattern -- honestly replays the ORIGINAL revocation_ref, matching
+// the real server's own RevokePrincipalBinding behavior.
+type revokedBindingRecord struct {
+	ReasonCode string
+	Network    string
+	Ref        string
 }
 
 func New(s store.Store) *Core {
@@ -77,7 +88,7 @@ func newCore(s store.Store, simulated bool, modes ...domain.TrustMode) *Core {
 		signers:             make(map[string]toscore.ExecutionSignerAuthorization),
 		agentIdentities:     make(map[string]bool),
 		principalBindings:   make(map[string]domain.PrincipalIdentityBinding),
-		revokedBindings:     make(map[string]string),
+		revokedBindings:     make(map[string]revokedBindingRecord),
 		manifestCommitments: make(map[string]manifestCommitmentRecord),
 	}
 }
@@ -150,8 +161,8 @@ func (c *Core) ResolvePrincipalBindingStatus(ctx context.Context, principalID st
 	if b, ok := c.principalBindings[principalID]; ok {
 		return b, true, false, "", nil
 	}
-	if reason, ok := c.revokedBindings[principalID]; ok {
-		return domain.PrincipalIdentityBinding{}, false, true, reason, nil
+	if record, ok := c.revokedBindings[principalID]; ok {
+		return domain.PrincipalIdentityBinding{}, false, true, record.ReasonCode, nil
 	}
 	return domain.PrincipalIdentityBinding{}, false, false, "", nil
 }
@@ -181,11 +192,21 @@ func (c *Core) RevokePrincipalBinding(ctx context.Context, callerID, idempotency
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.principalBindings[principalID]; !ok {
+		// No active binding to revoke -- but if this principal was ALREADY
+		// revoked (e.g. a lost-response retry under a fresh idempotency_key,
+		// the documented safe retry pattern), honestly replay the ORIGINAL
+		// revocation_ref rather than reporting revoked=false, matching the
+		// real tos-protocol server's RevokePrincipalBinding exactly: a
+		// caller must see the same "revoked=true" fact regardless of which
+		// attempt (original or retry) they're looking at.
+		if record, ok := c.revokedBindings[principalID]; ok {
+			return true, record.Network, record.Ref, nil
+		}
 		return false, "", "", nil
 	}
 	delete(c.principalBindings, principalID)
-	c.revokedBindings[principalID] = reasonCode
 	ref := simulatedRef("principal-binding-revocation", domain.TrustModeManaged, principalID+":"+idempotencyKey)
+	c.revokedBindings[principalID] = revokedBindingRecord{ReasonCode: reasonCode, Network: c.network, Ref: ref}
 	return true, c.network, ref, nil
 }
 

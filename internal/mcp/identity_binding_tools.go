@@ -61,20 +61,20 @@ func (s *Server) toolRevokeIdentity(ctx context.Context, principal auth.Principa
 		return nil, domain.NewError(domain.ErrValidationFailed, "idempotency_key is required", false)
 	}
 	principalID := argString(args, "principal_id")
-	// Captured BEFORE calling Revoke -- see httpapi.handleRevokeIdentity's
-	// identical comment: the operation's own checkpoint can't distinguish
-	// "actually revoked something" from "nothing to revoke."
-	_, wasBound, err := s.IdentityBindings.CurrentBinding(ctx, principalID)
-	if err != nil {
-		return nil, err
-	}
 	op, err := s.IdentityBindings.Revoke(ctx, service.RevokeIdentityBindingInput{
 		PrincipalID: principalID, ReasonCode: argString(args, "reason_code"), IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return revokeIdentityResult{Revoked: wasBound, Network: op.RefNetwork, RevocationRef: op.BindingRef}, nil
+	// Revoked is derived from the operation's own outcome, not a local
+	// pre-call CurrentBinding check -- see httpapi.handleRevokeIdentity's
+	// identical comment: a fresh-idempotency-key retry after a lost
+	// response would otherwise report revoked:false alongside a populated
+	// network/revocation_ref, since tos-protocol honestly replays the
+	// original revocation for the retry even though this principal's local
+	// binding row was already deleted by the original successful call.
+	return revokeIdentityResult{Revoked: op.BindingRef != "", Network: op.RefNetwork, RevocationRef: op.BindingRef}, nil
 }
 
 type identityBindingStatusResult struct {
