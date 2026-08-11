@@ -52,6 +52,14 @@ type TOSRPCConfig struct {
 	CAFile          string
 	ClientCertFile  string
 	ClientKeyFile   string
+	// Network is this deployment's configured TOS network identity (e.g.
+	// "tos-mainnet"/"tos-testnet-1") -- Phase 4A's ActivationAuthority
+	// rejects any provider identity binding anchored on a DIFFERENT
+	// network rather than silently accepting it (atos-spec
+	// docs/IMPLEMENTATION_ROADMAP.md §8.1's network/genesis/finality
+	// binding requirement). Required whenever TOSBackend is rpc; empty
+	// under mock, since mock never anchors anything to a real network.
+	Network string
 }
 
 type AuthConfig struct {
@@ -197,6 +205,7 @@ func Load() (Config, error) {
 			CAFile:         strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_CA_FILE")),
 			ClientCertFile: strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_CLIENT_CERT_FILE")),
 			ClientKeyFile:  strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_CLIENT_KEY_FILE")),
+			Network:        strings.TrimSpace(os.Getenv("ATOS_TOS_NETWORK")),
 		},
 		PayoutBackend:             PayoutBackend(strings.ToLower(envOr("ATOS_PAYOUT_BACKEND", string(PayoutBackendDisabled)))),
 		RemoteThirdPartyExecution: remoteThirdParty,

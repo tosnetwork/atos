@@ -80,10 +80,26 @@ type RevokeExecutionSignerRequest struct {
 }
 
 type Core interface {
+	// Network is this deployment's configured TOS network identity, as
+	// reported by the underlying connection (empty for the mock/dev
+	// backend, which never anchors anything to a real network). Phase 4A's
+	// TOSBackedActivationAuthority rejects activation when this is empty --
+	// an unconfigured network must fail closed, never be treated as a
+	// wildcard that matches any provider identity binding.
+	Network() string
 	// Identity and capability trust facts.
 	ResolveAgent(ctx context.Context, principalID string) (agentID string, err error)
 	ResolveCapability(ctx context.Context, capabilityID string) (domain.Trust, error)
 	ReadReputation(ctx context.Context, providerID string) (domain.Trust, error)
+	// CommitCapabilityManifest anchors capability's exact
+	// manifest/version/ownership commitment (docs/CAPABILITIES.md §11) --
+	// idempotent and safe to call on every Register/Update, mirroring
+	// tos-protocol's own CommitCapabilityManifest idempotency (a replay
+	// with identical provider_id/manifest digest returns the existing
+	// commitment; a conflicting replay under the same capability_id+version
+	// errors). ownershipRef is opaque "network:reference" (this codebase's
+	// standing convention for TOS reference fields).
+	CommitCapabilityManifest(ctx context.Context, capability domain.Capability) (ownershipRef string, err error)
 	// VerifyCapabilityOwnership checks that providerID owns capabilityID
 	// and, when expectedManifestDigest is non-empty ("sha256:<hex>",
 	// matching capabilityManifestCommitment's format), that it matches the

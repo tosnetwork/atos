@@ -15,6 +15,29 @@ import (
 	atostosv1 "github.com/tosnetwork/tos-protocol/gen/atos/tos/v1"
 )
 
+// Network returns this client's configured TOS network identity ("" if
+// unconfigured -- see Config.Network's doc comment).
+func (c *Client) Network() string {
+	return c.network
+}
+
+// CommitCapabilityManifest is the public toscore.Core entry point for the
+// existing commitCapability RPC call (used internally by RegisterProvider/
+// QuoteExecution) -- exposed directly so CapabilityService can anchor a
+// capability's manifest/ownership commitment as part of ordinary
+// registration, not only as a side effect of third-party execution
+// dispatch. Idempotent: see commitCapability's own CommitCapabilityManifest
+// RPC semantics (identical provider_id+manifest digest replays the same
+// commitment; a conflicting replay under the same capability_id+version
+// errors).
+func (c *Client) CommitCapabilityManifest(ctx context.Context, capability domain.Capability) (string, error) {
+	identity, err := c.commitCapability(ctx, capability)
+	if err != nil {
+		return "", err
+	}
+	return reference(identity.GetOwnershipRef()), nil
+}
+
 func (c *Client) ResolveAgent(ctx context.Context, principalID string) (string, error) {
 	if strings.TrimSpace(principalID) == "" {
 		return "", domain.NewError(domain.ErrValidationFailed, "principal_id is required", false)

@@ -48,6 +48,11 @@ type Config struct {
 	ClientCertFile  string
 	ClientKeyFile   string
 	Store           store.Store
+	// Network is this deployment's configured TOS network identity (see
+	// config.TOSRPCConfig.Network's doc comment). Empty means unconfigured
+	// -- Client.Network() then returns "", which TOSBackedActivationAuthority
+	// treats as a hard fail-closed condition, never a wildcard.
+	Network string
 }
 
 type Client struct {
@@ -55,6 +60,7 @@ type Client struct {
 	token      string
 	timeout    time.Duration
 	retention  time.Duration
+	network    string
 	httpClient *http.Client
 	store      store.Store
 
@@ -138,7 +144,7 @@ func New(config Config) (*Client, error) {
 	client := &Client{
 		baseURL: config.BaseURL, token: config.BearerToken,
 		timeout: config.Timeout, retention: defaultRetention,
-		httpClient: httpClient, store: config.Store,
+		httpClient: httpClient, store: config.Store, network: config.Network,
 	}
 	client.identity = atostosv1connect.NewIdentityServiceClient(httpClient, config.BaseURL, options...)
 	client.capability = atostosv1connect.NewCapabilityServiceClient(httpClient, config.BaseURL, options...)

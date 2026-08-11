@@ -13,16 +13,68 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/tosnetwork/atos/internal/adapters/toscore"
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/store"
 )
 
 type CapabilityService struct {
 	store store.Store
+	// manifestAnchor is Phase 4A's optional TOS-backed manifest/ownership
+	// anchoring dependency (docs/IMPLEMENTATION_ROADMAP.md §8.1) -- nil by
+	// default, matching every other optional service dependency in this
+	// codebase (see AccountService.WithClock, QuoteService.WithAccountService).
+	// Every one of this file's 49 existing callers stays valid unchanged;
+	// only cmd/api/main.go's real wiring opts in via WithManifestAnchor.
+	manifestAnchor toscore.Core
 }
 
 func NewCapabilityService(s store.Store) *CapabilityService {
 	return &CapabilityService{store: s}
+}
+
+// WithManifestAnchor opts this service into Phase 4A's TOS-backed manifest
+// commitment: Register/Update anchor a capability requesting verified or
+// native modes through core.CommitCapabilityManifest and durably record the
+// resulting commitment before returning. Anchoring failure fails the whole
+// Register/Update call (never silently registers an unanchored capability
+// that requested a stronger mode) -- a provider that only requests managed
+// is entirely unaffected, matching CommitCapabilityManifest's own "Managed
+// registration MAY create a capability before any TOS anchor exists" rule
+// (docs/CAPABILITIES.md §13).
+func (s *CapabilityService) WithManifestAnchor(core toscore.Core) *CapabilityService {
+	s.manifestAnchor = core
+	return s
+}
+
+// anchorManifestIfRequested calls CommitCapabilityManifest and persists the
+// resulting CapabilityOwnershipCommitment when c requests any non-Managed
+// mode and a manifest anchor is configured. It is a no-op (nil error) for a
+// Managed-only capability or when no anchor is configured, so Register/
+// Update remain usable in mock/dev deployments exactly as before Phase 4A.
+func (s *CapabilityService) anchorManifestIfRequested(ctx context.Context, c domain.Capability) error {
+	if s.manifestAnchor == nil {
+		return nil
+	}
+	requestsStrongerMode := false
+	for _, mode := range c.RequestedTrustModes {
+		if mode != domain.TrustModeManaged {
+			requestsStrongerMode = true
+			break
+		}
+	}
+	if !requestsStrongerMode {
+		return nil
+	}
+	ownershipRef, err := s.manifestAnchor.CommitCapabilityManifest(ctx, c)
+	if err != nil {
+		return err
+	}
+	return s.store.PutCapabilityOwnershipCommitment(ctx, domain.CapabilityOwnershipCommitment{
+		CapabilityID: c.ID, Version: c.Version, ProviderID: c.ProviderID,
+		Network: s.manifestAnchor.Network(), ManifestCommitment: c.ManifestCommitment,
+		OwnershipCommitment: ownershipRef, CommittedAt: time.Now().UTC(),
+	})
 }
 
 func (s *CapabilityService) Get(ctx context.Context, id string) (domain.Capability, error) {
@@ -132,6 +184,9 @@ func (s *CapabilityService) Register(ctx context.Context, in RegisterCapabilityI
 	}
 	c.SupportedTrustModes = c.ModeSupport.ActiveModes()
 	c.ManifestCommitment = capabilityManifestCommitment(c)
+	if err := s.anchorManifestIfRequested(ctx, c); err != nil {
+		return domain.Capability{}, err
+	}
 	if err := s.store.Put(ctx, c); err != nil {
 		return domain.Capability{}, err
 	}
