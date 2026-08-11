@@ -106,7 +106,7 @@ func main() {
 	previousLedgerSequence := flag.Int64("previous-ledger-sequence", 0, "expected prior Blnk chain sequence for non-genesis batch")
 	retentionURL := flag.String("retention-url", "", "independent immutable-retention verification endpoint")
 	retainedVersion := flag.String("retained-version", "", "exact immutable object version ID")
-	minimumRetention := flag.Duration("minimum-retention", 365*24*time.Hour, "minimum remaining COMPLIANCE retention")
+	minimumRemainingRetention := flag.Duration("minimum-remaining-retention", 0, "optional minimum remaining COMPLIANCE retention")
 	flag.Parse()
 	if *evidencePath == "" || *anchorPath == "" || *keysPath == "" || *tosURL == "" || *gateway == "" || *network == "" || *retentionURL == "" || *retainedVersion == "" {
 		fmt.Fprintln(os.Stderr, "all evidence, anchor, trusted-keys, tos-url, gateway, network, retention-url and retained-version flags are required")
@@ -118,7 +118,7 @@ func main() {
 		os.Exit(2)
 	}
 	retentionKey := os.Getenv("ATOS_VERIFIER_RETENTION_HMAC_KEY")
-	retentionResolver, err := financial.NewHTTPRetainer(*retentionURL, retentionKey, 30*time.Second, *minimumRetention)
+	retentionResolver, err := financial.NewHTTPRetentionResolver(*retentionURL, retentionKey, 30*time.Second)
 	if err != nil {
 		fail(err)
 	}
@@ -141,7 +141,7 @@ func main() {
 	client := atostosv1connect.NewFinancialIntegrityServiceClient(http.DefaultClient, *tosURL)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	err = financial.VerifyEvidence(ctx, bundle, anchor, financial.VerifyOptions{GatewayID: *gateway, NetworkID: *network, TrustedPublicKeys: keys, ExpectedPreviousAnchorID: *previousAnchor, ExpectedPreviousRoot: *previousRoot, ExpectedPreviousCommitment: *previousCommitment, ExpectedPreviousLedgerHead: *previousLedgerHead, ExpectedPreviousLedgerSequence: *previousLedgerSequence, Resolver: resolver{client: client, token: token, gateway: *gateway}, RetentionResolver: retentionResolver, RetainedVersionID: *retainedVersion, MinimumRetention: *minimumRetention})
+	err = financial.VerifyEvidence(ctx, bundle, anchor, financial.VerifyOptions{GatewayID: *gateway, NetworkID: *network, TrustedPublicKeys: keys, ExpectedPreviousAnchorID: *previousAnchor, ExpectedPreviousRoot: *previousRoot, ExpectedPreviousCommitment: *previousCommitment, ExpectedPreviousLedgerHead: *previousLedgerHead, ExpectedPreviousLedgerSequence: *previousLedgerSequence, Resolver: resolver{client: client, token: token, gateway: *gateway}, RetentionResolver: retentionResolver, RetainedVersionID: *retainedVersion, MinimumRemainingRetention: *minimumRemainingRetention})
 	if err != nil {
 		fail(err)
 	}

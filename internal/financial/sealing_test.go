@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -23,8 +24,10 @@ func TestHTTPRetainerAuthenticatesAndRequiresImmutableVersion(t *testing.T) {
 	var omitVersion atomic.Bool
 	var lockMode atomic.Value
 	var retentionSeconds atomic.Int64
+	var headStatus atomic.Int64
 	lockMode.Store("COMPLIANCE")
 	retentionSeconds.Store(int64((2 * time.Hour).Seconds()))
+	headStatus.Store(http.StatusOK)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		target := request.URL.EscapedPath()
 		if request.URL.RawQuery != "" {
@@ -49,6 +52,10 @@ func TestHTTPRetainerAuthenticatesAndRequiresImmutableVersion(t *testing.T) {
 			}
 			writer.WriteHeader(http.StatusCreated)
 		case http.MethodHead:
+			if status := int(headStatus.Load()); status != http.StatusOK {
+				writer.WriteHeader(status)
+				return
+			}
 			writer.Header().Set("X-Content-SHA256", digest)
 			if !omitVersion.Load() {
 				writer.Header().Set("X-Object-Version-ID", "locked-version-1")
@@ -77,16 +84,31 @@ func TestHTTPRetainerAuthenticatesAndRequiresImmutableVersion(t *testing.T) {
 		t.Fatal("retention succeeded without an immutable object version")
 	}
 	omitVersion.Store(false)
-	if _, err := retainWithProof(context.Background(), retainer, "evidence/3.json", body, digest); err != nil {
+	deadline := time.Now().UTC().Truncate(time.Second).Add(time.Hour)
+	if _, err := retainWithProof(context.Background(), retainer, "evidence/3.json", body, digest, deadline); err != nil {
 		t.Fatalf("valid COMPLIANCE retention was rejected: %v", err)
 	}
+	// A retry uses the original durable deadline instead of extending it from
+	// the retry time. This is the crash window after PUT but before retained.
+	if _, err := retainWithProof(context.Background(), retainer, "evidence/3.json", body, digest, deadline); err != nil {
+		t.Fatalf("stable retention deadline did not converge on retry: %v", err)
+	}
 	lockMode.Store("GOVERNANCE")
-	if _, err := retainWithProof(context.Background(), retainer, "evidence/4.json", body, digest); err == nil {
+	if _, err := retainWithProof(context.Background(), retainer, "evidence/4.json", body, digest, deadline); err == nil {
 		t.Fatal("production state transition accepted non-COMPLIANCE retention")
 	}
 	lockMode.Store("COMPLIANCE")
 	retentionSeconds.Store(int64((30 * time.Minute).Seconds()))
-	if _, err := retainWithProof(context.Background(), retainer, "evidence/5.json", body, digest); err == nil {
+	if _, err := retainWithProof(context.Background(), retainer, "evidence/5.json", body, digest, deadline); err == nil {
 		t.Fatal("production state transition accepted retention below configured minimum")
+	}
+	retentionSeconds.Store(int64((2 * time.Hour).Seconds()))
+	headStatus.Store(http.StatusServiceUnavailable)
+	if _, err := retainer.ResolveRetention(context.Background(), "evidence/3.json", "locked-version-1", digest); err == nil || errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("temporary retention failure misclassified as integrity conflict: %v", err)
+	}
+	headStatus.Store(http.StatusNotFound)
+	if _, err := retainer.ResolveRetention(context.Background(), "evidence/3.json", "locked-version-1", digest); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("missing exact version was not an integrity conflict: %v", err)
 	}
 }

@@ -109,6 +109,77 @@ func financialTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+func TestRetentionDeadlinesAreDurableAndReplicaStable(t *testing.T) {
+	ctx := context.Background()
+	pool1 := financialTestPool(t)
+	pool2, err := pgxpool.New(ctx, os.Getenv("ATOS_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool2.Close()
+	repository1, _ := NewRepository(pool1, "gw-retention", "net-retention")
+	repository2, _ := NewRepository(pool2, "gw-retention", "net-retention")
+	batchID := fmt.Sprintf("fbat_retention_%d", time.Now().UnixNano())
+	digest := "sha256:" + strings.Repeat("1", 64)
+	if _, err := pool1.Exec(ctx, `INSERT INTO financial_batches
+ (batch_id,batch_sequence,first_sequence,last_sequence,commitment_count,previous_batch_id,
+  previous_merkle_root,merkle_root,manifest_digest,manifest_cbor,manifest,state,created_at)
+ VALUES ($1,1,1,1,1,'',$2,$2,$3,'\\x00','{}','signed',now())`, batchID, GenesisDigest, digest); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	deadlines := make(chan time.Time, 2)
+	errorsOut := make(chan error, 2)
+	for _, repository := range []*Repository{repository1, repository2} {
+		go func(repository *Repository) {
+			<-start
+			deadline, deadlineErr := repository.batchRetentionDeadline(ctx, batchID, 365*24*time.Hour, false)
+			deadlines <- deadline
+			errorsOut <- deadlineErr
+		}(repository)
+	}
+	close(start)
+	first, second := <-deadlines, <-deadlines
+	for range 2 {
+		if err := <-errorsOut; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !first.Equal(second) {
+		t.Fatalf("replicas allocated different retention deadlines: %s != %s", first, second)
+	}
+	if _, err := pool1.Exec(ctx, `UPDATE financial_batches SET required_retain_until=required_retain_until+interval '1 second' WHERE batch_id=$1`, batchID); err == nil {
+		t.Fatal("durable retention deadline remained mutable")
+	}
+
+	anchorBatchID := batchID + "_anchor"
+	anchorDigest := "sha256:" + strings.Repeat("2", 64)
+	if _, err := pool1.Exec(ctx, `INSERT INTO financial_batches
+ (batch_id,batch_sequence,first_sequence,last_sequence,commitment_count,previous_batch_id,
+  previous_merkle_root,merkle_root,manifest_digest,manifest_cbor,manifest,state,created_at,
+  required_retain_until,retained_object_key,retained_version_id)
+ VALUES ($1,2,2,2,1,$2,$3,$3,$4,'\\x00','{}','retained',now(),now()+interval '365 days','evidence','version')`,
+		anchorBatchID, batchID, GenesisDigest, anchorDigest); err != nil {
+		t.Fatal(err)
+	}
+	anchorDeadline, err := repository1.batchRetentionDeadline(ctx, anchorBatchID, 365*24*time.Hour, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryDeadline, err := repository2.batchRetentionDeadline(ctx, anchorBatchID, 365*24*time.Hour, true)
+	if err != nil || !anchorDeadline.Equal(retryDeadline) {
+		t.Fatalf("anchor receipt deadline did not converge: first=%s retry=%s err=%v", anchorDeadline, retryDeadline, err)
+	}
+	entered, err := repository1.EnforceSealingHealth(ctx, time.Hour, errors.New("temporary WORM HTTP 503"))
+	if err != nil || entered {
+		t.Fatalf("temporary retention outage entered safe mode before maximum lag: entered=%t err=%v", entered, err)
+	}
+	entered, err = repository1.EnforceSealingHealth(ctx, time.Hour, errors.Join(ErrIdempotencyConflict, errors.New("retention proof mismatch")))
+	if err != nil || !entered {
+		t.Fatalf("authenticated retention mismatch did not enter safe mode: entered=%t err=%v", entered, err)
+	}
+}
+
 func requestFor(id string, event EventType, source, destination AccountCode, sourceOwner, destinationOwner string) TransferRequest {
 	principalID := sourceOwner
 	if event == EventAccountGenesis || event == EventEscrowRelease || event == EventSettlementRefund {

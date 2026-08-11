@@ -108,6 +108,10 @@ func (r *Repository) AnchorBatch(ctx context.Context, batch Batch, signature Sig
 	if err != nil {
 		return AnchorReceipt{}, err
 	}
+	deadline, err := r.batchRetentionDeadline(ctx, batch.Manifest.BatchID, retainer.MinimumRetention(), true)
+	if err != nil {
+		return AnchorReceipt{}, err
+	}
 	receipt, found, resolveErr := publisher.ResolveManagedFinancialAnchor(ctx, anchor)
 	if resolveErr == nil && !found {
 		receipt, resolveErr = publisher.PublishManagedFinancialAnchor(ctx, anchor)
@@ -126,10 +130,14 @@ func (r *Repository) AnchorBatch(ctx context.Context, batch Batch, signature Sig
 	hash := sha256.Sum256(body)
 	digest := "sha256:" + hex.EncodeToString(hash[:])
 	key := "atos-financial/v1/" + anchor.GatewayID + "/" + anchor.NetworkID + "/anchors/" + anchor.AnchorID + ".json"
-	if _, err := retainWithProof(ctx, retainer, key, body, digest); err != nil {
+	proof, err := retainWithProof(ctx, retainer, key, body, digest, deadline)
+	if err != nil {
 		return AnchorReceipt{}, err
 	}
-	result, err := r.pool.Exec(ctx, `UPDATE financial_batches SET anchor_id=$2,state='anchored',updated_at=now() WHERE batch_id=$1 AND state IN ('retained','anchored') AND (anchor_id='' OR anchor_id=$2)`, batch.Manifest.BatchID, anchor.AnchorID)
+	result, err := r.pool.Exec(ctx, `UPDATE financial_batches SET anchor_id=$2,anchor_retained_object_key=$3,anchor_retained_version_id=$4,state='anchored',updated_at=now()
+ WHERE batch_id=$1 AND state IN ('retained','anchored') AND (anchor_id='' OR anchor_id=$2)
+   AND (anchor_retained_object_key='' OR anchor_retained_object_key=$3)
+   AND (anchor_retained_version_id='' OR anchor_retained_version_id=$4)`, batch.Manifest.BatchID, anchor.AnchorID, key, proof.VersionID)
 	if err != nil {
 		return AnchorReceipt{}, err
 	}

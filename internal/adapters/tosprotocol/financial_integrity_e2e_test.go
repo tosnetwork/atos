@@ -244,7 +244,7 @@ func TestFinancialBatchExternalSignerWORMRPCAndVerifier(t *testing.T) {
 		t.Fatal(err)
 	}
 	trusted := map[string]string{"kms-key-2026-08": trustedPublicKey}
-	verifyOptions := financial.VerifyOptions{GatewayID: gateway, NetworkID: network, TrustedPublicKeys: trusted, Resolver: protocolClient, RetentionResolver: retainer, RetainedVersionID: "locked-v1", MinimumRetention: time.Hour}
+	verifyOptions := financial.VerifyOptions{GatewayID: gateway, NetworkID: network, TrustedPublicKeys: trusted, Resolver: protocolClient, RetentionResolver: retainer, RetainedVersionID: "locked-v1", MinimumRemainingRetention: time.Hour}
 	if err := financial.VerifyEvidence(ctx, bundle, receipt, verifyOptions); err != nil {
 		t.Fatal(err)
 	}

@@ -28,7 +28,7 @@ type VerifyOptions struct {
 	Resolver                       AnchorPublisher
 	RetentionResolver              RetentionResolver
 	RetainedVersionID              string
-	MinimumRetention               time.Duration
+	MinimumRemainingRetention      time.Duration
 }
 
 func DecodeEvidenceBundle(data []byte) (EvidenceBundle, error) {
@@ -133,13 +133,15 @@ func VerifyEvidence(ctx context.Context, bundle EvidenceBundle, anchorReceipt An
 	bundleHash := sha256.Sum256(bundleBytes)
 	bundleDigest := "sha256:" + hex.EncodeToString(bundleHash[:])
 	objectKey := fmt.Sprintf("atos-financial/v1/%s/%s/%d-%s.json", manifest.GatewayID, manifest.NetworkID, manifest.BatchSequence, manifest.BatchID)
-	if options.RetentionResolver == nil || options.RetainedVersionID == "" || options.MinimumRetention <= 0 {
+	if options.RetentionResolver == nil || options.RetainedVersionID == "" || options.MinimumRemainingRetention < 0 {
 		return errors.New("financial verifier: immutable retention resolver and version are required")
 	}
 	retention, err := options.RetentionResolver.ResolveRetention(ctx, objectKey, options.RetainedVersionID, bundleDigest)
+	verifiedAt := time.Now().UTC().Truncate(time.Second)
 	if err != nil || retention.ObjectKey != objectKey || retention.VersionID != options.RetainedVersionID ||
 		retention.Digest != bundleDigest || retention.LockMode != "COMPLIANCE" ||
-		retention.RetainUntil.Before(time.Now().UTC().Truncate(time.Second).Add(options.MinimumRetention)) {
+		!retention.RetainUntil.After(verifiedAt) ||
+		(options.MinimumRemainingRetention > 0 && retention.RetainUntil.Before(verifiedAt.Add(options.MinimumRemainingRetention))) {
 		return errors.New("financial verifier: immutable Object Lock evidence is missing, expired, or changed")
 	}
 

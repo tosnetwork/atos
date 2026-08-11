@@ -139,7 +139,7 @@ func testEvidence(t *testing.T) (EvidenceBundle, AnchorReceipt, VerifyOptions) {
 	bundleDigest := "sha256:" + hex.EncodeToString(bundleHash[:])
 	objectKey := "atos-financial/v1/gateway.example/tos-localnet-1/1-" + batch.Manifest.BatchID + ".json"
 	retention := RetentionProof{ObjectKey: objectKey, VersionID: "locked-version-1", Digest: bundleDigest, LockMode: "COMPLIANCE", RetainUntil: time.Now().UTC().Add(24 * time.Hour)}
-	options := VerifyOptions{GatewayID: anchor.GatewayID, NetworkID: anchor.NetworkID, TrustedPublicKeys: map[string]string{"kms-key-1": envelope.PublicKey}, Resolver: fixedResolver{receipt}, RetentionResolver: fixedRetentionResolver{retention}, RetainedVersionID: retention.VersionID, MinimumRetention: time.Hour}
+	options := VerifyOptions{GatewayID: anchor.GatewayID, NetworkID: anchor.NetworkID, TrustedPublicKeys: map[string]string{"kms-key-1": envelope.PublicKey}, Resolver: fixedResolver{receipt}, RetentionResolver: fixedRetentionResolver{retention}, RetainedVersionID: retention.VersionID, MinimumRemainingRetention: time.Hour}
 	return bundle, receipt, options
 }
 
@@ -147,6 +147,16 @@ func TestIndependentVerifierRejectsTampering(t *testing.T) {
 	bundle, receipt, options := testEvidence(t)
 	if err := VerifyEvidence(context.Background(), bundle, receipt, options); err != nil {
 		t.Fatal(err)
+	}
+	currentLockOnly := options
+	currentLockOnly.MinimumRemainingRetention = 0
+	if err := VerifyEvidence(context.Background(), bundle, receipt, currentLockOnly); err != nil {
+		t.Fatalf("current unexpired COMPLIANCE lock was rejected without an extra remaining-retention policy: %v", err)
+	}
+	excessiveRemaining := options
+	excessiveRemaining.MinimumRemainingRetention = 25 * time.Hour
+	if err := VerifyEvidence(context.Background(), bundle, receipt, excessiveRemaining); err == nil {
+		t.Fatal("verifier accepted a lock shorter than the caller-selected remaining-retention policy")
 	}
 	tests := map[string]func(*EvidenceBundle, *AnchorReceipt, *VerifyOptions){
 		"amount": func(b *EvidenceBundle, _ *AnchorReceipt, _ *VerifyOptions) { b.Commitments[0].AtomicAmount = "126" },

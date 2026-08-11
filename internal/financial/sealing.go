@@ -222,8 +222,21 @@ type HTTPRetainer struct {
 }
 
 func NewHTTPRetainer(endpoint, hmacKey string, timeout, minimumRetention time.Duration) (*HTTPRetainer, error) {
+	if minimumRetention <= 0 {
+		return nil, errors.New("financial: invalid WORM endpoint")
+	}
+	return newHTTPRetainer(endpoint, hmacKey, timeout, minimumRetention)
+}
+
+// NewHTTPRetentionResolver constructs a read-only exact-version resolver. The
+// verifier supplies any remaining-retention policy separately from transport.
+func NewHTTPRetentionResolver(endpoint, hmacKey string, timeout time.Duration) (*HTTPRetainer, error) {
+	return newHTTPRetainer(endpoint, hmacKey, timeout, 0)
+}
+
+func newHTTPRetainer(endpoint, hmacKey string, timeout, minimumRetention time.Duration) (*HTTPRetainer, error) {
 	parsed, err := url.Parse(endpoint)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" || timeout <= 0 || len(hmacKey) < 32 || minimumRetention <= 0 {
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || timeout <= 0 || len(hmacKey) < 32 {
 		return nil, errors.New("financial: invalid WORM endpoint")
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
@@ -281,8 +294,14 @@ func (r *HTTPRetainer) ResolveRetention(ctx context.Context, key, versionID, dig
 	retainUntil, timeErr := time.Parse(time.RFC3339, response.Header.Get("X-Object-Retain-Until"))
 	proof := RetentionProof{ObjectKey: key, VersionID: response.Header.Get("X-Object-Version-ID"),
 		Digest: response.Header.Get("X-Content-SHA256"), LockMode: response.Header.Get("X-Object-Lock-Mode"), RetainUntil: retainUntil}
-	if response.StatusCode != http.StatusOK || timeErr != nil || proof.VersionID != versionID || proof.Digest != digest || proof.LockMode != "COMPLIANCE" {
-		return RetentionProof{}, ErrIdempotencyConflict
+	if response.StatusCode != http.StatusOK {
+		if response.StatusCode == http.StatusNotFound {
+			return RetentionProof{}, errors.Join(ErrIdempotencyConflict, errors.New("financial: exact retained object version is missing"))
+		}
+		return RetentionProof{}, fmt.Errorf("financial: WORM retention lookup returned HTTP %d", response.StatusCode)
+	}
+	if timeErr != nil || proof.VersionID != versionID || proof.Digest != digest || proof.LockMode != "COMPLIANCE" {
+		return RetentionProof{}, errors.Join(ErrIdempotencyConflict, errors.New("financial: authenticated retention proof mismatch"))
 	}
 	return proof, nil
 }
@@ -300,8 +319,11 @@ func (r *HTTPRetainer) resolve(ctx context.Context, endpoint string, digest stri
 	defer resolved.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resolved.Body, 4096))
 	version := strings.TrimSpace(resolved.Header.Get("X-Object-Version-ID"))
-	if resolved.StatusCode != http.StatusOK || resolved.Header.Get("X-Content-SHA256") != digest || version == "" {
-		return "", ErrIdempotencyConflict
+	if resolved.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("financial: WORM recovery lookup returned HTTP %d", resolved.StatusCode)
+	}
+	if resolved.Header.Get("X-Content-SHA256") != digest || version == "" {
+		return "", errors.Join(ErrIdempotencyConflict, errors.New("financial: authenticated WORM recovery proof mismatch"))
 	}
 	return version, nil
 }
@@ -392,25 +414,42 @@ func (r *FileRetainer) ResolveRetention(context.Context, string, string, string)
 
 func (r *FileRetainer) MinimumRetention() time.Duration { return 0 }
 
-func retainWithProof(ctx context.Context, retainer Retainer, key string, body []byte, digest string) (RetentionProof, error) {
-	if retainer == nil || retainer.MinimumRetention() <= 0 {
-		return RetentionProof{}, errors.New("financial: positive minimum WORM retention is required")
+func retainWithProof(ctx context.Context, retainer Retainer, key string, body []byte, digest string, requiredRetainUntil time.Time) (RetentionProof, error) {
+	if retainer == nil || requiredRetainUntil.IsZero() {
+		return RetentionProof{}, errors.New("financial: durable WORM retention deadline is required")
 	}
-	// Truncate to the protocol's RFC3339-second precision before the PUT. A
-	// store applying exactly the configured duration at write time then passes,
-	// while any shorter lock fails closed.
-	minimumRetainUntil := time.Now().UTC().Truncate(time.Second).Add(retainer.MinimumRetention())
 	version, err := retainer.PutIfAbsent(ctx, key, body, digest)
 	if err != nil {
 		return RetentionProof{}, err
 	}
 	proof, err := retainer.ResolveRetention(ctx, key, version, digest)
-	if err != nil || proof.ObjectKey != key || proof.VersionID != version || proof.Digest != digest ||
-		proof.LockMode != "COMPLIANCE" || proof.RetainUntil.Before(minimumRetainUntil) {
-		return RetentionProof{}, errors.Join(ErrIdempotencyConflict, err,
+	if err != nil {
+		return RetentionProof{}, err
+	}
+	if proof.ObjectKey != key || proof.VersionID != version || proof.Digest != digest || proof.LockMode != "COMPLIANCE" ||
+		!proof.RetainUntil.After(time.Now().UTC()) || proof.RetainUntil.Before(requiredRetainUntil) {
+		return RetentionProof{}, errors.Join(ErrIdempotencyConflict,
 			errors.New("financial: exact object version lacks required COMPLIANCE retention"))
 	}
 	return proof, nil
+}
+
+func (r *Repository) batchRetentionDeadline(ctx context.Context, batchID string, minimum time.Duration, anchorReceipt bool) (time.Time, error) {
+	if minimum <= 0 {
+		return time.Time{}, errors.New("financial: positive minimum WORM retention is required")
+	}
+	candidate := time.Now().UTC().Truncate(time.Second).Add(minimum)
+	query := `UPDATE financial_batches SET required_retain_until=COALESCE(required_retain_until,$2),updated_at=now()
+ WHERE batch_id=$1 AND state IN ('signed','retained') RETURNING required_retain_until`
+	if anchorReceipt {
+		query = `UPDATE financial_batches SET anchor_required_retain_until=COALESCE(anchor_required_retain_until,$2),updated_at=now()
+ WHERE batch_id=$1 AND state IN ('retained','anchored') RETURNING anchor_required_retain_until`
+	}
+	var deadline time.Time
+	if err := r.pool.QueryRow(ctx, query, batchID, candidate).Scan(&deadline); err != nil {
+		return time.Time{}, err
+	}
+	return deadline.UTC(), nil
 }
 
 func (r *Repository) RetainBatch(ctx context.Context, batch Batch, signature SignatureEnvelope, retainer Retainer) (string, string, error) {
@@ -427,7 +466,11 @@ func (r *Repository) RetainBatch(ctx context.Context, batch Batch, signature Sig
 	hash := sha256.Sum256(body)
 	digest := "sha256:" + hex.EncodeToString(hash[:])
 	key := fmt.Sprintf("atos-financial/v1/%s/%s/%d-%s.json", batch.Manifest.GatewayID, batch.Manifest.NetworkID, batch.Manifest.BatchSequence, batch.Manifest.BatchID)
-	proof, err := retainWithProof(ctx, retainer, key, body, digest)
+	deadline, err := r.batchRetentionDeadline(ctx, batch.Manifest.BatchID, retainer.MinimumRetention(), false)
+	if err != nil {
+		return "", "", err
+	}
+	proof, err := retainWithProof(ctx, retainer, key, body, digest, deadline)
 	if err != nil {
 		return "", "", err
 	}
