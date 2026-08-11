@@ -38,6 +38,93 @@ func (c *Client) ResolveAgent(ctx context.Context, principalID string) (string, 
 	return principalID, nil
 }
 
+// ResolvePrincipalBindingStatus is tos-protocol's full
+// ResolvePrincipalBinding answer -- unlike ResolveAgent (which silently
+// falls back to treating principalID itself as the agent identity for
+// Managed-compatible callers), this exposes the real bound/revoked facts a
+// Phase 4A authority decision needs and must never paper over. revoked is
+// true only when a binding EXISTED and was explicitly revoked (distinct
+// from "never bound" -- see atos-spec docs/TOS_RPC.md §10).
+func (c *Client) ResolvePrincipalBindingStatus(ctx context.Context, principalID string) (binding domain.PrincipalIdentityBinding, bound, revoked bool, revocationReasonCode string, err error) {
+	if strings.TrimSpace(principalID) == "" {
+		return domain.PrincipalIdentityBinding{}, false, false, "", domain.NewError(domain.ErrValidationFailed, "principal_id is required", false)
+	}
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	request := connect.NewRequest(&atostosv1.ResolvePrincipalBindingRequest{
+		Context: c.requestContext(ctx, "atos-gateway", "", time.Time{}), PrincipalId: principalID,
+	})
+	decorateRequest(c, ctx, request)
+	response, err := c.identity.ResolvePrincipalBinding(callCtx, request)
+	if err != nil {
+		return domain.PrincipalIdentityBinding{}, false, false, "", rpcError(err)
+	}
+	if response.Msg == nil {
+		return domain.PrincipalIdentityBinding{}, false, false, "", nil
+	}
+	revoked = response.Msg.Status == atostosv1.PrincipalBindingStatus_PRINCIPAL_BINDING_STATUS_REVOKED
+	if !response.Msg.Bound || response.Msg.Identity == nil || response.Msg.BindingRef == nil {
+		return domain.PrincipalIdentityBinding{}, false, revoked, response.Msg.RevocationReasonCode, nil
+	}
+	binding = domain.PrincipalIdentityBinding{
+		PrincipalID: principalID, AgentID: response.Msg.Identity.AgentId,
+		Network: response.Msg.BindingRef.Network, BindingRef: response.Msg.BindingRef.Reference,
+	}
+	return binding, true, false, "", nil
+}
+
+// CreatePrincipalBinding anchors a durable binding from principalID to
+// agentID through tos-protocol's IdentityService.CreatePrincipalBinding
+// (Phase 4A). callerID scopes the underlying RPC's idempotency namespace --
+// this gateway's own trusted identity (see atos-spec docs/TOS_RPC.md §10:
+// context.caller_id identifies the operating ATOS backend, never the
+// principal the binding is FOR), never principalID itself.
+func (c *Client) CreatePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, agentID string) (domain.PrincipalIdentityBinding, bool, error) {
+	if strings.TrimSpace(principalID) == "" || strings.TrimSpace(agentID) == "" {
+		return domain.PrincipalIdentityBinding{}, false, domain.NewError(domain.ErrValidationFailed, "principal_id and agent_id are required", false)
+	}
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	request := connect.NewRequest(&atostosv1.CreatePrincipalBindingRequest{
+		Context:     c.requestContext(ctx, callerID, idempotencyKey, time.Time{}),
+		PrincipalId: principalID, AgentId: agentID,
+	})
+	decorateRequest(c, ctx, request)
+	response, err := c.identity.CreatePrincipalBinding(callCtx, request)
+	if err != nil {
+		return domain.PrincipalIdentityBinding{}, false, rpcError(err)
+	}
+	if response.Msg == nil || response.Msg.BindingRef == nil {
+		return domain.PrincipalIdentityBinding{}, false, domain.NewError(domain.ErrProviderFailed, "tos-protocol returned an incomplete principal binding", true)
+	}
+	return domain.PrincipalIdentityBinding{
+		PrincipalID: principalID, AgentID: agentID,
+		Network: response.Msg.BindingRef.Network, BindingRef: response.Msg.BindingRef.Reference,
+	}, response.Msg.Created, nil
+}
+
+// RevokePrincipalBinding revokes principalID's current binding through
+// tos-protocol's IdentityService.RevokePrincipalBinding. revoked=false with
+// a nil error means there was nothing to revoke -- not an error, mirroring
+// tos-protocol's own convention.
+func (c *Client) RevokePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, reasonCode string) (revoked bool, err error) {
+	if strings.TrimSpace(principalID) == "" {
+		return false, domain.NewError(domain.ErrValidationFailed, "principal_id is required", false)
+	}
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	request := connect.NewRequest(&atostosv1.RevokePrincipalBindingRequest{
+		Context:     c.requestContext(ctx, callerID, idempotencyKey, time.Time{}),
+		PrincipalId: principalID, ReasonCode: reasonCode,
+	})
+	decorateRequest(c, ctx, request)
+	response, err := c.identity.RevokePrincipalBinding(callCtx, request)
+	if err != nil {
+		return false, rpcError(err)
+	}
+	return response.Msg != nil && response.Msg.Revoked, nil
+}
+
 func (c *Client) ResolveCapability(ctx context.Context, capabilityID string) (domain.Trust, error) {
 	if strings.TrimSpace(capabilityID) == "" {
 		return domain.Trust{}, domain.NewError(domain.ErrValidationFailed, "capability_id is required", false)
