@@ -374,6 +374,50 @@ type Certifications interface {
 	UpdateCertification(ctx context.Context, id string, fn func(c domain.SandboxCertification, exists bool) (domain.SandboxCertification, error)) (domain.SandboxCertification, error)
 }
 
+// PasskeyAccounts backs atos-spec docs/AUTH.md's "Human Account
+// Authentication (Passkey/WebAuthn)" section -- the "who is this human"
+// identity primitive Device Authorization's /activate page always assumed
+// existed elsewhere. Modeled on tosnetwork/atos-aidrop's proven schema.
+type PasskeyAccounts interface {
+	// CreatePasskeyAccountWithCredential atomically creates the account row
+	// and its first credential in one transaction -- an account MUST NEVER
+	// durably exist without at least one credential able to authenticate
+	// it (a partial failure between the two, e.g. a mid-transaction crash
+	// or a credential_id collision, must roll back the account too, not
+	// strand it forever unauthenticatable). This is the ONLY way to create
+	// a PasskeyAccount; there is no standalone CreatePasskeyAccount.
+	CreatePasskeyAccountWithCredential(ctx context.Context, a domain.PasskeyAccount, c domain.WebAuthnCredentialRecord) error
+	PasskeyAccountByPrincipalID(ctx context.Context, principalID string) (domain.PasskeyAccount, error)
+	// PasskeyAccountByDisplayHandle exists purely to detect a display-handle
+	// collision before insert (see service.generateDisplayHandle) -- never
+	// used as a login lookup path (passkey login is discoverable/
+	// usernameless, never handle-based).
+	PasskeyAccountByDisplayHandle(ctx context.Context, handle string) (domain.PasskeyAccount, error)
+
+	SaveWebAuthnCredential(ctx context.Context, c domain.WebAuthnCredentialRecord) error
+	WebAuthnCredentialsByPrincipalID(ctx context.Context, principalID string) ([]domain.WebAuthnCredentialRecord, error)
+	WebAuthnCredentialViews(ctx context.Context, principalID string) ([]domain.WebAuthnCredentialRecord, error)
+	// TouchWebAuthnCredential records a successful assertion's updated
+	// counter/clone-warning/backup-state -- go-webauthn's own clone-
+	// detection signal, persisted so a later login sees the latest count
+	// rather than the value from when the credential was first attested.
+	TouchWebAuthnCredential(ctx context.Context, id string, signCount uint32, cloneWarning, backupState bool) error
+
+	CreateWebAuthnCeremony(ctx context.Context, c domain.WebAuthnCeremony) error
+	// ConsumeWebAuthnCeremony atomically fetches and deletes the ceremony
+	// row (a ceremony is single-use by construction: replaying a stale
+	// challenge must never succeed) -- ErrNotFound covers both "never
+	// existed" and "already consumed," and the caller MUST also reject an
+	// expired-but-not-yet-swept row rather than trusting ExpiresAt was
+	// already enforced by a background sweep.
+	ConsumeWebAuthnCeremony(ctx context.Context, id string, purpose domain.WebAuthnCeremonyPurpose) (domain.WebAuthnCeremony, error)
+	// PurgeExpiredWebAuthnCeremonies deletes ceremonies whose ExpiresAt is
+	// before cutoff, returning the count removed -- called periodically by
+	// the same background-sweep discipline every other reconciler in this
+	// codebase already uses.
+	PurgeExpiredWebAuthnCeremonies(ctx context.Context, cutoff time.Time) (int, error)
+}
+
 // ExecutionSignerOperations stores the durable execution-signer
 // authorize/rotate/revoke journal (atos-spec
 // docs/IMPLEMENTATION_ROADMAP.md §7.2.2) -- see
@@ -777,5 +821,6 @@ type Store interface {
 	Certifications
 	ExecutionSignerOperations
 	OpenTasks
+	PasskeyAccounts
 	Idempotency
 }

@@ -128,6 +128,16 @@ var defaultConsumerScopes = []Scope{
 	ScopeOpenTasksWrite,
 }
 
+// DefaultConsumerScopes returns a copy of the scope bundle an ordinary
+// self-service Device Authorization grant defaults to when no
+// requested_scopes are given -- exported so other issuance paths (e.g.
+// service.PasskeyService's passkey signup/login) can build on the exact
+// same canonical bundle instead of maintaining a second copy that could
+// silently drift from it.
+func DefaultConsumerScopes() []Scope {
+	return append([]Scope(nil), defaultConsumerScopes...)
+}
+
 // adminScopes carries system-wide, ownership-independent trust-side power
 // -- a holder acts on ANY provider's ANY capability, not just their own.
 // Explicit-grant-only scopes (ScopeExecutionSignersWrite, ScopeSettlementWrite,
@@ -512,6 +522,40 @@ func (s *Service) ExchangeDevice(deviceCode string) (TokenPair, error) {
 	default:
 		return TokenPair{}, &OAuthError{Code: "invalid_grant", Description: "device_code already consumed"}
 	}
+}
+
+// IssueForPrincipal mints a token pair directly for principalID, skipping
+// the grant/user-code/poll ceremony entirely -- used by passkey
+// registration/login (atos-spec docs/AUTH.md's "Human Account
+// Authentication (Passkey/WebAuthn)" section), where the ceremony itself (a
+// successful WebAuthn attestation/assertion) IS the identification step
+// Device Authorization's /activate page otherwise assumes already happened
+// via its own trusted-boundary precondition. Reuses the exact same
+// Device/credential/issueLocked machinery ExchangeDevice's
+// DeviceGrantApproved branch uses, so revocation, refresh and every other
+// Bearer-token mechanic behaves identically regardless of which front door
+// issued the token.
+func (s *Service) IssueForPrincipal(principalID string, scopes []Scope, clientType, clientName string) (TokenPair, error) {
+	if principalID == "" {
+		return TokenPair{}, errors.New("principal_id is required")
+	}
+	now := s.now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	deviceID := "dev_" + uuid.NewString()
+	device := Device{
+		ID: deviceID, PrincipalID: principalID,
+		ClientType: clientType, ClientName: clientName,
+		Scopes: append([]Scope(nil), scopes...), CreatedAt: now, LastUsedAt: now,
+	}
+	s.devices[deviceID] = device
+	principal := Principal{ID: principalID, DeviceID: deviceID, Scopes: scopeSet(scopes), ExpiresAt: now.Add(s.tokenTTL)}
+	pair := s.issueLocked(principal)
+	if err := s.persistLocked(); err != nil {
+		return TokenPair{}, err
+	}
+	return pair, nil
 }
 
 func (s *Service) Refresh(refreshToken string) (TokenPair, error) {

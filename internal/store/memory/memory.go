@@ -42,6 +42,10 @@ type Store struct {
 	openTaskProposals    map[string]domain.OpenTaskProposal         // proposalID -> proposal
 	acceptanceOperations map[string]domain.AcceptanceOperation      // opID -> operation
 	acceptanceOpByIdem   map[string]string                          // principalID+":"+key -> opID
+	passkeyAccounts      map[string]domain.PasskeyAccount           // principalID -> account
+	passkeyHandles       map[string]string                          // displayHandle -> principalID
+	passkeyCredentials   map[string]domain.WebAuthnCredentialRecord // credentialRowID -> credential
+	passkeyCeremonies    map[string]domain.WebAuthnCeremony         // ceremonyID -> ceremony
 	idempotency          map[string]store.IdempotencyRecord         // principalID+":"+key
 }
 
@@ -74,6 +78,10 @@ func New() *Store {
 		openTaskProposals:    make(map[string]domain.OpenTaskProposal),
 		acceptanceOperations: make(map[string]domain.AcceptanceOperation),
 		acceptanceOpByIdem:   make(map[string]string),
+		passkeyAccounts:      make(map[string]domain.PasskeyAccount),
+		passkeyHandles:       make(map[string]string),
+		passkeyCredentials:   make(map[string]domain.WebAuthnCredentialRecord),
+		passkeyCeremonies:    make(map[string]domain.WebAuthnCeremony),
 		idempotency:          make(map[string]store.IdempotencyRecord),
 	}
 }

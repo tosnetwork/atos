@@ -6,10 +6,13 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/go-webauthn/webauthn/webauthn"
 
 	"github.com/tosnetwork/atos/internal/a2a"
 	"github.com/tosnetwork/atos/internal/adapters/payout"
@@ -211,6 +214,38 @@ func main() {
 	activationAuthority := service.FailClosedActivationAuthority{}
 	openTasks := service.NewOpenTaskService(st, quotes, jobs)
 
+	// Passkey/WebAuthn human account authentication (atos-spec
+	// docs/AUTH.md's "Human Account Authentication (Passkey/WebAuthn)"
+	// section) is opt-in: a deployment that hasn't set ATOS_WEBAUTHN_RP_ID
+	// gets a PasskeyService with a nil webAuthn instance, which every
+	// method already fails closed against (ErrPasskeyNotConfigured) rather
+	// than this process refusing to start.
+	var webAuthnInstance *webauthn.WebAuthn
+	if cfg.WebAuthn.RPID != "" {
+		webAuthnInstance, err = webauthn.New(&webauthn.Config{
+			RPID: cfg.WebAuthn.RPID, RPDisplayName: cfg.WebAuthn.RPDisplayName, RPOrigins: cfg.WebAuthn.RPOrigins,
+		})
+		if err != nil {
+			logger.Error("initialize WebAuthn failed", "error", err)
+			os.Exit(1)
+		}
+	}
+	passkeys := service.NewPasskeyService(st, webAuthnInstance, authorization)
+
+	// config.Config.Validate already confirmed every entry parses as a
+	// CIDR, so this only ever fails on a config/validate drift, not on
+	// anything an operator can trigger by misconfiguring
+	// ATOS_TRUSTED_PROXY_CIDRS at runtime.
+	trustedProxyCIDRs := make([]netip.Prefix, 0, len(cfg.TrustedProxyCIDRs))
+	for _, raw := range cfg.TrustedProxyCIDRs {
+		parsed, err := netip.ParsePrefix(raw)
+		if err != nil {
+			logger.Error("invalid trusted proxy CIDR", "cidr", raw, "error", err)
+			os.Exit(2)
+		}
+		trustedProxyCIDRs = append(trustedProxyCIDRs, parsed)
+	}
+
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
 	defer reconcileCancel()
 	go jobs.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
@@ -231,6 +266,21 @@ func main() {
 	go openTasks.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("open task acceptance reconciliation pending", "error", reconcileErr)
 	})
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-reconcileCtx.Done():
+				return
+			case <-ticker.C:
+				if _, err := passkeys.PurgeExpiredCeremonies(reconcileCtx); err != nil {
+					logger.Error("passkey ceremony purge failed", "error", err)
+				}
+				passkeys.PurgeStaleRateLimitEntries()
+			}
+		}
+	}()
 
 	if err := seedDemoCapability(capabilities, cfg.TOSBackend); err != nil {
 		logger.Error("failed to seed demo capability", "error", err)
@@ -240,10 +290,12 @@ func main() {
 	restServer := &httpapi.Server{
 		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,
 		Certifications:      certifications,
+		Passkeys:            passkeys,
 		ActivationAuthority: activationAuthority, OpenTasks: openTasks, Quotes: quotes,
 		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts,
 		Earnings: earnings, Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 		ApprovalToken: cfg.Auth.ApprovalToken, AdminApprovalToken: cfg.Auth.AdminApprovalToken,
+		TrustedProxyCIDRs: trustedProxyCIDRs,
 	}
 	mcpServer := &mcp.Server{
 		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,
@@ -265,6 +317,20 @@ func main() {
 	httpServer := &http.Server{
 		Addr: cfg.Addr, Handler: observability.Middleware(logger, mux),
 		ReadHeaderTimeout: 5 * time.Second,
+		// IdleTimeout bounds how long a keep-alive connection may sit idle
+		// between requests -- safe to set unconditionally, since it only
+		// applies between requests, never during one. A blanket
+		// ReadTimeout/WriteTimeout is deliberately NOT set here: this
+		// server also handles GET /v1/jobs/{id}/stream (a genuine SSE
+		// endpoint with its own 5-minute internal bound, internal/httpapi/
+		// stream.go's streamMaxWait) and blob uploads with a 15-minute
+		// upload TTL (internal/adapters/storage/local's uploadTTL) --
+		// either timeout would need a careful per-route audit to avoid
+		// silently truncating those, which is out of scope for the
+		// specific anonymous-body-size fix this hardens (see
+		// internal/httpapi/passkey.go's http.MaxBytesReader on the two
+		// truly anonymous passkey finish routes instead).
+		IdleTimeout: 120 * time.Second,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

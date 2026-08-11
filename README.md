@@ -211,6 +211,44 @@ curl -s -X POST http://localhost:8080/v1/invocations \
 
 MCP is exposed at `POST /mcp`; A2A is exposed at `POST /a2a`.
 
+### Passkey / WebAuthn (human account authentication)
+
+Registration and login skip the Device Authorization ceremony entirely
+(`POST /v1/passkeys/registration/begin|finish`, `POST /v1/passkeys/login/begin|finish`)
+and mint the same fixed v1 scope bundle directly. Disabled unless
+`ATOS_WEBAUTHN_RP_ID` is set — there is no auto-derived fallback, so a deployment
+that forgets to configure it simply has passkey auth off, not silently on with the
+wrong Relying Party ID.
+
+Before enabling this in production:
+
+- Set `ATOS_WEBAUTHN_RP_ID` to the exact registrable domain served over HTTPS, and
+  confirm `ATOS_PUBLIC_BASE_URL`'s origin matches what the WebAuthn ceremony expects.
+- Set `ATOS_TRUSTED_PROXY_CIDRS` to the exact CIDR(s) of the reverse proxy/load
+  balancer terminating client connections. Left empty, `X-Real-IP`/`X-Forwarded-For`
+  are ignored entirely and rate limiting keys on the TCP peer address, which is wrong
+  behind any proxy and right otherwise.
+- If `ATOS_TRUSTED_PROXY_CIDRS` is set, the proxy MUST overwrite `X-Real-IP` with the
+  real client address rather than passing through whatever the client sent — this
+  header is trusted as a single value once the peer is inside a trusted CIDR, so a
+  proxy that merely forwards a client-supplied `X-Real-IP` lets that client spoof its
+  own rate-limit identity. Example nginx config:
+
+  ```nginx
+  proxy_set_header X-Real-IP $remote_addr;
+  ```
+
+  If this cannot be guaranteed, remove `X-Real-IP` from the trusted proxy's config
+  entirely and rely on `X-Forwarded-For` alone (walked right-to-left, skipping
+  trusted-proxy hops — see `internal/httpapi/passkey.go`'s `clientIP`).
+- `ATOS_MANAGED_INITIAL_BALANCE` defaults to `0.00` — new passkey accounts get no
+  free signup balance until an operator deliberately opts in, since there is still
+  no invite code/KYC/promotional gating on account creation. Raising it above `0`
+  before opening signup publicly requires a real anti-Sybil policy alongside it
+  (e.g. invite codes, per-device/per-payment-method gating), not just the env var.
+- Use a durable Postgres database (`ATOS_DATABASE_URL`) — the in-memory store loses
+  all passkey accounts, credentials and rate-limit state on restart.
+
 ## PostgreSQL
 
 ```bash
