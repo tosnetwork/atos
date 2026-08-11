@@ -121,34 +121,20 @@ type identityBindingStatusResponse struct {
 // projection only -- it does not itself re-verify against tos-protocol
 // (TOSBackedActivationAuthority does that at evaluation time; cached
 // status here is for operator visibility/audit, never an activation
-// decision).
+// decision). The active/revoked/unspecified branching itself lives in
+// service.IdentityBindingService.Status, shared with the MCP transport, so
+// this handler is just a field mapping.
 func (s *Server) handleIdentityBindingStatus(w http.ResponseWriter, r *http.Request) {
 	principalID := r.PathValue("principal_id")
-	binding, found, err := s.IdentityBindings.CurrentBinding(r.Context(), principalID)
+	status, err := s.IdentityBindings.Status(r.Context(), principalID)
 	if err != nil {
 		writeDomainErr(w, err)
 		return
 	}
-	if !found {
-		reasonCode, wasRevoked, err := s.IdentityBindings.RevocationHistory(r.Context(), principalID)
-		if err != nil {
-			writeDomainErr(w, err)
-			return
-		}
-		if wasRevoked {
-			writeJSON(w, http.StatusOK, identityBindingStatusResponse{
-				PrincipalID: principalID, Bound: false, Status: "revoked", RevocationReasonCode: reasonCode,
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, identityBindingStatusResponse{
-			PrincipalID: principalID, Bound: false, Status: "unspecified",
-		})
-		return
-	}
 	writeJSON(w, http.StatusOK, identityBindingStatusResponse{
-		PrincipalID: principalID, Bound: true, AgentID: binding.AgentID,
-		Network: binding.Network, BindingRef: binding.BindingRef, Status: "active",
+		PrincipalID: principalID, Bound: status.Bound, AgentID: status.AgentID,
+		Network: status.Network, BindingRef: status.BindingRef,
+		Status: status.Status, RevocationReasonCode: status.RevocationReasonCode,
 	})
 }
 

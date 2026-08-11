@@ -108,3 +108,49 @@ func TestCapabilityUpdate_NoTermsChangeDoesNotReanchor(t *testing.T) {
 			original.Version, original.ManifestCommitment, updated.Version, updated.ManifestCommitment)
 	}
 }
+
+// TestCapabilityUpdate_ResubmittingIdenticalSchemaDoesNotBumpVersion proves
+// input_schema/output_schema/bindings are gated on the value actually
+// differing, not merely on the key being present in the patch (like
+// pricing's own samePricing check already was) -- a client that always
+// resends the full current object (a common, legitimate REST PATCH
+// pattern) must not bump the version, re-anchor the manifest, or (since a
+// version bump now also suspends an already-Active stronger mode) suspend
+// Verified on every resubmission of UNCHANGED content.
+func TestCapabilityUpdate_ResubmittingIdenticalSchemaDoesNotBumpVersion(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := NewCapabilityService(st)
+	core := toscoremock.NewContractFixture(st)
+	core.SetNetwork("tos-devnet")
+	capabilities.WithManifestAnchor(core)
+
+	in := testRegisterInput("agt_resubmit_identical", domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}})
+	in.RequestedTrustModes = []domain.TrustMode{domain.TrustModeManaged, domain.TrustModeVerified}
+	original, err := capabilities.Register(ctx, in)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	// Simulate this capability having already reached Active for verified
+	// (see the parallel test in capability_update_suspends_active_mode_test.go).
+	if _, err := st.UpdateCapability(ctx, original.ID, func(current domain.Capability, exists bool) (domain.Capability, error) {
+		current.ModeSupport = current.ModeSupport.AdvanceToPending(domain.TrustModeVerified).Activate(domain.TrustModeVerified)
+		current.SupportedTrustModes = current.ModeSupport.ActiveModes()
+		return current, nil
+	}); err != nil {
+		t.Fatalf("test setup: %v", err)
+	}
+
+	updated, err := capabilities.Update(ctx, original.ID, "agt_resubmit_identical", map[string]any{
+		"input_schema": map[string]any{"type": "object"}, // identical to what Register already set
+	}, "update-resubmit-identical-1")
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if updated.Version != original.Version {
+		t.Fatalf("resubmitting an UNCHANGED input_schema must not bump the version: before=%s after=%s", original.Version, updated.Version)
+	}
+	if !updated.ModeSupport.Active(domain.TrustModeVerified) {
+		t.Fatal("resubmitting UNCHANGED content must not suspend an already-Active mode")
+	}
+}

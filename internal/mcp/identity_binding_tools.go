@@ -83,25 +83,19 @@ type identityBindingStatusResult struct {
 
 // toolIdentityBindingStatus reads the durable LOCAL current-state
 // projection only -- see httpapi.handleIdentityBindingStatus's identical
-// "never an activation decision" doc comment.
+// "never an activation decision" doc comment. The active/revoked/
+// unspecified branching itself lives in
+// service.IdentityBindingService.Status, shared with the REST transport, so
+// this tool is just a field mapping.
 func (s *Server) toolIdentityBindingStatus(ctx context.Context, principal auth.Principal, args map[string]any) (any, error) {
 	principalID := argString(args, "principal_id")
-	binding, found, err := s.IdentityBindings.CurrentBinding(ctx, principalID)
+	status, err := s.IdentityBindings.Status(ctx, principalID)
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		reasonCode, wasRevoked, err := s.IdentityBindings.RevocationHistory(ctx, principalID)
-		if err != nil {
-			return nil, err
-		}
-		if wasRevoked {
-			return identityBindingStatusResult{PrincipalID: principalID, Bound: false, Status: "revoked", RevocationReasonCode: reasonCode}, nil
-		}
-		return identityBindingStatusResult{PrincipalID: principalID, Bound: false, Status: "unspecified"}, nil
-	}
 	return identityBindingStatusResult{
-		PrincipalID: principalID, Bound: true, AgentID: binding.AgentID,
-		Network: binding.Network, BindingRef: binding.BindingRef, Status: "active",
+		PrincipalID: principalID, Bound: status.Bound, AgentID: status.AgentID,
+		Network: status.Network, BindingRef: status.BindingRef,
+		Status: status.Status, RevocationReasonCode: status.RevocationReasonCode,
 	}, nil
 }

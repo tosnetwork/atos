@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -279,13 +280,24 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 				termsChanged = true
 			}
 		}
+		// Gated on the value actually differing (like pricing's samePricing
+		// check above), not merely on the key being present -- otherwise a
+		// client that always resends the full current object (a common,
+		// legitimate REST PATCH pattern) would bump the version, re-anchor
+		// the manifest, and (since a version bump now also suspends an
+		// already-Active stronger mode) needlessly suspend Verified/Native
+		// on every resubmission of UNCHANGED content.
 		if inputSchema, ok := patch["input_schema"].(map[string]any); ok {
-			c.InputSchema = inputSchema
-			termsChanged = true
+			if !reflect.DeepEqual(c.InputSchema, inputSchema) {
+				c.InputSchema = inputSchema
+				termsChanged = true
+			}
 		}
 		if outputSchema, ok := patch["output_schema"].(map[string]any); ok {
-			c.OutputSchema = outputSchema
-			termsChanged = true
+			if !reflect.DeepEqual(c.OutputSchema, outputSchema) {
+				c.OutputSchema = outputSchema
+				termsChanged = true
+			}
 		}
 		if raw, ok := patch["requested_trust_modes"]; ok {
 			modes, err := decodeTrustModes(raw)
@@ -300,9 +312,11 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 			if err != nil {
 				return domain.Capability{}, err
 			}
-			c.Bindings = bindings
-			c.AdapterType = bindings[0].Transport
-			termsChanged = true
+			if !reflect.DeepEqual(c.Bindings, bindings) {
+				c.Bindings = bindings
+				c.AdapterType = bindings[0].Transport
+				termsChanged = true
+			}
 		}
 		if termsChanged {
 			c.Version = bumpMinorVersion(c.Version)

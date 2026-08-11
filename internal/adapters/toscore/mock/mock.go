@@ -43,7 +43,16 @@ type Core struct {
 	// current-bindings/revocation-history split exactly, for the same
 	// "never bound" vs "bound then revoked" distinction.
 	principalBindings map[string]domain.PrincipalIdentityBinding
-	revokedBindings   map[string]revokedBindingRecord
+	// principalBindingCreationKey records which idempotency_key ORIGINALLY
+	// created each current binding, so a crash-recovery retry (driveBind
+	// re-calling CreatePrincipalBinding with the SAME key after a crash
+	// between the mock's write and the caller's own checkpoint advance)
+	// can honestly report created=true, matching the real server's
+	// atomicMutation cache (which replays the ORIGINAL response rather
+	// than re-deriving it from current state) instead of always reporting
+	// created=false merely because a binding now exists.
+	principalBindingCreationKey map[string]string
+	revokedBindings             map[string]revokedBindingRecord
 	// manifestCommitments is keyed by "capability_id@version", mirroring
 	// the remote service's own capability-key bucketing for
 	// CommitCapabilityManifest.
@@ -86,11 +95,12 @@ func newCore(s store.Store, simulated bool, modes ...domain.TrustMode) *Core {
 	return &Core{
 		store: s, verified: make(map[string]domain.ExecutionReceipt),
 		quotes: make(map[string]domain.Quote), modes: allowed, simulated: simulated,
-		signers:             make(map[string]toscore.ExecutionSignerAuthorization),
-		agentIdentities:     make(map[string]bool),
-		principalBindings:   make(map[string]domain.PrincipalIdentityBinding),
-		revokedBindings:     make(map[string]revokedBindingRecord),
-		manifestCommitments: make(map[string]manifestCommitmentRecord),
+		signers:                     make(map[string]toscore.ExecutionSignerAuthorization),
+		agentIdentities:             make(map[string]bool),
+		principalBindings:           make(map[string]domain.PrincipalIdentityBinding),
+		principalBindingCreationKey: make(map[string]string),
+		revokedBindings:             make(map[string]revokedBindingRecord),
+		manifestCommitments:         make(map[string]manifestCommitmentRecord),
 	}
 }
 
@@ -178,13 +188,20 @@ func (c *Core) CreatePrincipalBinding(ctx context.Context, callerID, idempotency
 		if existing.AgentID != agentID {
 			return domain.PrincipalIdentityBinding{}, false, domain.NewError(domain.ErrIdempotencyConflict, "principal is already bound to a different TOS Agent Identity; revoke the existing binding first", false)
 		}
-		return existing, false, nil
+		// Replay the ORIGINAL outcome for the exact key that created this
+		// binding (a crash-recovery retry with the SAME idempotency_key
+		// after a crash between this write and the caller's own checkpoint
+		// advance) -- any OTHER key naming the same principal+agent is a
+		// genuine no-op rebind, correctly created=false.
+		created := c.principalBindingCreationKey[principalID] == idempotencyKey
+		return existing, created, nil
 	}
 	binding := domain.PrincipalIdentityBinding{
 		PrincipalID: principalID, AgentID: agentID, Network: c.network,
 		BindingRef: simulatedRef("principal-binding", domain.TrustModeManaged, principalID+":"+agentID),
 	}
 	c.principalBindings[principalID] = binding
+	c.principalBindingCreationKey[principalID] = idempotencyKey
 	delete(c.revokedBindings, principalID)
 	return binding, true, nil
 }

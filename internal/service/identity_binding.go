@@ -182,6 +182,49 @@ func (s *IdentityBindingService) RevocationHistory(ctx context.Context, principa
 	return op.ReasonCode, true, nil
 }
 
+// IdentityBindingStatus is the three-way current-state projection (active /
+// revoked / unspecified) docs/API.md §9A's status endpoint contract
+// requires, shared by both the REST and MCP transports so the
+// CurrentBinding + RevocationHistory branching logic exists in exactly one
+// place -- this repo has already fixed one REST/MCP divergence bug in this
+// exact area (a Revoked-field source mismatch), which is precisely the
+// class of bug two independent copies of the same branch risks
+// reintroducing.
+type IdentityBindingStatus struct {
+	Bound                bool
+	AgentID              string
+	Network              string
+	BindingRef           string
+	Status               string // "active" | "revoked" | "unspecified"
+	RevocationReasonCode string
+}
+
+// Status resolves principalID's current identity-binding status for
+// operator visibility/audit -- the local read path (does not itself call
+// the remote identity service; TOSBackedActivationAuthority re-resolves
+// freshness separately for activation decisions, since cached local state
+// is never authority).
+func (s *IdentityBindingService) Status(ctx context.Context, principalID string) (IdentityBindingStatus, error) {
+	binding, found, err := s.CurrentBinding(ctx, principalID)
+	if err != nil {
+		return IdentityBindingStatus{}, err
+	}
+	if found {
+		return IdentityBindingStatus{
+			Bound: true, AgentID: binding.AgentID, Network: binding.Network,
+			BindingRef: binding.BindingRef, Status: "active",
+		}, nil
+	}
+	reasonCode, wasRevoked, err := s.RevocationHistory(ctx, principalID)
+	if err != nil {
+		return IdentityBindingStatus{}, err
+	}
+	if wasRevoked {
+		return IdentityBindingStatus{Status: "revoked", RevocationReasonCode: reasonCode}, nil
+	}
+	return IdentityBindingStatus{Status: "unspecified"}, nil
+}
+
 func (s *IdentityBindingService) drive(ctx context.Context, op domain.IdentityBindingOperation) (domain.IdentityBindingOperation, error) {
 	if op.Checkpoint == domain.IdentityBindingCheckpointCompleted {
 		return op, nil

@@ -267,6 +267,16 @@ func (c Config) Validate() error {
 		if c.TOSRPC.URL == "" || c.TOSRPC.Token == "" {
 			return errors.New("ATOS_TOS_RPC_URL and ATOS_TOS_RPC_TOKEN are required when ATOS_TOS_BACKEND=rpc")
 		}
+		// TOSRPC.Network's own doc comment already states this is required
+		// whenever the backend is rpc -- enforcing it here turns a silent
+		// runtime fallback (cmd/api/main.go's tosBackedAuthorityWired gate
+		// quietly keeps FailClosedActivationAuthority, logged at info level
+		// only) into a fail-fast startup error, so a missing
+		// ATOS_TOS_NETWORK surfaces immediately instead of as "Verified
+		// activation mysteriously never works in production."
+		if strings.TrimSpace(c.TOSRPC.Network) == "" {
+			return errors.New("ATOS_TOS_NETWORK is required when ATOS_TOS_BACKEND=rpc")
+		}
 		if c.TOSRPC.Timeout <= 0 || c.TOSRPC.Timeout > 15*time.Minute {
 			return errors.New("ATOS_TOS_RPC_TIMEOUT is outside the allowed range")
 		}

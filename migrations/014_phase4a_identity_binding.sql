@@ -82,6 +82,16 @@ CREATE INDEX IF NOT EXISTS idx_identity_binding_operations_pending
     ON identity_binding_operations (updated_at ASC)
     WHERE checkpoint <> 'completed';
 
+-- Drives LatestCompletedIdentityBindingOperation (the identity-binding
+-- status read path's revoked-vs-never-bound lookup): every COMPLETED
+-- operation for one principal, most recent first. Deliberately the inverse
+-- partial-index condition of idx_identity_binding_operations_pending above
+-- -- that index explicitly EXCLUDES completed rows, so it provides zero
+-- support for this query's access pattern.
+CREATE INDEX IF NOT EXISTS idx_identity_binding_operations_completed
+    ON identity_binding_operations (principal_id, completed_at DESC)
+    WHERE checkpoint = 'completed';
+
 -- Capability ownership/manifest anchoring state (atos-spec
 -- docs/CAPABILITIES.md §1's "ownership":{"status","network","commitment"}
 -- object). One row per capability_id + version, immutable once committed
