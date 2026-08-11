@@ -14,75 +14,83 @@ import (
 )
 
 type Store struct {
-	mu                   sync.Mutex
-	capabilities         map[string]domain.Capability
-	quotes               map[string]domain.Quote
-	escrows              map[string]domain.Escrow
-	receipts             map[string]domain.Receipt
-	receiptsByJob        map[string]string // jobID -> receiptID
-	jobs                 map[string]domain.Job
-	streamEvents         map[string][]domain.JobEvent      // jobID -> ordered events
-	streamEventHashes    map[string][]string               // jobID -> content hash of the pristine incoming event at that index, mirroring Postgres's content_hash column
-	streamCursors        map[string]domain.JobStreamCursor // jobID -> cursor
-	streamDigests        map[string]streamDigestState      // jobID -> resumable hasher state
-	accounts             map[string]domain.Account
-	billingSnapshots     map[string]domain.BillingSnapshot // jobID -> snapshot
-	earnings             map[string]domain.ProviderEarning // earningID -> earning
-	earningsBySettlement map[string]string                 // settlementID -> earningID
-	earningsByJob        map[string]string                 // jobID -> earningID
-	disputes             map[string]domain.Dispute         // disputeID -> dispute
-	disputesByJob        map[string]string                 // jobID -> disputeID
-	artifacts            map[string]domain.StoredArtifact
-	healthChecks         map[string]domain.AdapterHealthCheck       // capabilityID+":"+capabilityVersion+":"+transport -> check
-	certifications       map[string]domain.SandboxCertification     // certID -> certification
-	certByIdempotencyKey map[string]string                          // providerID+":"+key -> certID
-	signerOperations     map[string]domain.ExecutionSignerOperation // opID -> operation
-	signerOpByIdemKey    map[string]string                          // providerID+":"+key -> opID
-	openTasks            map[string]domain.OpenTask                 // taskID -> task
-	openTaskProposals    map[string]domain.OpenTaskProposal         // proposalID -> proposal
-	acceptanceOperations map[string]domain.AcceptanceOperation      // opID -> operation
-	acceptanceOpByIdem   map[string]string                          // principalID+":"+key -> opID
-	passkeyAccounts      map[string]domain.PasskeyAccount           // principalID -> account
-	passkeyHandles       map[string]string                          // displayHandle -> principalID
-	passkeyCredentials   map[string]domain.WebAuthnCredentialRecord // credentialRowID -> credential
-	passkeyCeremonies    map[string]domain.WebAuthnCeremony         // ceremonyID -> ceremony
-	idempotency          map[string]store.IdempotencyRecord         // principalID+":"+key
+	mu                         sync.Mutex
+	capabilities               map[string]domain.Capability
+	quotes                     map[string]domain.Quote
+	escrows                    map[string]domain.Escrow
+	receipts                   map[string]domain.Receipt
+	receiptsByJob              map[string]string // jobID -> receiptID
+	jobs                       map[string]domain.Job
+	streamEvents               map[string][]domain.JobEvent      // jobID -> ordered events
+	streamEventHashes          map[string][]string               // jobID -> content hash of the pristine incoming event at that index, mirroring Postgres's content_hash column
+	streamCursors              map[string]domain.JobStreamCursor // jobID -> cursor
+	streamDigests              map[string]streamDigestState      // jobID -> resumable hasher state
+	accounts                   map[string]domain.Account
+	billingSnapshots           map[string]domain.BillingSnapshot // jobID -> snapshot
+	earnings                   map[string]domain.ProviderEarning // earningID -> earning
+	earningsBySettlement       map[string]string                 // settlementID -> earningID
+	earningsByJob              map[string]string                 // jobID -> earningID
+	disputes                   map[string]domain.Dispute         // disputeID -> dispute
+	disputesByJob              map[string]string                 // jobID -> disputeID
+	artifacts                  map[string]domain.StoredArtifact
+	healthChecks               map[string]domain.AdapterHealthCheck            // capabilityID+":"+capabilityVersion+":"+transport -> check
+	certifications             map[string]domain.SandboxCertification          // certID -> certification
+	certByIdempotencyKey       map[string]string                               // providerID+":"+key -> certID
+	signerOperations           map[string]domain.ExecutionSignerOperation      // opID -> operation
+	signerOpByIdemKey          map[string]string                               // providerID+":"+key -> opID
+	openTasks                  map[string]domain.OpenTask                      // taskID -> task
+	openTaskProposals          map[string]domain.OpenTaskProposal              // proposalID -> proposal
+	acceptanceOperations       map[string]domain.AcceptanceOperation           // opID -> operation
+	acceptanceOpByIdem         map[string]string                               // principalID+":"+key -> opID
+	passkeyAccounts            map[string]domain.PasskeyAccount                // principalID -> account
+	passkeyHandles             map[string]string                               // displayHandle -> principalID
+	passkeyCredentials         map[string]domain.WebAuthnCredentialRecord      // credentialRowID -> credential
+	passkeyCeremonies          map[string]domain.WebAuthnCeremony              // ceremonyID -> ceremony
+	idempotency                map[string]store.IdempotencyRecord              // principalID+":"+key
+	principalBindings          map[string]domain.PrincipalIdentityBinding      // principalID -> binding
+	identityBindingOps         map[string]domain.IdentityBindingOperation      // opID -> operation
+	identityBindingOpByIdemKey map[string]string                               // principalID+":"+key -> opID
+	ownershipCommitments       map[string]domain.CapabilityOwnershipCommitment // capabilityID+"@"+version -> commitment
 }
 
 func New() *Store {
 	return &Store{
-		capabilities:         make(map[string]domain.Capability),
-		quotes:               make(map[string]domain.Quote),
-		escrows:              make(map[string]domain.Escrow),
-		receipts:             make(map[string]domain.Receipt),
-		receiptsByJob:        make(map[string]string),
-		jobs:                 make(map[string]domain.Job),
-		streamEvents:         make(map[string][]domain.JobEvent),
-		streamEventHashes:    make(map[string][]string),
-		streamCursors:        make(map[string]domain.JobStreamCursor),
-		streamDigests:        make(map[string]streamDigestState),
-		accounts:             make(map[string]domain.Account),
-		billingSnapshots:     make(map[string]domain.BillingSnapshot),
-		earnings:             make(map[string]domain.ProviderEarning),
-		earningsBySettlement: make(map[string]string),
-		earningsByJob:        make(map[string]string),
-		disputes:             make(map[string]domain.Dispute),
-		disputesByJob:        make(map[string]string),
-		artifacts:            make(map[string]domain.StoredArtifact),
-		healthChecks:         make(map[string]domain.AdapterHealthCheck),
-		certifications:       make(map[string]domain.SandboxCertification),
-		certByIdempotencyKey: make(map[string]string),
-		signerOperations:     make(map[string]domain.ExecutionSignerOperation),
-		signerOpByIdemKey:    make(map[string]string),
-		openTasks:            make(map[string]domain.OpenTask),
-		openTaskProposals:    make(map[string]domain.OpenTaskProposal),
-		acceptanceOperations: make(map[string]domain.AcceptanceOperation),
-		acceptanceOpByIdem:   make(map[string]string),
-		passkeyAccounts:      make(map[string]domain.PasskeyAccount),
-		passkeyHandles:       make(map[string]string),
-		passkeyCredentials:   make(map[string]domain.WebAuthnCredentialRecord),
-		passkeyCeremonies:    make(map[string]domain.WebAuthnCeremony),
-		idempotency:          make(map[string]store.IdempotencyRecord),
+		capabilities:               make(map[string]domain.Capability),
+		quotes:                     make(map[string]domain.Quote),
+		escrows:                    make(map[string]domain.Escrow),
+		receipts:                   make(map[string]domain.Receipt),
+		receiptsByJob:              make(map[string]string),
+		jobs:                       make(map[string]domain.Job),
+		streamEvents:               make(map[string][]domain.JobEvent),
+		streamEventHashes:          make(map[string][]string),
+		streamCursors:              make(map[string]domain.JobStreamCursor),
+		streamDigests:              make(map[string]streamDigestState),
+		accounts:                   make(map[string]domain.Account),
+		billingSnapshots:           make(map[string]domain.BillingSnapshot),
+		earnings:                   make(map[string]domain.ProviderEarning),
+		earningsBySettlement:       make(map[string]string),
+		earningsByJob:              make(map[string]string),
+		disputes:                   make(map[string]domain.Dispute),
+		disputesByJob:              make(map[string]string),
+		artifacts:                  make(map[string]domain.StoredArtifact),
+		healthChecks:               make(map[string]domain.AdapterHealthCheck),
+		certifications:             make(map[string]domain.SandboxCertification),
+		certByIdempotencyKey:       make(map[string]string),
+		signerOperations:           make(map[string]domain.ExecutionSignerOperation),
+		signerOpByIdemKey:          make(map[string]string),
+		openTasks:                  make(map[string]domain.OpenTask),
+		openTaskProposals:          make(map[string]domain.OpenTaskProposal),
+		acceptanceOperations:       make(map[string]domain.AcceptanceOperation),
+		acceptanceOpByIdem:         make(map[string]string),
+		passkeyAccounts:            make(map[string]domain.PasskeyAccount),
+		passkeyHandles:             make(map[string]string),
+		passkeyCredentials:         make(map[string]domain.WebAuthnCredentialRecord),
+		passkeyCeremonies:          make(map[string]domain.WebAuthnCeremony),
+		idempotency:                make(map[string]store.IdempotencyRecord),
+		principalBindings:          make(map[string]domain.PrincipalIdentityBinding),
+		identityBindingOps:         make(map[string]domain.IdentityBindingOperation),
+		identityBindingOpByIdemKey: make(map[string]string),
+		ownershipCommitments:       make(map[string]domain.CapabilityOwnershipCommitment),
 	}
 }
 

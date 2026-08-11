@@ -87,13 +87,20 @@ type CapabilityBinding struct {
 }
 
 type Capability struct {
-	ID                       string              `json:"id"`
-	CanonicalURI             string              `json:"canonical_uri,omitempty"`
-	ProviderID               string              `json:"provider_id"`
-	Name                     string              `json:"name"`
-	Description              string              `json:"description"`
-	Version                  string              `json:"version"`
-	ManifestCommitment       string              `json:"manifest_commitment,omitempty"`
+	ID                 string `json:"id"`
+	CanonicalURI       string `json:"canonical_uri,omitempty"`
+	ProviderID         string `json:"provider_id"`
+	Name               string `json:"name"`
+	Description        string `json:"description"`
+	Version            string `json:"version"`
+	ManifestCommitment string `json:"manifest_commitment,omitempty"`
+	// Ownership is Phase 4A's ownership-anchoring projection
+	// (docs/CAPABILITIES.md §1/§13). normalizeCapability defaults an empty
+	// Status to OwnershipUnanchored -- Managed registration creates a
+	// Capability before any TOS anchor exists; the field only becomes
+	// OwnershipAnchored after CapabilityOwnershipService durably commits
+	// this exact version's manifest/ownership through tos-protocol.
+	Ownership                CapabilityOwnership `json:"ownership"`
 	Tags                     []string            `json:"tags,omitempty"`
 	Modalities               []string            `json:"modalities,omitempty"`
 	DeliveryMode             DeliveryMode        `json:"delivery_mode"`

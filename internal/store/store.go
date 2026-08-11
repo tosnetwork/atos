@@ -805,6 +805,50 @@ type Idempotency interface {
 
 // Store aggregates every collection the service layer needs. Concrete
 // implementations (memory, later postgres) satisfy this in one place.
+// IdentityBindings backs Phase 4A's principal-to-TOS-Agent-Identity
+// binding: PrincipalIdentityBindings is the queryable current-state
+// projection (one row per principal_id, overwritten on rebind, deleted on
+// revoke); IdentityBindingOperations is the durable external-operation
+// journal giving crash/lost-response recovery for the tos-protocol
+// CreatePrincipalBinding/RevokePrincipalBinding calls that produce it --
+// mirrors ExecutionSignerOperations' shape, simplified for a single-step
+// (not multi-checkpoint) remote operation.
+type IdentityBindings interface {
+	CurrentPrincipalBinding(ctx context.Context, principalID string) (domain.PrincipalIdentityBinding, bool, error)
+	PutPrincipalBinding(ctx context.Context, b domain.PrincipalIdentityBinding) error
+	DeletePrincipalBinding(ctx context.Context, principalID string) error
+
+	// OpenIdentityBindingOperation idempotently creates an operation
+	// record keyed by (principalID, idempotencyKey) -- identical contract
+	// to OpenSignerOperation: created=true on first open; created=false
+	// with the existing record on a same-content replay;
+	// domain.ErrIdempotencyConflict on a same-key different-content
+	// replay.
+	OpenIdentityBindingOperation(ctx context.Context, principalID string, op domain.IdentityBindingOperation) (domain.IdentityBindingOperation, bool, error)
+	GetIdentityBindingOperation(ctx context.Context, id string) (domain.IdentityBindingOperation, error)
+	IdentityBindingOperationByIdempotencyKey(ctx context.Context, principalID, key string) (domain.IdentityBindingOperation, error)
+	// StaleIdentityBindingOperations returns up to limit non-terminal
+	// operations (checkpoint <> completed) last updated before cutoff,
+	// oldest first -- the reconciler's sweep query.
+	StaleIdentityBindingOperations(ctx context.Context, cutoff time.Time, limit int) ([]domain.IdentityBindingOperation, error)
+	// UpdateIdentityBindingOperation atomically applies fn to the
+	// operation's current stored state. Implementations MUST reject
+	// (domain.ErrIdempotencyConflict) a returned value whose ID or
+	// identity fields (PrincipalID/Type/IdempotencyKey/AgentID/ReasonCode)
+	// differ from the existing stored record -- only
+	// Checkpoint/BindingRef/FailureReason/CompletedAt/UpdatedAt may
+	// change, mirroring UpdateSignerOperation's own contract.
+	UpdateIdentityBindingOperation(ctx context.Context, id string, fn func(op domain.IdentityBindingOperation, exists bool) (domain.IdentityBindingOperation, error)) (domain.IdentityBindingOperation, error)
+
+	// PutCapabilityOwnershipCommitment durably records the immutable
+	// manifest/ownership anchoring for one capability_id+version. Callers
+	// MUST treat an existing row for the same (capability_id, version) as
+	// immutable state to verify against, never overwrite -- mirrors
+	// ManifestCommitment's own immutability rule.
+	PutCapabilityOwnershipCommitment(ctx context.Context, c domain.CapabilityOwnershipCommitment) error
+	CapabilityOwnershipCommitmentByVersion(ctx context.Context, capabilityID, version string) (domain.CapabilityOwnershipCommitment, bool, error)
+}
+
 type Store interface {
 	Capabilities
 	Quotes
@@ -822,5 +866,6 @@ type Store interface {
 	ExecutionSignerOperations
 	OpenTasks
 	PasskeyAccounts
+	IdentityBindings
 	Idempotency
 }

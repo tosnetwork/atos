@@ -663,6 +663,9 @@ func normalizeCapability(c domain.Capability) domain.Capability {
 	if c.ManifestCommitment == "" {
 		c.ManifestCommitment = capabilityManifestCommitment(c)
 	}
+	if c.Ownership.Status == "" {
+		c.Ownership.Status = domain.OwnershipUnanchored
+	}
 	if len(c.Bindings) == 0 {
 		transport := c.AdapterType
 		if transport == "" {
