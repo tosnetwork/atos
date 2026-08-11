@@ -104,6 +104,53 @@ func TestIdentityEvidenceReconciler_SuspendsAfterIdentityRevoked(t *testing.T) {
 	}
 }
 
+// TestIdentityEvidenceReconciler_FailClosedAuthoritySuspendsEveryActiveCapability
+// pins down the exact hazard cmd/api/main.go's tosBackedAuthorityWired gate
+// exists to prevent: FailClosedActivationAuthority always returns
+// granted=false with a NIL error, indistinguishable from SweepVerified's
+// perspective from a real authority genuinely finding every capability
+// invalid. If this reconciler is ever wired against the fail-closed
+// placeholder (a config regression, not a corner case -- see the
+// ATOS_TOS_NETWORK-required Validate() fix), its very first sweep mass-
+// suspends every already-active Verified capability. This test does not
+// exercise main.go's wiring decision itself (cmd/api has no test file);
+// it documents and pins the underlying reconciler behavior that decision
+// depends on, so the hazard stays visible even if main.go's gate is ever
+// weakened.
+func TestIdentityEvidenceReconciler_FailClosedAuthoritySuspendsEveryActiveCapability(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+
+	cap := registerSignerTestCapability(t, capabilities, "prn_reconciler_failclosed", domain.TrustModeManaged, domain.TrustModeVerified)
+	// Simulate this capability having already legitimately reached Active
+	// for verified under a real authority in a PRIOR run -- this
+	// reconciler run must not be what put it there.
+	if _, err := st.UpdateCapability(ctx, cap.ID, func(current domain.Capability, exists bool) (domain.Capability, error) {
+		current.ModeSupport = current.ModeSupport.AdvanceToPending(domain.TrustModeVerified).Activate(domain.TrustModeVerified)
+		current.SupportedTrustModes = current.ModeSupport.ActiveModes()
+		return current, nil
+	}); err != nil {
+		t.Fatalf("test setup: %v", err)
+	}
+
+	reconciler := service.NewIdentityEvidenceReconciler(capabilities, service.FailClosedActivationAuthority{})
+	if err := reconciler.SweepVerified(ctx, 100); err != nil {
+		t.Fatal(err)
+	}
+	after, err := capabilities.Get(ctx, cap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := after.ModeSupport.Entry(domain.TrustModeVerified)
+	if entry.Status != domain.ModeSupportSuspended {
+		t.Fatalf("FailClosedActivationAuthority's very first sweep must suspend a previously-legitimate active capability (status=%s) -- this is exactly why cmd/api/main.go must never wire this reconciler against it", entry.Status)
+	}
+	if entry.Reason != domain.ActivationAuthorityUnavailable {
+		t.Fatalf("suspension reason = %q, want %q", entry.Reason, domain.ActivationAuthorityUnavailable)
+	}
+}
+
 func TestIdentityEvidenceReconciler_NilSafe(t *testing.T) {
 	var r *service.IdentityEvidenceReconciler
 	if err := r.SweepVerified(context.Background(), 10); err != nil {

@@ -227,6 +227,107 @@ func TestIdentityBindingBind_AmbiguousFailureThenReconcile(t *testing.T) {
 	}
 }
 
+// TestIdentityBindingRevoke_AmbiguousFailureThenReconcile is
+// TestIdentityBindingBind_AmbiguousFailureThenReconcile's Revoke
+// counterpart -- this cell of the (bind|revoke) x (ambiguous|definitive)
+// failure matrix had no test at all despite flakyIdentityCore already
+// supporting it.
+func TestIdentityBindingRevoke_AmbiguousFailureThenReconcile(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	base := toscoremock.New(st)
+	base.SetNetwork("tos-devnet")
+	base.SeedAgentIdentity("agt_1")
+	flaky := &flakyIdentityCore{Core: base}
+	svc := service.NewIdentityBindingService(st, flaky)
+
+	if _, err := svc.Bind(ctx, service.BindIdentityInput{PrincipalID: "prn_1", AgentID: "agt_1", IdempotencyKey: "key-1"}); err != nil {
+		t.Fatal(err)
+	}
+	flaky.revokeFailuresLeft, flaky.revokeFailureRetryable = 1, true
+
+	_, err := svc.Revoke(ctx, service.RevokeIdentityBindingInput{PrincipalID: "prn_1", ReasonCode: "TEST", IdempotencyKey: "key-revoke"})
+	if err == nil {
+		t.Fatal("expected the ambiguous first attempt to surface a retryable error")
+	}
+	var domainErr *domain.Error
+	if !errors.As(err, &domainErr) || !domainErr.Retryable {
+		t.Fatalf("err = %v, want a retryable domain error", err)
+	}
+
+	op, err := st.IdentityBindingOperationByIdempotencyKey(ctx, "prn_1", "key-revoke")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.Checkpoint != domain.IdentityBindingCheckpointReconciling {
+		t.Fatalf("checkpoint = %s, want reconciling after an ambiguous failure", op.Checkpoint)
+	}
+	// The binding must still be intact -- an ambiguous revoke failure must
+	// not have silently torn it down.
+	if _, found, err := svc.CurrentBinding(ctx, "prn_1"); err != nil || !found {
+		t.Fatalf("found=%v err=%v, binding must still exist while the revoke operation is still reconciling", found, err)
+	}
+
+	if err := svc.ReconcileStaleOperations(ctx, time.Now().UTC().Add(time.Hour), 10); err != nil {
+		t.Fatal(err)
+	}
+	reconciled, err := st.GetIdentityBindingOperation(ctx, op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciled.Checkpoint != domain.IdentityBindingCheckpointCompleted {
+		t.Fatalf("checkpoint after reconcile = %s, want completed", reconciled.Checkpoint)
+	}
+	if !reconciled.Revoked {
+		t.Fatal("reconciled revoke must record Revoked=true")
+	}
+	if flaky.revokeCalls != 2 {
+		t.Fatalf("revokeCalls = %d, want 2 (one ambiguous failure, one successful reconcile retry)", flaky.revokeCalls)
+	}
+	if _, found, err := svc.CurrentBinding(ctx, "prn_1"); err != nil || found {
+		t.Fatalf("found=%v err=%v after reconcile, want not found (revoke actually completed)", found, err)
+	}
+}
+
+// TestIdentityBindingRevoke_DefinitiveRejectionDoesNotReconcile is
+// TestIdentityBindingBind_DefinitiveRejectionDoesNotReconcile's Revoke
+// counterpart.
+func TestIdentityBindingRevoke_DefinitiveRejectionDoesNotReconcile(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	base := toscoremock.New(st)
+	base.SetNetwork("tos-devnet")
+	base.SeedAgentIdentity("agt_1")
+	flaky := &flakyIdentityCore{Core: base}
+	svc := service.NewIdentityBindingService(st, flaky)
+
+	if _, err := svc.Bind(ctx, service.BindIdentityInput{PrincipalID: "prn_1", AgentID: "agt_1", IdempotencyKey: "key-1"}); err != nil {
+		t.Fatal(err)
+	}
+	flaky.revokeFailuresLeft, flaky.revokeFailureRetryable = 1, false
+
+	_, err := svc.Revoke(ctx, service.RevokeIdentityBindingInput{PrincipalID: "prn_1", ReasonCode: "TEST", IdempotencyKey: "key-revoke"})
+	if err == nil {
+		t.Fatal("expected the definitive failure to surface")
+	}
+
+	op, err := st.IdentityBindingOperationByIdempotencyKey(ctx, "prn_1", "key-revoke")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.Checkpoint != domain.IdentityBindingCheckpointIntentPersisted {
+		t.Fatalf("checkpoint = %s, want intent_persisted (unchanged by a definitive rejection)", op.Checkpoint)
+	}
+	if op.FailureReason == "" {
+		t.Fatal("expected FailureReason to record the definitive rejection for operator visibility")
+	}
+	// The binding must still be intact -- a definitively-rejected revoke
+	// attempt must not have torn it down either.
+	if _, found, err := svc.CurrentBinding(ctx, "prn_1"); err != nil || !found {
+		t.Fatalf("found=%v err=%v, binding must still exist after a definitively-rejected revoke", found, err)
+	}
+}
+
 // TestIdentityBindingBind_DefinitiveRejectionDoesNotReconcile proves a
 // non-ambiguous (Retryable=false) failure is recorded as a genuine
 // rejection at its current checkpoint (unchanged, with FailureReason set

@@ -68,6 +68,89 @@ func TestGetIdentityBindingOperation_NotFound(t *testing.T) {
 	}
 }
 
+func TestLatestCompletedIdentityBindingOperation_NeverBound(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	_, found, err := s.LatestCompletedIdentityBindingOperation(ctx, "prn_never_seen_"+randSuffix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("a principal with no operations at all must report found=false")
+	}
+}
+
+func TestLatestCompletedIdentityBindingOperation_IgnoresNonCompleted(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	principalID := "prn_pending_" + suffix
+	op := testIdentityBindingOperation(principalID, "key_"+suffix, "agt_"+suffix)
+	if _, _, err := s.OpenIdentityBindingOperation(ctx, principalID, op); err != nil {
+		t.Fatal(err)
+	}
+	// Still intent_persisted -- never completed.
+	_, found, err := s.LatestCompletedIdentityBindingOperation(ctx, principalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("a non-completed operation must not be returned")
+	}
+}
+
+// TestLatestCompletedIdentityBindingOperation_ReturnsMostRecentByCompletedAt
+// mirrors store/memory's identically-named test exactly -- both backends
+// must agree that the LATEST completed operation is selected by
+// completed_at, not insertion/creation order, since
+// IdentityBindingService.RevocationHistory relies on this to correctly
+// report "revoked" (not "bound") after a bind-then-revoke sequence.
+func TestLatestCompletedIdentityBindingOperation_ReturnsMostRecentByCompletedAt(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	principalID := "prn_latest_" + suffix
+
+	bind := testIdentityBindingOperation(principalID, "key-bind_"+suffix, "agt_"+suffix)
+	if _, _, err := s.OpenIdentityBindingOperation(ctx, principalID, bind); err != nil {
+		t.Fatal(err)
+	}
+	earlier := time.Now().UTC().Add(-time.Hour)
+	if _, err := s.UpdateIdentityBindingOperation(ctx, bind.ID, func(current domain.IdentityBindingOperation, exists bool) (domain.IdentityBindingOperation, error) {
+		current.Checkpoint = domain.IdentityBindingCheckpointCompleted
+		current.CompletedAt = &earlier
+		return current, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	revoke := testIdentityBindingOperation(principalID, "key-revoke_"+suffix, "")
+	revoke.Type = domain.IdentityBindingOperationRevoke
+	if _, _, err := s.OpenIdentityBindingOperation(ctx, principalID, revoke); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().UTC()
+	if _, err := s.UpdateIdentityBindingOperation(ctx, revoke.ID, func(current domain.IdentityBindingOperation, exists bool) (domain.IdentityBindingOperation, error) {
+		current.Checkpoint = domain.IdentityBindingCheckpointCompleted
+		current.Revoked = true
+		current.CompletedAt = &later
+		return current, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	latest, found, err := s.LatestCompletedIdentityBindingOperation(ctx, principalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected a completed operation to be found")
+	}
+	if latest.ID != revoke.ID || latest.Type != domain.IdentityBindingOperationRevoke {
+		t.Fatalf("latest = %+v, want the later-completed revoke operation", latest)
+	}
+}
+
 func TestOpenIdentityBindingOperation_ReplaySameContentReturnsExisting(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)

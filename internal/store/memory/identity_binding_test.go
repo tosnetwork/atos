@@ -169,6 +169,85 @@ func TestStaleIdentityBindingOperations_ExcludesCompletedAndRecent(t *testing.T)
 	}
 }
 
+func TestLatestCompletedIdentityBindingOperation_NeverBound(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+	_, found, err := s.LatestCompletedIdentityBindingOperation(ctx, "prn_never_seen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("a principal with no operations at all must report found=false")
+	}
+}
+
+func TestLatestCompletedIdentityBindingOperation_IgnoresNonCompleted(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+	op := testIdentityBindingOp("prn_1", "key-pending")
+	if _, _, err := s.OpenIdentityBindingOperation(ctx, "prn_1", op); err != nil {
+		t.Fatal(err)
+	}
+	// Still intent_persisted -- never completed.
+	_, found, err := s.LatestCompletedIdentityBindingOperation(ctx, "prn_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("a non-completed operation must not be returned")
+	}
+}
+
+// TestLatestCompletedIdentityBindingOperation_ReturnsMostRecentByCompletedAt
+// proves the LATEST completed operation is selected by completed_at, not by
+// insertion/creation order -- this is what
+// IdentityBindingService.RevocationHistory relies on to correctly report
+// "revoked" (not "bound") after a bind-then-revoke sequence.
+func TestLatestCompletedIdentityBindingOperation_ReturnsMostRecentByCompletedAt(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+	bind := testIdentityBindingOp("prn_1", "key-bind")
+	if _, _, err := s.OpenIdentityBindingOperation(ctx, "prn_1", bind); err != nil {
+		t.Fatal(err)
+	}
+	earlier := time.Now().UTC().Add(-time.Hour)
+	if _, err := s.UpdateIdentityBindingOperation(ctx, bind.ID, func(current domain.IdentityBindingOperation, exists bool) (domain.IdentityBindingOperation, error) {
+		current.Checkpoint = domain.IdentityBindingCheckpointCompleted
+		current.CompletedAt = &earlier
+		return current, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	revoke := testIdentityBindingOp("prn_1", "key-revoke")
+	revoke.Type = domain.IdentityBindingOperationRevoke
+	revoke.AgentID = ""
+	revoke.ID = "idop_key-revoke"
+	if _, _, err := s.OpenIdentityBindingOperation(ctx, "prn_1", revoke); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().UTC()
+	if _, err := s.UpdateIdentityBindingOperation(ctx, revoke.ID, func(current domain.IdentityBindingOperation, exists bool) (domain.IdentityBindingOperation, error) {
+		current.Checkpoint = domain.IdentityBindingCheckpointCompleted
+		current.Revoked = true
+		current.CompletedAt = &later
+		return current, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	latest, found, err := s.LatestCompletedIdentityBindingOperation(ctx, "prn_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected a completed operation to be found")
+	}
+	if latest.ID != revoke.ID || latest.Type != domain.IdentityBindingOperationRevoke {
+		t.Fatalf("latest = %+v, want the later-completed revoke operation", latest)
+	}
+}
+
 func TestGetIdentityBindingOperation_NotFound(t *testing.T) {
 	ctx := context.Background()
 	s := New()
