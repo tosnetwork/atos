@@ -91,6 +91,16 @@ const (
 	// consumer scope (a consumer never certifies someone else's binding).
 	ScopeCertificationsRead  Scope = "certifications:read"
 	ScopeCertificationsWrite Scope = "certifications:write"
+	// ScopeIdentityBindingsRead/Write authorize Phase 4A's identity-binding
+	// operator surface (atos-spec docs/IMPLEMENTATION_ROADMAP.md §8.1,
+	// docs/API.md §9A): binding/revoking/reading which TOS Agent Identity a
+	// principal_id is bound to. Like ScopeActivationEvaluate, this is an
+	// activation-authority/operator-side action, not owner-scoped -- a
+	// principal cannot bind ITSELF to an arbitrary claimed TOS identity
+	// merely by being authenticated, so this carries no ownership
+	// precondition and is explicit-grant-only, never a default scope.
+	ScopeIdentityBindingsRead  Scope = "identity_bindings:read"
+	ScopeIdentityBindingsWrite Scope = "identity_bindings:write"
 )
 
 var allowedScopes = map[Scope]struct{}{
@@ -103,6 +113,7 @@ var allowedScopes = map[Scope]struct{}{
 	ScopeActivationEvaluate: {},
 	ScopeOpenTasksRead:      {}, ScopeOpenTasksWrite: {}, ScopeOpenTaskProposalsWrite: {},
 	ScopeCertificationsRead: {}, ScopeCertificationsWrite: {},
+	ScopeIdentityBindingsRead: {}, ScopeIdentityBindingsWrite: {},
 }
 
 var defaultConsumerScopes = []Scope{
@@ -148,12 +159,20 @@ func DefaultConsumerScopes() []Scope {
 // administrator approved it." Scopes in this set additionally require
 // RequiresAdminApproval's stronger operator-secret gate at approval time
 // (see internal/httpapi/auth.go's DecideDevice callers) before a pending
-// grant can ever be approved. Currently just ScopeActivationEvaluate --
-// the only scope with zero ownership scoping at all -- not
-// ScopeSettlementWrite/ScopeDisputesReview, which is a deliberate,
-// separate decision this set makes easy to revisit later, not an oversight.
+// grant can ever be approved. The set is every scope with zero ownership
+// scoping at all -- not ScopeSettlementWrite/ScopeDisputesReview, which is
+// a deliberate, separate decision this set makes easy to revisit later,
+// not an oversight. ScopeIdentityBindingsRead is included alongside
+// ScopeIdentityBindingsWrite despite being read-only: it returns any
+// principal_id's TOS agent_id/network/binding_ref with the same zero
+// ownership precondition as the write side (see its declaration above),
+// which is exactly this set's inclusion criterion -- a read scope isn't
+// automatically less sensitive than a write one when it's the only thing
+// gating cross-tenant identity-binding data.
 var adminScopes = map[Scope]struct{}{
-	ScopeActivationEvaluate: {},
+	ScopeActivationEvaluate:    {},
+	ScopeIdentityBindingsRead:  {},
+	ScopeIdentityBindingsWrite: {},
 }
 
 // RequiresAdminApproval reports whether scopes contains any scope in

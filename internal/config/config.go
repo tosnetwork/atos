@@ -62,6 +62,14 @@ type TOSRPCConfig struct {
 	CAFile          string
 	ClientCertFile  string
 	ClientKeyFile   string
+	// Network is this deployment's configured TOS network identity (e.g.
+	// "tos-mainnet"/"tos-testnet-1") -- Phase 4A's ActivationAuthority
+	// rejects any provider identity binding anchored on a DIFFERENT
+	// network rather than silently accepting it (atos-spec
+	// docs/IMPLEMENTATION_ROADMAP.md §8.1's network/genesis/finality
+	// binding requirement). Required whenever TOSBackend is rpc; empty
+	// under mock, since mock never anchors anything to a real network.
+	Network string
 }
 
 type AuthConfig struct {
@@ -282,6 +290,7 @@ func Load() (Config, error) {
 			CAFile:         strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_CA_FILE")),
 			ClientCertFile: strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_CLIENT_CERT_FILE")),
 			ClientKeyFile:  strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_CLIENT_KEY_FILE")),
+			Network:        strings.TrimSpace(os.Getenv("ATOS_TOS_NETWORK")),
 		},
 		PayoutBackend:             PayoutBackend(strings.ToLower(envOr("ATOS_PAYOUT_BACKEND", string(PayoutBackendDisabled)))),
 		RemoteThirdPartyExecution: remoteThirdParty,
@@ -394,6 +403,16 @@ func (c Config) Validate() error {
 	case TOSBackendRPC:
 		if c.TOSRPC.URL == "" || c.TOSRPC.Token == "" {
 			return errors.New("ATOS_TOS_RPC_URL and ATOS_TOS_RPC_TOKEN are required when ATOS_TOS_BACKEND=rpc")
+		}
+		// TOSRPC.Network's own doc comment already states this is required
+		// whenever the backend is rpc -- enforcing it here turns a silent
+		// runtime fallback (cmd/api/main.go's tosBackedAuthorityWired gate
+		// quietly keeps FailClosedActivationAuthority, logged at info level
+		// only) into a fail-fast startup error, so a missing
+		// ATOS_TOS_NETWORK surfaces immediately instead of as "Verified
+		// activation mysteriously never works in production."
+		if strings.TrimSpace(c.TOSRPC.Network) == "" {
+			return errors.New("ATOS_TOS_NETWORK is required when ATOS_TOS_BACKEND=rpc")
 		}
 		if c.TOSRPC.Timeout <= 0 || c.TOSRPC.Timeout > 15*time.Minute {
 			return errors.New("ATOS_TOS_RPC_TIMEOUT is outside the allowed range")

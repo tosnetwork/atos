@@ -44,6 +44,7 @@ func TestProductionRejectsMockPayoutBackend(t *testing.T) {
 	t.Setenv("ATOS_TOS_BACKEND", "rpc")
 	t.Setenv("ATOS_TOS_RPC_URL", "https://tos-protocol.internal")
 	t.Setenv("ATOS_TOS_RPC_TOKEN", "integration-token")
+	t.Setenv("ATOS_TOS_NETWORK", "tos-devnet")
 	t.Setenv("ATOS_REMOTE_THIRD_PARTY_EXECUTION", "true")
 	t.Setenv("ATOS_PAYOUT_BACKEND", "mock")
 	setProductionFinancial(t)
@@ -69,6 +70,7 @@ func TestProductionRequiresRemoteThirdPartyExecution(t *testing.T) {
 	t.Setenv("ATOS_TOS_BACKEND", "rpc")
 	t.Setenv("ATOS_TOS_RPC_URL", "https://tos-protocol.internal")
 	t.Setenv("ATOS_TOS_RPC_TOKEN", "integration-token")
+	t.Setenv("ATOS_TOS_NETWORK", "tos-devnet")
 	setProductionFinancial(t)
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "ATOS_REMOTE_THIRD_PARTY_EXECUTION=true is required in production") {
 		t.Fatalf("Load() error = %v, want remote-third-party-execution-required-in-production rejection", err)
@@ -91,11 +93,29 @@ func TestLoadRPCBackendRequiresEndpointAndToken(t *testing.T) {
 	}
 }
 
+// TestLoadRPCBackendRequiresNetwork proves TOSRPC.Network's own doc comment
+// ("Required whenever TOSBackend is rpc") is actually enforced at startup,
+// not left as a silent runtime fallback -- without this, an operator
+// missing ATOS_TOS_NETWORK would see the process start successfully and
+// only discover Verified activation is permanently unavailable much later,
+// from cmd/api/main.go's tosBackedAuthorityWired gate quietly falling back
+// to FailClosedActivationAuthority with just an info-level log line.
+func TestLoadRPCBackendRequiresNetwork(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ATOS_TOS_BACKEND", "rpc")
+	t.Setenv("ATOS_TOS_RPC_URL", "https://tos-protocol.internal")
+	t.Setenv("ATOS_TOS_RPC_TOKEN", "integration-token")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "ATOS_TOS_NETWORK") {
+		t.Fatalf("Load() error = %v, want missing ATOS_TOS_NETWORK error", err)
+	}
+}
+
 func TestLoadRPCBackendAcceptsCompleteConfiguration(t *testing.T) {
 	clearEnvironment(t)
 	t.Setenv("ATOS_TOS_BACKEND", "rpc")
 	t.Setenv("ATOS_TOS_RPC_URL", "https://tos-protocol.internal")
 	t.Setenv("ATOS_TOS_RPC_TOKEN", "integration-token")
+	t.Setenv("ATOS_TOS_NETWORK", "tos-devnet")
 	t.Setenv("ATOS_TOS_RPC_SERVER_NAME", "tos-protocol.internal")
 	cfg, err := Load()
 	if err != nil {
@@ -127,6 +147,7 @@ func TestProductionAcceptsCompleteManagedConfiguration(t *testing.T) {
 	t.Setenv("ATOS_TOS_BACKEND", "rpc")
 	t.Setenv("ATOS_TOS_RPC_URL", "https://tos-protocol.internal")
 	t.Setenv("ATOS_TOS_RPC_TOKEN", "integration-token")
+	t.Setenv("ATOS_TOS_NETWORK", "tos-devnet")
 	t.Setenv("ATOS_REMOTE_THIRD_PARTY_EXECUTION", "true")
 	setProductionFinancial(t)
 	cfg, err := Load()
@@ -204,6 +225,7 @@ func TestLoadRequiresClientCertificatePair(t *testing.T) {
 	t.Setenv("ATOS_TOS_BACKEND", "rpc")
 	t.Setenv("ATOS_TOS_RPC_URL", "https://tos-protocol.internal")
 	t.Setenv("ATOS_TOS_RPC_TOKEN", "integration-token")
+	t.Setenv("ATOS_TOS_NETWORK", "tos-devnet")
 	t.Setenv("ATOS_TOS_RPC_CLIENT_CERT_FILE", "/tmp/client.crt")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must be configured together") {
 		t.Fatalf("Load() error = %v, want incomplete mTLS pair error", err)
@@ -217,7 +239,7 @@ func clearEnvironment(t *testing.T) {
 		"ATOS_AUTH_AUTO_APPROVE", "ATOS_AUTH_STATE_PATH", "ATOS_APPROVAL_TOKEN",
 		"ATOS_AUTH_TOKEN_TTL", "ATOS_AUTH_DEVICE_TTL", "ATOS_AUTH_POLL_INTERVAL",
 		"ATOS_MANAGED_CURRENCY", "ATOS_MANAGED_INITIAL_BALANCE", "ATOS_MANAGED_PER_CALL_LIMIT", "ATOS_MANAGED_DAILY_LIMIT",
-		"ATOS_TOS_BACKEND", "ATOS_TOS_RPC_URL", "ATOS_TOS_RPC_TOKEN", "ATOS_TOS_RPC_INSECURE",
+		"ATOS_TOS_BACKEND", "ATOS_TOS_RPC_URL", "ATOS_TOS_RPC_TOKEN", "ATOS_TOS_RPC_INSECURE", "ATOS_TOS_NETWORK",
 		"ATOS_TOS_RPC_TIMEOUT", "ATOS_TOS_RPC_MAX_MESSAGE_BYTES", "ATOS_TOS_RPC_SERVER_NAME",
 		"ATOS_TOS_RPC_CA_FILE", "ATOS_TOS_RPC_CLIENT_CERT_FILE", "ATOS_TOS_RPC_CLIENT_KEY_FILE",
 		"ATOS_PAYOUT_BACKEND",

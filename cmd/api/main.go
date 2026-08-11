@@ -108,6 +108,7 @@ func main() {
 			Insecure: cfg.TOSRPC.Insecure, ServerName: cfg.TOSRPC.ServerName,
 			CAFile: cfg.TOSRPC.CAFile, ClientCertFile: cfg.TOSRPC.ClientCertFile,
 			ClientKeyFile: cfg.TOSRPC.ClientKeyFile, Store: st,
+			Network: cfg.TOSRPC.Network,
 		})
 		if rpcErr != nil {
 			logger.Error("configure tos-protocol RPC backend", "error", rpcErr)
@@ -251,13 +252,32 @@ func main() {
 	if remoteProber != nil {
 		certifications.WithRemoteProber(remoteProber)
 	}
-	// FailClosedActivationAuthority is the only domain.ActivationAuthority
-	// implementation that exists today -- see its own doc comment and
-	// atos-spec docs/IMPLEMENTATION_ROADMAP.md §7.2.1. A config-driven
-	// selector is deliberately not introduced here: there is nothing else
-	// to select between yet, and Phase 3B intentionally does not implement
-	// a fake on-chain authority just to make the interface non-trivial.
-	activationAuthority := service.FailClosedActivationAuthority{}
+	// Phase 4A: capability registration anchors its manifest/ownership
+	// commitment through core (real tos-protocol RPC, or the mock's
+	// in-process simulation under ATOS_TOS_BACKEND=mock) whenever a
+	// capability requests any non-Managed mode -- see
+	// CapabilityService.WithManifestAnchor's doc comment.
+	capabilities.WithManifestAnchor(core)
+	identityBindings := service.NewIdentityBindingService(st, core)
+
+	// domain.ActivationAuthority: TOSBackedActivationAuthority is only
+	// wired when this deployment is both on the real RPC backend AND has
+	// an explicit ATOS_TOS_NETWORK configured -- either condition missing
+	// keeps FailClosedActivationAuthority, exactly as Phase 3B's own
+	// "production has no implementation that ever returns granted=true
+	// until Phase 4 supplies a real authority" default. The mock backend
+	// deliberately never gets the real authority: it exists for local
+	// dev/test, and its CommitCapabilityManifest/identity-binding
+	// simulation must never be presented as a real TOS guarantee (atos-spec
+	// docs/IMPLEMENTATION_ROADMAP.md §8.1).
+	var activationAuthority domain.ActivationAuthority = service.FailClosedActivationAuthority{}
+	tosBackedAuthorityWired := cfg.TOSBackend == config.TOSBackendRPC && cfg.TOSRPC.Network != ""
+	if tosBackedAuthorityWired {
+		activationAuthority = service.NewTOSBackedActivationAuthority(core, st, executionSigners)
+		logger.Info("using TOS-backed ActivationAuthority", "network", cfg.TOSRPC.Network)
+	} else {
+		logger.Info("using fail-closed ActivationAuthority (verified/native activation is unavailable)")
+	}
 	openTasks := service.NewOpenTaskService(st, quotes, jobs)
 
 	// Passkey/WebAuthn human account authentication (atos-spec
@@ -380,6 +400,26 @@ func main() {
 	go openTasks.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("open task acceptance reconciliation pending", "error", reconcileErr)
 	})
+	go identityBindings.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
+		logger.Error("identity-binding operation reconciliation pending", "error", reconcileErr)
+	})
+	// Only run the suspension sweep when a REAL authority is wired.
+	// FailClosedActivationAuthority always returns granted=false with a nil
+	// error -- indistinguishable, from SweepVerified's perspective, from a
+	// real authority genuinely finding every active capability invalid.
+	// Running this sweep against the fail-closed placeholder would mass-
+	// suspend every already-active Verified capability on its very first
+	// (immediate, startup) sweep the moment this deployment lacks a real
+	// authority (e.g. ATOS_TOS_NETWORK accidentally unset, or a maintenance
+	// restart on the mock backend) -- turning a pure configuration gap into
+	// live suspensions of previously-legitimate capabilities, rather than
+	// just correctly blocking NEW activations the way fail-closed should.
+	if tosBackedAuthorityWired {
+		identityEvidence := service.NewIdentityEvidenceReconciler(capabilities, activationAuthority)
+		go identityEvidence.RunReconciler(reconcileCtx, 5*time.Minute, 200, func(reconcileErr error) {
+			logger.Error("identity-evidence suspension sweep pending", "error", reconcileErr)
+		})
+	}
 	go func() {
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
@@ -405,7 +445,7 @@ func main() {
 		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,
 		Certifications:      certifications,
 		Passkeys:            passkeys,
-		ActivationAuthority: activationAuthority, OpenTasks: openTasks, Quotes: quotes,
+		ActivationAuthority: activationAuthority, IdentityBindings: identityBindings, OpenTasks: openTasks, Quotes: quotes,
 		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts,
 		Earnings: earnings, Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 		ApprovalToken: cfg.Auth.ApprovalToken, AdminApprovalToken: cfg.Auth.AdminApprovalToken,
@@ -414,7 +454,7 @@ func main() {
 	mcpServer := &mcp.Server{
 		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,
 		Certifications:      certifications,
-		ActivationAuthority: activationAuthority, OpenTasks: openTasks, Quotes: quotes,
+		ActivationAuthority: activationAuthority, IdentityBindings: identityBindings, OpenTasks: openTasks, Quotes: quotes,
 		Jobs: jobs, Accounts: accounts, Receipts: receipts, Earnings: earnings,
 		Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}

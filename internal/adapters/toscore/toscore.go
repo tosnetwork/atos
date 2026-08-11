@@ -80,12 +80,52 @@ type RevokeExecutionSignerRequest struct {
 }
 
 type Core interface {
+	// Network is this deployment's configured TOS network identity, as
+	// reported by the underlying connection (empty for the mock/dev
+	// backend, which never anchors anything to a real network). Phase 4A's
+	// TOSBackedActivationAuthority rejects activation when this is empty --
+	// an unconfigured network must fail closed, never be treated as a
+	// wildcard that matches any provider identity binding.
+	Network() string
 	// Identity and capability trust facts.
 	ResolveAgent(ctx context.Context, principalID string) (agentID string, err error)
 	ResolveCapability(ctx context.Context, capabilityID string) (domain.Trust, error)
 	ReadReputation(ctx context.Context, providerID string) (domain.Trust, error)
-	VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID string) (bool, error)
+	// CommitCapabilityManifest anchors capability's exact
+	// manifest/version/ownership commitment (docs/CAPABILITIES.md §11) --
+	// idempotent and safe to call on every Register/Update, mirroring the
+	// remote service's own CommitCapabilityManifest idempotency (a replay
+	// with identical provider_id/manifest digest returns the existing
+	// commitment; a conflicting replay under the same capability_id+version
+	// errors). ownershipRef is opaque "network:reference" (this codebase's
+	// standing convention for TOS reference fields).
+	CommitCapabilityManifest(ctx context.Context, capability domain.Capability) (ownershipRef string, err error)
+	// VerifyCapabilityOwnership checks that providerID owns capabilityID
+	// at EXACTLY version (never "whatever is current now" -- a Job/Quote
+	// executing against an older version, or a re-anchoring race with a
+	// concurrent Update, both need to verify a specific historical
+	// version's commitment, not silently default to latest) and, when
+	// expectedManifestDigest is non-empty ("sha256:<hex>", matching
+	// capabilityManifestCommitment's format), that it matches the digest
+	// anchored for that exact version -- this is the manifest/version
+	// TOCTOU check Phase 4A's ActivationAuthority requires (a provider
+	// mutating a capability after committing must not keep a stale
+	// activation valid). version="" means "whatever is currently latest",
+	// matching the remote service's own version-defaulting convention.
+	// reasonCode is non-empty whenever verified is false
+	// (NOT_FOUND/PROVIDER_MISMATCH/MANIFEST_MISMATCH).
+	VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID, version, expectedManifestDigest string) (verified bool, reasonCode string, err error)
 	UpdateReputationEvidence(ctx context.Context, providerID string, evidence string) error
+
+	// Phase 4A identity binding (docs/IMPLEMENTATION_ROADMAP.md §8.1).
+	// Deliberately separate from ResolveAgent above, which silently falls
+	// back to treating principal_id itself as the agent identity for
+	// Managed-compatible callers -- a Phase 4A authority decision must
+	// never accept that fallback silently, so it uses
+	// ResolvePrincipalBindingStatus instead.
+	ResolvePrincipalBindingStatus(ctx context.Context, principalID string) (binding domain.PrincipalIdentityBinding, bound, revoked bool, revocationReasonCode string, err error)
+	CreatePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, agentID string) (domain.PrincipalIdentityBinding, bool, error)
+	RevokePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, reasonCode string) (revoked bool, revocationNetwork, revocationRef string, err error)
 
 	// Quote and execution-signer trust.
 	CommitQuote(ctx context.Context, quote domain.Quote) (proofRef string, err error)

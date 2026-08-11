@@ -207,6 +207,40 @@ func (s *Store) Search(ctx context.Context, query string, limit int) ([]domain.C
 	return out, rows.Err()
 }
 
+// ActiveByMode uses the GIN index on (payload->'supported_trust_modes')
+// migration 003 already created for exactly this containment query shape --
+// no new index needed.
+func (s *Store) ActiveByMode(ctx context.Context, mode domain.TrustMode, limit int) ([]domain.Capability, error) {
+	// limit<=0 means unbounded, matching store/memory's ActiveByMode
+	// exactly -- passed as SQL NULL (LIMIT NULL is unbounded in Postgres,
+	// the same as omitting LIMIT) rather than the raw non-positive int,
+	// which LIMIT would otherwise take literally (LIMIT 0 returns zero
+	// rows, not "no limit").
+	var limitArg any
+	if limit > 0 {
+		limitArg = limit
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+capabilityColumns+` FROM capabilities
+		WHERE payload->'supported_trust_modes' @> $1::jsonb
+		ORDER BY updated_at ASC, id ASC
+		LIMIT $2
+	`, mustMarshal([]domain.TrustMode{mode}), limitArg)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.Capability
+	for rows.Next() {
+		c, err := scanCapability(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ByProvider(ctx context.Context, providerID string) ([]domain.Capability, error) {
 	rows, err := s.pool.Query(ctx, `SELECT `+capabilityColumns+` FROM capabilities WHERE provider_id=$1 ORDER BY updated_at DESC, id ASC`, providerID)
 	if err != nil {

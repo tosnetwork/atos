@@ -19,7 +19,16 @@ func (c *Client) RegisterProvider(ctx context.Context, providerID string, capabi
 	return err
 }
 
+// commitCapability is the shared RPC helper behind every capability-identity
+// commit path (RegisterProvider, QuoteExecution, CommitCapabilityManifest).
+// The capability-identity validation lives HERE, once, rather than
+// copy-pasted into each caller -- RegisterProvider previously had no such
+// guard at all (only checked provider_id), and any future fourth caller
+// would otherwise have to remember to add it independently.
 func (c *Client) commitCapability(ctx context.Context, capability domain.Capability) (*atostosv1.CapabilityIdentity, error) {
+	if capability.ID == "" || capability.ProviderID == "" || capability.Version == "" {
+		return nil, domain.NewError(domain.ErrValidationFailed, "capability identity is incomplete", false)
+	}
 	manifest, err := digest(capability.ManifestCommitment)
 	if err != nil {
 		return nil, err
@@ -50,6 +59,12 @@ func (c *Client) commitCapability(ctx context.Context, capability domain.Capabil
 }
 
 func (c *Client) QuoteExecution(ctx context.Context, req tosai.QuoteExecutionRequest) (tosai.ServiceExecutionQuote, error) {
+	// Checked explicitly here (in addition to commitCapability's own copy of
+	// this same guard below) so a request with BOTH an incomplete
+	// capability identity and a non-future execution_deadline still
+	// reports the identity problem first -- moving this guard into
+	// commitCapability alone would silently reorder it after the deadline
+	// check purely as a side effect of which helper happens to run first.
 	if req.Capability.ID == "" || req.Capability.ProviderID == "" || req.Capability.Version == "" {
 		return tosai.ServiceExecutionQuote{}, domain.NewError(domain.ErrValidationFailed, "capability identity is incomplete", false)
 	}

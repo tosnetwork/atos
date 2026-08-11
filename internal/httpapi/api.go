@@ -66,18 +66,24 @@ type Server struct {
 	// production wiring MUST always set it (service.FailClosedActivationAuthority
 	// today), since domain.ActivationAuthority has no nil-safe default.
 	ActivationAuthority domain.ActivationAuthority
-	OpenTasks           *service.OpenTaskService
-	Quotes              *service.QuoteService
-	Jobs                *service.JobService
-	Streams             *service.StreamService
-	Accounts            *service.AccountService
-	Receipts            *service.ReceiptService
-	Earnings            *service.EarningsService
-	Disputes            *service.DisputeService
-	Artifacts           *service.ArtifactService
-	Logger              *slog.Logger
-	PublicBaseURL       string
-	ApprovalToken       string
+	// IdentityBindings backs Phase 4A's identity-binding operator surface
+	// (atos-spec docs/API.md §9A) -- nil is safe: handlers would panic on
+	// first use, but production wiring (cmd/api/main.go) always sets it,
+	// same "no nil-safe default, wiring is the guard" contract as
+	// ActivationAuthority above.
+	IdentityBindings *service.IdentityBindingService
+	OpenTasks        *service.OpenTaskService
+	Quotes           *service.QuoteService
+	Jobs             *service.JobService
+	Streams          *service.StreamService
+	Accounts         *service.AccountService
+	Receipts         *service.ReceiptService
+	Earnings         *service.EarningsService
+	Disputes         *service.DisputeService
+	Artifacts        *service.ArtifactService
+	Logger           *slog.Logger
+	PublicBaseURL    string
+	ApprovalToken    string
 	// AdminApprovalToken additionally gates approval of a Device
 	// Authorization grant requesting an admin scope (see
 	// auth.RequiresAdminApproval) -- required on top of ApprovalToken, not
@@ -128,6 +134,10 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("GET /v1/capabilities/{id}/execution-signer", s.withScopes(s.handleGetExecutionSignerStatus, auth.ScopeExecutionSignersRead))
 
 	mux.HandleFunc("POST /v1/capabilities/{id}/activation/evaluate", s.withScopes(s.handleEvaluateActivation, auth.ScopeActivationEvaluate))
+
+	mux.HandleFunc("POST /v1/identity-bindings/{principal_id}/bind", s.withScopes(s.handleBindIdentity, auth.ScopeIdentityBindingsWrite))
+	mux.HandleFunc("POST /v1/identity-bindings/{principal_id}/revoke", s.withScopes(s.handleRevokeIdentity, auth.ScopeIdentityBindingsWrite))
+	mux.HandleFunc("GET /v1/identity-bindings/{principal_id}", s.withScopes(s.handleIdentityBindingStatus, auth.ScopeIdentityBindingsRead))
 
 	mux.HandleFunc("POST /v1/capabilities/{id}/certification", s.withScopes(s.handleOpenCertification, auth.ScopeCertificationsWrite))
 	mux.HandleFunc("GET /v1/capabilities/{id}/certification", s.withScopes(s.handleGetCertificationStatus, auth.ScopeCertificationsRead))

@@ -757,3 +757,61 @@ func TestExecutionSignerAuthorize_DefinitiveRejectionDoesNotReconcile(t *testing
 		t.Fatal("expected FailureReason to record the definitive rejection for operator visibility")
 	}
 }
+
+// TestExecutionSignerService_SignerAtUsesExplicitVersionNotCurrent proves
+// SignerAt resolves the signer at the EXPLICITLY given version, unlike
+// CurrentSigner which always re-resolves against the capability's CURRENT
+// stored version. This matters for callers (e.g.
+// TOSBackedActivationAuthority.Evaluate) that pin every other check to a
+// specific capabilityVersion argument: using CurrentSigner there would let
+// a concurrent version bump silently resolve the signer against a
+// DIFFERENT version than the rest of the evaluation, breaking the
+// version-pinning discipline the whole function otherwise enforces.
+func TestExecutionSignerService_SignerAtUsesExplicitVersionNotCurrent(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	core := toscoremock.NewContractFixture(st)
+	signers := service.NewExecutionSignerService(st, core, capabilities)
+	cap := registerSignerTestCapability(t, capabilities, "agt_sig_pinned", domain.TrustModeManaged)
+	pinnedVersion := cap.Version
+
+	now := time.Now().UTC()
+	if _, err := signers.Authorize(ctx, service.AuthorizeSignerInput{
+		ProviderID: "agt_sig_pinned", CapabilityID: cap.ID,
+		ExecutionSignerID: "signer-pinned", SignerPublicKey: testSignerKey(t), SignatureAlgorithm: "ed25519",
+		ValidFrom: now.Add(-time.Minute), ValidUntil: now.Add(24 * time.Hour),
+		IdempotencyKey: "authz-pinned-1",
+	}); err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+
+	// The capability's CURRENT stored version moves on (simulating an
+	// ordinary terms Update bumping it) -- directly, since this test
+	// targets SignerAt's own version-pinning behavior in isolation, not
+	// Update's separate mode-suspension mechanism.
+	if _, err := st.UpdateCapability(ctx, cap.ID, func(current domain.Capability, exists bool) (domain.Capability, error) {
+		current.Version = "9.9.9"
+		return current, nil
+	}); err != nil {
+		t.Fatalf("test setup: %v", err)
+	}
+
+	// CurrentSigner re-resolves against the NEW current version and
+	// correctly finds nothing -- no signer was ever authorized for 9.9.9.
+	if _, _, found, err := signers.CurrentSigner(ctx, cap.ID); err != nil {
+		t.Fatal(err)
+	} else if found {
+		t.Fatal("CurrentSigner must find nothing for the new current version, which has no authorized signer")
+	}
+
+	// SignerAt, pinned to the ORIGINAL version, must still find it --
+	// unaffected by what the capability's current version has since become.
+	_, signerID, found, err := signers.SignerAt(ctx, cap.ID, pinnedVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || signerID != "signer-pinned" {
+		t.Fatalf("SignerAt(pinnedVersion) = signerID=%q found=%v, want signer-pinned/true regardless of the capability's current version", signerID, found)
+	}
+}

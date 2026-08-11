@@ -9,6 +9,69 @@ import (
 	"github.com/tosnetwork/atos/internal/domain"
 )
 
+// TestCapability_ActiveByMode mirrors postgres_test.go's identically-named
+// test exactly (same assertions, same edge cases) -- store.Capabilities has
+// two independent implementations for testing convenience, and prior to
+// this the limit<=0 edge case was only ever exercised against postgres,
+// letting the two diverge (memory treats it as unbounded, an earlier
+// postgres revision treated it as "return zero rows") without any test
+// catching the mismatch. Both backends must now assert the identical
+// behavior for identical input.
+func TestCapability_ActiveByMode(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+
+	verified := domain.Capability{
+		ID: "cap_active_verified", ProviderID: "agt_active",
+		Name: "Active Verified", Description: "for ActiveByMode",
+		Version: "1.0.0", DeliveryMode: domain.DeliveryInstant,
+		InputSchema: map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing:             domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}},
+		SupportedTrustModes: []domain.TrustMode{domain.TrustModeManaged, domain.TrustModeVerified},
+		Status:              domain.CapabilityActive,
+	}
+	managedOnly := verified
+	managedOnly.ID = "cap_active_managed"
+	managedOnly.SupportedTrustModes = []domain.TrustMode{domain.TrustModeManaged}
+
+	if err := s.Put(ctx, verified); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(ctx, managedOnly); err != nil {
+		t.Fatal(err)
+	}
+
+	active, err := s.ActiveByMode(ctx, domain.TrustModeVerified, 100)
+	if err != nil {
+		t.Fatalf("ActiveByMode: %v", err)
+	}
+	if !containsCapabilityID(active, verified.ID) {
+		t.Errorf("ActiveByMode(verified) did not return %s", verified.ID)
+	}
+	if containsCapabilityID(active, managedOnly.ID) {
+		t.Errorf("ActiveByMode(verified) incorrectly returned managed-only capability %s", managedOnly.ID)
+	}
+
+	// limit<=0 means unbounded -- identical assertion to postgres_test.go's
+	// TestCapability_ActiveByMode, proving both backends agree.
+	unbounded, err := s.ActiveByMode(ctx, domain.TrustModeVerified, 0)
+	if err != nil {
+		t.Fatalf("ActiveByMode(limit=0): %v", err)
+	}
+	if !containsCapabilityID(unbounded, verified.ID) {
+		t.Errorf("ActiveByMode(verified, limit=0) must be unbounded, not return zero rows: got %d results", len(unbounded))
+	}
+}
+
+func containsCapabilityID(caps []domain.Capability, id string) bool {
+	for _, c := range caps {
+		if c.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func TestUpdateCapability_ExistsFalseForUnknownID(t *testing.T) {
 	ctx := context.Background()
 	s := New()

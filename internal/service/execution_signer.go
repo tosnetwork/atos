@@ -72,7 +72,20 @@ func (s *ExecutionSignerService) CurrentSigner(ctx context.Context, capabilityID
 	if err != nil {
 		return "", "", false, err
 	}
-	op, ok, err := s.store.LatestCompletedSignerOperationByCapability(ctx, capabilityID, cap.Version)
+	return s.SignerAt(ctx, capabilityID, cap.Version)
+}
+
+// SignerAt is CurrentSigner's version-pinned counterpart: it looks up the
+// signer for capabilityID AT exactly version, never re-resolving "whatever
+// the capability's version happens to be right now." Callers that already
+// hold a specific, pinned version (e.g. TOSBackedActivationAuthority.Evaluate,
+// which pins every OTHER check to its capabilityVersion argument) must use
+// this instead of CurrentSigner -- otherwise a concurrent Update bumping the
+// capability's version between this call and the caller's other checks
+// would let the signer check silently resolve against a DIFFERENT version
+// than the rest of the evaluation, defeating the whole point of pinning.
+func (s *ExecutionSignerService) SignerAt(ctx context.Context, capabilityID, version string) (authorizationID, signerID string, found bool, err error) {
+	op, ok, err := s.store.LatestCompletedSignerOperationByCapability(ctx, capabilityID, version)
 	if err != nil || !ok {
 		return "", "", false, err
 	}

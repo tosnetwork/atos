@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,16 +14,80 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/tosnetwork/atos/internal/adapters/toscore"
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/store"
 )
 
 type CapabilityService struct {
 	store store.Store
+	// manifestAnchor is Phase 4A's optional TOS-backed manifest/ownership
+	// anchoring dependency (docs/IMPLEMENTATION_ROADMAP.md §8.1) -- nil by
+	// default, matching every other optional service dependency in this
+	// codebase (see AccountService.WithClock, QuoteService.WithAccountService).
+	// Every one of this file's 49 existing callers stays valid unchanged;
+	// only cmd/api/main.go's real wiring opts in via WithManifestAnchor.
+	manifestAnchor toscore.Core
 }
 
 func NewCapabilityService(s store.Store) *CapabilityService {
 	return &CapabilityService{store: s}
+}
+
+// WithManifestAnchor opts this service into Phase 4A's TOS-backed manifest
+// commitment: Register/Update anchor a capability requesting verified or
+// native modes through core.CommitCapabilityManifest and durably record the
+// resulting commitment before returning. Anchoring failure fails the whole
+// Register/Update call (never silently registers an unanchored capability
+// that requested a stronger mode) -- a provider that only requests managed
+// is entirely unaffected, matching CommitCapabilityManifest's own "Managed
+// registration MAY create a capability before any TOS anchor exists" rule
+// (docs/CAPABILITIES.md §13).
+func (s *CapabilityService) WithManifestAnchor(core toscore.Core) *CapabilityService {
+	s.manifestAnchor = core
+	return s
+}
+
+// anchorManifestIfRequested calls CommitCapabilityManifest and persists the
+// resulting CapabilityOwnershipCommitment when c requests any non-Managed
+// mode and a manifest anchor is configured, returning c with its public
+// Ownership projection (docs/CAPABILITIES.md §1/§13) updated to reflect the
+// anchor. It is a no-op (c returned unchanged) for a Managed-only
+// capability or when no anchor is configured, so Register/Update remain
+// usable in mock/dev deployments exactly as before Phase 4A -- Ownership
+// then stays at normalizeCapability's "unanchored" default, matching
+// "Managed registration MAY create a capability before any TOS anchor
+// exists."
+func (s *CapabilityService) anchorManifestIfRequested(ctx context.Context, c domain.Capability) (domain.Capability, error) {
+	if s.manifestAnchor == nil {
+		return c, nil
+	}
+	requestsStrongerMode := false
+	for _, mode := range c.RequestedTrustModes {
+		if mode != domain.TrustModeManaged {
+			requestsStrongerMode = true
+			break
+		}
+	}
+	if !requestsStrongerMode {
+		return c, nil
+	}
+	ownershipRef, err := s.manifestAnchor.CommitCapabilityManifest(ctx, c)
+	if err != nil {
+		return domain.Capability{}, err
+	}
+	network := s.manifestAnchor.Network()
+	if err := s.store.PutCapabilityOwnershipCommitment(ctx, domain.CapabilityOwnershipCommitment{
+		CapabilityID: c.ID, Version: c.Version, ProviderID: c.ProviderID,
+		Network: network, ManifestCommitment: c.ManifestCommitment,
+		OwnershipCommitment: ownershipRef, CommittedAt: time.Now().UTC(),
+	}); err != nil {
+		return domain.Capability{}, err
+	}
+	c.Ownership = domain.CapabilityOwnership{
+		Status: domain.OwnershipAnchored, Network: network, Commitment: ownershipRef,
+	}
+	return c, nil
 }
 
 func (s *CapabilityService) Get(ctx context.Context, id string) (domain.Capability, error) {
@@ -132,6 +197,10 @@ func (s *CapabilityService) Register(ctx context.Context, in RegisterCapabilityI
 	}
 	c.SupportedTrustModes = c.ModeSupport.ActiveModes()
 	c.ManifestCommitment = capabilityManifestCommitment(c)
+	c, err = s.anchorManifestIfRequested(ctx, c)
+	if err != nil {
+		return domain.Capability{}, err
+	}
 	if err := s.store.Put(ctx, c); err != nil {
 		return domain.Capability{}, err
 	}
@@ -211,13 +280,24 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 				termsChanged = true
 			}
 		}
+		// Gated on the value actually differing (like pricing's samePricing
+		// check above), not merely on the key being present -- otherwise a
+		// client that always resends the full current object (a common,
+		// legitimate REST PATCH pattern) would bump the version, re-anchor
+		// the manifest, and (since a version bump now also suspends an
+		// already-Active stronger mode) needlessly suspend Verified/Native
+		// on every resubmission of UNCHANGED content.
 		if inputSchema, ok := patch["input_schema"].(map[string]any); ok {
-			c.InputSchema = inputSchema
-			termsChanged = true
+			if !reflect.DeepEqual(c.InputSchema, inputSchema) {
+				c.InputSchema = inputSchema
+				termsChanged = true
+			}
 		}
 		if outputSchema, ok := patch["output_schema"].(map[string]any); ok {
-			c.OutputSchema = outputSchema
-			termsChanged = true
+			if !reflect.DeepEqual(c.OutputSchema, outputSchema) {
+				c.OutputSchema = outputSchema
+				termsChanged = true
+			}
 		}
 		if raw, ok := patch["requested_trust_modes"]; ok {
 			modes, err := decodeTrustModes(raw)
@@ -232,12 +312,30 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 			if err != nil {
 				return domain.Capability{}, err
 			}
-			c.Bindings = bindings
-			c.AdapterType = bindings[0].Transport
-			termsChanged = true
+			if !reflect.DeepEqual(c.Bindings, bindings) {
+				c.Bindings = bindings
+				c.AdapterType = bindings[0].Transport
+				termsChanged = true
+			}
 		}
 		if termsChanged {
 			c.Version = bumpMinorVersion(c.Version)
+			// A version bump invalidates the PREVIOUS version's activation
+			// decision: ActivationAuthority.Evaluate was only ever run
+			// against the old manifest/schemas/pricing, so an already-Active
+			// stronger mode must not silently keep advertising "active" for
+			// content that was never evaluated -- the same manifest/version
+			// TOCTOU concern TOSBackedActivationAuthority.Evaluate already
+			// guards per-call, applied here to the cached mode_support state
+			// itself. Suspend (not a hard reset) so EvaluateActivation's own
+			// legality check (pending/suspended only) accepts it directly --
+			// re-activation requires a fresh, explicit evaluation, exactly
+			// like any other suspension.
+			for _, mode := range []domain.TrustMode{domain.TrustModeVerified, domain.TrustModeNative} {
+				if c.ModeSupport.Active(mode) {
+					c.ModeSupport = c.ModeSupport.Suspend(mode, "capability version changed; re-evaluation required")
+				}
+			}
 		}
 
 		// Validated against the fully-built candidate, after every patched
@@ -259,6 +357,56 @@ func (s *CapabilityService) Update(ctx context.Context, id, requestingProviderID
 	})
 	if err != nil {
 		return domain.Capability{}, err
+	}
+	// Anchoring runs AFTER the CAS write commits, never inside the
+	// UpdateCapability closure -- unlike EvaluateActivation's staleness
+	// concern (applying a DECISION made against state that has since
+	// moved on), anchoring a specific id@version's manifest is immutable
+	// and version-scoped: anchoring c's exact version is still correct
+	// and useful even if a concurrent Update has already superseded it
+	// with a newer version, exactly like Register's own commitment for a
+	// version that may later be bumped away. A failure here (deferred
+	// Release still fires since committed stays false) lets a retry
+	// re-run the whole Update -- the CAS closure recomputes against
+	// whatever is NOW current, so termsChanged correctly becomes a no-op
+	// if this attempt's fields already match, rather than double-bumping
+	// the version.
+	anchored, err := s.anchorManifestIfRequested(ctx, c)
+	if err != nil {
+		return domain.Capability{}, err
+	}
+	if anchored.Ownership != c.Ownership {
+		// c is already durably committed by the UpdateCapability call
+		// above; anchoring ran afterward (never inside that closure -- see
+		// this function's own anchoring comment) so the resulting
+		// Ownership projection needs a second, narrowly-scoped CAS write.
+		// Guarded on the row still being at THIS exact version: if a
+		// concurrent Update has already superseded it, this anchor's
+		// Ownership fact no longer describes the CURRENT row and must not
+		// be force-written over whatever that concurrent write produced.
+		// Only reassign c (this function's own return value) if the
+		// Ownership write actually applied to THIS caller's own row: if a
+		// concurrent Update already superseded it, UpdateCapability's
+		// closure correctly declines to overwrite that newer state, but it
+		// still returns the CURRENT (concurrently-written) row -- blindly
+		// reassigning c to that would make this call return a DIFFERENT
+		// caller's write instead of confirming the caller's own successful
+		// change (already durably committed by the first CAS write above).
+		ownershipApplied := false
+		updated, err := s.store.UpdateCapability(ctx, id, func(current domain.Capability, exists bool) (domain.Capability, error) {
+			if !exists || current.Version != anchored.Version {
+				return current, nil
+			}
+			current.Ownership = anchored.Ownership
+			ownershipApplied = true
+			return current, nil
+		})
+		if err != nil {
+			return domain.Capability{}, err
+		}
+		if ownershipApplied {
+			c = updated
+		}
 	}
 	if err := s.store.Finish(ctx, requestingProviderID, idempotencyKey, c.ID); err != nil {
 		return domain.Capability{}, err
@@ -310,6 +458,38 @@ func (s *CapabilityService) RecordReadinessEvidence(ctx context.Context, capabil
 // activation depended on is no longer valid for the Capability's CURRENT
 // version. reason is stored as the mode's ModeSupportEntry.Reason. A no-op
 // for a mode that isn't currently active.
+// ActiveByMode lists every Capability currently active for mode -- the
+// enumeration Phase 4A's post-activation identity/ownership reconciler
+// sweeps (see service.IdentityEvidenceReconciler).
+func (s *CapabilityService) ActiveByMode(ctx context.Context, mode domain.TrustMode, limit int) ([]domain.Capability, error) {
+	return s.store.ActiveByMode(ctx, mode, limit)
+}
+
+// SuspendMode is SuspendModeIfActive's mode-direct counterpart: it suspends
+// exactly the named mode, not every mode eligible for a transport binding.
+// Phase 4A's identity-evidence reconciler needs this because a stale
+// provider identity/ownership/signer fact invalidates a specific trust
+// mode's activation directly -- there is no transport-level health signal
+// to key off, unlike HealthService.CheckCapability's use of
+// SuspendModeIfActive. A no-op (mode already not active) is not an error.
+func (s *CapabilityService) SuspendMode(ctx context.Context, capabilityID string, mode domain.TrustMode, reason string) error {
+	_, err := s.store.UpdateCapability(ctx, capabilityID, func(current domain.Capability, exists bool) (domain.Capability, error) {
+		if !exists {
+			return domain.Capability{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability not found", false)
+		}
+		cap := normalizeCapability(current)
+		before := cap.ModeSupport.Entry(mode).Status
+		cap.ModeSupport = cap.ModeSupport.Suspend(mode, reason)
+		if cap.ModeSupport.Entry(mode).Status == before {
+			return current, nil
+		}
+		cap.SupportedTrustModes = cap.ModeSupport.ActiveModes()
+		cap.UpdatedAt = time.Now().UTC()
+		return cap, nil
+	})
+	return err
+}
+
 func (s *CapabilityService) SuspendModeIfActive(ctx context.Context, capabilityID string, transport domain.EndpointAdapterType, reason string) error {
 	_, err := s.store.UpdateCapability(ctx, capabilityID, func(current domain.Capability, exists bool) (domain.Capability, error) {
 		if !exists {
@@ -662,6 +842,9 @@ func normalizeCapability(c domain.Capability) domain.Capability {
 	}
 	if c.ManifestCommitment == "" {
 		c.ManifestCommitment = capabilityManifestCommitment(c)
+	}
+	if c.Ownership.Status == "" {
+		c.Ownership.Status = domain.OwnershipUnanchored
 	}
 	if len(c.Bindings) == 0 {
 		transport := c.AdapterType
