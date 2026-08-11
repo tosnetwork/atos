@@ -286,6 +286,17 @@ type Disputes interface {
 	// under 8+ concurrent callers or two independent ATOS replicas.
 	OpenDispute(ctx context.Context, jobID, settlementID string, build func(earning domain.ProviderEarning, earningExists bool) (domain.Dispute, domain.ProviderEarning, error)) (dispute domain.Dispute, earning domain.ProviderEarning, created bool, err error)
 	GetDispute(ctx context.Context, id string) (domain.Dispute, error)
+	// GetDisputeWithEarning reads a dispute and its associated earning as a
+	// single atomic snapshot -- unlike calling GetDispute and the earning
+	// store's Get separately, which are two independent reads with no
+	// atomicity across them, this guarantees a caller never observes a
+	// combination that ResolveDispute's own atomic write never produced
+	// (e.g. ReviewStatus already resolved_for_principal but the earning's
+	// Status not yet Reversed). earningExists is false only when the
+	// dispute's EarningID does not resolve (should not happen in practice
+	// since EarningID is set at OpenDispute time, but callers must still
+	// handle it rather than assume).
+	GetDisputeWithEarning(ctx context.Context, id string) (dispute domain.Dispute, earning domain.ProviderEarning, earningExists bool, err error)
 	DisputeByJob(ctx context.Context, jobID string) (domain.Dispute, error)
 	DisputeByIdempotencyKey(ctx context.Context, principalID, key string) (domain.Dispute, error)
 	DisputesByPrincipal(ctx context.Context, principalID string) ([]domain.Dispute, error)

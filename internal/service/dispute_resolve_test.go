@@ -217,8 +217,8 @@ func TestDisputeResolve_PrincipalWinConcurrentResolveConvergesToOneCredit(t *tes
 // account) rather than two.
 func TestDisputeResolve_PrincipalWinHasNoObservableIntermediateState(t *testing.T) {
 	ctx := context.Background()
-	h, earnings, disputes := disputeHarness(t)
-	job, d := openedDispute(t, h, disputes, "agt_atomic_resolve", "prn_atomic_resolve", "1.00")
+	h, _, disputes := disputeHarness(t)
+	_, d := openedDispute(t, h, disputes, "agt_atomic_resolve", "prn_atomic_resolve", "1.00")
 	if _, err := disputes.Review(ctx, d.ID, "rev_1"); err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,13 @@ func TestDisputeResolve_PrincipalWinHasNoObservableIntermediateState(t *testing.
 	// A concurrent reader polling mid-resolution must only ever observe
 	// either the pre-resolution state (Frozen, no credit) or the fully
 	// resolved state (Reversed, credited, terminal) -- never anything in
-	// between.
+	// between. This must read the dispute and its earning through
+	// GetWithEarning (one atomic snapshot), not two separate Get calls --
+	// ResolveDispute's write of the two is atomic, but two independent
+	// reads are not atomic with respect to each other regardless of how
+	// that write is implemented, so composing two separate Gets can
+	// observe a torn combination the write itself never produced (see
+	// GetWithEarning's doc comment).
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	var badObservation error
@@ -239,12 +245,8 @@ func TestDisputeResolve_PrincipalWinHasNoObservableIntermediateState(t *testing.
 				return
 			default:
 			}
-			earning, err := earnings.Get(ctx, d.EarningID, job.ProviderID)
-			if err != nil {
-				continue
-			}
-			dispute, err := disputes.Get(ctx, d.ID)
-			if err != nil {
+			dispute, earning, earningExists, err := disputes.GetWithEarning(ctx, d.ID)
+			if err != nil || !earningExists {
 				continue
 			}
 			reversedButNotTerminal := earning.Status == domain.EarningReversed && dispute.ReviewStatus != domain.DisputeResolvedForPrincipal

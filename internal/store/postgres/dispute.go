@@ -179,6 +179,39 @@ func (s *Store) GetDispute(ctx context.Context, id string) (domain.Dispute, erro
 	return d, err
 }
 
+// GetDisputeWithEarning reads the dispute and its earning as a single
+// atomic snapshot. Plain READ COMMITTED (the default -- see ResolveDispute's
+// own doc comment on this package's convention) takes a FRESH snapshot per
+// statement, so two separate SELECTs on that isolation level could observe
+// a concurrent ResolveDispute's write applied to one row but not yet to the
+// other -- exactly the "no observable intermediate state" invariant this
+// method exists to close. REPEATABLE READ fixes one snapshot for the whole
+// transaction, so both SELECTs below see the same point in time regardless
+// of what commits in between.
+func (s *Store) GetDisputeWithEarning(ctx context.Context, id string) (domain.Dispute, domain.ProviderEarning, bool, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return domain.Dispute{}, domain.ProviderEarning{}, false, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	d, err := scanDispute(tx.QueryRow(ctx, `SELECT `+disputeColumns+` FROM disputes WHERE id=$1`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Dispute{}, domain.ProviderEarning{}, false, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.Dispute{}, domain.ProviderEarning{}, false, err
+	}
+	e, err := scanEarning(tx.QueryRow(ctx, `SELECT `+earningColumns+` FROM provider_earnings WHERE id=$1`, d.EarningID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return d, domain.ProviderEarning{}, false, nil
+	}
+	if err != nil {
+		return domain.Dispute{}, domain.ProviderEarning{}, false, err
+	}
+	return d, e, true, nil
+}
+
 func (s *Store) DisputeByJob(ctx context.Context, jobID string) (domain.Dispute, error) {
 	d, err := scanDispute(s.pool.QueryRow(ctx, `SELECT `+disputeColumns+` FROM disputes WHERE job_id=$1`, jobID))
 	if errors.Is(err, pgx.ErrNoRows) {

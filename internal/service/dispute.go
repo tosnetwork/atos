@@ -617,6 +617,24 @@ func (s *DisputeService) Get(ctx context.Context, id string) (domain.Dispute, er
 	return d, nil
 }
 
+// GetWithEarning reads a dispute together with its earning as a single
+// atomic snapshot -- unlike calling Get and EarningsService.Get separately
+// (two independent reads with no atomicity across them), a caller here can
+// never observe a combination ResolveDispute's own atomic write never
+// produced (e.g. the dispute already resolved_for_principal but the
+// earning not yet Reversed). Use this whenever both are needed together;
+// Get remains for callers that only need the dispute.
+func (s *DisputeService) GetWithEarning(ctx context.Context, id string) (domain.Dispute, domain.ProviderEarning, bool, error) {
+	d, e, earningExists, err := s.store.GetDisputeWithEarning(ctx, id)
+	if err != nil {
+		if err == store.ErrNotFound {
+			return domain.Dispute{}, domain.ProviderEarning{}, false, domain.NewError(domain.ErrNotFound, "dispute not found", false)
+		}
+		return domain.Dispute{}, domain.ProviderEarning{}, false, err
+	}
+	return d, e, earningExists, nil
+}
+
 func (s *DisputeService) ListByPrincipal(ctx context.Context, principalID string) ([]domain.Dispute, error) {
 	return s.store.DisputesByPrincipal(ctx, principalID)
 }

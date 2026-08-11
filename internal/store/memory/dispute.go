@@ -72,6 +72,17 @@ func (s *Store) GetDispute(ctx context.Context, id string) (domain.Dispute, erro
 	return d, nil
 }
 
+func (s *Store) GetDisputeWithEarning(ctx context.Context, id string) (domain.Dispute, domain.ProviderEarning, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.disputes[id]
+	if !ok {
+		return domain.Dispute{}, domain.ProviderEarning{}, false, store.ErrNotFound
+	}
+	e, earningExists := s.earnings[d.EarningID]
+	return d, e, earningExists, nil
+}
+
 func (s *Store) DisputeByJob(ctx context.Context, jobID string) (domain.Dispute, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

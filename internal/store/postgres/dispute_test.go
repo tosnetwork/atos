@@ -3,6 +3,7 @@ package postgres_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -394,5 +395,79 @@ func TestResolveDisputeCreditsExactlyOnceConcurrently(t *testing.T) {
 	}
 	if finalEarning.Status != domain.EarningReversed {
 		t.Fatalf("final earning status = %s, want reversed", finalEarning.Status)
+	}
+}
+
+// TestGetDisputeWithEarningNeverObservesTornState proves GetDisputeWithEarning's
+// REPEATABLE READ snapshot closes the race two separate GetDispute/GetEarning
+// calls are exposed to: a poller running concurrently with ResolveDispute's
+// atomic write must never see the dispute already resolved_for_principal
+// while its earning is still Frozen (or vice versa).
+func TestGetDisputeWithEarningNeverObservesTornState(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	suffix := randSuffix()
+	jobID := "job_torn_" + suffix
+	principalID := "prn_" + suffix
+	earning := testDisputeEarning("prov_"+suffix, jobID, "settle_"+suffix)
+	if _, _, err := s.CreateEarning(ctx, earning); err != nil {
+		t.Fatal(err)
+	}
+	dispute, _, _, err := s.OpenDispute(ctx, jobID, earning.SettlementID, func(e domain.ProviderEarning, exists bool) (domain.Dispute, domain.ProviderEarning, error) {
+		d := testDisputeFor(jobID, e)
+		d.PrincipalID = principalID
+		next := e
+		next.Status = domain.EarningFrozen
+		return d, next, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var badObservation error
+	var mu sync.Mutex
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			d, e, exists, err := s.GetDisputeWithEarning(ctx, dispute.ID)
+			if err != nil || !exists {
+				continue
+			}
+			reversedButNotTerminal := e.Status == domain.EarningReversed && d.ReviewStatus != domain.DisputeResolvedForPrincipal
+			terminalButNotReversed := d.ReviewStatus == domain.DisputeResolvedForPrincipal && e.Status != domain.EarningReversed
+			if reversedButNotTerminal || terminalButNotReversed {
+				mu.Lock()
+				badObservation = fmt.Errorf("observed inconsistent intermediate state: earning.Status=%s dispute.ReviewStatus=%s", e.Status, d.ReviewStatus)
+				mu.Unlock()
+				return
+			}
+		}
+	}()
+
+	_, _, _, err = s.ResolveDispute(ctx, dispute.ID, principalID, domain.Account{PrincipalID: principalID},
+		func(d domain.Dispute, e domain.ProviderEarning, eExists bool, a domain.Account, aExists bool) (domain.Dispute, domain.ProviderEarning, domain.Account, error) {
+			a.Balance = domain.Money{Amount: "1.05", Currency: "USD"}
+			e.Status = domain.EarningReversed
+			d.EconomicState = domain.DisputeEconomicRefunded
+			d.ReviewStatus = domain.DisputeResolvedForPrincipal
+			return d, e, a, nil
+		})
+	if err != nil {
+		t.Fatalf("ResolveDispute: %v", err)
+	}
+	close(stop)
+	wg.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if badObservation != nil {
+		t.Fatal(badObservation)
 	}
 }
