@@ -20,12 +20,15 @@ import (
 // instances / goroutines -- this simulates the single shared external
 // payout rail that two real ATOS replicas would both be calling.
 type pgCountingAdapter struct {
-	inner payout.Adapter
-	calls int64
+	inner           payout.Adapter
+	targetEarningID string
+	calls           int64
 }
 
 func (a *pgCountingAdapter) Payout(ctx context.Context, req payout.Request) (payout.Result, error) {
-	atomic.AddInt64(&a.calls, 1)
+	if req.EarningID == a.targetEarningID {
+		atomic.AddInt64(&a.calls, 1)
+	}
 	return a.inner.Payout(ctx, req)
 }
 
@@ -82,6 +85,11 @@ func TestEarningsService_TwoRealPostgresInstancesConvergeToOnePayout(t *testing.
 	if err != nil {
 		t.Fatalf("RecordSettlement: %v", err)
 	}
+	// PayoutSweep legitimately visits other durable pending earnings when
+	// this test shares a database with the rest of the package. Count only
+	// calls for the economic event under test so unrelated rows cannot make
+	// the concurrency bound order-dependent.
+	sharedAdapter.targetEarningID = earning.ID
 	// Force straight to Available via storeA (bypassing the maturation
 	// window, which is irrelevant to what this test is proving).
 	if _, err := storeA.UpdateEarning(ctx, earning.ID, func(current domain.ProviderEarning, exists bool) (domain.ProviderEarning, error) {

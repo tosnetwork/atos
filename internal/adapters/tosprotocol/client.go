@@ -64,12 +64,13 @@ type Client struct {
 	httpClient *http.Client
 	store      store.Store
 
-	identity   atostosv1connect.IdentityServiceClient
-	capability atostosv1connect.CapabilityServiceClient
-	trust      atostosv1connect.TrustServiceClient
-	settlement atostosv1connect.SettlementServiceClient
-	proof      atostosv1connect.ProofServiceClient
-	execution  atostosv1connect.ExecutionGatewayServiceClient
+	identity           atostosv1connect.IdentityServiceClient
+	capability         atostosv1connect.CapabilityServiceClient
+	trust              atostosv1connect.TrustServiceClient
+	settlement         atostosv1connect.SettlementServiceClient
+	proof              atostosv1connect.ProofServiceClient
+	execution          atostosv1connect.ExecutionGatewayServiceClient
+	financialIntegrity atostosv1connect.FinancialIntegrityServiceClient
 
 	receipts  sync.Map // receipt_id -> *ExecutionReceiptEnvelope
 	proofRefs sync.Map // client-facing receipt/proof id -> protocol proof reference
@@ -152,6 +153,7 @@ func New(config Config) (*Client, error) {
 	client.settlement = atostosv1connect.NewSettlementServiceClient(httpClient, config.BaseURL, options...)
 	client.proof = atostosv1connect.NewProofServiceClient(httpClient, config.BaseURL, options...)
 	client.execution = atostosv1connect.NewExecutionGatewayServiceClient(httpClient, config.BaseURL, options...)
+	client.financialIntegrity = atostosv1connect.NewFinancialIntegrityServiceClient(httpClient, config.BaseURL, options...)
 	return client, nil
 }
 

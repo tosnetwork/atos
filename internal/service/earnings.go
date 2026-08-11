@@ -8,6 +8,8 @@ import (
 
 	"github.com/tosnetwork/atos/internal/adapters/payout"
 	"github.com/tosnetwork/atos/internal/domain"
+	"github.com/tosnetwork/atos/internal/financial"
+	"github.com/tosnetwork/atos/internal/money"
 	"github.com/tosnetwork/atos/internal/store"
 )
 
@@ -36,6 +38,12 @@ type EarningsService struct {
 	store            store.Store
 	payoutAdapter    payout.Adapter
 	maturationPeriod time.Duration
+	financial        financial.ATOSFinancialAdapter
+}
+
+func (s *EarningsService) WithFinancialAuthority(adapter financial.ATOSFinancialAdapter) *EarningsService {
+	s.financial = adapter
+	return s
 }
 
 func NewEarningsService(s store.Store, adapter payout.Adapter) *EarningsService {
@@ -212,7 +220,13 @@ func (s *EarningsService) beginPayoutUnderLock(ctx context.Context, earningID st
 		current.Status = domain.EarningPayoutPending
 		current.PayoutRequestedAt = &now
 		if current.PayoutIdempotencyKey == "" {
+			if current.PayoutGeneration == 0 {
+				current.PayoutGeneration = 1
+			}
 			current.PayoutIdempotencyKey = payoutIdempotencyKey(current.ID)
+			if current.PayoutGeneration > 1 {
+				current.PayoutIdempotencyKey = fmt.Sprintf("%s:attempt:%d", current.PayoutIdempotencyKey, current.PayoutGeneration)
+			}
 		}
 		return current, nil
 	})
@@ -228,6 +242,9 @@ func (s *EarningsService) beginPayoutUnderLock(ctx context.Context, earningID st
 func (s *EarningsService) attemptPayout(ctx context.Context, e domain.ProviderEarning) (domain.ProviderEarning, error) {
 	if e.Status != domain.EarningPayoutPending {
 		return e, nil
+	}
+	if err := s.recordFinancialPayout(ctx, e, financial.EventPayoutIntent); err != nil {
+		return s.recordPayoutAttempt(ctx, e, err)
 	}
 	// Query first: if a prior attempt already completed on the rail but
 	// this process crashed before recording it locally -- or a concurrent
@@ -247,6 +264,9 @@ func (s *EarningsService) attemptPayout(ctx context.Context, e domain.ProviderEa
 	}
 	switch result.Status {
 	case payout.StatusPaid:
+		if err := s.recordFinancialPayout(ctx, e, financial.EventPayoutSuccess); err != nil {
+			return s.recordPayoutAttempt(ctx, e, err)
+		}
 		return s.store.UpdateEarning(ctx, e.ID, func(current domain.ProviderEarning, exists bool) (domain.ProviderEarning, error) {
 			if !exists {
 				return domain.ProviderEarning{}, store.ErrNotFound
@@ -269,6 +289,9 @@ func (s *EarningsService) attemptPayout(ctx context.Context, e domain.ProviderEa
 		// it is safe to fall back to Available for a corrected future
 		// retry (e.g. after an operator fixes payout details) rather than
 		// leaving the earning stuck in payout_pending forever.
+		if err := s.recordFinancialPayout(ctx, e, financial.EventPayoutFailure); err != nil {
+			return s.recordPayoutAttempt(ctx, e, err)
+		}
 		return s.store.UpdateEarning(ctx, e.ID, func(current domain.ProviderEarning, exists bool) (domain.ProviderEarning, error) {
 			if !exists {
 				return domain.ProviderEarning{}, store.ErrNotFound
@@ -281,11 +304,57 @@ func (s *EarningsService) attemptPayout(ctx context.Context, e domain.ProviderEa
 			current.PayoutFailureReason = result.Reason
 			current.PayoutAttempts++
 			current.PayoutLastAttemptAt = time.Now().UTC()
+			current.PayoutIdempotencyKey = ""
+			current.PayoutGeneration++
 			return current, nil
 		})
 	default: // payout.StatusPending: outcome unknown, stay payout_pending.
 		return s.recordPayoutAttempt(ctx, e, fmt.Errorf("payout pending: %s", result.Reason))
 	}
+}
+
+func (s *EarningsService) recordFinancialPayout(ctx context.Context, earning domain.ProviderEarning, eventType financial.EventType) error {
+	if s.financial == nil {
+		return nil
+	}
+	job, err := s.store.GetJob(ctx, earning.JobID)
+	if err != nil {
+		return err
+	}
+	quote, err := s.store.GetQuote(ctx, earning.QuoteID)
+	if err != nil {
+		return err
+	}
+	amount, err := money.Parse(earning.NetAmount.Amount, earning.NetAmount.Currency, accountDecimals)
+	if err != nil {
+		return err
+	}
+	payoutID := fmt.Sprintf("payout_%s_%d", earning.ID, earning.PayoutGeneration)
+	request := financial.TransferRequest{
+		EventType:  eventType,
+		Identities: financialIdentities(job, quote, "billing_"+job.ID, earning.ReceiptID, earning.SettlementID, earning.ID, "", payoutID),
+		Asset:      amount.Currency, Decimals: accountDecimals, AtomicAmount: amount.Minor.String(),
+	}
+	switch eventType {
+	case financial.EventPayoutIntent:
+		request.IdempotencyIdentity = "payout:" + payoutID + ":intent:v1"
+		request.SourceCode, request.SourceOwnerID = financial.ProviderPayable, earning.ProviderID
+		request.DestinationCode, request.DestinationOwnerID = financial.PayoutClearing, payoutID
+		_, err = s.financial.BeginPayout(ctx, request)
+	case financial.EventPayoutSuccess:
+		request.IdempotencyIdentity = "payout:" + payoutID + ":success:v1"
+		request.SourceCode, request.SourceOwnerID = financial.PayoutClearing, payoutID
+		request.DestinationCode, request.DestinationOwnerID = financial.PayoutDisbursed, "_"
+		_, err = s.financial.CompletePayout(ctx, request)
+	case financial.EventPayoutFailure:
+		request.IdempotencyIdentity = fmt.Sprintf("payout:%s:failure:%d:v1", payoutID, earning.PayoutGeneration)
+		request.SourceCode, request.SourceOwnerID = financial.PayoutClearing, payoutID
+		request.DestinationCode, request.DestinationOwnerID = financial.ProviderPayable, earning.ProviderID
+		_, err = s.financial.FailPayout(ctx, request)
+	default:
+		return errors.New("unsupported financial payout event")
+	}
+	return err
 }
 
 func (s *EarningsService) recordPayoutAttempt(ctx context.Context, e domain.ProviderEarning, attemptErr error) (domain.ProviderEarning, error) {

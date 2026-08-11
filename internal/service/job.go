@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/tosnetwork/atos/internal/adapters/tosai"
 	"github.com/tosnetwork/atos/internal/adapters/toscore"
 	"github.com/tosnetwork/atos/internal/domain"
+	"github.com/tosnetwork/atos/internal/financial"
 	"github.com/tosnetwork/atos/internal/store"
 )
 
@@ -31,12 +33,18 @@ const (
 )
 
 type JobService struct {
-	store    store.Store
-	provider tosai.Provider
-	core     toscore.Core
-	accounts *AccountService
-	earnings *EarningsService
-	jobLocks sync.Map // job_id -> *sync.Mutex; process-local lifecycle serialization
+	store     store.Store
+	provider  tosai.Provider
+	core      toscore.Core
+	accounts  *AccountService
+	earnings  *EarningsService
+	financial financial.ATOSFinancialAdapter
+	jobLocks  sync.Map // job_id -> *sync.Mutex; process-local lifecycle serialization
+}
+
+func (s *JobService) WithFinancialAuthority(adapter financial.ATOSFinancialAdapter) *JobService {
+	s.financial = adapter
+	return s
 }
 
 func NewJobService(s store.Store, provider tosai.Provider, core toscore.Core, accounts *AccountService) *JobService {
@@ -750,6 +758,9 @@ func (s *JobService) reconcileCredit(ctx context.Context, jobID string) (domain.
 	}
 	if job.State != domain.JobReconciling || job.PendingCredit == nil {
 		return job, nil
+	}
+	if s.financial != nil {
+		return job, errors.New("legacy mutable balance credit is forbidden with Blnk financial authority")
 	}
 	credit := *job.PendingCredit
 	updated, _, err := s.store.UpdateJobAndAccount(ctx, job.ID, job.PrincipalID, s.accounts.defaultAccount(job.PrincipalID), func(current domain.Job, exists bool, account domain.Account, _ bool) (domain.Job, domain.Account, error) {

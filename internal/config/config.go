@@ -2,16 +2,26 @@
 package config
 
 import (
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
+
+var nonNegativeDecimalPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)(\.[0-9]+)?$`)
+var financialDomainIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 type Environment string
 
@@ -98,6 +108,35 @@ type ManagedAccountConfig struct {
 	DailyLimit     string
 }
 
+type FinancialBackend string
+
+const (
+	FinancialBackendDisabled FinancialBackend = "disabled"
+	FinancialBackendBlnk     FinancialBackend = "blnk"
+)
+
+type FinancialConfig struct {
+	Backend           FinancialBackend
+	BlnkURL           string
+	BlnkKey           string
+	Timeout           time.Duration
+	GatewayID         string
+	NetworkID         string
+	IssuanceLimit     string
+	SignerURL         string
+	SignerToken       string
+	SigningKeyID      string
+	SigningPublicKey  string
+	SigningAlgorithm  string
+	RetentionURL      string
+	RetentionHMACKey  string
+	MinimumRetention  time.Duration
+	SealInterval      time.Duration
+	MaxAnchorLag      time.Duration
+	FullAuditInterval time.Duration
+	BatchSize         int
+}
+
 type Config struct {
 	Environment   Environment
 	Addr          string
@@ -121,6 +160,7 @@ type Config struct {
 	Auth              AuthConfig
 	WebAuthn          WebAuthnConfig
 	ManagedAccount    ManagedAccountConfig
+	Financial         FinancialConfig
 	TOSBackend        TOSBackend
 	TOSRPC            TOSRPCConfig
 	PayoutBackend     PayoutBackend
@@ -155,6 +195,30 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	timeout, err := durationEnv("ATOS_TOS_RPC_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	financialTimeout, err := durationEnv("ATOS_BLNK_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	sealInterval, err := durationEnv("ATOS_FINANCIAL_SEAL_INTERVAL", time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	maxAnchorLag, err := durationEnv("ATOS_FINANCIAL_MAX_ANCHOR_LAG", 15*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	minimumRetention, err := durationEnv("ATOS_FINANCIAL_MIN_RETENTION", 365*24*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+	fullAuditInterval, err := durationEnv("ATOS_FINANCIAL_FULL_AUDIT_INTERVAL", 5*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	batchSize, err := intEnv("ATOS_FINANCIAL_BATCH_SIZE", 4096)
 	if err != nil {
 		return Config{}, err
 	}
@@ -195,6 +259,27 @@ func Load() (Config, error) {
 			InitialBalance: envOr("ATOS_MANAGED_INITIAL_BALANCE", "0.00"),
 			PerCallLimit:   envOr("ATOS_MANAGED_PER_CALL_LIMIT", "2.00"),
 			DailyLimit:     envOr("ATOS_MANAGED_DAILY_LIMIT", "20.00"),
+		},
+		Financial: FinancialConfig{
+			Backend:           FinancialBackend(strings.ToLower(envOr("ATOS_FINANCIAL_BACKEND", string(FinancialBackendDisabled)))),
+			BlnkURL:           strings.TrimSpace(os.Getenv("ATOS_BLNK_URL")),
+			BlnkKey:           strings.TrimSpace(os.Getenv("ATOS_BLNK_KEY")),
+			Timeout:           financialTimeout,
+			GatewayID:         strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_GATEWAY_ID")),
+			NetworkID:         strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_NETWORK_ID")),
+			IssuanceLimit:     envOr("ATOS_FINANCIAL_ISSUANCE_LIMIT", "0.00"),
+			SignerURL:         strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_SIGNER_URL")),
+			SignerToken:       os.Getenv("ATOS_FINANCIAL_SIGNER_TOKEN"),
+			SigningKeyID:      strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_SIGNING_KEY_ID")),
+			SigningPublicKey:  strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_SIGNING_PUBLIC_KEY")),
+			SigningAlgorithm:  strings.ToLower(envOr("ATOS_FINANCIAL_SIGNING_ALGORITHM", "ed25519")),
+			RetentionURL:      strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_RETENTION_URL")),
+			RetentionHMACKey:  os.Getenv("ATOS_FINANCIAL_RETENTION_HMAC_KEY"),
+			MinimumRetention:  minimumRetention,
+			SealInterval:      sealInterval,
+			MaxAnchorLag:      maxAnchorLag,
+			FullAuditInterval: fullAuditInterval,
+			BatchSize:         batchSize,
 		},
 		TOSBackend: TOSBackend(strings.ToLower(envOr("ATOS_TOS_BACKEND", string(TOSBackendMock)))),
 		TOSRPC: TOSRPCConfig{
@@ -260,6 +345,58 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.ManagedAccount.Currency) == "" || len(c.ManagedAccount.Currency) > 12 {
 		return errors.New("ATOS_MANAGED_CURRENCY is invalid")
 	}
+	switch c.Financial.Backend {
+	case FinancialBackendDisabled:
+	case FinancialBackendBlnk:
+		if c.DatabaseURL == "" || c.Financial.BlnkURL == "" || c.Financial.GatewayID == "" || c.Financial.NetworkID == "" {
+			return errors.New("ATOS_DATABASE_URL, ATOS_BLNK_URL, ATOS_FINANCIAL_GATEWAY_ID and ATOS_FINANCIAL_NETWORK_ID are required when ATOS_FINANCIAL_BACKEND=blnk")
+		}
+		if c.Financial.Timeout <= 0 || c.Financial.Timeout > 2*time.Minute {
+			return errors.New("ATOS financial Blnk timeout is outside the allowed range")
+		}
+		if len(c.Financial.GatewayID) > 253 || len(c.Financial.NetworkID) > 128 ||
+			!financialDomainIDPattern.MatchString(c.Financial.GatewayID) || !financialDomainIDPattern.MatchString(c.Financial.NetworkID) {
+			return errors.New("ATOS_FINANCIAL_GATEWAY_ID or ATOS_FINANCIAL_NETWORK_ID is not a safe canonical domain identifier")
+		}
+		issuanceLimit, ok := new(big.Rat).SetString(c.Financial.IssuanceLimit)
+		if !ok || issuanceLimit.Sign() < 0 || !nonNegativeDecimalPattern.MatchString(c.Financial.IssuanceLimit) {
+			return errors.New("ATOS_FINANCIAL_ISSUANCE_LIMIT must be a non-negative decimal amount")
+		}
+		initialBalance, ok := new(big.Rat).SetString(c.ManagedAccount.InitialBalance)
+		if !ok || initialBalance.Sign() < 0 || initialBalance.Sign() > 0 && issuanceLimit.Sign() <= 0 {
+			return errors.New("a positive managed initial balance requires a positive ATOS_FINANCIAL_ISSUANCE_LIMIT")
+		}
+		if c.Financial.SealInterval <= 0 || c.Financial.SealInterval > 24*time.Hour || c.Financial.MaxAnchorLag < c.Financial.SealInterval || c.Financial.MaxAnchorLag > 24*time.Hour || c.Financial.MinimumRetention <= 0 || c.Financial.MinimumRetention > 10*365*24*time.Hour || c.Financial.FullAuditInterval < 10*time.Second || c.Financial.FullAuditInterval > 24*time.Hour || c.Financial.BatchSize < 1 || c.Financial.BatchSize > 4096 {
+			return errors.New("ATOS financial seal, anchor lag, WORM retention, full audit interval, or batch size is outside the allowed range")
+		}
+		if c.Financial.SigningAlgorithm != "ed25519" && c.Financial.SigningAlgorithm != "ecdsa_p256_sha256" {
+			return errors.New("ATOS_FINANCIAL_SIGNING_ALGORITHM is unsupported")
+		}
+		if c.Financial.SigningPublicKey != "" {
+			raw, err := base64.StdEncoding.Strict().DecodeString(c.Financial.SigningPublicKey)
+			if err != nil {
+				return errors.New("ATOS_FINANCIAL_SIGNING_PUBLIC_KEY is not strict base64")
+			}
+			if c.Financial.SigningAlgorithm == "ed25519" && len(raw) != ed25519.PublicKeySize {
+				return errors.New("ATOS_FINANCIAL_SIGNING_PUBLIC_KEY is not an Ed25519 public key")
+			}
+			if c.Financial.SigningAlgorithm == "ecdsa_p256_sha256" {
+				parsed, err := x509.ParsePKIXPublicKey(raw)
+				key, ok := parsed.(*ecdsa.PublicKey)
+				if err != nil || !ok || key.Curve != elliptic.P256() {
+					return errors.New("ATOS_FINANCIAL_SIGNING_PUBLIC_KEY is not a P-256 PKIX public key")
+				}
+			}
+		}
+		if c.Financial.RetentionURL != "" && len(c.Financial.RetentionHMACKey) < 32 {
+			return errors.New("ATOS_FINANCIAL_RETENTION_HMAC_KEY must contain at least 32 characters when WORM retention is configured")
+		}
+		if c.Financial.SignerURL != "" && len(c.Financial.SignerToken) < 32 {
+			return errors.New("ATOS_FINANCIAL_SIGNER_TOKEN must contain at least 32 characters when an external signer is configured")
+		}
+	default:
+		return fmt.Errorf("invalid ATOS_FINANCIAL_BACKEND %q (expected disabled or blnk)", c.Financial.Backend)
+	}
 
 	switch c.TOSBackend {
 	case TOSBackendMock:
@@ -311,6 +448,24 @@ func (c Config) Validate() error {
 		}
 		if c.TOSBackend != TOSBackendRPC {
 			return errors.New("ATOS_TOS_BACKEND=rpc is required in production")
+		}
+		if c.Financial.Backend != FinancialBackendBlnk {
+			return errors.New("ATOS_FINANCIAL_BACKEND=blnk is required in production")
+		}
+		if c.Financial.BlnkKey == "" {
+			return errors.New("ATOS_BLNK_KEY is required in production")
+		}
+		if c.Financial.SignerURL == "" || len(c.Financial.SignerToken) < 32 || c.Financial.SigningKeyID == "" || c.Financial.SigningPublicKey == "" || c.Financial.RetentionURL == "" || len(c.Financial.RetentionHMACKey) < 32 {
+			return errors.New("authenticated external financial signer, pinned signing public key, key identity, authenticated WORM retention endpoint, and retention HMAC key are required in production")
+		}
+		for name, endpoint := range map[string]string{
+			"ATOS_BLNK_URL": c.Financial.BlnkURL, "ATOS_FINANCIAL_SIGNER_URL": c.Financial.SignerURL,
+			"ATOS_FINANCIAL_RETENTION_URL": c.Financial.RetentionURL,
+		} {
+			parsed, err := url.Parse(endpoint)
+			if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+				return fmt.Errorf("%s must be an absolute HTTPS URL in production", name)
+			}
 		}
 		if !c.RemoteThirdPartyExecution {
 			return errors.New("ATOS_REMOTE_THIRD_PARTY_EXECUTION=true is required in production " +

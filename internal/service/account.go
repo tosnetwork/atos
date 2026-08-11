@@ -2,9 +2,12 @@ package service
 
 import (
 	"context"
+	"errors"
+	"math/big"
 	"time"
 
 	"github.com/tosnetwork/atos/internal/domain"
+	"github.com/tosnetwork/atos/internal/financial"
 	"github.com/tosnetwork/atos/internal/money"
 	"github.com/tosnetwork/atos/internal/store"
 )
@@ -52,9 +55,18 @@ func ValidateAccountDefaults(defaults AccountDefaults) error {
 }
 
 type AccountService struct {
-	store    store.Store
-	defaults AccountDefaults
-	now      func() time.Time
+	store     store.Store
+	defaults  AccountDefaults
+	now       func() time.Time
+	financial financial.ATOSFinancialAdapter
+}
+
+// WithFinancialAuthority makes Blnk, through ATOSFinancialAdapter, the only
+// source used for balances and economic mutations. The account row remains a
+// rebuildable policy/projection record.
+func (s *AccountService) WithFinancialAuthority(adapter financial.ATOSFinancialAdapter) *AccountService {
+	s.financial = adapter
+	return s
 }
 
 func NewAccountService(s store.Store, configured ...AccountDefaults) *AccountService {
@@ -125,21 +137,66 @@ func (s *AccountService) Get(ctx context.Context, principalID string) (domain.Ac
 	if err == nil {
 		normalized := s.normalizeAccount(a)
 		if !accountNormalizationChanged(a, normalized) {
-			return normalized, nil
+			return s.withAuthoritativeBalance(ctx, normalized)
 		}
 		// Re-read and normalize under the store's atomic mutation boundary.
 		// Persisting the earlier snapshot with PutAccount could overwrite a
 		// concurrent debit or credit at the UTC policy-reset boundary.
-		return s.store.UpdateAccount(ctx, principalID, s.defaultAccount(principalID), func(current domain.Account, _ bool) (domain.Account, error) {
+		updated, err := s.store.UpdateAccount(ctx, principalID, s.defaultAccount(principalID), func(current domain.Account, _ bool) (domain.Account, error) {
 			return s.normalizeAccount(current), nil
 		})
+		if err != nil {
+			return domain.Account{}, err
+		}
+		return s.withAuthoritativeBalance(ctx, updated)
 	}
 	if err != store.ErrNotFound {
 		return domain.Account{}, err
 	}
-	return s.store.UpdateAccount(ctx, principalID, s.defaultAccount(principalID), func(a domain.Account, _ bool) (domain.Account, error) {
+	created, err := s.store.UpdateAccount(ctx, principalID, s.defaultAccount(principalID), func(a domain.Account, _ bool) (domain.Account, error) {
 		return s.normalizeAccount(a), nil
 	})
+	if err != nil {
+		return domain.Account{}, err
+	}
+	return s.withAuthoritativeBalance(ctx, created)
+}
+
+func (s *AccountService) withAuthoritativeBalance(ctx context.Context, account domain.Account) (domain.Account, error) {
+	if s.financial == nil {
+		return account, nil
+	}
+	initial, err := money.Parse(s.defaults.InitialBalance.Amount, s.defaults.InitialBalance.Currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	// A zero opening balance is absence of an economic event. Blnk correctly
+	// rejects zero-value transactions, so do not fabricate a ledger posting;
+	// the authoritative read below maps an as-yet absent balance to zero.
+	if !initial.IsZero() {
+		_, err = s.financial.ProvisionAccount(ctx, financial.TransferRequest{
+			EventType:           financial.EventAccountGenesis,
+			IdempotencyIdentity: "principal:" + account.PrincipalID + ":genesis:v1",
+			Identities:          financial.Identities{PrincipalID: account.PrincipalID},
+			Asset:               initial.Currency, Decimals: accountDecimals, AtomicAmount: initial.Minor.String(),
+			SourceCode: financial.GatewayCreditIssuance, SourceOwnerID: "_",
+			DestinationCode: financial.PrincipalAvailable, DestinationOwnerID: account.PrincipalID,
+			AllowOverdraft: true,
+		})
+		if err != nil {
+			return domain.Account{}, err
+		}
+	}
+	balance, err := s.financial.Balance(ctx, financial.PrincipalAvailable, account.PrincipalID, initial.Currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	amount := money.Amount{Minor: new(big.Int), Currency: balance.Asset, Decimals: balance.Decimals}
+	if _, ok := amount.Minor.SetString(balance.AtomicAmount, 10); !ok {
+		return domain.Account{}, errors.New("invalid authoritative balance")
+	}
+	account.Balance = domain.Money{Amount: amount.String(), Currency: amount.Currency}
+	return account, nil
 }
 
 func accountNormalizationChanged(before, after domain.Account) bool {
@@ -202,6 +259,62 @@ func (s *AccountService) debitAccountValue(a domain.Account, amountStr, currency
 	return a, nil
 }
 
+// debitPolicyValue consumes only the autonomous-spend policy projection. With
+// Blnk enabled, account.Balance is read-only and authoritative in Blnk, while
+// RemainingToday remains ATOS business policy state. Callers must update it in
+// the same store transaction as a durable economic checkpoint.
+func (s *AccountService) debitPolicyValue(a domain.Account, amountStr, currency string) (domain.Account, error) {
+	amount, err := money.Parse(amountStr, currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, domain.NewError(domain.ErrValidationFailed, "invalid amount", false)
+	}
+	a = s.normalizeAccount(a)
+	remaining, err := money.Parse(a.SpendPolicy.RemainingToday.Amount, a.SpendPolicy.RemainingToday.Currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	if amount.Currency != remaining.Currency {
+		return domain.Account{}, domain.NewError(domain.ErrValidationFailed, "currency mismatch with spend policy", false)
+	}
+	newRemaining, err := remaining.Sub(amount)
+	if err != nil {
+		return domain.Account{}, domain.NewError(domain.ErrSpendLimitExceeded, "daily autonomous spend limit exceeded", false)
+	}
+	a.SpendPolicy.RemainingToday = domain.Money{Amount: newRemaining.String(), Currency: newRemaining.Currency}
+	return a, nil
+}
+
+func (s *AccountService) creditPolicyValue(a domain.Account, amountStr, currency string) (domain.Account, error) {
+	amount, err := money.Parse(amountStr, currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, domain.NewError(domain.ErrValidationFailed, "invalid amount", false)
+	}
+	a = s.normalizeAccount(a)
+	if amount.IsZero() {
+		return a, nil
+	}
+	remaining, err := money.Parse(a.SpendPolicy.RemainingToday.Amount, a.SpendPolicy.RemainingToday.Currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	dailyLimit, err := money.Parse(a.SpendPolicy.DailyLimit.Amount, a.SpendPolicy.DailyLimit.Currency, accountDecimals)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	if amount.Currency != remaining.Currency || amount.Currency != dailyLimit.Currency {
+		return domain.Account{}, domain.NewError(domain.ErrValidationFailed, "currency mismatch with spend policy", false)
+	}
+	newRemaining, err := remaining.Add(amount)
+	if err != nil {
+		return domain.Account{}, err
+	}
+	if newRemaining.Cmp(dailyLimit) > 0 {
+		newRemaining = dailyLimit
+	}
+	a.SpendPolicy.RemainingToday = domain.Money{Amount: newRemaining.String(), Currency: newRemaining.Currency}
+	return a, nil
+}
+
 func (s *AccountService) creditAccountValue(a domain.Account, amountStr, currency string) (domain.Account, error) {
 	amount, err := money.Parse(amountStr, currency, accountDecimals)
 	if err != nil {
@@ -243,6 +356,9 @@ func (s *AccountService) creditAccountValue(a domain.Account, amountStr, currenc
 }
 
 func (s *AccountService) Debit(ctx context.Context, principalID, amountStr, currency string) error {
+	if s.financial != nil {
+		return errors.New("managed balance mutation requires an authorized financial event")
+	}
 	amount, err := money.Parse(amountStr, currency, accountDecimals)
 	if err != nil {
 		return domain.NewError(domain.ErrValidationFailed, "invalid amount", false)
@@ -281,6 +397,9 @@ func (s *AccountService) Debit(ctx context.Context, principalID, amountStr, curr
 }
 
 func (s *AccountService) Credit(ctx context.Context, principalID, amountStr, currency string) error {
+	if s.financial != nil {
+		return errors.New("managed balance mutation requires an authorized financial event")
+	}
 	amount, err := money.Parse(amountStr, currency, accountDecimals)
 	if err != nil {
 		return domain.NewError(domain.ErrValidationFailed, "invalid amount", false)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-webauthn/webauthn/webauthn"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/tosnetwork/atos/internal/a2a"
 	"github.com/tosnetwork/atos/internal/adapters/payout"
@@ -31,6 +32,7 @@ import (
 	"github.com/tosnetwork/atos/internal/auth"
 	"github.com/tosnetwork/atos/internal/config"
 	"github.com/tosnetwork/atos/internal/domain"
+	"github.com/tosnetwork/atos/internal/financial"
 	"github.com/tosnetwork/atos/internal/httpapi"
 	"github.com/tosnetwork/atos/internal/mcp"
 	"github.com/tosnetwork/atos/internal/observability"
@@ -49,6 +51,7 @@ func main() {
 	}
 
 	var st store.Store
+	var pgStore *postgres.Store
 	if cfg.DatabaseURL != "" {
 		pg, err := postgres.Open(context.Background(), cfg.DatabaseURL)
 		if err != nil {
@@ -56,6 +59,7 @@ func main() {
 			os.Exit(1)
 		}
 		defer pg.Close()
+		pgStore = pg
 		st = pg
 		logger.Info("using postgres store")
 	} else {
@@ -86,6 +90,7 @@ func main() {
 	var execution tosai.Provider
 	var core toscore.Core
 	var quoter tosai.Quoter
+	var anchorPublisher financial.AnchorPublisher
 	// remoteProber, when set, routes HealthService's readiness probing
 	// through the same execution/data-plane boundary as third-party
 	// execution (see service.ThirdPartyHealthProber's doc comment) instead
@@ -118,6 +123,7 @@ func main() {
 		}
 		defer rpcClient.Close()
 		execution, core, quoter = rpcClient, rpcClient, rpcClient
+		anchorPublisher = rpcClient
 		if cfg.RemoteThirdPartyExecution {
 			remoteProber = rpcClient
 		}
@@ -168,8 +174,42 @@ func main() {
 		os.Exit(2)
 	}
 	accounts := service.NewAccountService(st, accountDefaults)
+	var financialAdapter *financial.Adapter
+	var financialRepository *financial.Repository
+	var financialBlnk *financial.BlnkClient
+	if cfg.Financial.Backend == config.FinancialBackendBlnk {
+		if pgStore == nil {
+			logger.Error("Blnk financial backend requires PostgreSQL")
+			os.Exit(2)
+		}
+		repository, repoErr := financial.NewRepository(pgStore.Pool(), cfg.Financial.GatewayID, cfg.Financial.NetworkID)
+		if repoErr != nil {
+			logger.Error("financial repository init failed", "error", repoErr)
+			os.Exit(2)
+		}
+		blnkClient, blnkErr := financial.NewBlnkClient(financial.BlnkConfig{
+			BaseURL: cfg.Financial.BlnkURL, APIKey: cfg.Financial.BlnkKey, Timeout: cfg.Financial.Timeout,
+			GenesisIssuanceLimit: cfg.Financial.IssuanceLimit,
+		})
+		if blnkErr != nil {
+			logger.Error("Blnk financial client init failed", "error", blnkErr)
+			os.Exit(2)
+		}
+		financialAdapter, err = financial.NewAdapter(repository, blnkClient)
+		if err != nil {
+			logger.Error("financial adapter init failed", "error", err)
+			os.Exit(2)
+		}
+		financialRepository = repository
+		financialBlnk = blnkClient
+		accounts.WithFinancialAuthority(financialAdapter)
+		logger.Info("using Blnk as authoritative managed financial ledger", "gateway_id", cfg.Financial.GatewayID, "network_id", cfg.Financial.NetworkID)
+	}
 	quotes.WithAccountService(accounts)
 	jobs := service.NewJobService(st, execution, core, accounts)
+	if financialAdapter != nil {
+		jobs.WithFinancialAuthority(financialAdapter)
+	}
 	streams := service.NewStreamService(st, execution)
 	receipts := service.NewReceiptService(st, core)
 
@@ -192,6 +232,9 @@ func main() {
 		logger.Info("ATOS_PAYOUT_BACKEND=disabled: provider earnings will mature to available and stop there; no payout will be attempted")
 	}
 	earnings := service.NewEarningsService(st, payoutAdapter)
+	if financialAdapter != nil {
+		earnings.WithFinancialAuthority(financialAdapter)
+	}
 	jobs.WithEarnings(earnings)
 
 	blobStorage, err := local.New(cfg.BlobDir, cfg.PublicBaseURL, st)
@@ -201,6 +244,9 @@ func main() {
 	}
 	artifacts := service.NewArtifactService(st, blobStorage)
 	disputes := service.NewDisputeService(st, jobs, earnings, accounts, artifacts)
+	if financialAdapter != nil {
+		disputes.WithFinancialAuthority(financialAdapter)
+	}
 	executionSigners := service.NewExecutionSignerService(st, core, capabilities)
 	certifications := service.NewCertificationService(st, capabilities, providerResolver)
 	if remoteProber != nil {
@@ -268,6 +314,74 @@ func main() {
 
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
 	defer reconcileCancel()
+	if financialRepository != nil && cfg.Financial.SignerURL != "" && cfg.Financial.SignerToken != "" && cfg.Financial.SigningKeyID != "" && cfg.Financial.SigningPublicKey != "" && cfg.Financial.RetentionURL != "" && cfg.Financial.RetentionHMACKey != "" && anchorPublisher != nil {
+		signer, signerErr := financial.NewHTTPSigner(cfg.Financial.SignerURL, cfg.Financial.SigningKeyID, cfg.Financial.SigningAlgorithm, cfg.Financial.SignerToken, cfg.Financial.Timeout)
+		if signerErr != nil {
+			logger.Error("financial signer init failed", "error", signerErr)
+			os.Exit(2)
+		}
+		retainer, retainerErr := financial.NewHTTPRetainer(cfg.Financial.RetentionURL, cfg.Financial.RetentionHMACKey, cfg.Financial.Timeout, cfg.Financial.MinimumRetention)
+		if retainerErr != nil {
+			logger.Error("financial WORM retainer init failed", "error", retainerErr)
+			os.Exit(2)
+		}
+		go func() {
+			ticker := time.NewTicker(cfg.Financial.SealInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-reconcileCtx.Done():
+					return
+				case <-ticker.C:
+					batch, sealErr := financialRepository.SealNext(reconcileCtx, financialBlnk, signer, cfg.Financial.SigningKeyID, cfg.Financial.SigningAlgorithm, cfg.Financial.SigningPublicKey, retainer, anchorPublisher, cfg.Financial.BatchSize)
+					if sealErr != nil && !errors.Is(sealErr, pgx.ErrNoRows) {
+						logger.Error("financial batch sealing failed", "error", sealErr)
+						if entered, healthErr := financialRepository.EnforceSealingHealth(reconcileCtx, cfg.Financial.MaxAnchorLag, sealErr); healthErr != nil {
+							logger.Error("financial sealing health enforcement failed", "error", healthErr)
+						} else if entered {
+							logger.Error("financial safe mode entered after sealing integrity/lag failure")
+						}
+					}
+					if sealErr == nil {
+						logger.Info("financial batch externally sealed and anchored", "batch_id", batch.Manifest.BatchID, "merkle_root", batch.Manifest.MerkleRoot)
+					}
+				}
+			}
+		}()
+	}
+	if financialAdapter != nil {
+		go func() {
+			recoveryTicker := time.NewTicker(10 * time.Second)
+			fullAuditTicker := time.NewTicker(cfg.Financial.FullAuditInterval)
+			defer recoveryTicker.Stop()
+			defer fullAuditTicker.Stop()
+			run := func(full bool) {
+				var result financial.ReconcileResult
+				var reconcileErr error
+				if full {
+					result, reconcileErr = financialAdapter.Reconcile(reconcileCtx, 100)
+				} else {
+					result, reconcileErr = financialAdapter.RecoverPending(reconcileCtx, 100)
+				}
+				if reconcileErr != nil {
+					logger.Error("financial reconciliation failed", "full_audit", full, "error", reconcileErr)
+				} else if result.Mismatches > 0 || result.SafeMode {
+					logger.Error("financial integrity safe mode", "full_audit", full, "mismatches", result.Mismatches, "safe_mode", result.SafeMode)
+				}
+			}
+			run(true)
+			for {
+				select {
+				case <-reconcileCtx.Done():
+					return
+				case <-recoveryTicker.C:
+					run(false)
+				case <-fullAuditTicker.C:
+					run(true)
+				}
+			}
+		}()
+	}
 	go jobs.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("managed economic reconciliation pending", "error", reconcileErr)
 	})
@@ -353,6 +467,9 @@ func main() {
 	mux.HandleFunc("POST /mcp", mcpServer.Handler())
 	mux.HandleFunc("POST /a2a", a2aServer.Handler())
 	mux.HandleFunc("/v1/blob/", blobStorage.BlobHandler())
+	if financialRepository != nil {
+		mux.Handle("GET /internal/financial-integrity/metrics", financial.MetricsHandler(financialRepository, 5*time.Second))
+	}
 
 	httpServer := &http.Server{
 		Addr: cfg.Addr, Handler: observability.Middleware(logger, mux),

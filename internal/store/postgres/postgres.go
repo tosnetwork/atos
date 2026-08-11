@@ -37,6 +37,11 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 
 func (s *Store) Close() { s.pool.Close() }
 
+// Pool exposes the process-owned connection pool to tightly scoped internal
+// repositories which participate in the same PostgreSQL durability boundary.
+// Callers must not close it.
+func (s *Store) Pool() *pgxpool.Pool { return s.pool }
+
 func mustMarshal(v any) []byte {
 	b, err := json.Marshal(v)
 	if err != nil {
