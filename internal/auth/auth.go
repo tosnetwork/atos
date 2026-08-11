@@ -91,6 +91,16 @@ const (
 	// consumer scope (a consumer never certifies someone else's binding).
 	ScopeCertificationsRead  Scope = "certifications:read"
 	ScopeCertificationsWrite Scope = "certifications:write"
+	// ScopeIdentityBindingsRead/Write authorize Phase 4A's identity-binding
+	// operator surface (atos-spec docs/IMPLEMENTATION_ROADMAP.md §8.1,
+	// docs/API.md §9A): binding/revoking/reading which TOS Agent Identity a
+	// principal_id is bound to. Like ScopeActivationEvaluate, this is an
+	// activation-authority/operator-side action, not owner-scoped -- a
+	// principal cannot bind ITSELF to an arbitrary claimed TOS identity
+	// merely by being authenticated, so this carries no ownership
+	// precondition and is explicit-grant-only, never a default scope.
+	ScopeIdentityBindingsRead  Scope = "identity_bindings:read"
+	ScopeIdentityBindingsWrite Scope = "identity_bindings:write"
 )
 
 var allowedScopes = map[Scope]struct{}{
@@ -103,6 +113,7 @@ var allowedScopes = map[Scope]struct{}{
 	ScopeActivationEvaluate: {},
 	ScopeOpenTasksRead:      {}, ScopeOpenTasksWrite: {}, ScopeOpenTaskProposalsWrite: {},
 	ScopeCertificationsRead: {}, ScopeCertificationsWrite: {},
+	ScopeIdentityBindingsRead: {}, ScopeIdentityBindingsWrite: {},
 }
 
 var defaultConsumerScopes = []Scope{
@@ -153,7 +164,8 @@ func DefaultConsumerScopes() []Scope {
 // ScopeSettlementWrite/ScopeDisputesReview, which is a deliberate,
 // separate decision this set makes easy to revisit later, not an oversight.
 var adminScopes = map[Scope]struct{}{
-	ScopeActivationEvaluate: {},
+	ScopeActivationEvaluate:    {},
+	ScopeIdentityBindingsWrite: {},
 }
 
 // RequiresAdminApproval reports whether scopes contains any scope in
