@@ -108,6 +108,7 @@ type ProviderEarning struct {
 	PayoutAttempts       int       `json:"-"`
 	PayoutLastAttemptAt  time.Time `json:"-"`
 	PayoutFailureReason  string    `json:"-"`
+	PayoutGeneration     int       `json:"-"`
 
 	// DisputeHoldID is the ID of the Dispute currently holding this earning
 	// out of the payout pipeline, or empty if none. It is set (in the same

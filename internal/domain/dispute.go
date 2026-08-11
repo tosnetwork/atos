@@ -150,6 +150,11 @@ type Dispute struct {
 	Outcome        DisputeOutcome       `json:"outcome,omitempty"`
 	ReviewerID     string               `json:"-"`
 	ReasonRejected string               `json:"reason_rejected,omitempty"`
+	// PendingOutcome/Reviewer make the human decision a durable intent before
+	// any Blnk side effect. They prevent a different resolution from racing a
+	// retry after the financial operation committed but the local outcome did not.
+	PendingOutcome    DisputeOutcome `json:"-"`
+	PendingReviewerID string         `json:"-"`
 
 	// DisputePolicyHash is copied from the disputed Quote at open time, so
 	// resolution always applies the policy (dispute window, etc.) the

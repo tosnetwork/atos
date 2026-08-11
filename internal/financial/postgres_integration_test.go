@@ -1,0 +1,296 @@
+package financial
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/tosnetwork/atos/migrations"
+)
+
+type testLedger struct {
+	mu           sync.Mutex
+	transactions map[string]LedgerTransaction
+	balances     map[string]int64
+	submitCalls  int
+	lostOnce     bool
+}
+
+func newTestLedger() *testLedger {
+	return &testLedger{transactions: map[string]LedgerTransaction{}, balances: map[string]int64{}}
+}
+func (l *testLedger) Submit(_ context.Context, e Event, allow bool) (LedgerTransaction, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.submitCalls++
+	if tx, ok := l.transactions[e.LedgerReference]; ok {
+		return tx, nil
+	}
+	var amount int64
+	fmt.Sscan(e.AtomicAmount, &amount)
+	if !allow && l.balances[e.SourceIndicator] < amount {
+		return LedgerTransaction{}, errors.New("insufficient")
+	}
+	l.balances[e.SourceIndicator] -= amount
+	l.balances[e.DestinationIndicator] += amount
+	tx := LedgerTransaction{TransactionID: e.LedgerTransactionID, Source: e.SourceIndicator, Destination: e.DestinationIndicator, Reference: e.LedgerReference, PreciseAmount: json.Number(e.AtomicAmount), Currency: e.Asset, Description: "atos-financial-v1:" + e.Digest, Status: "APPLIED"}
+	l.transactions[e.LedgerReference] = tx
+	if l.lostOnce {
+		l.lostOnce = false
+		return LedgerTransaction{}, errors.New("injected lost response")
+	}
+	return tx, nil
+}
+func (l *testLedger) Lookup(_ context.Context, ref string) (LedgerTransaction, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	tx, ok := l.transactions[ref]
+	return tx, ok, nil
+}
+func (l *testLedger) Balance(_ context.Context, indicator, _ string) (string, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	value, ok := l.balances[indicator]
+	return fmt.Sprint(value), ok, nil
+}
+func (l *testLedger) Verify(_ context.Context, e Event, tx LedgerTransaction) error {
+	if tx.TransactionID != e.LedgerTransactionID || tx.Reference != e.LedgerReference || tx.PreciseAmount.String() != e.AtomicAmount || tx.Currency != e.Asset || tx.Description != "atos-financial-v1:"+e.Digest || tx.Status != "APPLIED" || tx.Source != e.SourceIndicator || tx.Destination != e.DestinationIndicator {
+		return ErrIdempotencyConflict
+	}
+	return nil
+}
+
+func financialTestPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	dsn := os.Getenv("ATOS_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("ATOS_TEST_DATABASE_URL is required for financial PostgreSQL integration")
+	}
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := migrations.Apply(context.Background(), pool); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `TRUNCATE financial_events,financial_projections,financial_integrity_incidents,financial_batches,financial_reconciler_leases`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE financial_chain_state SET next_sequence=1,last_commitment=$1,next_batch_sequence=1,last_batch_id='',last_batch_root=$1,last_anchor_id=''`, GenesisDigest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE financial_integrity_state SET safe_mode=FALSE,reason='',incident_id='',entered_at=NULL`); err != nil {
+		t.Fatal(err)
+	}
+	return pool
+}
+
+func requestFor(id string, event EventType, source, destination AccountCode, sourceOwner, destinationOwner string) TransferRequest {
+	principalID := sourceOwner
+	if event == EventAccountGenesis || event == EventEscrowRelease || event == EventSettlementRefund {
+		principalID = destinationOwner
+	}
+	return TransferRequest{EventType: event, IdempotencyIdentity: id, Identities: Identities{PrincipalID: principalID, ProviderID: "provider_" + id, JobID: "job_" + id, QuoteID: "quote_" + id, CapabilityID: "cap_" + id, CapabilityVersion: "1", BillingSnapshotID: "billing_" + id, ExecutionReceiptID: "execution_" + id, SettlementID: "settlement_" + id, ProviderEarningID: "earning_" + id, DisputeID: "dispute_" + id, PayoutID: "payout_" + id}, Asset: "USD", Decimals: 2, AtomicAmount: "1000", SourceCode: source, SourceOwnerID: sourceOwner, DestinationCode: destination, DestinationOwnerID: destinationOwner}
+}
+
+func TestFinancialMetricsExposeOnlyAggregateDurableState(t *testing.T) {
+	pool := financialTestPool(t)
+	repository, err := NewRepository(pool, "gateway-metrics", "network-metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest("GET", "/internal/financial-integrity/metrics", nil)
+	response := httptest.NewRecorder()
+	MetricsHandler(repository, time.Second).ServeHTTP(response, request)
+	if response.Code != 200 {
+		t.Fatalf("metrics response status=%d body=%s", response.Code, response.Body.String())
+	}
+	body, _ := io.ReadAll(response.Body)
+	for _, name := range []string{"atos_financial_safe_mode", "atos_financial_last_finalized_sequence", "atos_financial_last_anchored_batch_sequence", "atos_financial_payout_reconciliation_lag_seconds"} {
+		if !strings.Contains(string(body), name) {
+			t.Fatalf("metrics response missing %s", name)
+		}
+	}
+	if strings.Contains(string(body), "gateway-metrics") || strings.Contains(string(body), "network-metrics") {
+		t.Fatal("metrics exposed financial identity")
+	}
+}
+
+func TestPostgresTwoReplicaIdempotencyAndLostResponse(t *testing.T) {
+	ctx := context.Background()
+	pool1 := financialTestPool(t)
+	pool2, err := pgxpool.New(ctx, os.Getenv("ATOS_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool2.Close()
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	gateway := "gw-" + suffix
+	network := "net-" + suffix
+	r1, _ := NewRepository(pool1, gateway, network)
+	r2, _ := NewRepository(pool2, gateway, network)
+	ledger := newTestLedger()
+	a1, _ := NewAdapter(r1, ledger)
+	a2, _ := NewAdapter(r2, ledger)
+	principal := "principal-" + suffix
+	genesis := requestFor("genesis-"+suffix, EventAccountGenesis, GatewayCreditIssuance, PrincipalAvailable, "_", principal)
+	genesis.AllowOverdraft = true
+	genesis.AtomicAmount = "1000"
+	if _, err := a1.ProvisionAccount(ctx, genesis); err != nil {
+		t.Fatal(err)
+	}
+	reserve := requestFor("reserve-"+suffix, EventReserve, PrincipalAvailable, PrincipalReserved, principal, principal)
+	const replicas = 24
+	errorsOut := make(chan error, replicas)
+	var wg sync.WaitGroup
+	for i := 0; i < replicas; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			adapter := a1
+			if i%2 == 1 {
+				adapter = a2
+			}
+			_, err := adapter.Reserve(ctx, reserve)
+			errorsOut <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errorsOut)
+	for err := range errorsOut {
+		if err != nil {
+			t.Fatalf("same semantic retry failed: %v", err)
+		}
+	}
+	ledger.mu.Lock()
+	calls := ledger.submitCalls
+	ledger.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("ledger submission count=%d want genesis+one reserve", calls)
+	}
+	changed := reserve
+	changed.AtomicAmount = "999"
+	if _, err := a2.Reserve(ctx, changed); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("changed semantics error=%v", err)
+	}
+	ledger.lostOnce = true
+	release := requestFor("release-"+suffix, EventReservationRelease, PrincipalReserved, PrincipalAvailable, principal, principal)
+	if _, err := a1.ReleaseReservation(ctx, release); err != nil {
+		t.Fatalf("lost response did not converge: %v", err)
+	}
+	event, err := a2.Lookup(ctx, release.IdempotencyIdentity)
+	if err != nil || event.State != "finalized" {
+		t.Fatalf("recovered event=%+v err=%v", event, err)
+	}
+}
+
+func TestCompensatingReversalExactlyInvertsOneFinalizedEvent(t *testing.T) {
+	ctx := context.Background()
+	pool := financialTestPool(t)
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	repository, _ := NewRepository(pool, "gw-"+suffix, "net-"+suffix)
+	ledger := newTestLedger()
+	adapter, _ := NewAdapter(repository, ledger)
+	principal := "principal-" + suffix
+	genesis := requestFor("genesis-reversal-"+suffix, EventAccountGenesis, GatewayCreditIssuance, PrincipalAvailable, "_", principal)
+	genesis.AtomicAmount = "1000"
+	genesis.AllowOverdraft = true
+	if _, err := adapter.ProvisionAccount(ctx, genesis); err != nil {
+		t.Fatal(err)
+	}
+	reserveRequest := requestFor("reserve-reversal-"+suffix, EventReserve, PrincipalAvailable, PrincipalReserved, principal, principal)
+	reserveRequest.AtomicAmount = "1000"
+	reserved, err := adapter.Reserve(ctx, reserveRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reversal := requestFor("reverse-once-"+suffix, EventCompensatingReversal, PrincipalReserved, PrincipalAvailable, principal, principal)
+	reversal.AtomicAmount = reserved.AtomicAmount
+	reversal.ReversesEventID = reserved.EventID
+	changed := reversal
+	changed.IdempotencyIdentity = "reverse-wrong-amount-" + suffix
+	changed.AtomicAmount = "999"
+	if _, err := adapter.CompensatingReversal(ctx, changed); err == nil {
+		t.Fatal("changed-amount reversal was accepted")
+	}
+	if _, err := adapter.CompensatingReversal(ctx, reversal); err != nil {
+		t.Fatalf("exact reversal failed: %v", err)
+	}
+	second := reversal
+	second.IdempotencyIdentity = "reverse-twice-" + suffix
+	if _, err := adapter.CompensatingReversal(ctx, second); err == nil {
+		t.Fatal("same finalized event was reversed twice")
+	}
+}
+
+func TestFinalizedEvidenceDatabaseMutationIsRejected(t *testing.T) {
+	ctx := context.Background()
+	pool := financialTestPool(t)
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	repo, _ := NewRepository(pool, "gw-"+suffix, "net-"+suffix)
+	ledger := newTestLedger()
+	adapter, _ := NewAdapter(repo, ledger)
+	principal := "p-" + suffix
+	request := requestFor("immutable-"+suffix, EventAccountGenesis, GatewayCreditIssuance, PrincipalAvailable, "_", principal)
+	request.AllowOverdraft = true
+	event, err := adapter.ProvisionAccount(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE financial_events SET atomic_amount=atomic_amount+1 WHERE idempotency_identity=$1`, request.IdempotencyIdentity); err == nil {
+		t.Fatal("sealed event amount mutation succeeded")
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM financial_events WHERE idempotency_identity=$1`, request.IdempotencyIdentity); err == nil {
+		t.Fatal("sealed event deletion succeeded")
+	}
+	if got, err := repo.Lookup(ctx, request.IdempotencyIdentity); err != nil || got.Digest != event.Digest {
+		t.Fatalf("evidence changed after mutation attempts: %+v %v", got, err)
+	}
+}
+
+func TestReconciliationMismatchEntersSafeMode(t *testing.T) {
+	ctx := context.Background()
+	pool := financialTestPool(t)
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	repo, _ := NewRepository(pool, "gw-"+suffix, "net-"+suffix)
+	ledger := newTestLedger()
+	adapter, _ := NewAdapter(repo, ledger)
+	principal := "p-" + suffix
+	request := requestFor("reconcile-"+suffix, EventAccountGenesis, GatewayCreditIssuance, PrincipalAvailable, "_", principal)
+	request.AllowOverdraft = true
+	if _, err := adapter.ProvisionAccount(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := adapter.Reconcile(ctx, 100); err != nil || result.SafeMode || result.Mismatches != 0 {
+		t.Fatalf("clean reconciliation result=%+v err=%v", result, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE financial_projections SET atomic_balance=atomic_balance+1 WHERE account_code=$1 AND account_owner_id=$2`, PrincipalAvailable, principal); err != nil {
+		t.Fatal(err)
+	}
+	result, err := adapter.Reconcile(ctx, 100)
+	if err == nil || !result.SafeMode || result.Mismatches != 1 {
+		t.Fatalf("corrupt reconciliation result=%+v err=%v", result, err)
+	}
+	if err := adapter.RebuildProjections(ctx); err != nil {
+		t.Fatalf("deterministic projection rebuild: %v", err)
+	}
+	var rebuilt string
+	if err := pool.QueryRow(ctx, `SELECT atomic_balance::text FROM financial_projections WHERE account_code=$1 AND account_owner_id=$2`, PrincipalAvailable, principal).Scan(&rebuilt); err != nil || rebuilt != "1000" {
+		t.Fatalf("rebuilt balance=%s err=%v", rebuilt, err)
+	}
+	if _, err := adapter.Reserve(ctx, requestFor("blocked-"+suffix, EventReserve, PrincipalAvailable, PrincipalReserved, principal, principal)); !errors.Is(err, ErrSafeMode) {
+		t.Fatalf("safe mode write error=%v", err)
+	}
+}

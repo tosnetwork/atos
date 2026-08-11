@@ -70,7 +70,11 @@ func (w *fakeThirdPartyWorker) Cancel(
 
 func startThirdPartyWorker(t *testing.T, worker edgev1connect.ThirdPartyExecutionServiceHandler) (string, func()) {
 	t.Helper()
-	directory := t.TempDir()
+	directory, err := os.MkdirTemp("", "atos-tp-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
 	if err := os.Chmod(directory, 0o700); err != nil {
 		t.Fatal(err)
 	}

@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/tosnetwork/atos/internal/domain"
+	"github.com/tosnetwork/atos/internal/financial"
+	"github.com/tosnetwork/atos/internal/money"
 	"github.com/tosnetwork/atos/internal/store"
 )
 
@@ -39,6 +41,12 @@ type DisputeService struct {
 	earnings  *EarningsService
 	accounts  *AccountService
 	artifacts *ArtifactService
+	financial financial.ATOSFinancialAdapter
+}
+
+func (s *DisputeService) WithFinancialAuthority(adapter financial.ATOSFinancialAdapter) *DisputeService {
+	s.financial = adapter
+	return s
 }
 
 func NewDisputeService(st store.Store, jobs *JobService, earnings *EarningsService, accounts *AccountService, artifacts *ArtifactService) *DisputeService {
@@ -106,6 +114,9 @@ func (s *DisputeService) Open(ctx context.Context, in OpenDisputeInput) (domain.
 	// recovery: the unique (principal_id, job_id) dispute identity makes
 	// this unambiguous.
 	if existing, lookupErr := s.store.DisputeByIdempotencyKey(ctx, in.PrincipalID, in.IdempotencyKey); lookupErr == nil {
+		if err := s.ensureFinancialDisputeHold(ctx, existing); err != nil {
+			return domain.Dispute{}, err
+		}
 		if err := s.store.Finish(ctx, in.PrincipalID, in.IdempotencyKey, existing.ID); err != nil {
 			return domain.Dispute{}, err
 		}
@@ -253,11 +264,44 @@ func (s *DisputeService) Open(ctx context.Context, in OpenDisputeInput) (domain.
 	if err != nil {
 		return domain.Dispute{}, err
 	}
+	if err := s.ensureFinancialDisputeHold(ctx, dispute); err != nil {
+		return domain.Dispute{}, err
+	}
 	if err := s.store.Finish(ctx, in.PrincipalID, in.IdempotencyKey, dispute.ID); err != nil {
 		return domain.Dispute{}, err
 	}
 	committed = true
 	return dispute, nil
+}
+
+func (s *DisputeService) ensureFinancialDisputeHold(ctx context.Context, dispute domain.Dispute) error {
+	if s.financial == nil || dispute.EconomicState != domain.DisputeEconomicFrozen {
+		return nil
+	}
+	job, err := s.store.GetJob(ctx, dispute.JobID)
+	if err != nil {
+		return err
+	}
+	quote, err := s.store.GetQuote(ctx, dispute.QuoteID)
+	if err != nil {
+		return err
+	}
+	earning, err := s.store.EarningByJob(ctx, dispute.JobID)
+	if err != nil {
+		return err
+	}
+	amount, err := money.Parse(earning.NetAmount.Amount, earning.NetAmount.Currency, accountDecimals)
+	if err != nil {
+		return err
+	}
+	_, err = s.financial.HoldDispute(ctx, financial.TransferRequest{
+		EventType: financial.EventDisputeHold, IdempotencyIdentity: "dispute:" + dispute.ID + ":hold:v1",
+		Identities: financialIdentities(job, quote, "billing_"+job.ID, dispute.ReceiptID, dispute.SettlementID, dispute.EarningID, dispute.ID, ""),
+		Asset:      amount.Currency, Decimals: accountDecimals, AtomicAmount: amount.Minor.String(),
+		SourceCode: financial.ProviderPayable, SourceOwnerID: dispute.ProviderID,
+		DestinationCode: financial.ProviderDisputed, DestinationOwnerID: dispute.ProviderID,
+	})
+	return err
 }
 
 // Review transitions a dispute from Opened to UnderReview, claiming it
@@ -341,6 +385,13 @@ func (s *DisputeService) Resolve(ctx context.Context, in ResolveDisputeInput) (d
 	if err != nil {
 		return domain.Dispute{}, err
 	}
+	seed, err = s.reserveResolutionIntent(ctx, seed.ID, in)
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	if err := s.applyFinancialDisputeResolution(ctx, seed, in.Outcome); err != nil {
+		return domain.Dispute{}, err
+	}
 
 	dispute, _, _, err := s.store.ResolveDispute(ctx, in.DisputeID, seed.PrincipalID, s.accounts.defaultAccount(seed.PrincipalID),
 		func(d domain.Dispute, e domain.ProviderEarning, earningExists bool, a domain.Account, accountExists bool) (domain.Dispute, domain.ProviderEarning, domain.Account, error) {
@@ -354,6 +405,9 @@ func (s *DisputeService) Resolve(ctx context.Context, in ResolveDisputeInput) (d
 			// disputes:review, which implicitly claims it here.
 			if d.ReviewerID != "" && d.ReviewerID != in.ReviewerID {
 				return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute is claimed by a different reviewer", false)
+			}
+			if d.PendingOutcome != "" && (d.PendingOutcome != in.Outcome || d.PendingReviewerID != in.ReviewerID) {
+				return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute has a different durable resolution intent", false)
 			}
 			if d.ReviewStatus.Terminal() {
 				if d.Outcome == in.Outcome {
@@ -402,9 +456,13 @@ func (s *DisputeService) Resolve(ctx context.Context, in ResolveDisputeInput) (d
 				e.DisputeHoldID = ""
 				switch in.Outcome {
 				case domain.DisputeOutcomePrincipal:
-					nextAccount, err := s.accounts.creditAccountValue(a, d.ChargedAmount.Amount, d.ChargedAmount.Currency)
-					if err != nil {
-						return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
+					nextAccount := a
+					if s.financial == nil {
+						var err error
+						nextAccount, err = s.accounts.creditAccountValue(a, d.ChargedAmount.Amount, d.ChargedAmount.Currency)
+						if err != nil {
+							return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, err
+						}
 					}
 					e.Status = domain.EarningReversed
 					d.EconomicState = domain.DisputeEconomicRefunded
@@ -445,6 +503,101 @@ func (s *DisputeService) Resolve(ctx context.Context, in ResolveDisputeInput) (d
 		return domain.Dispute{}, err
 	}
 	return dispute, nil
+}
+
+func (s *DisputeService) reserveResolutionIntent(ctx context.Context, disputeID string, in ResolveDisputeInput) (domain.Dispute, error) {
+	return s.store.UpdateDispute(ctx, disputeID, func(d domain.Dispute, exists bool) (domain.Dispute, error) {
+		if !exists {
+			return domain.Dispute{}, store.ErrNotFound
+		}
+		if d.ReviewStatus.Terminal() {
+			if d.Outcome == in.Outcome {
+				return d, nil
+			}
+			return domain.Dispute{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute already resolved with a different outcome", false)
+		}
+		if d.PrincipalID == in.ReviewerID || d.ProviderID == in.ReviewerID {
+			return domain.Dispute{}, domain.NewError(domain.ErrPermissionDenied, "a party to the dispute cannot resolve it", false)
+		}
+		if d.ReviewerID != "" && d.ReviewerID != in.ReviewerID {
+			return domain.Dispute{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute is claimed by a different reviewer", false)
+		}
+		if in.Outcome != domain.DisputeOutcomeRejected && d.ReviewStatus != domain.DisputeUnderReview {
+			return domain.Dispute{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute must be under review before it can be decided for a party", false)
+		}
+		if d.PendingOutcome != "" && (d.PendingOutcome != in.Outcome || d.PendingReviewerID != in.ReviewerID) {
+			return domain.Dispute{}, domain.NewError(domain.ErrDisputeInvalidTransition, "a different resolution intent is already durable", false)
+		}
+		d.PendingOutcome = in.Outcome
+		d.PendingReviewerID = in.ReviewerID
+		d.UpdatedAt = time.Now().UTC()
+		return d, nil
+	})
+}
+
+func (s *DisputeService) applyFinancialDisputeResolution(ctx context.Context, dispute domain.Dispute, outcome domain.DisputeOutcome) error {
+	if s.financial == nil || dispute.ReviewStatus.Terminal() || dispute.EconomicState != domain.DisputeEconomicFrozen {
+		return nil
+	}
+	job, err := s.store.GetJob(ctx, dispute.JobID)
+	if err != nil {
+		return err
+	}
+	quote, err := s.store.GetQuote(ctx, dispute.QuoteID)
+	if err != nil {
+		return err
+	}
+	earning, err := s.store.EarningByJob(ctx, dispute.JobID)
+	if err != nil {
+		return err
+	}
+	snapshot, err := s.store.BillingSnapshotByJob(ctx, dispute.JobID)
+	if err != nil {
+		return err
+	}
+	identities := financialIdentities(job, quote, "billing_"+job.ID, dispute.ReceiptID, dispute.SettlementID, dispute.EarningID, dispute.ID, "")
+	providerAmount, err := money.Parse(earning.NetAmount.Amount, earning.NetAmount.Currency, accountDecimals)
+	if err != nil {
+		return err
+	}
+	if outcome == domain.DisputeOutcomeProvider || outcome == domain.DisputeOutcomeRejected {
+		_, err = s.financial.ReleaseDispute(ctx, financial.TransferRequest{
+			EventType: financial.EventDisputeRelease, IdempotencyIdentity: "dispute:" + dispute.ID + ":release:v1",
+			Identities: identities, Asset: providerAmount.Currency, Decimals: accountDecimals, AtomicAmount: providerAmount.Minor.String(),
+			SourceCode: financial.ProviderDisputed, SourceOwnerID: dispute.ProviderID,
+			DestinationCode: financial.ProviderPayable, DestinationOwnerID: dispute.ProviderID,
+		})
+		return err
+	}
+	_, err = s.financial.FullRefund(ctx, financial.TransferRequest{
+		EventType: financial.EventFullRefund, IdempotencyIdentity: "refund:" + dispute.ID + ":provider-full:v1",
+		Identities: identities, Asset: providerAmount.Currency, Decimals: accountDecimals, AtomicAmount: providerAmount.Minor.String(),
+		SourceCode: financial.ProviderDisputed, SourceOwnerID: dispute.ProviderID,
+		DestinationCode: financial.PrincipalAvailable, DestinationOwnerID: dispute.PrincipalID,
+	})
+	if err != nil {
+		return err
+	}
+	fee, err := money.Parse(snapshot.GatewayFee.Amount, snapshot.GatewayFee.Currency, accountDecimals)
+	if err != nil || fee.IsZero() {
+		return err
+	}
+	_, err = s.financial.FundGatewayRefund(ctx, financial.TransferRequest{
+		EventType: financial.EventGatewayRefundFund, IdempotencyIdentity: "refund:" + dispute.ID + ":gateway-fee-fund:v1",
+		Identities: identities, Asset: fee.Currency, Decimals: accountDecimals, AtomicAmount: fee.Minor.String(),
+		SourceCode: financial.GatewayFeeRevenue, SourceOwnerID: "_",
+		DestinationCode: financial.GatewayRefundLiability, DestinationOwnerID: "_",
+	})
+	if err != nil {
+		return err
+	}
+	_, err = s.financial.PayGatewayRefund(ctx, financial.TransferRequest{
+		EventType: financial.EventGatewayRefundPay, IdempotencyIdentity: "refund:" + dispute.ID + ":gateway-fee-pay:v1",
+		Identities: identities, Asset: fee.Currency, Decimals: accountDecimals, AtomicAmount: fee.Minor.String(),
+		SourceCode: financial.GatewayRefundLiability, SourceOwnerID: "_",
+		DestinationCode: financial.PrincipalAvailable, DestinationOwnerID: dispute.PrincipalID,
+	})
+	return err
 }
 
 func (s *DisputeService) Get(ctx context.Context, id string) (domain.Dispute, error) {

@@ -9,6 +9,8 @@ import (
 	"github.com/tosnetwork/atos/internal/adapters/tosai"
 	"github.com/tosnetwork/atos/internal/adapters/toscore"
 	"github.com/tosnetwork/atos/internal/domain"
+	"github.com/tosnetwork/atos/internal/financial"
+	"github.com/tosnetwork/atos/internal/money"
 	"github.com/tosnetwork/atos/internal/store"
 )
 
@@ -24,6 +26,38 @@ func domainErrorIs(err error, code domain.ErrorCode) bool {
 }
 
 func (s *JobService) atomicDebitCheckpoint(ctx context.Context, job domain.Job, quote domain.Quote) (domain.Job, error) {
+	if s.financial != nil {
+		amount, err := money.Parse(quote.Price.TotalMax, quote.Price.Currency, accountDecimals)
+		if err != nil {
+			return domain.Job{}, err
+		}
+		_, err = s.financial.Reserve(ctx, financial.TransferRequest{
+			EventType: financial.EventReserve, IdempotencyIdentity: "job:" + job.ID + ":reserve:v1",
+			Identities: financialIdentities(job, quote, "", "", "", "", "", ""),
+			Asset:      amount.Currency, Decimals: accountDecimals, AtomicAmount: amount.Minor.String(),
+			SourceCode: financial.PrincipalAvailable, SourceOwnerID: job.PrincipalID,
+			DestinationCode: financial.PrincipalReserved, DestinationOwnerID: job.PrincipalID,
+		})
+		if err != nil {
+			return domain.Job{}, err
+		}
+		updated, err := s.store.UpdateJob(ctx, job.ID, func(current domain.Job, exists bool) (domain.Job, error) {
+			if !exists {
+				return domain.Job{}, domain.NewError(domain.ErrNotFound, "job not found during economic reserve", false)
+			}
+			if current.EconomicState != domain.EconomicNone {
+				return current, nil
+			}
+			if current.State != domain.JobSubmitted {
+				return domain.Job{}, store.ErrConflict
+			}
+			current.EconomicState = domain.EconomicDebited
+			current.ProofStatus.Quote = proofCheckpointForCommittedQuote(current.TrustMode)
+			current.UpdatedAt = time.Now().UTC()
+			return current, nil
+		})
+		return updated, err
+	}
 	updated, _, err := s.store.UpdateJobAndAccount(ctx, job.ID, job.PrincipalID, s.accounts.defaultAccount(job.PrincipalID), func(current domain.Job, exists bool, account domain.Account, _ bool) (domain.Job, domain.Account, error) {
 		if !exists {
 			return domain.Job{}, domain.Account{}, domain.NewError(domain.ErrNotFound, "job not found during economic debit", false)
@@ -44,6 +78,52 @@ func (s *JobService) atomicDebitCheckpoint(ctx context.Context, job domain.Job, 
 		return current, nextAccount, nil
 	})
 	return updated, err
+}
+
+func financialIdentities(job domain.Job, quote domain.Quote, billingID, executionReceiptID, settlementID, earningID, disputeID, payoutID string) financial.Identities {
+	return financial.Identities{
+		PrincipalID: job.PrincipalID, ProviderID: job.ProviderID, JobID: job.ID,
+		QuoteID: quote.ID, CapabilityID: job.CapabilityID, CapabilityVersion: job.CapabilityVersion,
+		BillingSnapshotID: billingID, ExecutionReceiptID: executionReceiptID,
+		SettlementID: settlementID, ProviderEarningID: earningID, DisputeID: disputeID, PayoutID: payoutID,
+	}
+}
+
+func (s *JobService) settleFinancialLegs(ctx context.Context, job domain.Job, quote domain.Quote, snapshot domain.BillingSnapshot, settlementID string) error {
+	if s.financial == nil {
+		return nil
+	}
+	identities := financialIdentities(job, quote, "billing_"+snapshot.JobID, snapshot.ReceiptID, settlementID, "earn_"+settlementID, "", "")
+	legs := []struct {
+		event       financial.EventType
+		suffix      string
+		amount      domain.Money
+		destination financial.AccountCode
+		owner       string
+	}{
+		{financial.EventSettlementProvider, "provider", snapshot.ProviderGross, financial.ProviderPayable, snapshot.ProviderID},
+		{financial.EventSettlementFee, "fee", snapshot.GatewayFee, financial.GatewayFeeRevenue, "_"},
+		{financial.EventSettlementRefund, "refund", snapshot.PrincipalRefund, financial.PrincipalAvailable, job.PrincipalID},
+	}
+	for _, leg := range legs {
+		amount, err := money.Parse(leg.amount.Amount, leg.amount.Currency, accountDecimals)
+		if err != nil {
+			return err
+		}
+		if amount.IsZero() {
+			continue
+		}
+		_, err = s.financial.Settle(ctx, financial.TransferRequest{
+			EventType: leg.event, IdempotencyIdentity: "settlement:" + settlementID + ":" + leg.suffix + ":v1",
+			Identities: identities, Asset: amount.Currency, Decimals: accountDecimals, AtomicAmount: amount.Minor.String(),
+			SourceCode: financial.ManagedEscrow, SourceOwnerID: job.ID,
+			DestinationCode: leg.destination, DestinationOwnerID: leg.owner,
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *JobService) markEconomicReconciliationUnderLock(ctx context.Context, jobID string, economic domain.EconomicState, target domain.JobState, code domain.ErrorCode, reason string) domain.Job {
@@ -88,6 +168,22 @@ func validateRecoveredEscrow(job domain.Job, quote domain.Quote, capability doma
 }
 
 func (s *JobService) recoverOrCreateEscrowUnderLock(ctx context.Context, job domain.Job, quote domain.Quote, capability domain.Capability) (domain.Escrow, error) {
+	if s.financial != nil {
+		amount, err := money.Parse(quote.Price.TotalMax, quote.Price.Currency, accountDecimals)
+		if err != nil {
+			return domain.Escrow{}, err
+		}
+		_, err = s.financial.FundEscrow(ctx, financial.TransferRequest{
+			EventType: financial.EventEscrowFund, IdempotencyIdentity: "job:" + job.ID + ":escrow-fund:v1",
+			Identities: financialIdentities(job, quote, "", "", "", "", "", ""),
+			Asset:      amount.Currency, Decimals: accountDecimals, AtomicAmount: amount.Minor.String(),
+			SourceCode: financial.PrincipalReserved, SourceOwnerID: job.PrincipalID,
+			DestinationCode: financial.ManagedEscrow, DestinationOwnerID: job.ID,
+		})
+		if err != nil {
+			return domain.Escrow{}, err
+		}
+	}
 	if existing, err := s.store.EscrowByJob(ctx, job.ID); err == nil {
 		if err := validateRecoveredEscrow(job, quote, capability, existing); err != nil {
 			return domain.Escrow{}, err
@@ -270,6 +366,34 @@ func (s *JobService) refundDebitedWithoutEscrowUnderLock(ctx context.Context, jo
 	if err != nil {
 		return job, err
 	}
+	if s.financial != nil {
+		amount, err := money.Parse(quote.Price.TotalMax, quote.Price.Currency, accountDecimals)
+		if err != nil {
+			return job, err
+		}
+		_, err = s.financial.ReleaseReservation(ctx, financial.TransferRequest{
+			EventType: financial.EventReservationRelease, IdempotencyIdentity: "job:" + job.ID + ":reservation-release:v1",
+			Identities: financialIdentities(job, quote, "", "", "", "", "", ""),
+			Asset:      amount.Currency, Decimals: accountDecimals, AtomicAmount: amount.Minor.String(),
+			SourceCode: financial.PrincipalReserved, SourceOwnerID: job.PrincipalID,
+			DestinationCode: financial.PrincipalAvailable, DestinationOwnerID: job.PrincipalID,
+		})
+		if err != nil {
+			return s.markEconomicReconciliationUnderLock(ctx, job.ID, domain.EconomicDebited, target, code, reason+"; financial reservation release requires recovery"), err
+		}
+		return s.store.UpdateJob(ctx, job.ID, func(current domain.Job, exists bool) (domain.Job, error) {
+			if !exists {
+				return domain.Job{}, store.ErrNotFound
+			}
+			if current.EconomicState == domain.EconomicReleased && current.State.Terminal() {
+				return current, nil
+			}
+			if current.EconomicState != domain.EconomicDebited {
+				return domain.Job{}, store.ErrConflict
+			}
+			return finalizeTerminalJob(current, target, code, reason, domain.EconomicReleased), nil
+		})
+	}
 	updated, _, err := s.store.UpdateJobAndAccount(ctx, job.ID, job.PrincipalID, s.accounts.defaultAccount(job.PrincipalID), func(current domain.Job, exists bool, account domain.Account, _ bool) (domain.Job, domain.Account, error) {
 		if !exists {
 			return domain.Job{}, domain.Account{}, store.ErrNotFound
@@ -356,6 +480,38 @@ func (s *JobService) releaseForTerminalUnderLock(ctx context.Context, job domain
 	receipt, releaseErr := s.core.ReleaseEscrow(ctx, job.EscrowID)
 	if releaseErr != nil {
 		return s.markEconomicReconciliationUnderLock(ctx, job.ID, domain.EconomicReleasePending, target, code, reason+"; escrow release requires replay: "+releaseErr.Error()), releaseErr
+	}
+	if s.financial != nil && nonZeroMoney(receipt.Refunded) {
+		amount, parseErr := money.Parse(receipt.Refunded.Amount, receipt.Refunded.Currency, accountDecimals)
+		if parseErr != nil {
+			return job, parseErr
+		}
+		_, financialErr := s.financial.ReleaseEscrow(ctx, financial.TransferRequest{
+			EventType: financial.EventEscrowRelease, IdempotencyIdentity: "job:" + job.ID + ":escrow-release:v1",
+			Identities: financialIdentities(job, quote, "", "", receipt.ID, "", "", ""),
+			Asset:      amount.Currency, Decimals: accountDecimals, AtomicAmount: amount.Minor.String(),
+			SourceCode: financial.ManagedEscrow, SourceOwnerID: job.ID,
+			DestinationCode: financial.PrincipalAvailable, DestinationOwnerID: job.PrincipalID,
+		})
+		if financialErr != nil {
+			return s.markEconomicReconciliationUnderLock(ctx, job.ID, domain.EconomicReleasePending, target, code, reason+"; Blnk escrow release requires recovery"), financialErr
+		}
+	}
+	if s.financial != nil {
+		return s.store.UpdateJob(ctx, job.ID, func(current domain.Job, exists bool) (domain.Job, error) {
+			if !exists {
+				return domain.Job{}, store.ErrNotFound
+			}
+			if current.EconomicState == domain.EconomicReleased && current.State.Terminal() {
+				return current, nil
+			}
+			if current.EconomicState != domain.EconomicReleasePending {
+				return domain.Job{}, store.ErrConflict
+			}
+			current.ProofStatus.Escrow = domain.ProofReleased
+			current.ProofStatus.Settlement = domain.ProofReleased
+			return finalizeTerminalJob(current, target, code, reason, domain.EconomicReleased), nil
+		})
 	}
 	updated, _, err := s.store.UpdateJobAndAccount(ctx, job.ID, job.PrincipalID, s.accounts.defaultAccount(job.PrincipalID), func(current domain.Job, exists bool, account domain.Account, _ bool) (domain.Job, domain.Account, error) {
 		if !exists {
@@ -481,6 +637,45 @@ func (s *JobService) settleProviderResultUnderLock(ctx context.Context, current 
 	})
 	if settleErr != nil {
 		return s.markEconomicReconciliationUnderLock(ctx, current.ID, domain.EconomicSettlementPending, domain.JobCompleted, domain.ErrSettlementFailed, "settlement outcome requires idempotent replay: "+settleErr.Error())
+	}
+	if financialErr := s.settleFinancialLegs(ctx, current, quote, billingSnapshot, settled.Receipt.ID); financialErr != nil {
+		return s.markEconomicReconciliationUnderLock(ctx, current.ID, domain.EconomicSettlementPending, domain.JobCompleted, domain.ErrSettlementFailed, "Blnk settlement requires idempotent recovery: "+financialErr.Error())
+	}
+	if s.financial != nil {
+		final, finalErr := s.store.UpdateJob(ctx, current.ID, func(job domain.Job, exists bool) (domain.Job, error) {
+			if !exists {
+				return domain.Job{}, store.ErrNotFound
+			}
+			if job.EconomicState == domain.EconomicSettled && job.State == domain.JobCompleted {
+				return job, nil
+			}
+			if job.EconomicState != domain.EconomicSettlementPending {
+				return domain.Job{}, store.ErrConflict
+			}
+			job.Output = cloneMap(current.Output)
+			job.Artifacts = append([]domain.Artifact(nil), current.Artifacts...)
+			job.ProofStatus.Receipt = domain.ProofVerified
+			job.ProofStatus.Settlement = domain.ProofSettled
+			job.EconomicState = domain.EconomicSettled
+			job.State = domain.JobCompleted
+			job.ReconciliationRequired = false
+			job.ReconciliationTarget = ""
+			job.ErrorCode = ""
+			job.FailureReason = ""
+			job.PendingCredit = nil
+			now := time.Now().UTC()
+			job.UpdatedAt = now
+			job.CompletedAt = &now
+			return job, nil
+		})
+		if finalErr != nil {
+			return s.markEconomicReconciliationUnderLock(ctx, current.ID, domain.EconomicSettlementPending, domain.JobCompleted, domain.ErrSettlementFailed, "Blnk settlement finalized but local projection must be retried: "+finalErr.Error())
+		}
+		if s.earnings != nil {
+			_, _ = s.earnings.RecordSettlement(ctx, billingSnapshot, settled.Receipt.ID)
+		}
+		_, _ = s.core.CommitProofOfServiceEvidence(ctx, receipt)
+		return final
 	}
 	final, _, finalErr := s.store.UpdateJobAndAccount(ctx, current.ID, current.PrincipalID, s.accounts.defaultAccount(current.PrincipalID), func(job domain.Job, exists bool, account domain.Account, _ bool) (domain.Job, domain.Account, error) {
 		if !exists {
