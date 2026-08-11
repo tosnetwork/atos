@@ -325,7 +325,7 @@ func main() {
 	mcpServer := &mcp.Server{
 		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,
 		Certifications:      certifications,
-		ActivationAuthority: activationAuthority, OpenTasks: openTasks, Quotes: quotes,
+		ActivationAuthority: activationAuthority, IdentityBindings: identityBindings, OpenTasks: openTasks, Quotes: quotes,
 		Jobs: jobs, Accounts: accounts, Receipts: receipts, Earnings: earnings,
 		Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}

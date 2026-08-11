@@ -36,6 +36,9 @@ var orderedToolSpecs = []toolSpec{
 	{Definition: revokeExecutionSignerTool(), RequiredScopes: []auth.Scope{auth.ScopeExecutionSignersWrite}},
 	{Definition: getExecutionSignerStatusTool(), RequiredScopes: []auth.Scope{auth.ScopeExecutionSignersRead}},
 	{Definition: evaluateActivationTool(), RequiredScopes: []auth.Scope{auth.ScopeActivationEvaluate}},
+	{Definition: bindIdentityTool(), RequiredScopes: []auth.Scope{auth.ScopeIdentityBindingsWrite}},
+	{Definition: revokeIdentityTool(), RequiredScopes: []auth.Scope{auth.ScopeIdentityBindingsWrite}},
+	{Definition: identityBindingStatusTool(), RequiredScopes: []auth.Scope{auth.ScopeIdentityBindingsRead}},
 	{Definition: openCertificationTool(), RequiredScopes: []auth.Scope{auth.ScopeCertificationsWrite}},
 	{Definition: getCertificationStatusTool(), RequiredScopes: []auth.Scope{auth.ScopeCertificationsRead}},
 	{Definition: publishOpenTaskTool(), RequiredScopes: []auth.Scope{auth.ScopeOpenTasksWrite}},
@@ -424,6 +427,43 @@ func evaluateActivationTool() map[string]any {
 			"capability_id":   map[string]any{"type": "string", "minLength": 1},
 			"mode":            map[string]any{"type": "string", "enum": []string{"verified", "native"}},
 			"idempotency_key": map[string]any{"type": "string", "minLength": 1},
+		}),
+		"outputSchema": map[string]any{"type": "object"},
+	}
+}
+
+func bindIdentityTool() map[string]any {
+	return map[string]any{
+		"name":        "atos_bind_identity",
+		"description": "Admin-triggered entry point for Phase 4A's identity-binding create (docs/API.md §9A). Deliberately not principal-owner-scoped, like atos_evaluate_activation -- a principal cannot bind itself to an arbitrary claimed TOS identity merely by being authenticated. agent_id MUST already independently resolve; this never creates a new TOS Agent Identity from nothing.",
+		"inputSchema": objectSchema([]string{"principal_id", "agent_id", "idempotency_key"}, map[string]any{
+			"principal_id":    map[string]any{"type": "string", "minLength": 1},
+			"agent_id":        map[string]any{"type": "string", "minLength": 1},
+			"idempotency_key": map[string]any{"type": "string", "minLength": 1},
+		}),
+		"outputSchema": map[string]any{"type": "object"},
+	}
+}
+
+func revokeIdentityTool() map[string]any {
+	return map[string]any{
+		"name":        "atos_revoke_identity",
+		"description": "Admin-triggered entry point for Phase 4A's identity-binding revoke. revoked:false (nothing was bound) is a normal outcome, not an error.",
+		"inputSchema": objectSchema([]string{"principal_id", "idempotency_key"}, map[string]any{
+			"principal_id":    map[string]any{"type": "string", "minLength": 1},
+			"reason_code":     map[string]any{"type": "string"},
+			"idempotency_key": map[string]any{"type": "string", "minLength": 1},
+		}),
+		"outputSchema": map[string]any{"type": "object"},
+	}
+}
+
+func identityBindingStatusTool() map[string]any {
+	return map[string]any{
+		"name":        "atos_identity_binding_status",
+		"description": "Read-only: principal_id's current TOS Agent Identity binding status (local durable projection only -- not a live re-verification against tos-protocol; TOSBackedActivationAuthority re-resolves freshness separately at evaluation time).",
+		"inputSchema": objectSchema([]string{"principal_id"}, map[string]any{
+			"principal_id": map[string]any{"type": "string", "minLength": 1},
 		}),
 		"outputSchema": map[string]any{"type": "object"},
 	}

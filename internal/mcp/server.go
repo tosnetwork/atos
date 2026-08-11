@@ -27,16 +27,20 @@ type Server struct {
 	// this is not optional: production wiring MUST always set it (see
 	// httpapi.Server.ActivationAuthority's identical doc comment).
 	ActivationAuthority domain.ActivationAuthority
-	OpenTasks           *service.OpenTaskService
-	Quotes              *service.QuoteService
-	Jobs                *service.JobService
-	Accounts            *service.AccountService
-	Receipts            *service.ReceiptService
-	Earnings            *service.EarningsService
-	Disputes            *service.DisputeService
-	Artifacts           *service.ArtifactService
-	Logger              *slog.Logger
-	PublicBaseURL       string
+	// IdentityBindings backs the atos_bind_identity/atos_revoke_identity/
+	// atos_identity_binding_status tools -- same "not optional in
+	// production, wiring is the guard" contract as ActivationAuthority.
+	IdentityBindings *service.IdentityBindingService
+	OpenTasks        *service.OpenTaskService
+	Quotes           *service.QuoteService
+	Jobs             *service.JobService
+	Accounts         *service.AccountService
+	Receipts         *service.ReceiptService
+	Earnings         *service.EarningsService
+	Disputes         *service.DisputeService
+	Artifacts        *service.ArtifactService
+	Logger           *slog.Logger
+	PublicBaseURL    string
 }
 
 type rpcRequest struct {
