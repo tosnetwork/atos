@@ -7,6 +7,13 @@ it documents *recurring bug classes* and the specific testing practices that
 would have caught them earlier, so future work in this repo builds these
 practices in from the start instead of discovering them the same way again.
 
+Categories 9-10 below were found during the post-merge verification pass for
+Phase 4A (running the full test suite after merging three repos' branches to
+`main`), not by the Phase 4A review rounds themselves — they're pre-existing
+bugs in unrelated workstreams (the financial-integrity work, and Phase 2C's
+dispute resolution), included here because the bug class generalizes well
+beyond where each was actually found.
+
 ## What kept slipping through, and why
 
 ### 1. Incomplete input-validation coverage on any new validated-input surface
@@ -143,6 +150,48 @@ which implementation of a dependency is wired needs a test against the
 **fail-closed/default** dependency, not only against the fully-configured
 real one. Misconfiguration is the common case in production, not an edge
 case.
+
+### 9. Hardcoded golden/vector test values transcribed incorrectly at commit time
+
+`internal/financial`'s V2 batch golden CBOR test vector (`BatchID`,
+`ManifestDigest`, `ManifestCBOR`, `ledger_evidence_digest`) was wrong from
+the moment it was hardcoded — reproducing the test at the exact commit that
+set it showed it never matched the code's own output, which is stable and
+deterministic across repeated runs. Not a later regression; a transcription
+error at commit time that nothing caught because the test only ever
+compares against itself.
+
+**Root cause:** whoever wrote the vector most likely computed or copied it
+by hand (or from a slightly different run) instead of pasting in the exact
+string the test itself printed on a passing run.
+
+**Practice:** never hand-write a golden/vector expected value. Run the code,
+capture its actual printed/logged output, and paste that in verbatim. When a
+"vector changed" assertion starts failing, don't assume the vector was ever
+correct — reproduce the failure at the exact commit that last touched the
+vector before concluding something regressed after it.
+
+### 10. Two independently-locked reads composed to test (or serve) one atomic write
+
+`TestDisputeResolve_PrincipalWinHasNoObservableIntermediateState` polled a
+dispute and its earning via two separate `Get` calls in a tight loop.
+`ResolveDispute`'s write of both fields together is atomic, but two
+independent reads are never atomic with respect to each other regardless of
+how well-locked the write is — the writer's entire critical section can
+land completely between the two reads. This produced an observable torn
+state (`dispute.ReviewStatus` resolved while `earning.Status` still frozen)
+in roughly 15-20% of runs.
+
+**Root cause:** an atomic multi-field write does not make two *separately
+locked* reads of those fields atomic with each other. This is a structural
+property, not something a faster or better-implemented write can fix.
+
+**Practice:** whenever a test (or a real caller) needs a consistent view of
+two-or-more fields/aggregates that one write updates together, provide and
+use a genuinely combined atomic read (memory store: one critical section
+covering both; Postgres: a single `REPEATABLE READ` transaction so every
+`SELECT` inside it sees one snapshot) — never compose two independently
+locked reads and assume the pair is consistent.
 
 ## Why 10 review rounds kept finding new things
 
