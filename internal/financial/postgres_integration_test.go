@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/tosnetwork/atos/migrations"
 )
@@ -23,6 +24,9 @@ type testLedger struct {
 	balances     map[string]int64
 	submitCalls  int
 	lostOnce     bool
+	blockLookup  string
+	lookupStart  chan struct{}
+	lookupResume chan struct{}
 }
 
 func newTestLedger() *testLedger {
@@ -52,8 +56,17 @@ func (l *testLedger) Submit(_ context.Context, e Event, allow bool) (LedgerTrans
 }
 func (l *testLedger) Lookup(_ context.Context, ref string) (LedgerTransaction, bool, error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	tx, ok := l.transactions[ref]
+	block := ref == l.blockLookup && l.lookupStart != nil && l.lookupResume != nil
+	started, resume := l.lookupStart, l.lookupResume
+	if block {
+		l.blockLookup = ""
+	}
+	l.mu.Unlock()
+	if block {
+		close(started)
+		<-resume
+	}
 	return tx, ok, nil
 }
 func (l *testLedger) Balance(_ context.Context, indicator, _ string) (string, bool, error) {
@@ -195,6 +208,84 @@ func TestPostgresTwoReplicaIdempotencyAndLostResponse(t *testing.T) {
 	}
 }
 
+func TestConcurrentDistinctMutationsDoNotStarvePool(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = financialTestPool(t)
+	configuration, err := pgxpool.ParseConfig(os.Getenv("ATOS_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration.MaxConns = 2
+	pool, err := pgxpool.NewWithConfig(ctx, configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	repository, _ := NewRepository(pool, "gw-"+suffix, "net-"+suffix)
+	ledger := newTestLedger()
+	adapter, _ := NewAdapter(repository, ledger)
+	principal := "principal-" + suffix
+	genesis := requestFor("pool-genesis-"+suffix, EventAccountGenesis, GatewayCreditIssuance, PrincipalAvailable, "_", principal)
+	genesis.AllowOverdraft = true
+	genesis.AtomicAmount = "1000"
+	if _, err := adapter.ProvisionAccount(ctx, genesis); err != nil {
+		t.Fatal(err)
+	}
+	const mutations = 16
+	errorsOut := make(chan error, mutations)
+	var wait sync.WaitGroup
+	for index := 0; index < mutations; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			request := requestFor(fmt.Sprintf("pool-reserve-%s-%d", suffix, index), EventReserve, PrincipalAvailable, PrincipalReserved, principal, principal)
+			request.AtomicAmount = "1"
+			_, mutationErr := adapter.Reserve(ctx, request)
+			errorsOut <- mutationErr
+		}(index)
+	}
+	wait.Wait()
+	close(errorsOut)
+	for err := range errorsOut {
+		if err != nil {
+			t.Fatalf("distinct concurrent mutation starved or failed: %v", err)
+		}
+	}
+}
+
+func TestReconciliationCompletesWithSingleConnectionPool(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = financialTestPool(t)
+	configuration, err := pgxpool.ParseConfig(os.Getenv("ATOS_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(ctx, configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	repository, _ := NewRepository(pool, "gw-"+suffix, "net-"+suffix)
+	ledger := newTestLedger()
+	adapter, _ := NewAdapter(repository, ledger)
+	principal := "principal-" + suffix
+	genesis := requestFor("single-pool-genesis-"+suffix, EventAccountGenesis, GatewayCreditIssuance, PrincipalAvailable, "_", principal)
+	genesis.AllowOverdraft = true
+	if _, err := adapter.ProvisionAccount(ctx, genesis); err != nil {
+		t.Fatal(err)
+	}
+	result, err := adapter.Reconcile(ctx, 100)
+	if err != nil || result.SafeMode || result.Mismatches != 0 {
+		t.Fatalf("single-connection reconciliation result=%+v err=%v", result, err)
+	}
+}
+
 func TestCompensatingReversalExactlyInvertsOneFinalizedEvent(t *testing.T) {
 	ctx := context.Background()
 	pool := financialTestPool(t)
@@ -292,5 +383,68 @@ func TestReconciliationMismatchEntersSafeMode(t *testing.T) {
 	}
 	if _, err := adapter.Reserve(ctx, requestFor("blocked-"+suffix, EventReserve, PrincipalAvailable, PrincipalReserved, principal, principal)); !errors.Is(err, ErrSafeMode) {
 		t.Fatalf("safe mode write error=%v", err)
+	}
+}
+
+func TestReconciliationSerializesMutationAndPersistsCrashCursor(t *testing.T) {
+	ctx := context.Background()
+	pool := financialTestPool(t)
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	repo, _ := NewRepository(pool, "gw-"+suffix, "net-"+suffix)
+	ledger := newTestLedger()
+	adapter, _ := NewAdapter(repo, ledger)
+	principal := "p-" + suffix
+	genesisRequest := requestFor("reconcile-lock-genesis-"+suffix, EventAccountGenesis, GatewayCreditIssuance, PrincipalAvailable, "_", principal)
+	genesisRequest.AllowOverdraft = true
+	genesis, err := adapter.ProvisionAccount(ctx, genesisRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger.mu.Lock()
+	ledger.blockLookup = genesis.LedgerReference
+	ledger.lookupStart = make(chan struct{})
+	ledger.lookupResume = make(chan struct{})
+	started, resume := ledger.lookupStart, ledger.lookupResume
+	ledger.mu.Unlock()
+
+	reconcileDone := make(chan error, 1)
+	go func() {
+		_, reconcileErr := adapter.Reconcile(ctx, 100)
+		reconcileDone <- reconcileErr
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconciler did not reach the injected ledger lookup")
+	}
+
+	reserveRequest := requestFor("reconcile-lock-reserve-"+suffix, EventReserve, PrincipalAvailable, PrincipalReserved, principal, principal)
+	reserveDone := make(chan error, 1)
+	go func() {
+		_, reserveErr := adapter.Reserve(ctx, reserveRequest)
+		reserveDone <- reserveErr
+	}()
+	select {
+	case err := <-reserveDone:
+		t.Fatalf("financial mutation bypassed active reconciliation: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := repo.Lookup(ctx, reserveRequest.IdempotencyIdentity); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("blocked mutation created an intent during reconciliation: %v", err)
+	}
+	close(resume)
+	if err := <-reconcileDone; err != nil {
+		t.Fatalf("reconciliation failed: %v", err)
+	}
+	if err := <-reserveDone; err != nil {
+		t.Fatalf("mutation did not resume after reconciliation: %v", err)
+	}
+	var cursor int64
+	var leaseExpired bool
+	if err := pool.QueryRow(ctx, `SELECT cursor,lease_until<=now() FROM financial_reconciler_leases WHERE lease_name=$1`, reconciliationLeaseName).Scan(&cursor, &leaseExpired); err != nil {
+		t.Fatal(err)
+	}
+	if cursor != 1 || !leaseExpired {
+		t.Fatalf("durable reconciliation checkpoint cursor=%d lease_expired=%t", cursor, leaseExpired)
 	}
 }

@@ -100,8 +100,11 @@ func (c *BlnkClient) request(ctx context.Context, method, path string, input, ou
 	defer response.Body.Close()
 	limited := io.LimitReader(response.Body, 2<<20)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		payload, _ := io.ReadAll(io.LimitReader(limited, 4096))
-		return response.StatusCode, fmt.Errorf("financial: Blnk HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(payload)))
+		// External error bodies are untrusted and may echo request metadata or
+		// credentials. Drain a bound for connection reuse but never persist or
+		// log the payload through the financial intent's last_error field.
+		_, _ = io.Copy(io.Discard, io.LimitReader(limited, 4096))
+		return response.StatusCode, fmt.Errorf("financial: Blnk HTTP %d", response.StatusCode)
 	}
 	if output != nil {
 		decoder := json.NewDecoder(limited)

@@ -2,9 +2,12 @@ package financial
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"time"
 )
 
 type ledgerClient interface {
@@ -35,59 +38,59 @@ func (a *Adapter) execute(ctx context.Context, request TransferRequest) (Event, 
 	if a.closed.Load() {
 		return Event{}, errors.New("financial: adapter is closed")
 	}
-	event, err := a.repository.OpenIntent(ctx, request)
-	if err != nil || event.State == "finalized" {
-		return event, err
-	}
-	unlock, err := a.repository.LockEvent(ctx, request.IdempotencyIdentity)
+	mutationDB, unlock, err := a.repository.LockMutationEvent(ctx, request.IdempotencyIdentity)
 	if err != nil {
 		return Event{}, err
 	}
 	defer unlock()
-	event, err = a.repository.Lookup(ctx, request.IdempotencyIdentity)
+	event, err := a.repository.openIntentWith(ctx, mutationDB, request)
+	if err != nil || event.State == "finalized" {
+		return event, err
+	}
+	event, err = a.repository.lookupWith(ctx, mutationDB, request.IdempotencyIdentity)
 	if err != nil || event.State == "finalized" {
 		return event, err
 	}
 	transaction, found, lookupErr := a.ledger.Lookup(ctx, event.LedgerReference)
 	if lookupErr == nil && found {
-		return a.observe(ctx, event, transaction)
+		return a.observe(ctx, mutationDB, event, transaction)
 	}
 	if lookupErr != nil {
-		_ = a.repository.MarkUncertain(ctx, request.IdempotencyIdentity, lookupErr)
+		_ = a.repository.markUncertainWith(ctx, mutationDB, request.IdempotencyIdentity, lookupErr)
 		return Event{}, errors.Join(ErrLedgerUncertain, lookupErr)
 	}
-	if err := a.repository.MarkSubmitting(ctx, request.IdempotencyIdentity); err != nil {
+	if err := a.repository.markSubmittingWith(ctx, mutationDB, request.IdempotencyIdentity); err != nil {
 		return Event{}, err
 	}
 	transaction, err = a.ledger.Submit(ctx, event, event.AllowOverdraft)
 	if err == nil {
-		return a.observe(ctx, event, transaction)
+		return a.observe(ctx, mutationDB, event, transaction)
 	}
 
 	// A transport error or duplicate response is not proof that the ledger did
 	// not commit. Resolve the stable reference before returning.
 	transaction, found, lookupErr = a.ledger.Lookup(ctx, event.LedgerReference)
 	if lookupErr == nil && found {
-		return a.observe(ctx, event, transaction)
+		return a.observe(ctx, mutationDB, event, transaction)
 	}
-	_ = a.repository.MarkUncertain(ctx, request.IdempotencyIdentity, err)
+	_ = a.repository.markUncertainWith(ctx, mutationDB, request.IdempotencyIdentity, err)
 	if lookupErr != nil {
 		return Event{}, errors.Join(ErrLedgerUncertain, err, lookupErr)
 	}
 	return Event{}, errors.Join(ErrLedgerUncertain, err)
 }
 
-func (a *Adapter) observe(ctx context.Context, event Event, transaction LedgerTransaction) (Event, error) {
+func (a *Adapter) observe(ctx context.Context, db repositoryDB, event Event, transaction LedgerTransaction) (Event, error) {
 	if transaction.Status == "REJECTED" {
 		err := fmt.Errorf("financial: Blnk rejected transaction %s", event.LedgerTransactionID)
-		_ = a.repository.MarkUncertain(ctx, event.IdempotencyIdentity, err)
+		_ = a.repository.markUncertainWith(ctx, db, event.IdempotencyIdentity, err)
 		return Event{}, err
 	}
 	if err := a.ledger.Verify(ctx, event, transaction); err != nil {
-		_, incidentErr := a.repository.EnterSafeMode(ctx, "ledger_semantic_mismatch", event, transaction)
+		_, incidentErr := a.repository.enterSafeModeWith(ctx, db, "ledger_semantic_mismatch", event, transaction)
 		return Event{}, errors.Join(err, incidentErr)
 	}
-	return a.repository.MarkFinalized(ctx, event.IdempotencyIdentity, transaction)
+	return a.repository.markFinalizedWith(ctx, db, event.IdempotencyIdentity, transaction)
 }
 
 func requireTransfer(request TransferRequest, event EventType, source AccountCode, destinations ...AccountCode) error {
@@ -260,48 +263,60 @@ func (a *Adapter) Lookup(ctx context.Context, identity string) (Event, error) {
 }
 
 func (a *Adapter) Reconcile(ctx context.Context, limit int) (ReconcileResult, error) {
-	pending, err := a.repository.Pending(ctx, limit)
+	reconciliationDB, unlockReconciliation, err := a.repository.LockReconciliation(ctx)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+	defer unlockReconciliation()
+	ownerBytes := make([]byte, 16)
+	if _, err := rand.Read(ownerBytes); err != nil {
+		return ReconcileResult{}, fmt.Errorf("financial: create reconciliation owner: %w", err)
+	}
+	owner := "frecon_" + hex.EncodeToString(ownerBytes)
+	if _, err := a.repository.claimReconciliationWith(ctx, reconciliationDB, owner, 15*time.Minute); err != nil {
+		return ReconcileResult{}, err
+	}
+	completed := false
+	defer func() {
+		if !completed {
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = a.repository.releaseReconciliationWith(releaseCtx, reconciliationDB, owner)
+		}
+	}()
+	pending, err := a.repository.pendingWith(ctx, reconciliationDB, limit)
 	if err != nil {
 		return ReconcileResult{}, err
 	}
 	result := ReconcileResult{Checked: len(pending)}
 	for _, event := range pending {
-		unlock, lockErr := a.repository.LockEvent(ctx, event.IdempotencyIdentity)
-		if lockErr != nil {
-			continue
-		}
-		current, currentErr := a.repository.Lookup(ctx, event.IdempotencyIdentity)
+		current, currentErr := a.repository.lookupWith(ctx, reconciliationDB, event.IdempotencyIdentity)
 		if currentErr != nil || current.State == "finalized" {
-			unlock()
 			continue
 		}
 		event = current
 		transaction, found, lookupErr := a.ledger.Lookup(ctx, event.LedgerReference)
 		if lookupErr != nil {
-			_ = a.repository.MarkUncertain(ctx, event.IdempotencyIdentity, lookupErr)
-			unlock()
+			_ = a.repository.markUncertainWith(ctx, reconciliationDB, event.IdempotencyIdentity, lookupErr)
 			continue
 		}
 		if !found {
 			result.Retried++
 			transaction, lookupErr = a.ledger.Submit(ctx, event, event.AllowOverdraft)
 			if lookupErr != nil {
-				_ = a.repository.MarkUncertain(ctx, event.IdempotencyIdentity, lookupErr)
-				unlock()
+				_ = a.repository.markUncertainWith(ctx, reconciliationDB, event.IdempotencyIdentity, lookupErr)
 				continue
 			}
 		}
-		if _, observeErr := a.observe(ctx, event, transaction); observeErr != nil {
+		if _, observeErr := a.observe(ctx, reconciliationDB, event, transaction); observeErr != nil {
 			if errors.Is(observeErr, ErrIdempotencyConflict) {
 				result.Mismatches++
 			}
-			unlock()
 			continue
 		}
 		result.Finalized++
-		unlock()
 	}
-	audited, auditErr := a.auditIntegrity(ctx)
+	audited, auditErr := a.auditIntegrity(ctx, reconciliationDB)
 	result.Checked += audited
 	if auditErr != nil {
 		// Availability uncertainty is recoverable; it is not positive evidence
@@ -310,10 +325,21 @@ func (a *Adapter) Reconcile(ctx context.Context, limit int) (ReconcileResult, er
 			return result, auditErr
 		}
 		result.Mismatches++
-		_, incidentErr := a.repository.EnterSafeMode(ctx, "financial_reconciliation_mismatch", map[string]any{"authority": "blnk"}, map[string]any{"error": auditErr.Error()})
+		_, incidentErr := a.repository.enterSafeModeWith(ctx, reconciliationDB, "financial_reconciliation_mismatch", map[string]any{"authority": "blnk"}, map[string]any{"error": auditErr.Error()})
 		result.SafeMode = true
 		return result, errors.Join(auditErr, incidentErr)
 	}
-	result.SafeMode, _, err = a.repository.SafeMode(ctx)
-	return result, err
+	result.SafeMode, _, err = a.repository.safeModeWith(ctx, reconciliationDB)
+	if err != nil {
+		return result, err
+	}
+	var cursor int64
+	if err = reconciliationDB.QueryRow(ctx, `SELECT next_sequence-1 FROM financial_chain_state WHERE singleton=TRUE`).Scan(&cursor); err != nil {
+		return result, err
+	}
+	if err = a.repository.completeReconciliationWith(ctx, reconciliationDB, owner, cursor); err != nil {
+		return result, err
+	}
+	completed = true
+	return result, nil
 }

@@ -21,6 +21,7 @@ import (
 )
 
 var nonNegativeDecimalPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)(\.[0-9]+)?$`)
+var financialDomainIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 type Environment string
 
@@ -115,10 +116,12 @@ type FinancialConfig struct {
 	NetworkID        string
 	IssuanceLimit    string
 	SignerURL        string
+	SignerToken      string
 	SigningKeyID     string
 	SigningPublicKey string
 	SigningAlgorithm string
 	RetentionURL     string
+	RetentionHMACKey string
 	SealInterval     time.Duration
 	BatchSize        int
 }
@@ -243,10 +246,12 @@ func Load() (Config, error) {
 			NetworkID:        strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_NETWORK_ID")),
 			IssuanceLimit:    envOr("ATOS_FINANCIAL_ISSUANCE_LIMIT", "0.00"),
 			SignerURL:        strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_SIGNER_URL")),
+			SignerToken:      os.Getenv("ATOS_FINANCIAL_SIGNER_TOKEN"),
 			SigningKeyID:     strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_SIGNING_KEY_ID")),
 			SigningPublicKey: strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_SIGNING_PUBLIC_KEY")),
 			SigningAlgorithm: strings.ToLower(envOr("ATOS_FINANCIAL_SIGNING_ALGORITHM", "ed25519")),
 			RetentionURL:     strings.TrimSpace(os.Getenv("ATOS_FINANCIAL_RETENTION_URL")),
+			RetentionHMACKey: os.Getenv("ATOS_FINANCIAL_RETENTION_HMAC_KEY"),
 			SealInterval:     sealInterval, BatchSize: batchSize,
 		},
 		TOSBackend: TOSBackend(strings.ToLower(envOr("ATOS_TOS_BACKEND", string(TOSBackendMock)))),
@@ -321,6 +326,10 @@ func (c Config) Validate() error {
 		if c.Financial.Timeout <= 0 || c.Financial.Timeout > 2*time.Minute {
 			return errors.New("ATOS financial Blnk timeout is outside the allowed range")
 		}
+		if len(c.Financial.GatewayID) > 253 || len(c.Financial.NetworkID) > 128 ||
+			!financialDomainIDPattern.MatchString(c.Financial.GatewayID) || !financialDomainIDPattern.MatchString(c.Financial.NetworkID) {
+			return errors.New("ATOS_FINANCIAL_GATEWAY_ID or ATOS_FINANCIAL_NETWORK_ID is not a safe canonical domain identifier")
+		}
 		issuanceLimit, ok := new(big.Rat).SetString(c.Financial.IssuanceLimit)
 		if !ok || issuanceLimit.Sign() < 0 || !nonNegativeDecimalPattern.MatchString(c.Financial.IssuanceLimit) {
 			return errors.New("ATOS_FINANCIAL_ISSUANCE_LIMIT must be a non-negative decimal amount")
@@ -350,6 +359,12 @@ func (c Config) Validate() error {
 					return errors.New("ATOS_FINANCIAL_SIGNING_PUBLIC_KEY is not a P-256 PKIX public key")
 				}
 			}
+		}
+		if c.Financial.RetentionURL != "" && len(c.Financial.RetentionHMACKey) < 32 {
+			return errors.New("ATOS_FINANCIAL_RETENTION_HMAC_KEY must contain at least 32 characters when WORM retention is configured")
+		}
+		if c.Financial.SignerURL != "" && len(c.Financial.SignerToken) < 32 {
+			return errors.New("ATOS_FINANCIAL_SIGNER_TOKEN must contain at least 32 characters when an external signer is configured")
 		}
 	default:
 		return fmt.Errorf("invalid ATOS_FINANCIAL_BACKEND %q (expected disabled or blnk)", c.Financial.Backend)
@@ -402,8 +417,8 @@ func (c Config) Validate() error {
 		if c.Financial.BlnkKey == "" {
 			return errors.New("ATOS_BLNK_KEY is required in production")
 		}
-		if c.Financial.SignerURL == "" || c.Financial.SigningKeyID == "" || c.Financial.SigningPublicKey == "" || c.Financial.RetentionURL == "" {
-			return errors.New("external financial signer, pinned signing public key, key identity, and WORM retention endpoint are required in production")
+		if c.Financial.SignerURL == "" || len(c.Financial.SignerToken) < 32 || c.Financial.SigningKeyID == "" || c.Financial.SigningPublicKey == "" || c.Financial.RetentionURL == "" || len(c.Financial.RetentionHMACKey) < 32 {
+			return errors.New("authenticated external financial signer, pinned signing public key, key identity, authenticated WORM retention endpoint, and retention HMAC key are required in production")
 		}
 		for name, endpoint := range map[string]string{
 			"ATOS_BLNK_URL": c.Financial.BlnkURL, "ATOS_FINANCIAL_SIGNER_URL": c.Financial.SignerURL,

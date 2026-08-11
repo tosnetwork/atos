@@ -160,6 +160,12 @@ type Balance struct {
 }
 
 var assetPattern = regexp.MustCompile(`^[A-Z][A-Z0-9]{1,15}$`)
+var gatewayNetworkIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+func validGatewayNetworkIDs(gatewayID, networkID string) bool {
+	return len(gatewayID) <= 253 && len(networkID) <= 128 &&
+		gatewayNetworkIDPattern.MatchString(gatewayID) && gatewayNetworkIDPattern.MatchString(networkID)
+}
 
 func (r TransferRequest) Validate() error {
 	if !validEventTypes[r.EventType] {
@@ -269,7 +275,7 @@ func (r TransferRequest) validateIdentityBindings() error {
 }
 
 func (c Commitment) Validate() error {
-	if c.Version != CommitmentVersion || c.Canonicalization != Canonicalization || c.Sequence < 1 || c.GatewayID == "" || c.NetworkID == "" {
+	if c.Version != CommitmentVersion || c.Canonicalization != Canonicalization || c.Sequence < 1 || !validGatewayNetworkIDs(c.GatewayID, c.NetworkID) {
 		return errors.New("financial: invalid commitment envelope")
 	}
 	if len(c.LedgerTransactionIDs) == 0 || !sort.StringsAreSorted(c.LedgerTransactionIDs) {

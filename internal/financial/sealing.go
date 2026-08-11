@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/x509"
@@ -100,15 +101,16 @@ type HTTPSigner struct {
 	endpoint  string
 	keyID     string
 	algorithm string
+	token     string
 	client    *http.Client
 }
 
-func NewHTTPSigner(endpoint, keyID, algorithm string, timeout time.Duration) (*HTTPSigner, error) {
+func NewHTTPSigner(endpoint, keyID, algorithm, token string, timeout time.Duration) (*HTTPSigner, error) {
 	parsed, err := url.Parse(endpoint)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" || keyID == "" || (algorithm != "ed25519" && algorithm != "ecdsa_p256_sha256") || timeout <= 0 {
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || keyID == "" || len(token) < 32 || (algorithm != "ed25519" && algorithm != "ecdsa_p256_sha256") || timeout <= 0 {
 		return nil, errors.New("financial: invalid external signer configuration")
 	}
-	return &HTTPSigner{endpoint: endpoint, keyID: keyID, algorithm: algorithm, client: &http.Client{Timeout: timeout}}, nil
+	return &HTTPSigner{endpoint: endpoint, keyID: keyID, algorithm: algorithm, token: token, client: &http.Client{Timeout: timeout}}, nil
 }
 
 func (s *HTTPSigner) Sign(ctx context.Context, request SignRequest) (SignResponse, error) {
@@ -122,6 +124,7 @@ func (s *HTTPSigner) Sign(ctx context.Context, request SignRequest) (SignRespons
 		return SignResponse{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+s.token)
 	response, err := s.client.Do(req)
 	if err != nil {
 		return SignResponse{}, err
@@ -189,15 +192,45 @@ type Retainer interface {
 type HTTPRetainer struct {
 	endpoint *url.URL
 	client   *http.Client
+	hmacKey  []byte
 }
 
-func NewHTTPRetainer(endpoint string, timeout time.Duration) (*HTTPRetainer, error) {
+func NewHTTPRetainer(endpoint, hmacKey string, timeout time.Duration) (*HTTPRetainer, error) {
 	parsed, err := url.Parse(endpoint)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" || timeout <= 0 {
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || timeout <= 0 || len(hmacKey) < 32 {
 		return nil, errors.New("financial: invalid WORM endpoint")
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
-	return &HTTPRetainer{parsed, &http.Client{Timeout: timeout}}, nil
+	return &HTTPRetainer{parsed, &http.Client{Timeout: timeout}, []byte(hmacKey)}, nil
+}
+
+func (r *HTTPRetainer) authenticate(request *http.Request, digest string) {
+	timestamp := fmt.Sprint(time.Now().UTC().Unix())
+	message := timestamp + "\n" + request.Method + "\n" + request.URL.EscapedPath() + "\n" + digest
+	mac := hmac.New(sha256.New, r.hmacKey)
+	_, _ = mac.Write([]byte(message))
+	request.Header.Set("X-Content-SHA256", digest)
+	request.Header.Set("X-ATOS-Retention-Timestamp", timestamp)
+	request.Header.Set("X-ATOS-Retention-Signature", "hmac-sha256="+hex.EncodeToString(mac.Sum(nil)))
+}
+
+func (r *HTTPRetainer) resolve(ctx context.Context, endpoint string, digest string) (string, error) {
+	head, err := http.NewRequestWithContext(ctx, http.MethodHead, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	r.authenticate(head, digest)
+	resolved, err := r.client.Do(head)
+	if err != nil {
+		return "", err
+	}
+	defer resolved.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resolved.Body, 4096))
+	version := strings.TrimSpace(resolved.Header.Get("X-Object-Version-ID"))
+	if resolved.StatusCode != http.StatusOK || resolved.Header.Get("X-Content-SHA256") != digest || version == "" {
+		return "", ErrIdempotencyConflict
+	}
+	return version, nil
 }
 
 func (r *HTTPRetainer) PutIfAbsent(ctx context.Context, key string, body []byte, digest string) (string, error) {
@@ -209,32 +242,27 @@ func (r *HTTPRetainer) PutIfAbsent(ctx context.Context, key string, body []byte,
 	}
 	req.Header.Set("If-None-Match", "*")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Content-SHA256", digest)
+	r.authenticate(req, digest)
 	response, err := r.client.Do(req)
 	if err == nil {
-		defer response.Body.Close()
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-		if response.StatusCode >= 200 && response.StatusCode < 300 {
-			return response.Header.Get("X-Object-Version-ID"), nil
-		}
-		if response.StatusCode != http.StatusConflict && response.StatusCode != http.StatusPreconditionFailed {
+		closeErr := response.Body.Close()
+		accepted := response.StatusCode >= 200 && response.StatusCode < 300
+		if !accepted && response.StatusCode != http.StatusConflict && response.StatusCode != http.StatusPreconditionFailed {
 			return "", fmt.Errorf("financial: WORM store returned HTTP %d", response.StatusCode)
 		}
+		if closeErr != nil {
+			err = closeErr
+		}
 	}
-	// Conflict and lost-response recovery both resolve the immutable object.
-	head, headErr := http.NewRequestWithContext(ctx, http.MethodHead, endpoint.String(), nil)
-	if headErr != nil {
-		return "", errors.Join(err, headErr)
+	// A successful PUT is not sufficient evidence of retention. Conflict,
+	// success, and lost-response paths all authenticate a HEAD lookup and bind
+	// the exact digest to a non-empty immutable object version.
+	version, resolveErr := r.resolve(ctx, endpoint.String(), digest)
+	if resolveErr == nil {
+		return version, nil
 	}
-	resolved, headErr := r.client.Do(head)
-	if headErr != nil {
-		return "", errors.Join(err, headErr)
-	}
-	defer resolved.Body.Close()
-	if resolved.StatusCode != http.StatusOK || resolved.Header.Get("X-Content-SHA256") != digest {
-		return "", errors.Join(err, ErrIdempotencyConflict)
-	}
-	return resolved.Header.Get("X-Object-Version-ID"), nil
+	return "", errors.Join(err, resolveErr)
 }
 
 type FileRetainer struct{ root string }

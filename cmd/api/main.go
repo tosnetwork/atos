@@ -292,13 +292,13 @@ func main() {
 
 	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
 	defer reconcileCancel()
-	if financialRepository != nil && cfg.Financial.SignerURL != "" && cfg.Financial.SigningKeyID != "" && cfg.Financial.SigningPublicKey != "" && cfg.Financial.RetentionURL != "" && anchorPublisher != nil {
-		signer, signerErr := financial.NewHTTPSigner(cfg.Financial.SignerURL, cfg.Financial.SigningKeyID, cfg.Financial.SigningAlgorithm, cfg.Financial.Timeout)
+	if financialRepository != nil && cfg.Financial.SignerURL != "" && cfg.Financial.SignerToken != "" && cfg.Financial.SigningKeyID != "" && cfg.Financial.SigningPublicKey != "" && cfg.Financial.RetentionURL != "" && cfg.Financial.RetentionHMACKey != "" && anchorPublisher != nil {
+		signer, signerErr := financial.NewHTTPSigner(cfg.Financial.SignerURL, cfg.Financial.SigningKeyID, cfg.Financial.SigningAlgorithm, cfg.Financial.SignerToken, cfg.Financial.Timeout)
 		if signerErr != nil {
 			logger.Error("financial signer init failed", "error", signerErr)
 			os.Exit(2)
 		}
-		retainer, retainerErr := financial.NewHTTPRetainer(cfg.Financial.RetentionURL, cfg.Financial.Timeout)
+		retainer, retainerErr := financial.NewHTTPRetainer(cfg.Financial.RetentionURL, cfg.Financial.RetentionHMACKey, cfg.Financial.Timeout)
 		if retainerErr != nil {
 			logger.Error("financial WORM retainer init failed", "error", retainerErr)
 			os.Exit(2)

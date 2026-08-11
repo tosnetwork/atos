@@ -8,8 +8,16 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+type repositoryDB interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+	BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
+}
 
 type Repository struct {
 	pool      *pgxpool.Pool
@@ -18,8 +26,13 @@ type Repository struct {
 	now       func() time.Time
 }
 
+const (
+	reconciliationLockName  = "atos-financial-global-reconciliation-v1"
+	reconciliationLeaseName = "managed-financial-integrity-v1"
+)
+
 func NewRepository(pool *pgxpool.Pool, gatewayID, networkID string) (*Repository, error) {
-	if pool == nil || gatewayID == "" || networkID == "" {
+	if pool == nil || !validGatewayNetworkIDs(gatewayID, networkID) {
 		return nil, errors.New("financial: repository requires pool, gateway and network")
 	}
 	return &Repository{pool: pool, gatewayID: gatewayID, networkID: networkID, now: time.Now}, nil
@@ -54,55 +67,149 @@ func scanEvent(row pgx.Row) (Event, error) {
 }
 
 func (r *Repository) Lookup(ctx context.Context, identity string) (Event, error) {
-	return scanEvent(r.pool.QueryRow(ctx, eventSelect, identity))
+	return r.lookupWith(ctx, r.pool, identity)
+}
+
+func (r *Repository) lookupWith(ctx context.Context, db repositoryDB, identity string) (Event, error) {
+	return scanEvent(db.QueryRow(ctx, eventSelect, identity))
 }
 
 func (r *Repository) LookupEventID(ctx context.Context, eventID string) (Event, error) {
 	return scanEvent(r.pool.QueryRow(ctx, eventColumns+` WHERE event_id=$1`, eventID))
 }
 
-// LockEvent acquires a PostgreSQL session advisory lock held across the Blnk
-// lookup/submit/observe window. It serializes replicas without holding a SQL
-// transaction open across network I/O.
-func (r *Repository) LockEvent(ctx context.Context, identity string) (func(), error) {
-	const retryInterval = 10 * time.Millisecond
-	lockName := "atos-financial-event:" + identity
-	ticker := time.NewTicker(retryInterval)
+// LockMutationEvent takes both the shared side of the global reconciliation
+// lock and the exclusive per-event lock on one PostgreSQL session. Keeping the
+// pair on one pooled connection avoids pool starvation when many replicas race
+// the same event. It is held across durable-intent -> Blnk -> durable-outcome,
+// so reconciliation cannot observe the ledger after submission but the ATOS
+// projection before finalization.
+func (r *Repository) LockMutationEvent(ctx context.Context, identity string) (*pgxpool.Conn, func(), error) {
+	if identity == "" {
+		return nil, nil, errors.New("financial: mutation lock identity is empty")
+	}
+	eventLockName := "atos-financial-event:" + identity
+	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		conn, err := r.pool.Acquire(ctx)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		var acquired bool
-		err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtextextended($1,0))`, lockName).Scan(&acquired)
+		err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtextextended($1,0))`, eventLockName).Scan(&acquired)
 		if err != nil {
 			conn.Release()
-			return nil, err
+			return nil, nil, err
 		}
-		if acquired {
-			return func() {
-				releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				_, _ = conn.Exec(releaseCtx, `SELECT pg_advisory_unlock(hashtextextended($1,0))`, lockName)
-				conn.Release()
-			}, nil
+		if !acquired {
+			conn.Release()
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-ticker.C:
+			}
+			continue
 		}
-		conn.Release()
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-ticker.C:
+		if _, err = conn.Exec(ctx, `SELECT pg_advisory_lock_shared(hashtextextended($1,0))`, reconciliationLockName); err != nil {
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, _ = conn.Exec(releaseCtx, `SELECT pg_advisory_unlock(hashtextextended($1,0))`, eventLockName)
+			cancel()
+			conn.Release()
+			return nil, nil, err
 		}
+		unlock := func() {
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = conn.Exec(releaseCtx, `SELECT pg_advisory_unlock_shared(hashtextextended($1,0))`, reconciliationLockName)
+			_, _ = conn.Exec(releaseCtx, `SELECT pg_advisory_unlock(hashtextextended($1,0))`, eventLockName)
+			conn.Release()
+		}
+		return conn, unlock, nil
 	}
 }
 
+// LockReconciliation takes the exclusive side of the same session-level lock.
+// PostgreSQL releases it automatically if the worker crashes or loses its
+// connection. Normal financial mutations use LockMutationEvent and may proceed
+// concurrently with each other, but not through this full-snapshot audit.
+func (r *Repository) LockReconciliation(ctx context.Context) (*pgxpool.Conn, func(), error) {
+	conn, err := r.pool.Acquire(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err = conn.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1,0))`, reconciliationLockName); err != nil {
+		conn.Release()
+		return nil, nil, err
+	}
+	return conn, func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = conn.Exec(releaseCtx, `SELECT pg_advisory_unlock(hashtextextended($1,0))`, reconciliationLockName)
+		conn.Release()
+	}, nil
+}
+
+// ClaimReconciliation records durable worker ownership and returns the last
+// successfully verified financial sequence. The caller must already hold the
+// exclusive advisory lock; that makes a stale lease after a crash safe to
+// replace immediately instead of delaying recovery until a timeout.
+func (r *Repository) ClaimReconciliation(ctx context.Context, owner string, lease time.Duration) (int64, error) {
+	return r.claimReconciliationWith(ctx, r.pool, owner, lease)
+}
+
+func (r *Repository) claimReconciliationWith(ctx context.Context, db repositoryDB, owner string, lease time.Duration) (int64, error) {
+	if owner == "" || len(owner) > 128 || lease <= 0 || lease > time.Hour {
+		return 0, errors.New("financial: invalid reconciliation lease")
+	}
+	var cursor int64
+	err := db.QueryRow(ctx, `INSERT INTO financial_reconciler_leases(lease_name,owner_id,lease_until,cursor)
+ VALUES($1,$2,now()+($3*interval '1 second'),0)
+ ON CONFLICT(lease_name) DO UPDATE SET owner_id=EXCLUDED.owner_id,lease_until=EXCLUDED.lease_until,updated_at=now()
+ RETURNING cursor`, reconciliationLeaseName, owner, lease.Seconds()).Scan(&cursor)
+	return cursor, err
+}
+
+func (r *Repository) CompleteReconciliation(ctx context.Context, owner string, cursor int64) error {
+	return r.completeReconciliationWith(ctx, r.pool, owner, cursor)
+}
+
+func (r *Repository) completeReconciliationWith(ctx context.Context, db repositoryDB, owner string, cursor int64) error {
+	if cursor < 0 {
+		return errors.New("financial: invalid reconciliation cursor")
+	}
+	result, err := db.Exec(ctx, `UPDATE financial_reconciler_leases
+ SET cursor=GREATEST(cursor,$3),lease_until=now(),updated_at=now()
+ WHERE lease_name=$1 AND owner_id=$2`, reconciliationLeaseName, owner, cursor)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return errors.New("financial: reconciliation lease ownership changed")
+	}
+	return nil
+}
+
+func (r *Repository) ReleaseReconciliation(ctx context.Context, owner string) error {
+	return r.releaseReconciliationWith(ctx, r.pool, owner)
+}
+
+func (r *Repository) releaseReconciliationWith(ctx context.Context, db repositoryDB, owner string) error {
+	_, err := db.Exec(ctx, `UPDATE financial_reconciler_leases SET lease_until=now(),updated_at=now()
+ WHERE lease_name=$1 AND owner_id=$2`, reconciliationLeaseName, owner)
+	return err
+}
+
 func (r *Repository) OpenIntent(ctx context.Context, request TransferRequest) (Event, error) {
+	return r.openIntentWith(ctx, r.pool, request)
+}
+
+func (r *Repository) openIntentWith(ctx context.Context, db repositoryDB, request TransferRequest) (Event, error) {
 	semantic, err := SemanticDigest(request)
 	if err != nil {
 		return Event{}, err
 	}
-	if existing, err := r.Lookup(ctx, request.IdempotencyIdentity); err == nil {
+	if existing, err := r.lookupWith(ctx, db, request.IdempotencyIdentity); err == nil {
 		if existing.SemanticDigest != semantic {
 			return Event{}, ErrIdempotencyConflict
 		}
@@ -111,7 +218,7 @@ func (r *Repository) OpenIntent(ctx context.Context, request TransferRequest) (E
 		return Event{}, err
 	}
 
-	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return Event{}, err
 	}
@@ -172,13 +279,17 @@ func (r *Repository) OpenIntent(ctx context.Context, request TransferRequest) (E
 }
 
 func (r *Repository) MarkSubmitting(ctx context.Context, identity string) error {
-	result, err := r.pool.Exec(ctx, `UPDATE financial_events SET state='submitting',attempts=attempts+1,last_error='',updated_at=now()
+	return r.markSubmittingWith(ctx, r.pool, identity)
+}
+
+func (r *Repository) markSubmittingWith(ctx context.Context, db repositoryDB, identity string) error {
+	result, err := db.Exec(ctx, `UPDATE financial_events SET state='submitting',attempts=attempts+1,last_error='',updated_at=now()
  WHERE idempotency_identity=$1 AND state IN ('intent','submitting')`, identity)
 	if err != nil {
 		return err
 	}
 	if result.RowsAffected() == 0 {
-		event, lookupErr := r.Lookup(ctx, identity)
+		event, lookupErr := r.lookupWith(ctx, db, identity)
 		if lookupErr == nil && event.State == "finalized" {
 			return nil
 		}
@@ -188,6 +299,10 @@ func (r *Repository) MarkSubmitting(ctx context.Context, identity string) error 
 }
 
 func (r *Repository) MarkUncertain(ctx context.Context, identity string, cause error) error {
+	return r.markUncertainWith(ctx, r.pool, identity, cause)
+}
+
+func (r *Repository) markUncertainWith(ctx context.Context, db repositoryDB, identity string, cause error) error {
 	message := "ledger outcome uncertain"
 	if cause != nil {
 		message = cause.Error()
@@ -195,13 +310,17 @@ func (r *Repository) MarkUncertain(ctx context.Context, identity string, cause e
 	if len(message) > 2048 {
 		message = message[:2048]
 	}
-	_, err := r.pool.Exec(ctx, `UPDATE financial_events SET state='submitting',last_error=$2,updated_at=now()
+	_, err := db.Exec(ctx, `UPDATE financial_events SET state='submitting',last_error=$2,updated_at=now()
  WHERE idempotency_identity=$1 AND state <> 'finalized'`, identity, message)
 	return err
 }
 
 func (r *Repository) MarkFinalized(ctx context.Context, identity string, ledgerResponse any) (Event, error) {
-	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	return r.markFinalizedWith(ctx, r.pool, identity, ledgerResponse)
+}
+
+func (r *Repository) markFinalizedWith(ctx context.Context, db repositoryDB, identity string, ledgerResponse any) (Event, error) {
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return Event{}, err
 	}
@@ -247,10 +366,14 @@ func (r *Repository) MarkFinalized(ctx context.Context, identity string, ledgerR
 }
 
 func (r *Repository) Pending(ctx context.Context, limit int) ([]Event, error) {
+	return r.pendingWith(ctx, r.pool, limit)
+}
+
+func (r *Repository) pendingWith(ctx context.Context, db repositoryDB, limit int) ([]Event, error) {
 	if limit < 1 || limit > 1000 {
 		return nil, errors.New("financial: pending limit must be 1-1000")
 	}
-	rows, err := r.pool.Query(ctx, `SELECT commitment,commitment_digest,canonical_cbor,semantic_digest,
+	rows, err := db.Query(ctx, `SELECT commitment,commitment_digest,canonical_cbor,semantic_digest,
  ledger_transaction_id,source_indicator,destination_indicator,decimals,allow_overdraft,state,attempts,last_error,finalized_at
  FROM financial_events WHERE state IN ('intent','submitting') ORDER BY sequence LIMIT $1`, limit)
 	if err != nil {
@@ -269,13 +392,17 @@ func (r *Repository) Pending(ctx context.Context, limit int) ([]Event, error) {
 }
 
 func (r *Repository) EnterSafeMode(ctx context.Context, classification string, expected, observed any) (string, error) {
+	return r.enterSafeModeWith(ctx, r.pool, classification, expected, observed)
+}
+
+func (r *Repository) enterSafeModeWith(ctx context.Context, db repositoryDB, classification string, expected, observed any) (string, error) {
 	incidentID, err := stableID("finc_", "tos.atos.financial.incident-id.v1", classification+":"+r.now().UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return "", err
 	}
 	expectedJSON, _ := json.Marshal(expected)
 	observedJSON, _ := json.Marshal(observed)
-	tx, err := r.pool.Begin(ctx)
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return "", err
 	}
@@ -283,15 +410,19 @@ func (r *Repository) EnterSafeMode(ctx context.Context, classification string, e
 	if _, err := tx.Exec(ctx, `INSERT INTO financial_integrity_incidents(incident_id,classification,expected,observed) VALUES($1,$2,$3,$4)`, incidentID, classification, expectedJSON, observedJSON); err != nil {
 		return "", err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE financial_integrity_state SET safe_mode=TRUE,reason=$1,incident_id=$2,entered_at=COALESCE(entered_at,now()),updated_at=now() WHERE singleton=TRUE`, classification, incidentID); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT enter_financial_safe_mode($1,$2)`, classification, incidentID); err != nil {
 		return "", err
 	}
 	return incidentID, tx.Commit(ctx)
 }
 
 func (r *Repository) SafeMode(ctx context.Context) (bool, string, error) {
+	return r.safeModeWith(ctx, r.pool)
+}
+
+func (r *Repository) safeModeWith(ctx context.Context, db repositoryDB) (bool, string, error) {
 	var enabled bool
 	var reason string
-	err := r.pool.QueryRow(ctx, `SELECT safe_mode,reason FROM financial_integrity_state WHERE singleton=TRUE`).Scan(&enabled, &reason)
+	err := db.QueryRow(ctx, `SELECT safe_mode,reason FROM financial_integrity_state WHERE singleton=TRUE`).Scan(&enabled, &reason)
 	return enabled, reason, err
 }

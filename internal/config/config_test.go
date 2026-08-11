@@ -146,9 +146,11 @@ func setProductionFinancial(t *testing.T) {
 	t.Setenv("ATOS_FINANCIAL_GATEWAY_ID", "gateway.example")
 	t.Setenv("ATOS_FINANCIAL_NETWORK_ID", "tos-mainnet")
 	t.Setenv("ATOS_FINANCIAL_SIGNER_URL", "https://kms.internal/sign")
+	t.Setenv("ATOS_FINANCIAL_SIGNER_TOKEN", strings.Repeat("s", 32))
 	t.Setenv("ATOS_FINANCIAL_SIGNING_KEY_ID", "kms-key-1")
 	t.Setenv("ATOS_FINANCIAL_SIGNING_PUBLIC_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	t.Setenv("ATOS_FINANCIAL_RETENTION_URL", "https://worm.internal")
+	t.Setenv("ATOS_FINANCIAL_RETENTION_HMAC_KEY", strings.Repeat("w", 32))
 }
 
 func TestBlnkOpeningCreditRequiresBoundedIssuance(t *testing.T) {
@@ -165,6 +167,27 @@ func TestBlnkOpeningCreditRequiresBoundedIssuance(t *testing.T) {
 	t.Setenv("ATOS_FINANCIAL_ISSUANCE_LIMIT", "1000.00")
 	if _, err := Load(); err != nil {
 		t.Fatalf("bounded issuance configuration rejected: %v", err)
+	}
+}
+
+func TestFinancialDomainsAndWORMAuthenticationFailClosed(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ATOS_DATABASE_URL", "postgres://atos@example/atos")
+	t.Setenv("ATOS_FINANCIAL_BACKEND", "blnk")
+	t.Setenv("ATOS_BLNK_URL", "https://blnk.internal")
+	t.Setenv("ATOS_FINANCIAL_GATEWAY_ID", "gateway/ambiguous")
+	t.Setenv("ATOS_FINANCIAL_NETWORK_ID", "tos-testnet")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "canonical domain identifier") {
+		t.Fatalf("unsafe financial domain error=%v", err)
+	}
+	t.Setenv("ATOS_FINANCIAL_GATEWAY_ID", "gateway.example")
+	t.Setenv("ATOS_FINANCIAL_RETENTION_URL", "https://worm.internal")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "RETENTION_HMAC_KEY") {
+		t.Fatalf("unauthenticated WORM configuration error=%v", err)
+	}
+	t.Setenv("ATOS_FINANCIAL_RETENTION_HMAC_KEY", strings.Repeat("r", 32))
+	if _, err := Load(); err != nil {
+		t.Fatalf("authenticated WORM configuration rejected: %v", err)
 	}
 }
 
@@ -199,10 +222,10 @@ func clearEnvironment(t *testing.T) {
 		"ATOS_TOS_RPC_CA_FILE", "ATOS_TOS_RPC_CLIENT_CERT_FILE", "ATOS_TOS_RPC_CLIENT_KEY_FILE",
 		"ATOS_PAYOUT_BACKEND",
 		"ATOS_FINANCIAL_BACKEND", "ATOS_BLNK_URL", "ATOS_BLNK_KEY", "ATOS_BLNK_TIMEOUT",
-		"ATOS_FINANCIAL_GATEWAY_ID", "ATOS_FINANCIAL_NETWORK_ID", "ATOS_FINANCIAL_SIGNER_URL",
+		"ATOS_FINANCIAL_GATEWAY_ID", "ATOS_FINANCIAL_NETWORK_ID", "ATOS_FINANCIAL_SIGNER_URL", "ATOS_FINANCIAL_SIGNER_TOKEN",
 		"ATOS_FINANCIAL_ISSUANCE_LIMIT",
 		"ATOS_FINANCIAL_SIGNING_KEY_ID", "ATOS_FINANCIAL_SIGNING_ALGORITHM", "ATOS_FINANCIAL_RETENTION_URL",
-		"ATOS_FINANCIAL_SIGNING_PUBLIC_KEY",
+		"ATOS_FINANCIAL_SIGNING_PUBLIC_KEY", "ATOS_FINANCIAL_RETENTION_HMAC_KEY",
 		"ATOS_FINANCIAL_SEAL_INTERVAL", "ATOS_FINANCIAL_BATCH_SIZE",
 		"ATOS_WEBAUTHN_RP_ID", "ATOS_WEBAUTHN_RP_NAME", "ATOS_WEBAUTHN_RP_ORIGINS", "ATOS_TRUSTED_PROXY_CIDRS",
 	} {

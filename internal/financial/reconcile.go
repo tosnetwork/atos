@@ -23,8 +23,8 @@ type projectionValue struct {
 
 // auditIntegrity deterministically rebuilds every projection from the sealed
 // commitment chain and compares it with Blnk. It never chooses a newer side.
-func (a *Adapter) auditIntegrity(ctx context.Context) (int, error) {
-	rows, err := a.repository.pool.Query(ctx, `SELECT commitment,commitment_digest,canonical_cbor,semantic_digest,
+func (a *Adapter) auditIntegrity(ctx context.Context, db repositoryDB) (int, error) {
+	rows, err := db.Query(ctx, `SELECT commitment,commitment_digest,canonical_cbor,semantic_digest,
  ledger_transaction_id,source_indicator,destination_indicator,decimals,allow_overdraft,state,attempts,last_error,finalized_at
  FROM financial_events ORDER BY sequence`)
 	if err != nil {
@@ -94,7 +94,7 @@ func (a *Adapter) auditIntegrity(ctx context.Context) (int, error) {
 	}
 	var nextSequence int64
 	var lastCommitment string
-	if err := a.repository.pool.QueryRow(ctx, `SELECT next_sequence,last_commitment FROM financial_chain_state WHERE singleton=TRUE`).Scan(&nextSequence, &lastCommitment); err != nil {
+	if err := db.QueryRow(ctx, `SELECT next_sequence,last_commitment FROM financial_chain_state WHERE singleton=TRUE`).Scan(&nextSequence, &lastCommitment); err != nil {
 		return checked, err
 	}
 	if nextSequence != expectedSequence || lastCommitment != previous {
@@ -109,7 +109,7 @@ func (a *Adapter) auditIntegrity(ctx context.Context) (int, error) {
 		}
 	}
 
-	projectionRows, err := a.repository.pool.Query(ctx, `SELECT account_code,account_owner_id,asset,atomic_balance::text,last_sequence FROM financial_projections`)
+	projectionRows, err := db.Query(ctx, `SELECT account_code,account_owner_id,asset,atomic_balance::text,last_sequence FROM financial_projections`)
 	if err != nil {
 		return checked, err
 	}
@@ -157,7 +157,12 @@ func (a *Adapter) auditIntegrity(ctx context.Context) (int, error) {
 // only the disposable ATOS projection in one transaction. Safe mode remains
 // enabled until a separately reviewed incident-resolution migration clears it.
 func (a *Adapter) RebuildProjections(ctx context.Context) error {
-	rows, err := a.repository.pool.Query(ctx, `SELECT commitment,commitment_digest,canonical_cbor,semantic_digest,
+	reconciliationDB, unlockReconciliation, err := a.repository.LockReconciliation(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlockReconciliation()
+	rows, err := reconciliationDB.Query(ctx, `SELECT commitment,commitment_digest,canonical_cbor,semantic_digest,
  ledger_transaction_id,source_indicator,destination_indicator,decimals,allow_overdraft,state,attempts,last_error,finalized_at
  FROM financial_events ORDER BY sequence`)
 	if err != nil {
@@ -197,7 +202,7 @@ func (a *Adapter) RebuildProjections(ctx context.Context) error {
 		return err
 	}
 	rows.Close()
-	tx, err := a.repository.pool.Begin(ctx)
+	tx, err := reconciliationDB.Begin(ctx)
 	if err != nil {
 		return err
 	}
@@ -226,6 +231,6 @@ GROUP BY posting->>'account_code',posting->>'account_owner_id',event.asset`)
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	_, err = a.auditIntegrity(ctx)
+	_, err = a.auditIntegrity(ctx, reconciliationDB)
 	return err
 }

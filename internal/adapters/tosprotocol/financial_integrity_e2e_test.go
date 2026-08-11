@@ -3,6 +3,7 @@ package toprotocol
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -13,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -94,9 +96,10 @@ func TestFinancialBatchExternalSignerWORMRPCAndVerifier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	signerToken := strings.Repeat("signer-service-token-", 2)
 	signerServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		var input financial.SignRequest
-		if request.Method != http.MethodPost || json.NewDecoder(io.LimitReader(request.Body, 1<<20)).Decode(&input) != nil {
+		if request.Method != http.MethodPost || request.Header.Get("Authorization") != "Bearer "+signerToken || json.NewDecoder(io.LimitReader(request.Body, 1<<20)).Decode(&input) != nil {
 			writer.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -110,19 +113,39 @@ func TestFinancialBatchExternalSignerWORMRPCAndVerifier(t *testing.T) {
 			PublicKey: base64.StdEncoding.EncodeToString(publicKey), SignedUnixMillis: 1786406400000})
 	}))
 	defer signerServer.Close()
-	signer, _ := financial.NewHTTPSigner(signerServer.URL, "kms-key-2026-08", "ed25519", 10*time.Second)
+	signer, _ := financial.NewHTTPSigner(signerServer.URL, "kms-key-2026-08", "ed25519", signerToken, 10*time.Second)
 
 	var objectMu sync.Mutex
 	objects := make(map[string]retainedObject)
 	loseFirstResponse := true
+	retentionHMACKey := strings.Repeat("retention-auth-key-", 2)
 	wormServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		objectMu.Lock()
 		defer objectMu.Unlock()
+		timestamp := request.Header.Get("X-ATOS-Retention-Timestamp")
+		timestampValue, timestampErr := strconv.ParseInt(timestamp, 10, 64)
+		if timestampErr != nil || timestampValue < time.Now().Unix()-300 || timestampValue > time.Now().Unix()+300 {
+			writer.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		digest := request.Header.Get("X-Content-SHA256")
+		message := timestamp + "\n" + request.Method + "\n" + request.URL.EscapedPath() + "\n" + digest
+		mac := hmac.New(sha256.New, []byte(retentionHMACKey))
+		_, _ = mac.Write([]byte(message))
+		expectedAuth := "hmac-sha256=" + hex.EncodeToString(mac.Sum(nil))
+		if !hmac.Equal([]byte(request.Header.Get("X-ATOS-Retention-Signature")), []byte(expectedAuth)) {
+			writer.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		key := strings.TrimPrefix(request.URL.Path, "/")
 		switch request.Method {
 		case http.MethodPut:
 			body, _ := io.ReadAll(io.LimitReader(request.Body, 4<<20))
-			digest := request.Header.Get("X-Content-SHA256")
+			bodyHash := sha256.Sum256(body)
+			if digest != "sha256:"+hex.EncodeToString(bodyHash[:]) {
+				writer.WriteHeader(http.StatusBadRequest)
+				return
+			}
 			if existing, found := objects[key]; found {
 				if existing.digest != digest {
 					writer.WriteHeader(http.StatusConflict)
@@ -157,7 +180,7 @@ func TestFinancialBatchExternalSignerWORMRPCAndVerifier(t *testing.T) {
 		}
 	}))
 	defer wormServer.Close()
-	retainer, _ := financial.NewHTTPRetainer(wormServer.URL, 10*time.Second)
+	retainer, _ := financial.NewHTTPRetainer(wormServer.URL, retentionHMACKey, 10*time.Second)
 
 	router, _ := atosrpc.NewStaticRouter(nil)
 	protocolServer, err := atosrpc.Open(atosrpc.Config{StatePath: t.TempDir() + "/protocol.db", BearerToken: "phase7a-token", Authority: &finalizedFinancialAuthority{network: network}, Router: router})
