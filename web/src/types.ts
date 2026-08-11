@@ -65,4 +65,4 @@ export type Quote = {
   expires_at: string
 }
 
-export type Session = { accessToken: string; refreshToken: string; expiresAt: number; principalId: string; scopes: string[] }
+export type Session = { accessToken: string; refreshToken: string; expiresAt: number; principalId: string; deviceId?: string; scopes: string[] }

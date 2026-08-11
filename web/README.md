@@ -24,7 +24,9 @@ page. Its normal login requests only requester scopes (`open_tasks:read`,
 separate, explicit Device Authorization grant that adds
 `open_task_proposals:write` and `capabilities:write`; the latter is required by
 the frozen `GET /capabilities/mine` contract and is never given to an ordinary
-marketplace session. Both flows open the server-issued
+marketplace session. A Provider grant is accepted only when its returned
+`principal_id` matches the existing requester session; a mismatched grant is
+immediately revoked and never replaces the current identity. Both flows open the server-issued
 `verification_uri_complete` and poll at the server-provided interval. The
 existing trusted login/reverse-proxy boundary on `/activate` authenticates the
 human and injects the approval headers.
