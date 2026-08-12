@@ -428,6 +428,12 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 
 	settlement, proof := quoteGuarantees(mode, subtotal.Currency)
 	now := time.Now().UTC().Truncate(time.Millisecond)
+	if mode == domain.TrustModeVerified {
+		// TaskEscrow stores deadlines as integer seconds. Freeze Verified
+		// Quote deadlines on that exact boundary before commitment so the
+		// economic contract never shortens signed millisecond terms.
+		now = now.Truncate(time.Second)
+	}
 	executionDeadline := now.Add(defaultExecutionTTL)
 	if cap.SLA.TimeoutMS > 0 {
 		executionDeadline = now.Add(time.Duration(cap.SLA.TimeoutMS) * time.Millisecond)
@@ -505,6 +511,14 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 		if serviceQuote.ExpiresAt.Before(q.ExpiresAt) {
 			q.ExpiresAt = serviceQuote.ExpiresAt.UTC().Truncate(time.Millisecond)
 		}
+	}
+	if mode == domain.TrustModeVerified &&
+		(q.ExpiresAt.UnixMilli()%1000 != 0 || q.ExecutionDeadline.UnixMilli()%1000 != 0) {
+		return domain.Quote{}, domain.NewError(
+			domain.ErrValidationFailed,
+			"Verified Quote and execution deadlines must be exactly second-aligned",
+			false,
+		)
 	}
 	q.TermsHash = termsHash(
 		q.CapabilityID, q.CapabilityVersion, q.ProviderID, q.PrincipalID,

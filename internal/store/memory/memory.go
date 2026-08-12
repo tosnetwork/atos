@@ -433,6 +433,13 @@ func (s *Store) ReceiptsByPrincipal(ctx context.Context, principalID string) ([]
 func (s *Store) PutJob(ctx context.Context, j domain.Job) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if j.TrustMode == domain.TrustModeVerified {
+		for id, existing := range s.jobs {
+			if id != j.ID && existing.TrustMode == domain.TrustModeVerified && existing.QuoteID == j.QuoteID {
+				return store.ErrConflict
+			}
+		}
+	}
 	s.jobs[j.ID] = j
 	return nil
 }

@@ -103,6 +103,28 @@ func TestVerifiedJobPersistsFinalizedEscrowOperationBeforeExecution(t *testing.T
 	}
 }
 
+func TestVerifiedQuoteFundsAtMostOneJob(t *testing.T) {
+	quotes, _, core, st, cap := verifiedQuoteHarness(t)
+	ctx := context.Background()
+	quote, err := quotes.Create(ctx, service.CreateQuoteInput{PrincipalID: "requester", CapabilityID: cap.ID, RequestedTrustMode: domain.RequestedTrustVerified, IdempotencyKey: "single-use-quote"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs := service.NewJobService(st, failAfterEscrowGateProvider{tosaimock.NewContractFixture()}, core, service.NewAccountService(st))
+	first, err := jobs.CreateJob(ctx, service.SubmitInput{PrincipalID: "requester", CapabilityID: cap.ID, QuoteID: quote.ID, Input: map[string]any{"n": 1}, IdempotencyKey: "single-use-job-a"})
+	if err != nil || first.Job.ID == "" {
+		t.Fatalf("first Job: %+v err=%v", first, err)
+	}
+	if _, err = jobs.CreateJob(ctx, service.SubmitInput{PrincipalID: "requester", CapabilityID: cap.ID, QuoteID: quote.ID, Input: map[string]any{"n": 2}, IdempotencyKey: "single-use-job-b"}); !domainErrorCode(err, domain.ErrIdempotencyConflict) {
+		t.Fatalf("second Job from the same Verified Quote err=%v", err)
+	}
+}
+
+func domainErrorCode(err error, code domain.ErrorCode) bool {
+	var typed *domain.Error
+	return errors.As(err, &typed) && typed.Code == code
+}
+
 func TestCompletedEscrowOperationCannotBeRegressedByStaleReplica(t *testing.T) {
 	s := verifiedTaskEscrowCompletedOperation(t)
 	got, err := s.store.UpdateEscrowOperation(context.Background(), s.jobID, domain.EscrowOperationReserve, func(op domain.EscrowOperation) (domain.EscrowOperation, error) {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tosnetwork/atos/internal/domain"
@@ -643,6 +644,10 @@ const jobColumns = `id, capability_id, quote_id, escrow_id, principal_id, state,
 
 func (s *Store) PutJob(ctx context.Context, j domain.Job) error {
 	_, err := s.pool.Exec(ctx, upsertJobSQL, jobWriteArgs(j)...)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.ConstraintName == "jobs_verified_quote_once_idx" {
+		return store.ErrConflict
+	}
 	return err
 }
 
