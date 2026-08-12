@@ -212,6 +212,7 @@ func main() {
 	}
 	streams := service.NewStreamService(st, execution)
 	receipts := service.NewReceiptService(st, core)
+	proofPackages := service.NewPortableProofService(st, core)
 
 	// No production payout rail exists yet. ATOS_PAYOUT_BACKEND defaults to
 	// "disabled": earnings still mature to Available and stop there --
@@ -409,6 +410,7 @@ func main() {
 	go identityBindings.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("identity-binding operation reconciliation pending", "error", reconcileErr)
 	})
+	go proofPackages.RunReconciler(reconcileCtx,15*time.Second,30*time.Second,100,func(reconcileErr error){logger.Error("portable proof reconciliation failed","error",reconcileErr)})
 	// Only run the suspension sweep when a REAL authority is wired.
 	// FailClosedActivationAuthority always returns granted=false with a nil
 	// error -- indistinguishable, from SweepVerified's perspective, from a
@@ -452,7 +454,7 @@ func main() {
 		Certifications:      certifications,
 		Passkeys:            passkeys,
 		ActivationAuthority: activationAuthority, IdentityBindings: identityBindings, OpenTasks: openTasks, Quotes: quotes,
-		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts,
+		Jobs: jobs, Streams: streams, Accounts: accounts, Receipts: receipts, ProofPackages: proofPackages,
 		Earnings: earnings, Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 		ApprovalToken: cfg.Auth.ApprovalToken, AdminApprovalToken: cfg.Auth.AdminApprovalToken,
 		TrustedProxyCIDRs: trustedProxyCIDRs,
@@ -461,11 +463,11 @@ func main() {
 		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,
 		Certifications:      certifications,
 		ActivationAuthority: activationAuthority, IdentityBindings: identityBindings, OpenTasks: openTasks, Quotes: quotes,
-		Jobs: jobs, Accounts: accounts, Receipts: receipts, Earnings: earnings,
+		Jobs: jobs, Accounts: accounts, Receipts: receipts, ProofPackages: proofPackages, Earnings: earnings,
 		Disputes: disputes, Artifacts: artifacts, Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}
 	a2aServer := &a2a.Server{
-		Auth: authorization, Quotes: quotes, Jobs: jobs, OpenTasks: openTasks,
+		Auth: authorization, Quotes: quotes, Jobs: jobs, OpenTasks: openTasks, ProofPackages: proofPackages,
 		Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}
 

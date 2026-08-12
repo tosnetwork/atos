@@ -46,3 +46,20 @@ func (s *Server) handleSettlementProof(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, proof)
 }
+
+func (s *Server) handleCreateProofPackage(w http.ResponseWriter, r *http.Request) {
+	p, e := s.ProofPackages.Create(r.Context(), r.PathValue("id"), principalFrom(r))
+	if e != nil {
+		writeDomainErr(w, e)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+func (s *Server) handleGetProofPackage(w http.ResponseWriter, r *http.Request) {
+	p, e := s.ProofPackages.Get(r.Context(), r.PathValue("id"), principalFrom(r))
+	if e != nil {
+		writeDomainErr(w, e)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}

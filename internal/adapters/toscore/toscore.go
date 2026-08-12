@@ -43,9 +43,26 @@ type ReleaseEscrowResult struct {
 }
 
 type VerifyExecutionReceiptResult struct {
-	Valid    bool
-	Reason   string
-	ProofRef string
+	Valid               bool
+	Reason              string
+	ProofRef            string
+	Network             string
+	Finalized           bool
+	FinalizedCheckpoint uint64
+}
+
+type CanonicalEvidence struct {
+	Network, Reference, Digest string
+	Finalized                  bool
+	FinalizedCheckpoint        uint64
+}
+type ProofOfServiceEvidence struct {
+	EvidenceID, ReceiptID, ProviderID, CapabilityID, CapabilityVersion, ContentDigest string
+	CanonicalEvidence
+}
+type PortableReceiptEvidence struct {
+	CanonicalCBOR []byte
+	Digest        string
 }
 
 type SettleJobRequest struct {
@@ -61,16 +78,19 @@ type SettleJobResult struct {
 }
 
 type ExecutionSignerAuthorization struct {
-	AuthorizationID   string
-	ProviderID        string
-	CapabilityID      string
-	CapabilityVersion string
-	ExecutionSignerID string
-	ValidFrom         time.Time
-	ValidUntil        time.Time
-	AuthorizationRef  string
-	Revoked           bool
-	RevocationRef     string
+	AuthorizationID     string
+	ProviderID          string
+	CapabilityID        string
+	CapabilityVersion   string
+	ExecutionSignerID   string
+	ValidFrom           time.Time
+	ValidUntil          time.Time
+	AuthorizationRef    string
+	Revoked             bool
+	RevocationRef       string
+	SignerPublicKey     []byte
+	SignatureAlgorithm  string
+	FinalizedCheckpoint uint64
 }
 
 type QuoteCommitment struct {
@@ -146,6 +166,7 @@ type Core interface {
 	// reasonCode is non-empty whenever verified is false
 	// (NOT_FOUND/PROVIDER_MISMATCH/MANIFEST_MISMATCH).
 	VerifyCapabilityOwnership(ctx context.Context, capabilityID, providerID, version, expectedManifestDigest string) (verified bool, reasonCode string, err error)
+	ResolveCapabilityOwnershipEvidence(ctx context.Context, capabilityID, providerID, version, expectedManifestDigest string) (CanonicalEvidence, bool, error)
 	UpdateReputationEvidence(ctx context.Context, providerID string, evidence string) error
 
 	// Phase 4A identity binding (docs/IMPLEMENTATION_ROADMAP.md §8.1).
@@ -186,8 +207,11 @@ type Core interface {
 	ReleaseEscrow(ctx context.Context, req ReleaseEscrowRequest) (ReleaseEscrowResult, error)
 	CommitExecutionReceipt(ctx context.Context, receipt domain.ExecutionReceipt) (proofRef string, err error)
 	VerifyExecutionReceipt(ctx context.Context, escrowID string, receipt domain.ExecutionReceipt) (VerifyExecutionReceiptResult, error)
+	PortableReceiptEvidence(context.Context, domain.ExecutionReceipt) (PortableReceiptEvidence, error)
+	ResolveExecutionReceiptEvidence(context.Context, domain.ExecutionReceipt) (CanonicalEvidence, bool, error)
 	SettleJob(ctx context.Context, req SettleJobRequest) (SettleJobResult, error)
 	CommitProofOfServiceEvidence(ctx context.Context, receipt domain.ExecutionReceipt) (evidenceRef string, err error)
+	ReadProofOfServiceEvidence(ctx context.Context, receipt domain.ExecutionReceipt) (ProofOfServiceEvidence, bool, error)
 	ReadSettlementStatus(ctx context.Context, escrowID string) (domain.EscrowStatus, error)
 	ReadProof(ctx context.Context, receiptID string) (map[string]any, error)
 }

@@ -24,6 +24,7 @@ type Server struct {
 	// "Open Task Marketplace Extension") -- deliberately not optional in
 	// production wiring, mirroring Jobs/Quotes' own treatment.
 	OpenTasks     *service.OpenTaskService
+	ProofPackages *service.PortableProofService
 	Logger        *slog.Logger
 	PublicBaseURL string
 }
@@ -105,6 +106,18 @@ func (s *Server) Handler() http.HandlerFunc {
 				return
 			}
 			s.handleTasksCancel(ctx, w, req, principal.ID)
+		case "proofs/create":
+			if !principal.Has(auth.ScopeProofsRead) {
+				writeRPCError(w, req.ID, codeForbidden, "proofs/create requires proofs:read", map[string]any{"code": domain.ErrPermissionDenied})
+				return
+			}
+			s.handleProofCreate(ctx, w, req, principal.ID)
+		case "proofs/get":
+			if !principal.Has(auth.ScopeProofsRead) {
+				writeRPCError(w, req.ID, codeForbidden, "proofs/get requires proofs:read", map[string]any{"code": domain.ErrPermissionDenied})
+				return
+			}
+			s.handleProofGet(ctx, w, req, principal.ID)
 		case "openTasks/publish":
 			if !principal.Has(auth.ScopeOpenTasksWrite) {
 				writeRPCError(w, req.ID, codeForbidden, "openTasks/publish requires open_tasks:write", map[string]any{"code": domain.ErrPermissionDenied})

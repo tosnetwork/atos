@@ -21,6 +21,7 @@ var orderedToolSpecs = []toolSpec{
 	{Definition: getJobTool(), RequiredScopes: []auth.Scope{auth.ScopeJobsRead}},
 	{Definition: cancelJobTool(), RequiredScopes: []auth.Scope{auth.ScopeJobsCancel}},
 	{Definition: accountTool(), RequiredScopes: []auth.Scope{auth.ScopeAccountRead}},
+	{Definition: proofPackageTool(), RequiredScopes: []auth.Scope{auth.ScopeProofsRead}},
 	{Definition: artifactTool()},
 	{Definition: registerCapabilityTool(), RequiredScopes: []auth.Scope{auth.ScopeCapabilitiesWrite}},
 	{Definition: updateCapabilityTool(), RequiredScopes: []auth.Scope{auth.ScopeCapabilitiesWrite}},
@@ -49,6 +50,10 @@ var orderedToolSpecs = []toolSpec{
 	{Definition: withdrawOpenTaskProposalTool(), RequiredScopes: []auth.Scope{auth.ScopeOpenTaskProposalsWrite}},
 	{Definition: acceptOpenTaskProposalTool(), RequiredScopes: []auth.Scope{auth.ScopeOpenTasksWrite}},
 	{Definition: cancelOpenTaskTool(), RequiredScopes: []auth.Scope{auth.ScopeOpenTasksWrite}},
+}
+
+func proofPackageTool() map[string]any {
+	return map[string]any{"name": "atos_verified_proof_package", "description": "Create or recover the canonical portable proof for an owned Verified Receipt.", "inputSchema": objectSchema([]string{"receipt_id"}, map[string]any{"receipt_id": map[string]any{"type": "string", "minLength": 1}})}
 }
 
 func toolName(spec toolSpec) string {

@@ -11,12 +11,13 @@ import "time"
 // confirms agent_id resolves to a real AgentIdentity before anchoring the
 // binding.
 type PrincipalIdentityBinding struct {
-	PrincipalID string    `json:"principal_id"`
-	AgentID     string    `json:"agent_id"`
-	Network     string    `json:"network"`
-	BindingRef  string    `json:"binding_ref"`
-	BoundAt     time.Time `json:"bound_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	PrincipalID         string    `json:"principal_id"`
+	AgentID             string    `json:"agent_id"`
+	Network             string    `json:"network"`
+	BindingRef          string    `json:"binding_ref"`
+	FinalizedCheckpoint uint64    `json:"finalized_checkpoint,omitempty"`
+	BoundAt             time.Time `json:"bound_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 // IdentityBindingOperationType identifies which of the two

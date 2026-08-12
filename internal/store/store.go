@@ -104,6 +104,14 @@ type Receipts interface {
 	ReceiptsByPrincipal(ctx context.Context, principalID string) ([]domain.Receipt, error)
 }
 
+type ProofPackages interface {
+	OpenProofPackageOperation(context.Context, domain.ProofPackageOperation) (domain.ProofPackageOperation, bool, error)
+	GetProofPackageOperation(context.Context, string) (domain.ProofPackageOperation, error)
+	ProofPackageOperationByReceipt(context.Context, string) (domain.ProofPackageOperation, error)
+	UpdateProofPackageOperation(context.Context, string, func(domain.ProofPackageOperation) (domain.ProofPackageOperation, error)) (domain.ProofPackageOperation, error)
+	StaleProofPackageOperations(context.Context, time.Time, int) ([]domain.ProofPackageOperation, error)
+}
+
 type Jobs interface {
 	PutJob(ctx context.Context, j domain.Job) error
 	GetJob(ctx context.Context, id string) (domain.Job, error)
@@ -890,6 +898,7 @@ type Store interface {
 	Quotes
 	Escrows
 	Receipts
+	ProofPackages
 	Jobs
 	JobStream
 	Accounts

@@ -16,6 +16,7 @@ import (
 	atostosv1 "github.com/tosnetwork/tos-protocol/gen/atos/tos/v1"
 	"github.com/tosnetwork/tos-protocol/pkg/escrowcommitment"
 	"github.com/tosnetwork/tos-protocol/pkg/quotecommitment"
+	"github.com/tosnetwork/tos-protocol/pkg/receiptcommitment"
 )
 
 // Network returns this client's configured TOS network identity ("" if
@@ -96,6 +97,7 @@ func (c *Client) ResolvePrincipalBindingStatus(ctx context.Context, principalID 
 	binding = domain.PrincipalIdentityBinding{
 		PrincipalID: principalID, AgentID: response.Msg.Identity.AgentId,
 		Network: response.Msg.BindingRef.Network, BindingRef: response.Msg.BindingRef.Reference,
+		FinalizedCheckpoint: response.Msg.BindingRef.FinalizedCheckpoint,
 	}
 	// revoked (computed above from Status) is threaded through here too,
 	// not hardcoded false: Bound and Status are independent response
@@ -247,6 +249,32 @@ func (c *Client) VerifyCapabilityOwnership(ctx context.Context, capabilityID, pr
 		return false, "NOT_FOUND", nil
 	}
 	return response.Msg.Verified, response.Msg.ReasonCode, nil
+}
+
+func (c *Client) ResolveCapabilityOwnershipEvidence(ctx context.Context, capabilityID, providerID, version, expectedManifestDigest string) (toscore.CanonicalEvidence, bool, error) {
+	if capabilityID == "" || providerID == "" || version == "" || expectedManifestDigest == "" {
+		return toscore.CanonicalEvidence{}, false, domain.NewError(domain.ErrValidationFailed, "complete capability ownership tuple is required", false)
+	}
+	d, err := digest(expectedManifestDigest)
+	if err != nil {
+		return toscore.CanonicalEvidence{}, false, err
+	}
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	request := connect.NewRequest(&atostosv1.VerifyCapabilityOwnershipRequest{Context: c.requestContext(ctx, providerID, "", time.Time{}), CapabilityId: capabilityID, ProviderId: providerID, Version: version, ExpectedManifestDigest: d})
+	decorateRequest(c, ctx, request)
+	response, err := c.capability.VerifyCapabilityOwnership(callCtx, request)
+	if err != nil {
+		return toscore.CanonicalEvidence{}, false, rpcError(err)
+	}
+	if response.Msg == nil || !response.Msg.Verified || response.Msg.OwnershipRef == nil {
+		return toscore.CanonicalEvidence{}, false, nil
+	}
+	r := response.Msg.OwnershipRef
+	if r.Network != c.network || !r.Finalized || r.FinalizedCheckpoint == 0 {
+		return toscore.CanonicalEvidence{}, false, domain.NewError(domain.ErrNetworkUnavailable, "capability ownership is not finalized on configured network", true)
+	}
+	return toscore.CanonicalEvidence{Network: r.Network, Reference: r.Reference, Digest: expectedManifestDigest, Finalized: r.Finalized, FinalizedCheckpoint: r.FinalizedCheckpoint}, true, nil
 }
 
 func (c *Client) UpdateReputationEvidence(context.Context, string, string) error {
@@ -411,6 +439,8 @@ func (c *Client) ResolveExecutionSignerAuthorization(
 		ValidUntil:        time.UnixMilli(value.ValidUntilUnixMillis).UTC(),
 		AuthorizationRef:  reference(response.Msg.Authorization.AuthorizationRef),
 		Revoked:           response.Msg.Authorization.Revoked,
+		SignerPublicKey:   append([]byte(nil), value.SignerPublicKey...), SignatureAlgorithm: value.SignatureAlgorithm,
+		FinalizedCheckpoint: response.Msg.Authorization.AuthorizationRef.GetFinalizedCheckpoint(),
 	}, true, nil
 }
 
@@ -428,6 +458,8 @@ func toExecutionSignerAuthorization(msg *atostosv1.ExecutionSignerAuthorization)
 		AuthorizationRef:  reference(msg.AuthorizationRef),
 		Revoked:           msg.Revoked,
 		RevocationRef:     reference(msg.RevocationRef),
+		SignerPublicKey:   append([]byte(nil), value.SignerPublicKey...), SignatureAlgorithm: value.SignatureAlgorithm,
+		FinalizedCheckpoint: msg.AuthorizationRef.GetFinalizedCheckpoint(),
 	}
 }
 
@@ -760,7 +792,48 @@ func (c *Client) VerifyExecutionReceipt(ctx context.Context, escrowID string, re
 	}
 	return toscore.VerifyExecutionReceiptResult{
 		Valid: response.Msg.Verified, Reason: response.Msg.ReasonCode, ProofRef: ref,
+		Network: response.Msg.ProofRef.GetNetwork(), Finalized: response.Msg.ProofRef.GetFinalized(), FinalizedCheckpoint: response.Msg.ProofRef.GetFinalizedCheckpoint(),
 	}, nil
+}
+
+func (c *Client) PortableReceiptEvidence(_ context.Context, receipt domain.ExecutionReceipt) (toscore.PortableReceiptEvidence, error) {
+	envelope, err := c.executionEnvelope(receipt)
+	if err != nil {
+		return toscore.PortableReceiptEvidence{}, err
+	}
+	b, err := receiptcommitment.Bytes(envelope)
+	if err != nil {
+		return toscore.PortableReceiptEvidence{}, err
+	}
+	d, err := receiptcommitment.Digest(envelope)
+	if err != nil {
+		return toscore.PortableReceiptEvidence{}, err
+	}
+	return toscore.PortableReceiptEvidence{CanonicalCBOR: b, Digest: d}, nil
+}
+
+func (c *Client) ResolveExecutionReceiptEvidence(ctx context.Context, receipt domain.ExecutionReceipt) (toscore.CanonicalEvidence, bool, error) {
+	envelope, err := c.executionEnvelope(receipt)
+	if err != nil {
+		return toscore.CanonicalEvidence{}, false, err
+	}
+	var expected *atostosv1.NetworkReference
+	if receipt.NetworkProofRef != "" {
+		expected = &atostosv1.NetworkReference{Network: c.network, Reference: receipt.NetworkProofRef, Finalized: true, FinalizedCheckpoint: receipt.NetworkProofCheckpoint}
+	}
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	request := connect.NewRequest(&atostosv1.ResolveExecutionReceiptRequest{Context: c.requestContext(ctx, receipt.PrincipalID, "", time.Time{}), Receipt: envelope, ExpectedReceiptRef: expected})
+	decorateRequest(c, ctx, request)
+	response, err := c.proof.ResolveExecutionReceipt(callCtx, request)
+	if err != nil {
+		return toscore.CanonicalEvidence{}, false, rpcError(err)
+	}
+	if response.Msg == nil || !response.Msg.Found || response.Msg.ReceiptRef == nil {
+		return toscore.CanonicalEvidence{}, false, nil
+	}
+	r := response.Msg.ReceiptRef
+	return toscore.CanonicalEvidence{Network: r.Network, Reference: r.Reference, Digest: digestString(response.Msg.ReceiptDigest), Finalized: r.Finalized, FinalizedCheckpoint: r.FinalizedCheckpoint}, true, nil
 }
 
 func (c *Client) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (toscore.SettleJobResult, error) {
@@ -967,6 +1040,34 @@ func (c *Client) CommitProofOfServiceEvidence(ctx context.Context, receipt domai
 		return "", nil
 	}
 	return ref, nil
+}
+
+func (c *Client) ReadProofOfServiceEvidence(ctx context.Context, receipt domain.ExecutionReceipt) (toscore.ProofOfServiceEvidence, bool, error) {
+	if receipt.ID == "" || receipt.ProviderID == "" || receipt.CapabilityID == "" {
+		return toscore.ProofOfServiceEvidence{}, false, domain.NewError(domain.ErrValidationFailed, "complete receipt tuple is required", false)
+	}
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	request := connect.NewRequest(&atostosv1.ReadProofOfServiceRequest{Context: c.requestContext(ctx, receipt.PrincipalID, "", time.Time{}), ProviderId: receipt.ProviderID, CapabilityId: receipt.CapabilityID, Page: &atostosv1.PageRequest{PageSize: 1000}})
+	decorateRequest(c, ctx, request)
+	response, err := c.proof.ReadProofOfService(callCtx, request)
+	if err != nil {
+		return toscore.ProofOfServiceEvidence{}, false, rpcError(err)
+	}
+	if response.Msg == nil {
+		return toscore.ProofOfServiceEvidence{}, false, nil
+	}
+	for _, e := range response.Msg.Evidence {
+		if e == nil || e.Value == nil || e.Value.ReceiptId != receipt.ID {
+			continue
+		}
+		r := e.EvidenceRef
+		if e.Value.ProviderId != receipt.ProviderID || e.Value.CapabilityId != receipt.CapabilityID || e.Value.CapabilityVersion != receipt.CapabilityVersion || r == nil || r.Network != c.network || !r.Finalized || r.FinalizedCheckpoint == 0 {
+			return toscore.ProofOfServiceEvidence{}, false, domain.NewError(domain.ErrProofVerificationFailed, "Proof-of-Service tuple/finality mismatch", false)
+		}
+		return toscore.ProofOfServiceEvidence{EvidenceID: e.Value.EvidenceId, ReceiptID: e.Value.ReceiptId, ProviderID: e.Value.ProviderId, CapabilityID: e.Value.CapabilityId, CapabilityVersion: e.Value.CapabilityVersion, ContentDigest: digestString(e.Value.EvidenceDigest), CanonicalEvidence: toscore.CanonicalEvidence{Network: r.Network, Reference: r.Reference, Digest: digestString(e.Value.EvidenceDigest), Finalized: r.Finalized, FinalizedCheckpoint: r.FinalizedCheckpoint}}, true, nil
+	}
+	return toscore.ProofOfServiceEvidence{}, false, nil
 }
 
 func (c *Client) ReadSettlementStatus(ctx context.Context, escrowID string) (domain.EscrowStatus, error) {

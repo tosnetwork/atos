@@ -23,6 +23,7 @@ func (s *Server) dispatch() map[string]toolHandler {
 		"atos_get_job":                     s.toolGetJob,
 		"atos_cancel_job":                  s.toolCancelJob,
 		"atos_account":                     s.toolAccount,
+		"atos_verified_proof_package":      s.toolProofPackage,
 		"atos_artifact":                    s.toolArtifact,
 		"atos_register_capability":         s.toolRegisterCapability,
 		"atos_update_capability":           s.toolUpdateCapability,
@@ -52,6 +53,10 @@ func (s *Server) dispatch() map[string]toolHandler {
 		"atos_accept_open_task_proposal":   s.toolAcceptOpenTaskProposal,
 		"atos_cancel_open_task":            s.toolCancelOpenTask,
 	}
+}
+
+func (s *Server) toolProofPackage(ctx context.Context, p auth.Principal, args map[string]any) (any, error) {
+	return s.ProofPackages.Create(ctx, argString(args, "receipt_id"), p.ID)
 }
 
 func argString(args map[string]any, key string) string {

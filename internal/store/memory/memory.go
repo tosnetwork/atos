@@ -23,6 +23,8 @@ type Store struct {
 	escrowOperations           map[string]domain.EscrowOperation
 	receipts                   map[string]domain.Receipt
 	receiptsByJob              map[string]string // jobID -> receiptID
+	proofPackageOperations     map[string]domain.ProofPackageOperation
+	proofPackageByReceipt      map[string]string
 	jobs                       map[string]domain.Job
 	streamEvents               map[string][]domain.JobEvent      // jobID -> ordered events
 	streamEventHashes          map[string][]string               // jobID -> content hash of the pristine incoming event at that index, mirroring Postgres's content_hash column
@@ -65,6 +67,8 @@ func New() *Store {
 		escrowOperations:           make(map[string]domain.EscrowOperation),
 		receipts:                   make(map[string]domain.Receipt),
 		receiptsByJob:              make(map[string]string),
+		proofPackageOperations:     make(map[string]domain.ProofPackageOperation),
+		proofPackageByReceipt:      make(map[string]string),
 		jobs:                       make(map[string]domain.Job),
 		streamEvents:               make(map[string][]domain.JobEvent),
 		streamEventHashes:          make(map[string][]string),

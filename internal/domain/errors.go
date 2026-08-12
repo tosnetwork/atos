@@ -11,6 +11,7 @@ const (
 	ErrTrustModeUnavailable         ErrorCode = "trust_mode_unavailable"
 	ErrProofRequirementsUnsatisfied ErrorCode = "proof_requirements_unsatisfied"
 	ErrProofProfileUnavailable      ErrorCode = "proof_profile_unavailable"
+	ErrProofVerificationFailed      ErrorCode = "proof_verification_failed"
 	ErrNetworkUnavailable           ErrorCode = "network_unavailable"
 	ErrQuoteExpired                 ErrorCode = "quote_expired"
 	ErrQuoteMismatch                ErrorCode = "quote_mismatch"

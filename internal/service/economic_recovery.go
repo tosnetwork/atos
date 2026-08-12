@@ -876,6 +876,7 @@ func (s *JobService) settleProviderResultUnderLock(ctx context.Context, current 
 		if verify.ProofRef != "" {
 			receipt.NetworkProofRef = verify.ProofRef
 		}
+		receipt.NetworkProofCheckpoint = verify.FinalizedCheckpoint
 		current, err = s.store.UpdateJob(ctx, current.ID, func(job domain.Job, exists bool) (domain.Job, error) {
 			if !exists {
 				return domain.Job{}, store.ErrNotFound

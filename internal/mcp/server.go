@@ -36,6 +36,7 @@ type Server struct {
 	Jobs             *service.JobService
 	Accounts         *service.AccountService
 	Receipts         *service.ReceiptService
+	ProofPackages    *service.PortableProofService
 	Earnings         *service.EarningsService
 	Disputes         *service.DisputeService
 	Artifacts        *service.ArtifactService

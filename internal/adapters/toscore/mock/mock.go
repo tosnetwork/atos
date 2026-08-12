@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/tosnetwork/tos-protocol/pkg/codec"
 	"reflect"
 	"sync"
 	"time"
@@ -285,6 +286,14 @@ func (c *Core) VerifyCapabilityOwnership(ctx context.Context, capabilityID, prov
 		return false, "MANIFEST_MISMATCH", nil
 	}
 	return true, "", nil
+}
+
+func (c *Core) ResolveCapabilityOwnershipEvidence(ctx context.Context, capabilityID, providerID, version, expectedManifestDigest string) (toscore.CanonicalEvidence, bool, error) {
+	ok, _, err := c.VerifyCapabilityOwnership(ctx, capabilityID, providerID, version, expectedManifestDigest)
+	if err != nil || !ok {
+		return toscore.CanonicalEvidence{}, false, err
+	}
+	return toscore.CanonicalEvidence{Network: c.Network(), Reference: "mock:ownership:" + capabilityID + ":" + version, Digest: expectedManifestDigest, Finalized: true, FinalizedCheckpoint: 1}, true, nil
 }
 
 func (c *Core) UpdateReputationEvidence(ctx context.Context, providerID string, evidence string) error {
@@ -631,7 +640,23 @@ func (c *Core) VerifyExecutionReceipt(ctx context.Context, escrowID string, rece
 	if c.simulated && receipt.TrustMode != domain.TrustModeManaged {
 		proofRef = simulatedRef("receipt-verified", receipt.TrustMode, receipt.ID)
 	}
-	return toscore.VerifyExecutionReceiptResult{Valid: true, ProofRef: proofRef}, nil
+	return toscore.VerifyExecutionReceiptResult{Valid: true, ProofRef: proofRef, Network: c.Network(), Finalized: true, FinalizedCheckpoint: 1}, nil
+}
+
+func (c *Core) PortableReceiptEvidence(_ context.Context, receipt domain.ExecutionReceipt) (toscore.PortableReceiptEvidence, error) {
+	b, e := codec.Marshal(receipt)
+	if e != nil {
+		return toscore.PortableReceiptEvidence{}, e
+	}
+	d, e := codec.DigestCanonical("tos.atos.execution-receipt.v2", b)
+	return toscore.PortableReceiptEvidence{CanonicalCBOR: b, Digest: d}, e
+}
+func (c *Core) ResolveExecutionReceiptEvidence(ctx context.Context, r domain.ExecutionReceipt) (toscore.CanonicalEvidence, bool, error) {
+	e, err := c.PortableReceiptEvidence(ctx, r)
+	if err != nil {
+		return toscore.CanonicalEvidence{}, false, err
+	}
+	return toscore.CanonicalEvidence{Network: c.Network(), Reference: r.NetworkProofRef, Digest: e.Digest, Finalized: true, FinalizedCheckpoint: 1}, true, nil
 }
 
 // SettleJob is replayable: a lost response after a committed settlement
@@ -736,6 +761,13 @@ func (c *Core) CommitProofOfServiceEvidence(ctx context.Context, receipt domain.
 		return simulatedRef("proof-of-service", receipt.TrustMode, receipt.ID), nil
 	}
 	return "", domain.NewError(domain.ErrNetworkUnavailable, "mock tos-core cannot commit portable Proof-of-Service evidence", true)
+}
+
+func (c *Core) ReadProofOfServiceEvidence(_ context.Context, receipt domain.ExecutionReceipt) (toscore.ProofOfServiceEvidence, bool, error) {
+	if receipt.ID == "" {
+		return toscore.ProofOfServiceEvidence{}, false, nil
+	}
+	return toscore.ProofOfServiceEvidence{EvidenceID: "pos_" + receipt.ID, ReceiptID: receipt.ID, ProviderID: receipt.ProviderID, CapabilityID: receipt.CapabilityID, CapabilityVersion: receipt.CapabilityVersion, ContentDigest: receipt.UsageCommitment, CanonicalEvidence: toscore.CanonicalEvidence{Network: c.Network(), Reference: "mock:pos:" + receipt.ID, Digest: receipt.UsageCommitment, Finalized: true, FinalizedCheckpoint: 1}}, true, nil
 }
 
 func (c *Core) ReadSettlementStatus(ctx context.Context, escrowID string) (domain.EscrowStatus, error) {

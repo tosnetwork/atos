@@ -78,6 +78,7 @@ type Server struct {
 	Streams          *service.StreamService
 	Accounts         *service.AccountService
 	Receipts         *service.ReceiptService
+	ProofPackages    *service.PortableProofService
 	Earnings         *service.EarningsService
 	Disputes         *service.DisputeService
 	Artifacts        *service.ArtifactService
@@ -176,6 +177,8 @@ func (s *Server) Mux() *http.ServeMux {
 	mux.HandleFunc("GET /v1/account/receipts", s.withScopes(s.handleListReceipts, auth.ScopeAccountRead))
 	mux.HandleFunc("GET /v1/receipts/{id}", s.withScopes(s.handleGetReceipt, auth.ScopeAccountRead))
 	mux.HandleFunc("GET /v1/receipts/{id}/settlement-proof", s.withScopes(s.handleSettlementProof, auth.ScopeProofsRead))
+	mux.HandleFunc("POST /v1/receipts/{id}/proof-package", s.withScopes(s.handleCreateProofPackage, auth.ScopeProofsRead))
+	mux.HandleFunc("GET /v1/receipts/{id}/proof-package", s.withScopes(s.handleGetProofPackage, auth.ScopeProofsRead))
 	mux.HandleFunc("GET /v1/jobs/{id}/billing", s.withScopes(s.handleGetJobBilling, auth.ScopeJobsRead))
 
 	mux.HandleFunc("GET /v1/provider/earnings", s.withScopes(s.handleListEarnings, auth.ScopeEarningsRead))
