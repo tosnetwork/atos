@@ -91,6 +91,10 @@ type Escrows interface {
 	PutEscrow(ctx context.Context, e domain.Escrow) error
 	GetEscrow(ctx context.Context, id string) (domain.Escrow, error)
 	EscrowByJob(ctx context.Context, jobID string) (domain.Escrow, error)
+	OpenEscrowOperation(ctx context.Context, op domain.EscrowOperation) (domain.EscrowOperation, bool, error)
+	GetEscrowOperation(ctx context.Context, jobID string, kind domain.EscrowOperationKind) (domain.EscrowOperation, error)
+	UpdateEscrowOperation(ctx context.Context, jobID string, kind domain.EscrowOperationKind, fn func(domain.EscrowOperation) (domain.EscrowOperation, error)) (domain.EscrowOperation, error)
+	StaleEscrowOperations(ctx context.Context, cutoff time.Time, limit int) ([]domain.EscrowOperation, error)
 }
 
 type Receipts interface {

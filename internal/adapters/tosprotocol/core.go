@@ -13,6 +13,7 @@ import (
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/store"
 	atostosv1 "github.com/tosnetwork/tos-protocol/gen/atos/tos/v1"
+	"github.com/tosnetwork/tos-protocol/pkg/escrowcommitment"
 	"github.com/tosnetwork/tos-protocol/pkg/quotecommitment"
 )
 
@@ -485,34 +486,40 @@ func (c *Client) RevokeExecutionSigner(ctx context.Context, req toscore.RevokeEx
 }
 
 func (c *Client) CreateEscrow(ctx context.Context, req toscore.CreateEscrowRequest) (domain.Escrow, error) {
-	if existing, err := c.store.EscrowByJob(ctx, req.JobID); err == nil {
-		if existing.QuoteID != req.QuoteID || existing.PrincipalID != req.PrincipalID ||
-			existing.ProviderID != req.ProviderID || existing.CapabilityID != req.CapabilityID ||
-			existing.CapabilityVersion != req.CapabilityVersion || existing.TrustMode != req.TrustMode ||
-			existing.ProofProfile != req.ProofProfile || existing.Reserved != req.Reserved {
-			return domain.Escrow{}, domain.NewError(domain.ErrIdempotencyConflict, "stored escrow does not match replayed request", false)
-		}
-		return existing, nil
-	} else if err != store.ErrNotFound {
-		return domain.Escrow{}, err
+	if req.Quote.ID == "" {
+		req.Quote = domain.Quote{ID: req.QuoteID, CapabilityID: req.CapabilityID, CapabilityVersion: req.CapabilityVersion, ProviderID: req.ProviderID, PrincipalID: req.PrincipalID, TrustMode: req.TrustMode, ProofProfile: req.ProofProfile, Settlement: req.Settlement, Price: domain.Price{TotalMax: req.Reserved.Amount, Currency: req.Reserved.Currency}, ExpiresAt: time.Now().UTC().Add(c.retention)}
 	}
-	reserve, err := networkAmount(req.Reserved)
+	if req.Quote.TrustMode != domain.TrustModeVerified {
+		return c.createManagedEscrow(ctx, req)
+	}
+	terms, digestValue, err := verifiedEscrowTerms(req.Quote, req.JobID)
 	if err != nil {
 		return domain.Escrow{}, err
 	}
-	expires := time.Now().UTC().Add(c.retention)
-	if quote, qerr := c.store.GetQuote(ctx, req.QuoteID); qerr == nil && quote.ExpiresAt.After(time.Now().UTC()) {
-		expires = quote.ExpiresAt
+	if existing, found, getErr := c.GetEscrow(ctx, toscore.GetEscrowRequest{Quote: req.Quote, JobID: req.JobID, ExpectedReservationDigest: digestValue}); getErr != nil {
+		return domain.Escrow{}, getErr
+	} else if found {
+		return existing, nil
+	}
+	expires := req.Quote.ExecutionDeadline
+	if expires.IsZero() {
+		expires = req.Quote.ExpiresAt
+	}
+	if !expires.After(time.Now().UTC()) {
+		return domain.Escrow{}, domain.NewError(domain.ErrQuoteExpired, "verified escrow deadline has passed", false)
+	}
+	if req.Quote.TrustMode != domain.TrustModeVerified {
+		return domain.Escrow{}, domain.NewError(domain.ErrValidationFailed, "TaskEscrow authority requires verified trust mode", false)
 	}
 	callCtx, cancel := c.callContext(ctx, expires)
 	defer cancel()
 	request := connect.NewRequest(&atostosv1.CreateEscrowRequest{
-		Context: c.requestContext(ctx, req.PrincipalID, "create-escrow:"+req.QuoteID+":"+req.JobID, expires),
-		QuoteId: req.QuoteID, PrincipalId: req.PrincipalID,
-		ProviderId: req.ProviderID, CapabilityId: req.CapabilityID,
-		TrustMode: trustMode(req.TrustMode), ProofProfile: proofProfile(req.ProofProfile),
-		Reserve: reserve, FundingModel: string(req.Settlement.FundingModel),
-		ExpiresUnixMillis: expires.UnixMilli(),
+		Context: c.requestContext(ctx, req.Quote.PrincipalID, "create-escrow:"+req.Quote.ID+":"+req.JobID, expires),
+		QuoteId: req.Quote.ID, PrincipalId: req.Quote.PrincipalID,
+		ProviderId: req.Quote.ProviderID, CapabilityId: req.Quote.CapabilityID,
+		TrustMode: trustMode(req.Quote.TrustMode), ProofProfile: proofProfile(req.Quote.ProofProfile),
+		Reserve: terms.Reserve, FundingModel: string(req.Quote.Settlement.FundingModel),
+		ExpiresUnixMillis: expires.UnixMilli(), VerifiedTerms: terms,
 	})
 	decorateRequest(c, ctx, request)
 	response, err := c.settlement.CreateEscrow(callCtx, request)
@@ -522,11 +529,8 @@ func (c *Client) CreateEscrow(ctx context.Context, req toscore.CreateEscrowReque
 	if response.Msg == nil || response.Msg.Escrow == nil {
 		return domain.Escrow{}, domain.NewError(domain.ErrNetworkUnavailable, "tos-protocol returned an empty escrow", true)
 	}
-	mapped := domainEscrow(response.Msg.Escrow, req.JobID, req.CapabilityVersion, req.Settlement)
-	if mapped.TrustMode == domain.TrustModeManaged {
-		mapped.NetworkProofRef = ""
-	}
-	if err := c.store.PutEscrow(ctx, mapped); err != nil {
+	mapped := domainEscrow(response.Msg.Escrow, req.JobID, req.Quote.CapabilityVersion, req.Quote.Settlement)
+	if err := validateCanonicalEscrow(req.Quote, req.JobID, digestValue, mapped); err != nil {
 		return domain.Escrow{}, err
 	}
 	if ref := reference(response.Msg.Escrow.EscrowRef); ref != "" {
@@ -535,39 +539,114 @@ func (c *Client) CreateEscrow(ctx context.Context, req toscore.CreateEscrowReque
 	return mapped, nil
 }
 
-func (c *Client) ReleaseEscrow(ctx context.Context, escrowID string) (domain.Receipt, error) {
-	local, err := c.store.GetEscrow(ctx, escrowID)
-	if err != nil {
-		return domain.Receipt{}, err
+func (c *Client) createManagedEscrow(ctx context.Context, req toscore.CreateEscrowRequest) (domain.Escrow, error) {
+	if existing, err := c.store.EscrowByJob(ctx, req.JobID); err == nil {
+		return existing, nil
+	} else if err != store.ErrNotFound {
+		return domain.Escrow{}, err
 	}
-	if local.Status == domain.EscrowReleased {
-		if receipt, replayErr := c.store.ReceiptByJob(ctx, local.JobID); replayErr == nil && receipt.EscrowID == local.ID && receipt.Status == domain.ReceiptReleased {
-			return receipt, nil
+	reserve, err := networkAmount(req.Reserved)
+	if err != nil {
+		return domain.Escrow{}, err
+	}
+	expires := req.Quote.ExpiresAt
+	callCtx, cancel := c.callContext(ctx, expires)
+	defer cancel()
+	request := connect.NewRequest(&atostosv1.CreateEscrowRequest{Context: c.requestContext(ctx, req.PrincipalID, "create-escrow:"+req.QuoteID+":"+req.JobID, expires), QuoteId: req.QuoteID, PrincipalId: req.PrincipalID, ProviderId: req.ProviderID, CapabilityId: req.CapabilityID, TrustMode: trustMode(req.TrustMode), ProofProfile: proofProfile(req.ProofProfile), Reserve: reserve, FundingModel: string(req.Settlement.FundingModel), ExpiresUnixMillis: expires.UnixMilli()})
+	decorateRequest(c, ctx, request)
+	response, err := c.settlement.CreateEscrow(callCtx, request)
+	if err != nil {
+		return domain.Escrow{}, rpcError(err)
+	}
+	if response.Msg == nil || response.Msg.Escrow == nil {
+		return domain.Escrow{}, domain.NewError(domain.ErrNetworkUnavailable, "tos-protocol returned an empty escrow", true)
+	}
+	mapped := domainEscrow(response.Msg.Escrow, req.JobID, req.CapabilityVersion, req.Settlement)
+	mapped.NetworkProofRef = ""
+	if err = c.store.PutEscrow(ctx, mapped); err != nil {
+		return domain.Escrow{}, err
+	}
+	return mapped, nil
+}
+
+func (c *Client) GetEscrow(ctx context.Context, req toscore.GetEscrowRequest) (domain.Escrow, bool, error) {
+	if req.Quote.TrustMode != domain.TrustModeVerified {
+		e, err := c.store.EscrowByJob(ctx, req.JobID)
+		if err == store.ErrNotFound {
+			return domain.Escrow{}, false, nil
 		}
+		return e, err == nil, err
+	}
+	terms, digestValue, err := verifiedEscrowTerms(req.Quote, req.JobID)
+	if err != nil {
+		return domain.Escrow{}, false, err
+	}
+	if req.ExpectedReservationDigest != "" && req.ExpectedReservationDigest != digestValue {
+		return domain.Escrow{}, false, domain.NewError(domain.ErrQuoteMismatch, "reservation digest assertion mismatched", false)
+	}
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	request := connect.NewRequest(&atostosv1.GetEscrowRequest{Context: c.requestContext(ctx, req.Quote.PrincipalID, "", time.Time{}), EscrowId: req.EscrowID, QuoteId: req.Quote.ID, ExpectedTerms: terms, ExpectedReservationDigest: digestValue})
+	if req.ExpectedEscrowRef != "" {
+		request.Msg.ExpectedEscrowRef = parseReference(req.Quote.NetworkID, req.ExpectedEscrowRef)
+	}
+	decorateRequest(c, ctx, request)
+	response, err := c.settlement.GetEscrow(callCtx, request)
+	if err != nil {
+		return domain.Escrow{}, false, rpcError(err)
+	}
+	if response.Msg == nil || !response.Msg.Found || response.Msg.Escrow == nil {
+		return domain.Escrow{}, false, nil
+	}
+	mapped := domainEscrow(response.Msg.Escrow, req.JobID, req.Quote.CapabilityVersion, req.Quote.Settlement)
+	if err = validateCanonicalEscrow(req.Quote, req.JobID, digestValue, mapped); err != nil {
+		return domain.Escrow{}, false, err
+	}
+	return mapped, true, nil
+}
+
+func (c *Client) ReleaseEscrow(ctx context.Context, req toscore.ReleaseEscrowRequest) (toscore.ReleaseEscrowResult, error) {
+	if req.Quote.TrustMode != domain.TrustModeVerified {
+		return c.releaseManagedEscrow(ctx, req)
+	}
+	local, found, err := c.GetEscrow(ctx, toscore.GetEscrowRequest{Quote: req.Quote, JobID: req.JobID, EscrowID: req.EscrowID})
+	if err != nil {
+		return toscore.ReleaseEscrowResult{}, err
+	}
+	if !found {
+		return toscore.ReleaseEscrowResult{}, domain.NewError(domain.ErrSettlementFailed, "canonical escrow not found", true)
+	}
+	terms, digestValue, err := verifiedEscrowTerms(req.Quote, req.JobID)
+	if err != nil {
+		return toscore.ReleaseEscrowResult{}, err
 	}
 	callCtx, cancel := c.callContext(ctx, time.Time{})
 	defer cancel()
 	request := connect.NewRequest(&atostosv1.ReleaseEscrowRequest{
-		Context:  c.requestContext(ctx, local.PrincipalID, "release-escrow:"+escrowID, time.Time{}),
-		EscrowId: escrowID, QuoteId: local.QuoteID, JobId: local.JobID,
-		ReasonCode: "ATOS_RELEASE",
+		Context:  c.requestContext(ctx, local.PrincipalID, "release-escrow:"+local.ID, time.Time{}),
+		EscrowId: local.ID, QuoteId: local.QuoteID, JobId: local.JobID,
+		ReasonCode: req.ReasonCode, ExpectedTerms: terms, ExpectedReservationDigest: digestValue, ExpectedEscrowRef: parseReference(req.Quote.NetworkID, local.NetworkProofRef),
 	})
 	decorateRequest(c, ctx, request)
 	response, err := c.settlement.ReleaseEscrow(callCtx, request)
 	if err != nil {
-		return domain.Receipt{}, rpcError(err)
+		return toscore.ReleaseEscrowResult{}, rpcError(err)
 	}
 	if response.Msg == nil || !response.Msg.Released || response.Msg.Escrow == nil {
-		return domain.Receipt{}, domain.NewError(domain.ErrSettlementFailed, "tos-protocol did not release escrow", true)
+		return toscore.ReleaseEscrowResult{}, domain.NewError(domain.ErrSettlementFailed, "tos-protocol did not release escrow", true)
+	}
+	released := domainEscrow(response.Msg.Escrow, req.JobID, req.Quote.CapabilityVersion, req.Quote.Settlement)
+	if err = validateCanonicalEscrow(req.Quote, req.JobID, digestValue, released); err != nil {
+		return toscore.ReleaseEscrowResult{}, err
+	}
+	if released.Status != domain.EscrowReleased || released.ReleaseRef == "" || released.ReleaseDigest == "" || released.ReleaseActionID == "" || released.ReleaseReason != req.ReasonCode {
+		return toscore.ReleaseEscrowResult{}, domain.NewError(domain.ErrSettlementFailed, "canonical release transition is incomplete or mismatched", false)
 	}
 	now := time.Now().UTC()
 	local.Status = domain.EscrowReleased
 	local.SettledAt = &now
 	if local.TrustMode != domain.TrustModeManaged {
 		local.NetworkProofRef = reference(response.Msg.ReleaseRef)
-	}
-	if err := c.store.PutEscrow(ctx, local); err != nil {
-		return domain.Receipt{}, err
 	}
 	proofStatus := domain.ProofNotRequired
 	if local.TrustMode != domain.TrustModeManaged {
@@ -584,13 +663,39 @@ func (c *Client) ReleaseEscrow(ctx context.Context, escrowID string) (domain.Rec
 	if local.TrustMode != domain.TrustModeManaged {
 		receipt.NetworkProofRef = reference(response.Msg.ReleaseRef)
 	}
-	if err := c.store.PutReceipt(ctx, receipt); err != nil {
-		return domain.Receipt{}, err
-	}
 	if receipt.NetworkProofRef != "" {
 		c.proofRefs.Store(receipt.ID, receipt.NetworkProofRef)
 	}
-	return receipt, nil
+	return toscore.ReleaseEscrowResult{Escrow: released, Receipt: receipt}, nil
+}
+
+func (c *Client) releaseManagedEscrow(ctx context.Context, req toscore.ReleaseEscrowRequest) (toscore.ReleaseEscrowResult, error) {
+	local, err := c.store.GetEscrow(ctx, req.EscrowID)
+	if err != nil {
+		return toscore.ReleaseEscrowResult{}, err
+	}
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	request := connect.NewRequest(&atostosv1.ReleaseEscrowRequest{Context: c.requestContext(ctx, local.PrincipalID, "release-escrow:"+local.ID, time.Time{}), EscrowId: local.ID, QuoteId: local.QuoteID, JobId: local.JobID, ReasonCode: req.ReasonCode})
+	decorateRequest(c, ctx, request)
+	response, err := c.settlement.ReleaseEscrow(callCtx, request)
+	if err != nil {
+		return toscore.ReleaseEscrowResult{}, rpcError(err)
+	}
+	if response.Msg == nil || !response.Msg.Released {
+		return toscore.ReleaseEscrowResult{}, domain.NewError(domain.ErrSettlementFailed, "tos-protocol did not release escrow", true)
+	}
+	now := time.Now().UTC()
+	local.Status = domain.EscrowReleased
+	local.SettledAt = &now
+	if err = c.store.PutEscrow(ctx, local); err != nil {
+		return toscore.ReleaseEscrowResult{}, err
+	}
+	receipt := domain.Receipt{ID: "rcpt_release_" + local.ID, QuoteID: local.QuoteID, EscrowID: local.ID, JobID: local.JobID, PrincipalID: local.PrincipalID, TrustMode: local.TrustMode, ProofProfile: local.ProofProfile, Charged: domain.Money{Amount: "0.00", Currency: local.Reserved.Currency}, Refunded: local.Reserved, Status: domain.ReceiptReleased, ProofStatus: domain.ProofNotRequired, CreatedAt: now}
+	if err = c.store.PutReceipt(ctx, receipt); err != nil {
+		return toscore.ReleaseEscrowResult{}, err
+	}
+	return toscore.ReleaseEscrowResult{Escrow: local, Receipt: receipt}, nil
 }
 
 func (c *Client) CommitExecutionReceipt(ctx context.Context, receipt domain.ExecutionReceipt) (string, error) {
@@ -780,6 +885,20 @@ func (c *Client) CommitProofOfServiceEvidence(ctx context.Context, receipt domai
 }
 
 func (c *Client) ReadSettlementStatus(ctx context.Context, escrowID string) (domain.EscrowStatus, error) {
+	if local, localErr := c.store.GetEscrow(ctx, escrowID); localErr == nil && local.TrustMode == domain.TrustModeVerified {
+		quote, quoteErr := c.store.GetQuote(ctx, local.QuoteID)
+		if quoteErr != nil {
+			return "", quoteErr
+		}
+		live, found, liveErr := c.GetEscrow(ctx, toscore.GetEscrowRequest{Quote: quote, JobID: local.JobID, EscrowID: local.ID, ExpectedEscrowRef: local.NetworkProofRef, ExpectedReservationDigest: local.ReservationDigest})
+		if liveErr != nil {
+			return "", liveErr
+		}
+		if !found {
+			return "", domain.NewError(domain.ErrNetworkUnavailable, "canonical verified escrow is unavailable", true)
+		}
+		return live.Status, nil
+	}
 	callCtx, cancel := c.callContext(ctx, time.Time{})
 	defer cancel()
 	request := connect.NewRequest(&atostosv1.GetEscrowRequest{
@@ -865,9 +984,52 @@ func domainEscrow(value *atostosv1.Escrow, jobID, capabilityVersion string, sett
 		TrustMode: domainTrustMode(value.TrustMode), ProofProfile: domainProofProfile(value.ProofProfile),
 		Settlement: settlement, Reserved: domainMoney(value.Reserved),
 		Status: domainEscrowStatus(value.State), NetworkProofRef: reference(value.EscrowRef),
+		QuoteCommitmentDigest: value.QuoteCommitmentDigest, QuoteCommitmentRef: reference(value.QuoteCommitmentRef),
+		ReservationDigest: value.ReservationDigest, ReservationActionID: value.ReservationActionId,
+		ContractCodeHash: value.ContractCodeHash, Finalized: value.Finalized, FinalizedCheckpoint: value.FinalizedCheckpoint,
+		ReleaseReason: value.ReleaseReasonCode, ReleaseDigest: value.ReleaseDigest, ReleaseActionID: value.ReleaseActionId, ReleaseRef: reference(value.ReleaseRef),
 		CreatedAt: time.UnixMilli(value.CreatedUnixMillis).UTC(),
 		ExpiresAt: time.UnixMilli(value.ExpiresUnixMillis).UTC(),
 	}
+}
+
+func verifiedEscrowTerms(q domain.Quote, jobID string) (*atostosv1.VerifiedEscrowTerms, string, error) {
+	if q.TrustMode != domain.TrustModeVerified || q.ProofProfile != domain.ProofProfileTOSVerifiedV1 || q.Commitment == nil || !q.Commitment.Finalized || q.Commitment.FinalizedCheckpoint == 0 {
+		return nil, "", domain.NewError(domain.ErrQuoteMismatch, "verified quote has no finalized canonical commitment", false)
+	}
+	reserve, err := networkAmount(domain.Money{Amount: q.Price.TotalMax, Currency: q.Price.Currency})
+	if err != nil {
+		return nil, "", err
+	}
+	subtotal, err := networkAmount(domain.Money{Amount: q.Price.Subtotal, Currency: q.Price.Currency})
+	if err != nil {
+		return nil, "", err
+	}
+	fees, err := networkAmount(domain.Money{Amount: q.Price.Fees, Currency: q.Price.Currency})
+	if err != nil {
+		return nil, "", err
+	}
+	if reserve.Asset != "TOS" || q.AssetDecimals != 9 || q.Settlement.Backend != domain.SettlementTOS || q.Settlement.ProviderAsset != "TOS" {
+		return nil, "", domain.NewError(domain.ErrValidationFailed, "verified escrow requires TOS with 9 atomic decimals", false)
+	}
+	t := &atostosv1.VerifiedEscrowTerms{Version: escrowcommitment.Version, Canonicalization: escrowcommitment.Canonicalization, NetworkId: q.NetworkID, Domain: q.CommitmentDomain, JobId: jobID, QuoteId: q.ID, QuoteCommitmentDigest: q.Commitment.Digest, QuoteCommitmentRef: parseReference(q.NetworkID, q.Commitment.Reference), PrincipalId: q.PrincipalID, RequesterAgentId: q.RequesterAgentID, ProviderId: q.ProviderID, CapabilityId: q.CapabilityID, CapabilityVersion: q.CapabilityVersion, ManifestDigest: mustDigest(q.ManifestCommitment), OwnershipRef: parseReference(q.NetworkID, q.OwnershipRef), TrustMode: trustMode(q.TrustMode), ProofProfile: proofProfile(q.ProofProfile), Reserve: reserve, AssetDecimals: q.AssetDecimals, SettlementBackend: string(q.Settlement.Backend), SettlementAsset: q.Settlement.ProviderAsset, FundingModel: string(q.Settlement.FundingModel), AcceptanceDeadlineUnixMillis: q.ExpiresAt.UnixMilli(), ExecutionDeadlineUnixMillis: q.ExecutionDeadline.UnixMilli(), EscrowDeadlineUnixMillis: q.ExecutionDeadline.UnixMilli(), UnderlyingServiceQuoteRef: q.ServiceQuoteID, DisputePolicyDigest: mustDigest(q.DisputePolicyHash), SignerAuthorizationId: q.SignerAuthorizationID, SignerAuthorizationRef: parseReference(q.NetworkID, q.SignerAuthorizationRef), Subtotal: subtotal, Fees: fees, TermsDigest: mustDigest(q.TermsHash)}
+	t.QuoteCommitmentRef.Finalized = q.Commitment.Finalized
+	t.QuoteCommitmentRef.FinalizedCheckpoint = q.Commitment.FinalizedCheckpoint
+	t.EscrowId = escrowcommitment.EscrowID(t.NetworkId, t.Domain, t.QuoteId, t.JobId)
+	d, err := escrowcommitment.Digest(t)
+	if err != nil {
+		return nil, "", domain.NewError(domain.ErrValidationFailed, "verified escrow terms cannot be canonicalized", false)
+	}
+	return t, d, nil
+}
+
+func validateCanonicalEscrow(q domain.Quote, jobID, digestValue string, e domain.Escrow) error {
+	expectedID := escrowcommitment.EscrowID(q.NetworkID, q.CommitmentDomain, q.ID, jobID)
+	legalState := e.Status == domain.EscrowReserved || e.Status == domain.EscrowReleased
+	if e.ID != expectedID || e.JobID != jobID || e.QuoteID != q.ID || e.PrincipalID != q.PrincipalID || e.ProviderID != q.ProviderID || e.CapabilityID != q.CapabilityID || e.CapabilityVersion != q.CapabilityVersion || e.TrustMode != q.TrustMode || e.ProofProfile != q.ProofProfile || e.Reserved != (domain.Money{Amount: q.Price.TotalMax, Currency: q.Price.Currency}) || e.QuoteCommitmentDigest != q.Commitment.Digest || e.QuoteCommitmentRef != q.Commitment.Reference || e.ReservationDigest != digestValue || e.NetworkProofRef == "" || e.ContractCodeHash == "" || !e.Finalized || e.FinalizedCheckpoint == 0 || !legalState {
+		return domain.NewError(domain.ErrSettlementFailed, "canonical TaskEscrow does not match the frozen verified Job/Quote", false)
+	}
+	return nil
 }
 
 func domainEscrowStatus(value atostosv1.EscrowState) domain.EscrowStatus {
@@ -889,7 +1051,11 @@ func domainMoney(value *atostosv1.NetworkAmount) domain.Money {
 	if value == nil {
 		return domain.Money{}
 	}
-	return domain.Money{Amount: atomicToAmount(value.AtomicAmount), Currency: value.Asset}
+	decimals := 2
+	if value.Asset == "TOS" {
+		decimals = 9
+	}
+	return domain.Money{Amount: atomicToAmount(value.AtomicAmount, decimals), Currency: value.Asset}
 }
 
 func textDigest(parts ...string) *atostosv1.Digest {

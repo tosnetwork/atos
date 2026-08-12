@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/tosnetwork/atos/internal/adapters/tosai"
+	tosaimock "github.com/tosnetwork/atos/internal/adapters/tosai/mock"
 	"github.com/tosnetwork/atos/internal/adapters/tosprotocol"
 	"github.com/tosnetwork/atos/internal/auth"
 	"github.com/tosnetwork/atos/internal/domain"
@@ -62,47 +63,83 @@ func (a *quoteAcceptanceAuthority) ResolveCommitment(_ context.Context, kind, id
 	return &atosrpc.NetworkReference{Network: a.Network(), Reference: reference, Finalized: true, FinalizedCheckpoint: 42}, nil
 }
 
-type quoteAcceptanceEconomy struct{}
+type quoteAcceptanceEconomy struct {
+	mu     sync.Mutex
+	result economic.Result
+	found  bool
+}
+
+func (e *quoteAcceptanceEconomy) ResolveEscrow(context.Context, economic.ReserveEscrowRequest) (economic.Result, bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.result, e.found, nil
+}
 
 type quoteAcceptanceQuoter struct{}
 
 func (quoteAcceptanceQuoter) QuoteExecution(_ context.Context, req tosai.QuoteExecutionRequest) (tosai.ServiceExecutionQuote, error) {
-	now := time.Now().UTC().Truncate(time.Millisecond)
+	now := time.Now().UTC().Truncate(time.Second)
 	return tosai.ServiceExecutionQuote{ID: "service-quote-phase4b1", Reference: "service:quote:phase4b1", ExpiresAt: now.Add(5 * time.Minute), ExecutionDeadline: req.ExecutionDeadline.UTC().Truncate(time.Millisecond)}, nil
 }
 
-func (quoteAcceptanceEconomy) Network() string { return "tos-test" }
-func (quoteAcceptanceEconomy) Supports(m economic.TrustMode) bool {
+func (*quoteAcceptanceEconomy) Network() string { return "tos-test" }
+func (*quoteAcceptanceEconomy) Supports(m economic.TrustMode) bool {
 	return m == economic.TrustModeVerified
 }
-func (quoteAcceptanceEconomy) CheckReady(context.Context) error { return nil }
-func (quoteAcceptanceEconomy) Close() error                     { return nil }
-func (quoteAcceptanceEconomy) ReserveEscrow(context.Context, economic.ReserveEscrowRequest) (economic.Result, error) {
+func (*quoteAcceptanceEconomy) CheckReady(context.Context) error { return nil }
+func (*quoteAcceptanceEconomy) Close() error                     { return nil }
+func (e *quoteAcceptanceEconomy) ReserveEscrow(_ context.Context, req economic.ReserveEscrowRequest) (economic.Result, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	state := chain.TaskEscrowState{Network: "tos-test", ContractAddress: "0:" + strings.Repeat("44", 32), Creator: req.Creator, Agent: req.Agent, HasAgent: true, BudgetNanoTOS: req.BudgetNanoTOS, BalanceNanoTOS: req.BudgetNanoTOS, DeadlineUnix: req.DeadlineUnix, Status: chain.TaskEscrowStatusOpen, PolicyHash: req.PolicyHash, PermissionHash: req.PermissionHash, CodeHash: "tvm-cell-sha256:" + strings.Repeat("cc", 32), ObservedMasterSeqno: 77, ObservedAt: time.Now().UTC()}
+	e.result = economic.Result{State: state, ContractReference: state.ContractAddress, TransitionReference: "tos:tx:reserve", ActionID: "task-action-reserve"}
+	e.found = true
+	return e.result, nil
+}
+func (*quoteAcceptanceEconomy) AcceptEscrow(context.Context, economic.AcceptEscrowRequest) (economic.Result, error) {
 	return economic.Result{}, nil
 }
-func (quoteAcceptanceEconomy) AcceptEscrow(context.Context, economic.AcceptEscrowRequest) (economic.Result, error) {
+func (*quoteAcceptanceEconomy) CommitResult(context.Context, economic.CommitResultRequest) (economic.Result, error) {
 	return economic.Result{}, nil
 }
-func (quoteAcceptanceEconomy) CommitResult(context.Context, economic.CommitResultRequest) (economic.Result, error) {
+func (e *quoteAcceptanceEconomy) ReleaseEscrow(_ context.Context, req economic.ReleaseEscrowRequest) (economic.Result, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.result.State.Status = chain.TaskEscrowStatusCancelled
+	e.result.State.BudgetNanoTOS = 0
+	e.result.State.BalanceNanoTOS = 0
+	e.result.State.ObservedMasterSeqno = 78
+	e.result.TransitionReference = "tos:tx:release"
+	e.result.ActionID = "task-action-release"
+	e.result.CreatorPaidNanoTOS = req.BudgetNanoTOS
+	return e.result, nil
+}
+func (*quoteAcceptanceEconomy) SettleProvider(context.Context, economic.SettleProviderRequest) (economic.Result, error) {
 	return economic.Result{}, nil
 }
-func (quoteAcceptanceEconomy) ReleaseEscrow(context.Context, economic.ReleaseEscrowRequest) (economic.Result, error) {
+func (*quoteAcceptanceEconomy) RefundPrincipal(context.Context, economic.RefundPrincipalRequest) (economic.Result, error) {
 	return economic.Result{}, nil
 }
-func (quoteAcceptanceEconomy) SettleProvider(context.Context, economic.SettleProviderRequest) (economic.Result, error) {
+func (*quoteAcceptanceEconomy) OpenDispute(context.Context, economic.OpenDisputeRequest) (economic.Result, error) {
 	return economic.Result{}, nil
 }
-func (quoteAcceptanceEconomy) RefundPrincipal(context.Context, economic.RefundPrincipalRequest) (economic.Result, error) {
+func (*quoteAcceptanceEconomy) ResolveDispute(context.Context, economic.ResolveDisputeRequest) (economic.Result, error) {
 	return economic.Result{}, nil
 }
-func (quoteAcceptanceEconomy) OpenDispute(context.Context, economic.OpenDisputeRequest) (economic.Result, error) {
-	return economic.Result{}, nil
+func (e *quoteAcceptanceEconomy) ReadEconomicState(context.Context, string) (chain.TaskEscrowState, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.result.State, nil
 }
-func (quoteAcceptanceEconomy) ResolveDispute(context.Context, economic.ResolveDisputeRequest) (economic.Result, error) {
-	return economic.Result{}, nil
+
+type failAfterRealEscrowProvider struct {
+	tosai.Provider
+	release <-chan struct{}
 }
-func (quoteAcceptanceEconomy) ReadEconomicState(context.Context, string) (chain.TaskEscrowState, error) {
-	return chain.TaskEscrowState{}, nil
+
+func (f failAfterRealEscrowProvider) SubmitJob(context.Context, tosai.SubmitJobRequest) (tosai.SubmitJobResult, error) {
+	<-f.release
+	return tosai.SubmitJobResult{State: domain.JobFailed}, nil
 }
 
 // TestVerifiedQuoteRealHTTPPostgresProtocol is the Phase 4B-1 composition
@@ -120,7 +157,8 @@ func TestVerifiedQuoteRealHTTPPostgresProtocol(t *testing.T) {
 	}
 	defer st.Close()
 	authority := &quoteAcceptanceAuthority{refs: make(map[string]string)}
-	protocolServer, err := atosrpc.Open(atosrpc.Config{StatePath: filepath.Join(t.TempDir(), "tos-protocol.db"), BearerToken: "phase4b1-secret", Authority: authority, EconomicDriver: quoteAcceptanceEconomy{}, TrustDomain: "atos.im"})
+	economy := new(quoteAcceptanceEconomy)
+	protocolServer, err := atosrpc.Open(atosrpc.Config{StatePath: filepath.Join(t.TempDir(), "tos-protocol.db"), BearerToken: "phase4b1-secret", Authority: authority, EconomicDriver: economy, TrustDomain: "atos.im"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +175,7 @@ func TestVerifiedQuoteRealHTTPPostgresProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	grant, err := authorization.StartDevice("test", "Phase 4B-1", []string{string(auth.ScopeQuotesRead)})
+	grant, err := authorization.StartDevice("test", "Phase 4B-2", []string{string(auth.ScopeQuotesRead), string(auth.ScopeJobsCreate), string(auth.ScopeJobsRead)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +202,7 @@ func TestVerifiedQuoteRealHTTPPostgresProtocol(t *testing.T) {
 	}
 
 	capabilities := service.NewCapabilityService(st).WithManifestAnchor(client)
-	cap, err := capabilities.Register(ctx, service.RegisterCapabilityInput{ProviderID: providerID, Name: "Verified Quote Real Acceptance", Description: "phase4b1", DeliveryMode: domain.DeliveryInstant, InputSchema: map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"}, Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}}, RequestedTrustModes: []domain.TrustMode{domain.TrustModeVerified}, IdempotencyKey: "register-" + providerID})
+	cap, err := capabilities.Register(ctx, service.RegisterCapabilityInput{ProviderID: providerID, Name: "Verified Quote Real Acceptance", Description: "phase4b1", DeliveryMode: domain.DeliveryInstant, InputSchema: map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"}, Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.000000000", Currency: "TOS"}}, RequestedTrustModes: []domain.TrustMode{domain.TrustModeVerified}, IdempotencyKey: "register-" + providerID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +221,10 @@ func TestVerifiedQuoteRealHTTPPostgresProtocol(t *testing.T) {
 		t.Fatal(err)
 	}
 	quotes := service.NewQuoteService(st, quoteAcceptanceQuoter{}).WithVerifiedCommitmentAuthority(client, signers, "atos.im")
-	api := httptest.NewServer((&Server{Auth: authorization, Capabilities: capabilities, Quotes: quotes}).Mux())
+	providerRelease := make(chan struct{})
+	defer close(providerRelease)
+	jobs := service.NewJobService(st, failAfterRealEscrowProvider{Provider: tosaimock.NewContractFixture(), release: providerRelease}, client, service.NewAccountService(st))
+	api := httptest.NewServer((&Server{Auth: authorization, Capabilities: capabilities, Quotes: quotes, Jobs: jobs}).Mux())
 	defer api.Close()
 	body, _ := json.Marshal(map[string]any{"capability_id": cap.ID, "requested_trust_mode": "verified"})
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, api.URL+"/v1/quotes", bytes.NewReader(body))
@@ -213,5 +254,33 @@ func TestVerifiedQuoteRealHTTPPostgresProtocol(t *testing.T) {
 	commitment, found, err := client.GetQuoteCommitment(ctx, stored)
 	if err != nil || !found || commitment.Digest != public.Commitment.Digest {
 		t.Fatalf("live canonical recheck found=%v commitment=%+v err=%v", found, commitment, err)
+	}
+	jobBody, _ := json.Marshal(map[string]any{"capability_id": cap.ID, "quote_id": public.ID, "input": map[string]any{"task": "reserve"}, "idempotency_key": "real-phase4b2-job-" + providerID})
+	jobReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, api.URL+"/v1/jobs", bytes.NewReader(jobBody))
+	jobReq.Header.Set("Authorization", "Bearer "+tokens.AccessToken)
+	jobReq.Header.Set("Content-Type", "application/json")
+	jobResp, err := http.DefaultClient.Do(jobReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jobResp.Body.Close()
+	if jobResp.StatusCode != http.StatusAccepted && jobResp.StatusCode != http.StatusOK {
+		failure, _ := io.ReadAll(jobResp.Body)
+		t.Fatalf("POST /v1/jobs status=%d body=%s", jobResp.StatusCode, failure)
+	}
+	var submitted submitResponse
+	if err = json.NewDecoder(jobResp.Body).Decode(&submitted); err != nil {
+		t.Fatal(err)
+	}
+	if submitted.Job.EscrowID == "" {
+		t.Fatalf("verified Job executed without reserved escrow: %+v", submitted.Job)
+	}
+	durableJob, err := st.GetJob(ctx, submitted.Job.ID)
+	if err != nil || durableJob.EconomicState != domain.EconomicEscrowReserved {
+		t.Fatalf("durable verified Job checkpoint=%+v err=%v", durableJob, err)
+	}
+	operation, err := st.GetEscrowOperation(ctx, submitted.Job.ID, domain.EscrowOperationReserve)
+	if err != nil || operation.Checkpoint != domain.EscrowOperationCompleted || !operation.Escrow.Finalized {
+		t.Fatalf("durable escrow operation=%+v err=%v", operation, err)
 	}
 }

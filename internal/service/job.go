@@ -187,9 +187,12 @@ func (s *JobService) submit(ctx context.Context, in SubmitInput, waitInline bool
 		return SubmitResult{}, domain.NewError(domain.ErrQuoteModeMismatch, "quote proof profile does not match trust mode", false)
 	}
 
-	needsConfirmation, err := s.accounts.RequiresConfirmation(ctx, in.PrincipalID, quote.Price.TotalMax, quote.Price.Currency)
-	if err != nil {
-		return SubmitResult{}, err
+	needsConfirmation := false
+	if quote.TrustMode != domain.TrustModeVerified {
+		needsConfirmation, err = s.accounts.RequiresConfirmation(ctx, in.PrincipalID, quote.Price.TotalMax, quote.Price.Currency)
+		if err != nil {
+			return SubmitResult{}, err
+		}
 	}
 	state := domain.JobSubmitted
 	proofStatus := domain.InitialProofStatus(quote.TrustMode)
@@ -227,6 +230,9 @@ func (s *JobService) submit(ctx context.Context, in SubmitInput, waitInline bool
 		job.Confirmation = newSpendConfirmation(job, quote, now)
 	}
 	if err := s.store.PutJob(ctx, job); err != nil {
+		if errors.Is(err, store.ErrConflict) && quote.TrustMode == domain.TrustModeVerified {
+			return SubmitResult{}, domain.NewError(domain.ErrIdempotencyConflict, "verified quote has already funded a Job", false)
+		}
 		return SubmitResult{}, err
 	}
 	if err := s.store.Finish(ctx, in.PrincipalID, in.IdempotencyKey, job.ID); err != nil {

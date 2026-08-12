@@ -24,7 +24,8 @@ import (
 const (
 	quoteTTL            = 10 * time.Minute
 	quoteDecimals       = 2
-	defaultFeeRate      = 0.05
+	verifiedTOSDecimals = 9
+	defaultFeePerMille  = int64(50)
 	defaultExecutionTTL = 15 * time.Minute
 	defaultMaxOutput    = 1 << 20
 )
@@ -372,7 +373,14 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 		return domain.Quote{}, domain.NewError(domain.ErrProofProfileUnavailable, err.Error(), false)
 	}
 
-	subtotal, err := money.Parse(cap.Pricing.PriceHint.Amount, cap.Pricing.PriceHint.Currency, quoteDecimals)
+	priceDecimals := quoteDecimals
+	if mode == domain.TrustModeVerified {
+		if cap.Pricing.PriceHint.Currency != "TOS" {
+			return domain.Quote{}, domain.NewError(domain.ErrCapabilityUnavailable, "verified capabilities must be priced directly in TOS", false)
+		}
+		priceDecimals = verifiedTOSDecimals
+	}
+	subtotal, err := money.Parse(cap.Pricing.PriceHint.Amount, cap.Pricing.PriceHint.Currency, priceDecimals)
 	if err != nil {
 		return domain.Quote{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability has an invalid price_hint", false)
 	}
@@ -384,7 +392,7 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 	if err := validatePricing(cap.Pricing); err != nil {
 		return domain.Quote{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability has invalid metered pricing: "+err.Error(), false)
 	}
-	fees, err := applyFeeRate(subtotal, defaultFeeRate)
+	fees, err := applyFeeRate(subtotal, defaultFeePerMille)
 	if err != nil {
 		return domain.Quote{}, err
 	}
@@ -394,7 +402,15 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 	}
 
 	requiresConfirmation := false
-	if s.accounts != nil && strings.TrimSpace(in.PrincipalID) != "" {
+	// Managed account limits are denominated in the gateway account's
+	// configured display currency (normally USD, with two decimals). They
+	// are neither a TOS wallet authorization nor an authority for a
+	// tos_verified_v1 reservation. Feeding a nine-decimal TOS maximum into
+	// that ledger both conflates assets and makes real Verified quotes fail
+	// before TaskEscrow can enforce the committed amount. Verified funding
+	// consent is therefore represented by acceptance of the immutable Quote
+	// and the canonical TOS reservation, never by Managed account policy.
+	if mode == domain.TrustModeManaged && s.accounts != nil && strings.TrimSpace(in.PrincipalID) != "" {
 		requiresConfirmation, err = s.accounts.RequiresConfirmation(ctx, in.PrincipalID, totalMax.String(), totalMax.Currency)
 		if err != nil {
 			return domain.Quote{}, err
@@ -409,7 +425,7 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 			return domain.Quote{}, domain.NewError(domain.ErrValidationFailed,
 				fmt.Sprintf("constraints.max_total is in %s but this capability prices in %s", in.MaxTotal.Currency, subtotal.Currency), false)
 		}
-		bound, err := money.Parse(in.MaxTotal.Amount, subtotal.Currency, quoteDecimals)
+		bound, err := money.Parse(in.MaxTotal.Amount, subtotal.Currency, priceDecimals)
 		if err != nil {
 			return domain.Quote{}, domain.NewError(domain.ErrValidationFailed, "invalid constraints.max_total.amount", false)
 		}
@@ -420,6 +436,12 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 
 	settlement, proof := quoteGuarantees(mode, subtotal.Currency)
 	now := time.Now().UTC().Truncate(time.Millisecond)
+	if mode == domain.TrustModeVerified {
+		// TaskEscrow stores deadlines as integer seconds. Freeze Verified
+		// Quote deadlines on that exact boundary before commitment so the
+		// economic contract never shortens signed millisecond terms.
+		now = now.Truncate(time.Second)
+	}
 	executionDeadline := now.Add(defaultExecutionTTL)
 	if cap.SLA.TimeoutMS > 0 {
 		executionDeadline = now.Add(time.Duration(cap.SLA.TimeoutMS) * time.Millisecond)
@@ -498,6 +520,14 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 			q.ExpiresAt = serviceQuote.ExpiresAt.UTC().Truncate(time.Millisecond)
 		}
 	}
+	if mode == domain.TrustModeVerified &&
+		(q.ExpiresAt.UnixMilli()%1000 != 0 || q.ExecutionDeadline.UnixMilli()%1000 != 0) {
+		return domain.Quote{}, domain.NewError(
+			domain.ErrValidationFailed,
+			"Verified Quote and execution deadlines must be exactly second-aligned",
+			false,
+		)
+	}
 	q.TermsHash = termsHash(
 		q.CapabilityID, q.CapabilityVersion, q.ProviderID, q.PrincipalID,
 		string(q.TrustMode), string(q.ProofProfile),
@@ -528,7 +558,7 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 		if s.core == nil || s.signers == nil || s.core.Network() == "" {
 			return domain.Quote{}, domain.NewError(domain.ErrNetworkUnavailable, "verified quote commitment authority is unavailable", true)
 		}
-		q.NetworkID, q.CommitmentDomain, q.AssetDecimals = s.core.Network(), s.commitmentDomain, quoteDecimals
+		q.NetworkID, q.CommitmentDomain, q.AssetDecimals = s.core.Network(), s.commitmentDomain, uint32(priceDecimals)
 		q.CommitmentVersion, q.CommitmentCanonicalization = quotecommitment.Version, quotecommitment.Canonicalization
 		requester, bound, revoked, _, err := s.core.ResolvePrincipalBindingStatus(ctx, q.PrincipalID)
 		if err != nil {
@@ -713,9 +743,12 @@ func (s *QuoteService) Get(ctx context.Context, id string) (domain.Quote, error)
 	return q, nil
 }
 
-func applyFeeRate(amount money.Amount, rate float64) (money.Amount, error) {
-	ratePerMille := big.NewInt(int64(rate * 1000))
-	scaled := new(big.Int).Mul(amount.Minor, ratePerMille)
+func applyFeeRate(amount money.Amount, ratePerMille int64) (money.Amount, error) {
+	if ratePerMille < 0 {
+		return money.Amount{}, domain.NewError(domain.ErrValidationFailed, "fee rate cannot be negative", false)
+	}
+	rate := big.NewInt(ratePerMille)
+	scaled := new(big.Int).Mul(amount.Minor, rate)
 	scaled.Div(scaled, big.NewInt(1000))
 	return money.Amount{Minor: scaled, Currency: amount.Currency, Decimals: amount.Decimals}, nil
 }

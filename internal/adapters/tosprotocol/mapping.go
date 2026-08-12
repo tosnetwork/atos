@@ -209,14 +209,18 @@ func money(value *atostosv1.Money) domain.Money {
 }
 
 func networkAmount(value domain.Money) (*atostosv1.NetworkAmount, error) {
-	minor, err := amountToAtomic(value.Amount)
+	decimals := 2
+	if value.Currency == "TOS" {
+		decimals = 9
+	}
+	minor, err := amountToAtomic(value.Amount, decimals)
 	if err != nil {
 		return nil, domain.NewError(domain.ErrValidationFailed, "invalid monetary amount: "+err.Error(), false)
 	}
 	return &atostosv1.NetworkAmount{Asset: value.Currency, AtomicAmount: minor}, nil
 }
 
-func amountToAtomic(value string) (string, error) {
+func amountToAtomic(value string, decimals int) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" || strings.HasPrefix(value, "-") {
 		return "", errors.New("amount is empty or negative")
@@ -230,15 +234,15 @@ func amountToAtomic(value string) (string, error) {
 	if whole == "" {
 		whole = "0"
 	}
-	if len(fraction) > 2 {
-		return "", errors.New("amount has more than two decimal places")
+	if len(fraction) > decimals {
+		return "", errors.New("amount has too many decimal places")
 	}
 	for _, r := range whole + fraction {
 		if r < '0' || r > '9' {
 			return "", errors.New("amount is not decimal")
 		}
 	}
-	fraction += strings.Repeat("0", 2-len(fraction))
+	fraction += strings.Repeat("0", decimals-len(fraction))
 	atomic := strings.TrimLeft(whole+fraction, "0")
 	if atomic == "" {
 		atomic = "0"
@@ -246,15 +250,15 @@ func amountToAtomic(value string) (string, error) {
 	return atomic, nil
 }
 
-func atomicToAmount(value string) string {
+func atomicToAmount(value string, decimals int) string {
 	value = strings.TrimLeft(strings.TrimSpace(value), "0")
 	if value == "" {
 		value = "0"
 	}
-	if len(value) <= 2 {
-		value = strings.Repeat("0", 3-len(value)) + value
+	if len(value) <= decimals {
+		value = strings.Repeat("0", decimals+1-len(value)) + value
 	}
-	return value[:len(value)-2] + "." + value[len(value)-2:]
+	return value[:len(value)-decimals] + "." + value[len(value)-decimals:]
 }
 
 func proofCheckpoint(value atostosv1.VerificationStatus) domain.ProofCheckpoint {

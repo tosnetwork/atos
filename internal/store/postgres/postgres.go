@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tosnetwork/atos/internal/domain"
@@ -432,16 +433,20 @@ func (s *Store) GetQuote(ctx context.Context, id string) (domain.Quote, error) {
 const escrowColumns = `id, quote_id, job_id, principal_id, provider_id, capability_id, reserved, status, created_at, expires_at, settled_at, payload`
 
 func (s *Store) PutEscrow(ctx context.Context, e domain.Escrow) error {
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		INSERT INTO escrows (
 			id, quote_id, job_id, principal_id, provider_id, capability_id, reserved,
 			status, created_at, expires_at, settled_at, payload
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		ON CONFLICT (id) DO UPDATE SET
 			job_id=$3, reserved=$7, status=$8, expires_at=$10, settled_at=$11, payload=$12
+		WHERE NOT (escrows.status IN ('settled','released') AND escrows.status <> EXCLUDED.status)
 	`, e.ID, e.QuoteID, e.JobID, e.PrincipalID, e.ProviderID, e.CapabilityID,
 		mustMarshal(e.Reserved), string(e.Status), e.CreatedAt, e.ExpiresAt,
 		e.SettledAt, mustMarshal(e))
+	if err == nil && tag.RowsAffected() == 0 {
+		return store.ErrConflict
+	}
 	return err
 }
 
@@ -481,6 +486,91 @@ func (s *Store) EscrowByJob(ctx context.Context, jobID string) (domain.Escrow, e
 		return domain.Escrow{}, store.ErrNotFound
 	}
 	return e, err
+}
+
+func (s *Store) OpenEscrowOperation(ctx context.Context, op domain.EscrowOperation) (domain.EscrowOperation, bool, error) {
+	tag, err := s.pool.Exec(ctx, `INSERT INTO escrow_operations (job_id,kind,operation_id,quote_id,principal_id,request_digest,checkpoint,payload,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING`, op.JobID, op.Kind, op.ID, op.QuoteID, op.PrincipalID, op.RequestDigest, op.Checkpoint, mustMarshal(op), op.CreatedAt, op.UpdatedAt)
+	if err != nil {
+		return op, false, err
+	}
+	if tag.RowsAffected() == 1 {
+		return op, true, nil
+	}
+	existing, err := s.GetEscrowOperation(ctx, op.JobID, op.Kind)
+	return existing, false, err
+}
+func (s *Store) GetEscrowOperation(ctx context.Context, jobID string, kind domain.EscrowOperationKind) (domain.EscrowOperation, error) {
+	var payload []byte
+	err := s.pool.QueryRow(ctx, `SELECT payload FROM escrow_operations WHERE job_id=$1 AND kind=$2`, jobID, kind).Scan(&payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.EscrowOperation{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.EscrowOperation{}, err
+	}
+	var op domain.EscrowOperation
+	err = json.Unmarshal(payload, &op)
+	return op, err
+}
+func (s *Store) UpdateEscrowOperation(ctx context.Context, jobID string, kind domain.EscrowOperationKind, fn func(domain.EscrowOperation) (domain.EscrowOperation, error)) (domain.EscrowOperation, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.EscrowOperation{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var payload []byte
+	err = tx.QueryRow(ctx, `SELECT payload FROM escrow_operations WHERE job_id=$1 AND kind=$2 FOR UPDATE`, jobID, kind).Scan(&payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.EscrowOperation{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.EscrowOperation{}, err
+	}
+	var current domain.EscrowOperation
+	if err = json.Unmarshal(payload, &current); err != nil {
+		return current, err
+	}
+	if current.Checkpoint.Terminal() {
+		return current, nil
+	}
+	next, err := fn(current)
+	if err != nil {
+		return current, err
+	}
+	if !current.Checkpoint.CanAdvance(next.Checkpoint, kind) {
+		return current, store.ErrConflict
+	}
+	_, err = tx.Exec(ctx, `UPDATE escrow_operations SET checkpoint=$3,payload=$4,updated_at=$5 WHERE job_id=$1 AND kind=$2 AND checkpoint <> 'completed'`, jobID, kind, next.Checkpoint, mustMarshal(next), next.UpdatedAt)
+	if err != nil {
+		return current, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return current, err
+	}
+	return next, nil
+}
+func (s *Store) StaleEscrowOperations(ctx context.Context, cutoff time.Time, limit int) ([]domain.EscrowOperation, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.pool.Query(ctx, `SELECT payload FROM escrow_operations WHERE checkpoint <> 'completed' AND updated_at <= $1 ORDER BY updated_at,job_id,kind LIMIT $2`, cutoff, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.EscrowOperation
+	for rows.Next() {
+		var payload []byte
+		if err = rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var op domain.EscrowOperation
+		if err = json.Unmarshal(payload, &op); err != nil {
+			return nil, err
+		}
+		out = append(out, op)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) PutReceipt(ctx context.Context, r domain.Receipt) error {
@@ -554,6 +644,10 @@ const jobColumns = `id, capability_id, quote_id, escrow_id, principal_id, state,
 
 func (s *Store) PutJob(ctx context.Context, j domain.Job) error {
 	_, err := s.pool.Exec(ctx, upsertJobSQL, jobWriteArgs(j)...)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.ConstraintName == "jobs_verified_quote_once_idx" {
+		return store.ErrConflict
+	}
 	return err
 }
 

@@ -226,7 +226,7 @@ func (r *Repository) createBatchWith(ctx context.Context, db repositoryDB, limit
 	if err != nil {
 		return Batch{}, err
 	}
-	ledgerEvidenceDigest, err := codec.Digest("tos.atos.financial.blnk-evidence.v1", ledgerEvidence)
+	ledgerEvidenceDigest, err := ledgerEvidenceDigest(ledgerEvidence)
 	if err != nil {
 		return Batch{}, err
 	}

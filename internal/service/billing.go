@@ -35,15 +35,22 @@ import (
 // compatibility with Jobs already in flight when this check shipped.
 func computeBillingSnapshot(quote domain.Quote, receipt domain.ExecutionReceipt) (domain.BillingSnapshot, error) {
 	currency := quote.Price.Currency
-	subtotal, err := money.Parse(quote.Price.Subtotal, currency, quoteDecimals)
+	decimals := quoteDecimals
+	if quote.TrustMode == domain.TrustModeVerified {
+		if quote.AssetDecimals != verifiedTOSDecimals || currency != "TOS" {
+			return domain.BillingSnapshot{}, domain.NewError(domain.ErrSettlementFailed, "verified Quote has invalid TOS decimal contract", false)
+		}
+		decimals = verifiedTOSDecimals
+	}
+	subtotal, err := money.Parse(quote.Price.Subtotal, currency, decimals)
 	if err != nil {
 		return domain.BillingSnapshot{}, domain.NewError(domain.ErrSettlementFailed, "quote has an invalid subtotal: "+err.Error(), false)
 	}
-	fees, err := money.Parse(quote.Price.Fees, currency, quoteDecimals)
+	fees, err := money.Parse(quote.Price.Fees, currency, decimals)
 	if err != nil {
 		return domain.BillingSnapshot{}, domain.NewError(domain.ErrSettlementFailed, "quote has an invalid fee: "+err.Error(), false)
 	}
-	totalMax, err := money.Parse(quote.Price.TotalMax, currency, quoteDecimals)
+	totalMax, err := money.Parse(quote.Price.TotalMax, currency, decimals)
 	if err != nil {
 		return domain.BillingSnapshot{}, domain.NewError(domain.ErrSettlementFailed, "quote has an invalid total_max: "+err.Error(), false)
 	}
@@ -52,7 +59,7 @@ func computeBillingSnapshot(quote domain.Quote, receipt domain.ExecutionReceipt)
 	switch quote.PricingModel {
 	case domain.PricingMetered, domain.PricingPerUnit:
 		if quote.MeteredRates != nil {
-			metered, err := meterUsage(*quote.MeteredRates, receipt.Usage, currency)
+			metered, err := meterUsage(*quote.MeteredRates, receipt.Usage, currency, decimals)
 			if err != nil {
 				return domain.BillingSnapshot{}, err
 			}
@@ -78,7 +85,7 @@ func computeBillingSnapshot(quote domain.Quote, receipt domain.ExecutionReceipt)
 			return domain.BillingSnapshot{}, err
 		}
 	case !providerGross.IsPositive():
-		gatewayFee = money.Zero(currency, quoteDecimals)
+		gatewayFee = money.Zero(currency, decimals)
 	}
 
 	grossCharge, err := providerGross.Add(gatewayFee)
@@ -196,7 +203,7 @@ func validateMeteredRateValues(rates *domain.MeteredRates, currency string) erro
 // meterUsage sums each configured per-dimension rate times its
 // corresponding verified usage count. A dimension with no configured rate
 // (empty string) does not contribute.
-func meterUsage(rates domain.MeteredRates, usage domain.Usage, currency string) (money.Amount, error) {
+func meterUsage(rates domain.MeteredRates, usage domain.Usage, currency string, settlementDecimals ...int) (money.Amount, error) {
 	total := money.Zero(currency, meteredRateDecimals)
 	dimensions := []struct {
 		rate  string
@@ -222,5 +229,9 @@ func meterUsage(rates domain.MeteredRates, usage domain.Usage, currency string) 
 		}
 		total = sum
 	}
-	return total.Rescale(quoteDecimals), nil
+	target := quoteDecimals
+	if len(settlementDecimals) > 0 {
+		target = settlementDecimals[0]
+	}
+	return total.Rescale(target), nil
 }

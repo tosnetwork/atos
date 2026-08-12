@@ -27,7 +27,7 @@ func verifiedQuoteHarness(t *testing.T) (*service.QuoteService, *service.Executi
 	if _, _, err := core.CreatePrincipalBinding(ctx, "gateway", "bind-provider", "provider", "provider-agent"); err != nil {
 		t.Fatal(err)
 	}
-	cap := domain.Capability{ID: "cap-verified", ProviderID: "provider", Name: "Verified", Description: "test", Version: "1.0.0", ManifestCommitment: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Status: domain.CapabilityActive, DeliveryMode: domain.DeliveryInstant, InputSchema: map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"}, Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.00", Currency: "USD"}}, ModeSupport: domain.ModeSupport{domain.TrustModeVerified: {Status: domain.ModeSupportActive, ProofProfile: domain.ProofProfileTOSVerifiedV1}}, SupportedTrustModes: []domain.TrustMode{domain.TrustModeVerified}}
+	cap := domain.Capability{ID: "cap-verified", ProviderID: "provider", Name: "Verified", Description: "test", Version: "1.0.0", ManifestCommitment: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Status: domain.CapabilityActive, DeliveryMode: domain.DeliveryInstant, InputSchema: map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"}, Pricing: domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.000000000", Currency: "TOS"}}, ModeSupport: domain.ModeSupport{domain.TrustModeVerified: {Status: domain.ModeSupportActive, ProofProfile: domain.ProofProfileTOSVerifiedV1}}, SupportedTrustModes: []domain.TrustMode{domain.TrustModeVerified}}
 	ref, err := core.CommitCapabilityManifest(ctx, cap)
 	if err != nil {
 		t.Fatal(err)
@@ -54,6 +54,9 @@ func TestVerifiedQuoteIsCommittedBeforeUsableAndAutoIsConcrete(t *testing.T) {
 	if q.TrustMode != domain.TrustModeVerified || q.Commitment == nil || !q.Commitment.Finalized || q.Commitment.State != "committed" {
 		t.Fatalf("quote not canonically committed: %+v", q)
 	}
+	if q.Price.Subtotal != "1.000000000" || q.Price.Fees != "0.050000000" || q.Price.TotalMax != "1.050000000" || q.AssetDecimals != 9 {
+		t.Fatalf("non-canonical nanoTOS quote arithmetic: %+v", q.Price)
+	}
 	stored, err := st.GetQuote(context.Background(), q.ID)
 	if err != nil || stored.Commitment.Reference != q.Commitment.Reference {
 		t.Fatalf("stored=%+v err=%v", stored, err)
@@ -69,6 +72,25 @@ func TestVerifiedQuoteIsCommittedBeforeUsableAndAutoIsConcrete(t *testing.T) {
 	})
 	if err != nil || op.Checkpoint != domain.QuoteCommitmentCompleted || op.FailureReason != "" {
 		t.Fatalf("terminal operation regressed: %+v err=%v", op, err)
+	}
+}
+
+func TestVerifiedQuoteDoesNotUseManagedAccountCurrencyPolicy(t *testing.T) {
+	quotes, _, _, _, cap := verifiedQuoteHarness(t)
+	// The default account is USD with two decimal places. A Verified Quote
+	// has a nine-decimal native TOS amount and must therefore never be fed
+	// through the Managed account confirmation ledger.
+	quotes.WithAccountService(service.NewAccountService(memory.New()))
+	q, err := quotes.Create(context.Background(), service.CreateQuoteInput{
+		PrincipalID: "requester", CapabilityID: cap.ID,
+		RequestedTrustMode: domain.RequestedTrustVerified,
+		IdempotencyKey:     "verified-native-funding-policy",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.Price.TotalMax != "1.050000000" || q.Price.Currency != "TOS" || q.RequiresConfirmation {
+		t.Fatalf("verified funding terms were interpreted as Managed account money: %+v", q)
 	}
 }
 

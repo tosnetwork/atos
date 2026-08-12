@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/tosnetwork/atos/internal/adapters/tosai"
@@ -26,7 +27,7 @@ func domainErrorIs(err error, code domain.ErrorCode) bool {
 }
 
 func (s *JobService) atomicDebitCheckpoint(ctx context.Context, job domain.Job, quote domain.Quote) (domain.Job, error) {
-	if s.financial != nil {
+	if s.financial != nil && quote.TrustMode != domain.TrustModeVerified {
 		policyPending, _, err := s.store.UpdateJobAndAccount(ctx, job.ID, job.PrincipalID, s.accounts.defaultAccount(job.PrincipalID), func(current domain.Job, exists bool, account domain.Account, _ bool) (domain.Job, domain.Account, error) {
 			if !exists {
 				return domain.Job{}, domain.Account{}, domain.NewError(domain.ErrNotFound, "job not found during policy reservation", false)
@@ -78,6 +79,23 @@ func (s *JobService) atomicDebitCheckpoint(ctx context.Context, job domain.Job, 
 			return current, nil
 		})
 		return updated, err
+	}
+	if quote.TrustMode == domain.TrustModeVerified {
+		return s.store.UpdateJob(ctx, job.ID, func(current domain.Job, exists bool) (domain.Job, error) {
+			if !exists {
+				return domain.Job{}, domain.NewError(domain.ErrNotFound, "job not found during verified escrow preparation", false)
+			}
+			if current.EconomicState != domain.EconomicNone {
+				return current, nil
+			}
+			if current.State != domain.JobSubmitted {
+				return domain.Job{}, store.ErrConflict
+			}
+			current.EconomicState = domain.EconomicDebited
+			current.ProofStatus.Quote = domain.ProofCommitted
+			current.UpdatedAt = time.Now().UTC()
+			return current, nil
+		})
 	}
 	updated, _, err := s.store.UpdateJobAndAccount(ctx, job.ID, job.PrincipalID, s.accounts.defaultAccount(job.PrincipalID), func(current domain.Job, exists bool, account domain.Account, _ bool) (domain.Job, domain.Account, error) {
 		if !exists {
@@ -185,11 +203,14 @@ func validateRecoveredEscrow(job domain.Job, quote domain.Quote, capability doma
 		escrow.ProofProfile != quote.ProofProfile || escrow.Reserved != expectedReserve {
 		return domain.NewError(domain.ErrSettlementFailed, "recovered escrow does not match the committed Job/Quote", false)
 	}
+	if quote.TrustMode == domain.TrustModeVerified && (quote.Commitment == nil || escrow.QuoteCommitmentDigest != quote.Commitment.Digest || escrow.QuoteCommitmentRef != quote.Commitment.Reference || escrow.ReservationDigest == "" || escrow.NetworkProofRef == "" || escrow.ContractCodeHash == "") {
+		return domain.NewError(domain.ErrSettlementFailed, "verified escrow authority fields do not match the committed Quote", false)
+	}
 	return nil
 }
 
 func (s *JobService) recoverOrCreateEscrowUnderLock(ctx context.Context, job domain.Job, quote domain.Quote, capability domain.Capability) (domain.Escrow, error) {
-	if s.financial != nil {
+	if s.financial != nil && quote.TrustMode != domain.TrustModeVerified {
 		amount, err := money.Parse(quote.Price.TotalMax, quote.Price.Currency, accountDecimals)
 		if err != nil {
 			return domain.Escrow{}, err
@@ -205,8 +226,66 @@ func (s *JobService) recoverOrCreateEscrowUnderLock(ctx context.Context, job dom
 			return domain.Escrow{}, err
 		}
 	}
+	if quote.TrustMode == domain.TrustModeVerified {
+		now := time.Now().UTC()
+		digest := termsHash("verified-task-escrow-operation-v1", job.ID, quote.ID, quote.TermsHash, quote.Commitment.Digest)
+		op, _, err := s.store.OpenEscrowOperation(ctx, domain.EscrowOperation{ID: "escrow-op:reserve:" + job.ID, Kind: domain.EscrowOperationReserve, JobID: job.ID, QuoteID: quote.ID, PrincipalID: job.PrincipalID, RequestDigest: digest, Checkpoint: domain.EscrowOperationIntentPersisted, CreatedAt: now, UpdatedAt: now})
+		if err != nil {
+			return domain.Escrow{}, err
+		}
+		if op.RequestDigest != digest || op.QuoteID != quote.ID || op.PrincipalID != job.PrincipalID {
+			return domain.Escrow{}, domain.NewError(domain.ErrIdempotencyConflict, "escrow operation semantics changed", false)
+		}
+		if op.Checkpoint == domain.EscrowOperationCompleted || op.Checkpoint == domain.EscrowOperationProjectionPersisted {
+			return op.Escrow, nil
+		}
+		_, err = s.store.UpdateEscrowOperation(ctx, job.ID, domain.EscrowOperationReserve, func(current domain.EscrowOperation) (domain.EscrowOperation, error) {
+			current.Checkpoint = domain.EscrowOperationReconciling
+			current.UpdatedAt = time.Now().UTC()
+			return current, nil
+		})
+		if err != nil {
+			return domain.Escrow{}, err
+		}
+		escrow, found, getErr := s.core.GetEscrow(ctx, toscore.GetEscrowRequest{Quote: quote, JobID: job.ID})
+		if getErr != nil {
+			return domain.Escrow{}, getErr
+		}
+		if !found {
+			escrow, getErr = s.core.CreateEscrow(ctx, toscore.CreateEscrowRequest{Quote: quote, QuoteID: quote.ID, JobID: job.ID, CapabilityID: capability.ID, CapabilityVersion: quote.CapabilityVersion, PrincipalID: job.PrincipalID, ProviderID: capability.ProviderID, TrustMode: quote.TrustMode, ProofProfile: quote.ProofProfile, Settlement: quote.Settlement, Reserved: domain.Money{Amount: quote.Price.TotalMax, Currency: quote.Price.Currency}})
+			if getErr != nil {
+				return domain.Escrow{}, getErr
+			}
+		}
+		if err = validateRecoveredEscrow(job, quote, capability, escrow); err != nil {
+			return domain.Escrow{}, err
+		}
+		if !escrow.Finalized || escrow.FinalizedCheckpoint == 0 || escrow.Status != domain.EscrowReserved {
+			return domain.Escrow{}, domain.NewError(domain.ErrSettlementFailed, "verified TaskEscrow is not finalized and reserved", true)
+		}
+		_, err = s.store.UpdateEscrowOperation(ctx, job.ID, domain.EscrowOperationReserve, func(current domain.EscrowOperation) (domain.EscrowOperation, error) {
+			current.Escrow = escrow
+			current.Checkpoint = domain.EscrowOperationAuthorityReserved
+			current.UpdatedAt = time.Now().UTC()
+			return current, nil
+		})
+		if err != nil {
+			return domain.Escrow{}, err
+		}
+		escrow.OperationCheckpoint = domain.EscrowOperationProjectionPersisted
+		if err = s.store.PutEscrow(ctx, escrow); err != nil {
+			return domain.Escrow{}, err
+		}
+		_, err = s.store.UpdateEscrowOperation(ctx, job.ID, domain.EscrowOperationReserve, func(current domain.EscrowOperation) (domain.EscrowOperation, error) {
+			current.Escrow = escrow
+			current.Checkpoint = domain.EscrowOperationProjectionPersisted
+			current.UpdatedAt = time.Now().UTC()
+			return current, nil
+		})
+		return escrow, err
+	}
 	if existing, err := s.store.EscrowByJob(ctx, job.ID); err == nil {
-		if err := validateRecoveredEscrow(job, quote, capability, existing); err != nil {
+		if err = validateRecoveredEscrow(job, quote, capability, existing); err != nil {
 			return domain.Escrow{}, err
 		}
 		return existing, nil
@@ -214,6 +293,7 @@ func (s *JobService) recoverOrCreateEscrowUnderLock(ctx context.Context, job dom
 		return domain.Escrow{}, err
 	}
 	return s.core.CreateEscrow(ctx, toscore.CreateEscrowRequest{
+		Quote:   quote,
 		QuoteID: quote.ID, JobID: job.ID,
 		// CapabilityVersion is the Quote's own frozen version, not the
 		// (possibly since-updated) live Capability's current one -- the
@@ -284,12 +364,22 @@ func (s *JobService) prepareExecutionUnderLock(ctx context.Context, jobID string
 		if quote.PrincipalID == "" {
 			quote.PrincipalID = job.PrincipalID
 		}
-		if _, err := s.core.CommitQuote(ctx, quote); err != nil {
-			if job.EconomicState == domain.EconomicPolicyPending {
-				pending := s.markEconomicReconciliationUnderLock(ctx, job.ID, domain.EconomicPolicyPending, domain.JobWorking, errCode(err), "quote commitment recovery failed after policy reservation: "+err.Error())
-				return pending, capability, err
+		var commitmentErr error
+		if quote.TrustMode == domain.TrustModeVerified {
+			commitment, found, liveErr := s.core.GetQuoteCommitment(ctx, quote)
+			commitmentErr = liveErr
+			if commitmentErr == nil && (!found || quote.Commitment == nil || commitment.Digest != quote.Commitment.Digest || commitment.Reference != quote.Commitment.Reference || !commitment.Finalized || commitment.FinalizedCheckpoint == 0) {
+				commitmentErr = domain.NewError(domain.ErrQuoteMismatch, "live canonical verified Quote commitment is missing or mismatched", false)
 			}
-			failed := s.finalizeNoEconomyUnderLock(ctx, job, domain.JobFailed, errCode(err), "quote commitment failed: "+err.Error())
+		} else {
+			_, commitmentErr = s.core.CommitQuote(ctx, quote)
+		}
+		if commitmentErr != nil {
+			if job.EconomicState == domain.EconomicPolicyPending {
+				pending := s.markEconomicReconciliationUnderLock(ctx, job.ID, domain.EconomicPolicyPending, domain.JobWorking, errCode(commitmentErr), "quote commitment recovery failed after policy reservation: "+commitmentErr.Error())
+				return pending, capability, commitmentErr
+			}
+			failed := s.finalizeNoEconomyUnderLock(ctx, job, domain.JobFailed, errCode(commitmentErr), "quote commitment failed: "+commitmentErr.Error())
 			return failed, capability, nil
 		}
 		job, err = s.atomicDebitCheckpoint(ctx, job, quote)
@@ -334,6 +424,30 @@ func (s *JobService) prepareExecutionUnderLock(ctx context.Context, jobID string
 			current.ErrorCode = ""
 			current.FailureReason = ""
 			current.UpdatedAt = time.Now().UTC()
+			return current, nil
+		})
+		if err != nil {
+			return job, capability, err
+		}
+	}
+	if job.EconomicState == domain.EconomicEscrowReserved && quote.TrustMode == domain.TrustModeVerified {
+		escrow, found, liveErr := s.core.GetEscrow(ctx, toscore.GetEscrowRequest{Quote: quote, JobID: job.ID, EscrowID: job.EscrowID})
+		if liveErr != nil || !found || escrow.Status != domain.EscrowReserved || !escrow.Finalized || escrow.FinalizedCheckpoint == 0 {
+			if liveErr == nil {
+				liveErr = domain.NewError(domain.ErrSettlementFailed, "canonical verified escrow is not executable", true)
+			}
+			return s.markEconomicReconciliationUnderLock(ctx, job.ID, job.EconomicState, domain.JobFailed, domain.ErrSettlementFailed, "live verified escrow gate failed"), capability, liveErr
+		}
+		// The operation becomes terminal only after both the public Job
+		// projection and a fresh canonical observation are durable. Keeping
+		// this outside the EconomicEscrowPending block also closes the crash
+		// window where the Job update commits but the operation update does
+		// not: a later replica repeats the live observation and finishes the
+		// exact same operation without another mutation.
+		_, err = s.store.UpdateEscrowOperation(ctx, job.ID, domain.EscrowOperationReserve, func(current domain.EscrowOperation) (domain.EscrowOperation, error) {
+			current.Checkpoint = domain.EscrowOperationCompleted
+			current.UpdatedAt = time.Now().UTC()
+			current.Escrow.OperationCheckpoint = domain.EscrowOperationCompleted
 			return current, nil
 		})
 		if err != nil {
@@ -426,6 +540,26 @@ func (s *JobService) refundDebitedWithoutEscrowUnderLock(ctx context.Context, jo
 			}
 			return finalizeTerminalJob(current, target, code, reason, domain.EconomicReleased), nextAccount, nil
 		})
+		return updated, updateErr
+	}
+	if quote.TrustMode == domain.TrustModeVerified {
+		updated, updateErr := s.store.UpdateJob(ctx, job.ID, func(current domain.Job, exists bool) (domain.Job, error) {
+			if !exists {
+				return domain.Job{}, store.ErrNotFound
+			}
+			if current.EconomicState == domain.EconomicReleased && current.State.Terminal() {
+				return current, nil
+			}
+			if current.EconomicState != domain.EconomicDebited {
+				return domain.Job{}, store.ErrConflict
+			}
+			current.ProofStatus.Escrow = domain.ProofReleased
+			current.ProofStatus.Settlement = domain.ProofReleased
+			return finalizeTerminalJob(current, target, code, reason, domain.EconomicReleased), nil
+		})
+		if updateErr != nil {
+			return updated, updateErr
+		}
 		return updated, updateErr
 	}
 	updated, _, err := s.store.UpdateJobAndAccount(ctx, job.ID, job.PrincipalID, s.accounts.defaultAccount(job.PrincipalID), func(current domain.Job, exists bool, account domain.Account, _ bool) (domain.Job, domain.Account, error) {
@@ -522,11 +656,65 @@ func (s *JobService) releaseForTerminalUnderLock(ctx context.Context, job domain
 			return job, err
 		}
 	}
-	receipt, releaseErr := s.core.ReleaseEscrow(ctx, job.EscrowID)
+	releaseReasonCode := string(code)
+	if releaseReasonCode == "" {
+		releaseReasonCode = "ATOS_" + strings.ToUpper(string(target))
+	}
+	if quote.TrustMode == domain.TrustModeVerified {
+		now := time.Now().UTC()
+		digest := termsHash("verified-task-escrow-release-operation-v1", job.ID, quote.ID, job.EscrowID, releaseReasonCode)
+		op, _, openErr := s.store.OpenEscrowOperation(ctx, domain.EscrowOperation{ID: "escrow-op:release:" + job.ID, Kind: domain.EscrowOperationRelease, JobID: job.ID, QuoteID: quote.ID, PrincipalID: job.PrincipalID, RequestDigest: digest, Checkpoint: domain.EscrowOperationIntentPersisted, CreatedAt: now, UpdatedAt: now})
+		if openErr != nil {
+			return job, openErr
+		}
+		if op.RequestDigest != digest {
+			return job, domain.NewError(domain.ErrIdempotencyConflict, "escrow release semantics changed", false)
+		}
+		_, openErr = s.store.UpdateEscrowOperation(ctx, job.ID, domain.EscrowOperationRelease, func(current domain.EscrowOperation) (domain.EscrowOperation, error) {
+			current.Checkpoint = domain.EscrowOperationReconciling
+			current.UpdatedAt = time.Now().UTC()
+			return current, nil
+		})
+		if openErr != nil {
+			return job, openErr
+		}
+	}
+	releaseResult, releaseErr := s.core.ReleaseEscrow(ctx, toscore.ReleaseEscrowRequest{Quote: quote, JobID: job.ID, EscrowID: job.EscrowID, ReasonCode: releaseReasonCode})
 	if releaseErr != nil {
 		return s.markEconomicReconciliationUnderLock(ctx, job.ID, domain.EconomicReleasePending, target, code, reason+"; escrow release requires replay: "+releaseErr.Error()), releaseErr
 	}
-	if s.financial != nil && nonZeroMoney(receipt.Refunded) {
+	receipt := releaseResult.Receipt
+	if quote.TrustMode == domain.TrustModeVerified {
+		escrow := releaseResult.Escrow
+		observeErr := error(nil)
+		if escrow.Status != domain.EscrowReleased || !escrow.Finalized || escrow.FinalizedCheckpoint == 0 || escrow.ReleaseRef == "" || escrow.ReleaseActionID == "" || escrow.ReleaseDigest == "" {
+			observeErr = domain.NewError(domain.ErrSettlementFailed, "canonical release is not finalized", true)
+			return s.markEconomicReconciliationUnderLock(ctx, job.ID, domain.EconomicReleasePending, target, code, reason+"; release observation pending"), observeErr
+		}
+		_, observeErr = s.store.UpdateEscrowOperation(ctx, job.ID, domain.EscrowOperationRelease, func(current domain.EscrowOperation) (domain.EscrowOperation, error) {
+			current.Escrow = escrow
+			current.Checkpoint = domain.EscrowOperationAuthorityReleased
+			current.UpdatedAt = time.Now().UTC()
+			return current, nil
+		})
+		if observeErr != nil {
+			return job, observeErr
+		}
+		escrow.OperationCheckpoint = domain.EscrowOperationProjectionPersisted
+		if observeErr = s.store.PutEscrow(ctx, escrow); observeErr != nil {
+			return job, observeErr
+		}
+		_, observeErr = s.store.UpdateEscrowOperation(ctx, job.ID, domain.EscrowOperationRelease, func(current domain.EscrowOperation) (domain.EscrowOperation, error) {
+			current.Escrow = escrow
+			current.Checkpoint = domain.EscrowOperationProjectionPersisted
+			current.UpdatedAt = time.Now().UTC()
+			return current, nil
+		})
+		if observeErr != nil {
+			return job, observeErr
+		}
+	}
+	if s.financial != nil && quote.TrustMode == domain.TrustModeManaged && nonZeroMoney(receipt.Refunded) {
 		amount, parseErr := money.Parse(receipt.Refunded.Amount, receipt.Refunded.Currency, accountDecimals)
 		if parseErr != nil {
 			return job, parseErr
@@ -542,7 +730,7 @@ func (s *JobService) releaseForTerminalUnderLock(ctx context.Context, job domain
 			return s.markEconomicReconciliationUnderLock(ctx, job.ID, domain.EconomicReleasePending, target, code, reason+"; Blnk escrow release requires recovery"), financialErr
 		}
 	}
-	if s.financial != nil {
+	if s.financial != nil && quote.TrustMode == domain.TrustModeManaged {
 		updated, _, updateErr := s.store.UpdateJobAndAccount(ctx, job.ID, job.PrincipalID, s.accounts.defaultAccount(job.PrincipalID), func(current domain.Job, exists bool, account domain.Account, _ bool) (domain.Job, domain.Account, error) {
 			if !exists {
 				return domain.Job{}, domain.Account{}, store.ErrNotFound
@@ -564,6 +752,32 @@ func (s *JobService) releaseForTerminalUnderLock(ctx context.Context, job domain
 			current.ProofStatus.Escrow = domain.ProofReleased
 			current.ProofStatus.Settlement = domain.ProofReleased
 			return finalizeTerminalJob(current, target, code, reason, domain.EconomicReleased), nextAccount, nil
+		})
+		return updated, updateErr
+	}
+	if quote.TrustMode == domain.TrustModeVerified {
+		updated, updateErr := s.store.UpdateJob(ctx, job.ID, func(current domain.Job, exists bool) (domain.Job, error) {
+			if !exists {
+				return domain.Job{}, store.ErrNotFound
+			}
+			if current.EconomicState == domain.EconomicReleased && current.State.Terminal() {
+				return current, nil
+			}
+			if current.EconomicState != domain.EconomicReleasePending {
+				return domain.Job{}, store.ErrConflict
+			}
+			current.ProofStatus.Escrow = domain.ProofReleased
+			current.ProofStatus.Settlement = domain.ProofReleased
+			return finalizeTerminalJob(current, target, code, reason, domain.EconomicReleased), nil
+		})
+		if updateErr != nil {
+			return updated, updateErr
+		}
+		_, updateErr = s.store.UpdateEscrowOperation(ctx, job.ID, domain.EscrowOperationRelease, func(current domain.EscrowOperation) (domain.EscrowOperation, error) {
+			current.Checkpoint = domain.EscrowOperationCompleted
+			current.UpdatedAt = time.Now().UTC()
+			current.Escrow.OperationCheckpoint = domain.EscrowOperationCompleted
+			return current, nil
 		})
 		return updated, updateErr
 	}
@@ -957,6 +1171,61 @@ func (s *JobService) ReconcileStaleJobs(ctx context.Context, updatedBefore time.
 	return len(jobs), joined
 }
 
+// ReconcileStaleEscrowOperations closes operation/projection crash windows
+// that are deliberately invisible to JobsForRecovery. In particular, a Job
+// may already be terminal after a finalized release while its release
+// operation is still projection_persisted. ReconcileJob correctly treats the
+// Job as terminal, so the operation requires its own durable sweep.
+func (s *JobService) ReconcileStaleEscrowOperations(ctx context.Context, updatedBefore time.Time, limit int) (int, error) {
+	operations, err := s.store.StaleEscrowOperations(ctx, updatedBefore, limit)
+	if err != nil {
+		return 0, err
+	}
+	var joined error
+	for _, operation := range operations {
+		job, getErr := s.store.GetJob(ctx, operation.JobID)
+		if getErr != nil {
+			s.touchEscrowOperationFailure(ctx, operation, getErr)
+			joined = errors.Join(joined, fmt.Errorf("load escrow operation job %s: %w", operation.JobID, getErr))
+			continue
+		}
+		if operation.Kind == domain.EscrowOperationRelease && job.State.Terminal() && job.EconomicState == domain.EconomicReleased {
+			escrow, projectionErr := s.store.EscrowByJob(ctx, job.ID)
+			if projectionErr == nil && (escrow.Status != domain.EscrowReleased || !escrow.Finalized || escrow.FinalizedCheckpoint == 0 || escrow.ReleaseRef == "" || escrow.ReleaseActionID == "" || escrow.ReleaseDigest == "") {
+				projectionErr = domain.NewError(domain.ErrSettlementFailed, "terminal release projection is incomplete", false)
+			}
+			if projectionErr == nil {
+				_, projectionErr = s.store.UpdateEscrowOperation(ctx, job.ID, operation.Kind, func(current domain.EscrowOperation) (domain.EscrowOperation, error) {
+					current.Escrow = escrow
+					current.Escrow.OperationCheckpoint = domain.EscrowOperationCompleted
+					current.Checkpoint = domain.EscrowOperationCompleted
+					current.UpdatedAt = time.Now().UTC()
+					return current, nil
+				})
+			}
+			if projectionErr != nil {
+				s.touchEscrowOperationFailure(ctx, operation, projectionErr)
+				joined = errors.Join(joined, fmt.Errorf("finish release operation %s: %w", operation.ID, projectionErr))
+			}
+			continue
+		}
+		if _, reconcileErr := s.ReconcileJob(ctx, operation.JobID); reconcileErr != nil {
+			s.touchEscrowOperationFailure(ctx, operation, reconcileErr)
+			joined = errors.Join(joined, fmt.Errorf("reconcile escrow operation %s: %w", operation.ID, reconcileErr))
+		}
+	}
+	return len(operations), joined
+}
+
+func (s *JobService) touchEscrowOperationFailure(ctx context.Context, operation domain.EscrowOperation, cause error) {
+	_, _ = s.store.UpdateEscrowOperation(ctx, operation.JobID, operation.Kind, func(current domain.EscrowOperation) (domain.EscrowOperation, error) {
+		current.LastErrorCode = errCode(cause)
+		current.LastError = cause.Error()
+		current.UpdatedAt = time.Now().UTC()
+		return current, nil
+	})
+}
+
 func (s *JobService) RunReconciler(ctx context.Context, interval, staleAfter time.Duration, limit int, report func(error)) {
 	if interval <= 0 {
 		interval = defaultReconcileInterval
@@ -968,8 +1237,10 @@ func (s *JobService) RunReconciler(ctx context.Context, interval, staleAfter tim
 		limit = defaultReconcileBatch
 	}
 	sweep := func() {
-		_, err := s.ReconcileStaleJobs(ctx, time.Now().UTC().Add(-staleAfter), limit)
-		if err != nil && report != nil {
+		cutoff := time.Now().UTC().Add(-staleAfter)
+		_, jobsErr := s.ReconcileStaleJobs(ctx, cutoff, limit)
+		_, operationsErr := s.ReconcileStaleEscrowOperations(ctx, cutoff, limit)
+		if err := errors.Join(jobsErr, operationsErr); err != nil && report != nil {
 			report(err)
 		}
 	}

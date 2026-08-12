@@ -10,6 +10,7 @@ import (
 )
 
 type CreateEscrowRequest struct {
+	Quote             domain.Quote
 	QuoteID           string
 	JobID             string
 	CapabilityID      string
@@ -20,6 +21,25 @@ type CreateEscrowRequest struct {
 	ProofProfile      domain.ProofProfile
 	Settlement        domain.SettlementDescriptor
 	Reserved          domain.Money
+}
+
+type GetEscrowRequest struct {
+	Quote                     domain.Quote
+	JobID                     string
+	EscrowID                  string
+	ExpectedReservationDigest string
+	ExpectedEscrowRef         string
+}
+
+type ReleaseEscrowRequest struct {
+	Quote      domain.Quote
+	JobID      string
+	EscrowID   string
+	ReasonCode string
+}
+type ReleaseEscrowResult struct {
+	Escrow  domain.Escrow
+	Receipt domain.Receipt
 }
 
 type VerifyExecutionReceiptResult struct {
@@ -161,7 +181,8 @@ type Core interface {
 
 	// Escrow, receipt and settlement.
 	CreateEscrow(ctx context.Context, req CreateEscrowRequest) (domain.Escrow, error)
-	ReleaseEscrow(ctx context.Context, escrowID string) (domain.Receipt, error)
+	GetEscrow(ctx context.Context, req GetEscrowRequest) (domain.Escrow, bool, error)
+	ReleaseEscrow(ctx context.Context, req ReleaseEscrowRequest) (ReleaseEscrowResult, error)
 	CommitExecutionReceipt(ctx context.Context, receipt domain.ExecutionReceipt) (proofRef string, err error)
 	VerifyExecutionReceipt(ctx context.Context, escrowID string, receipt domain.ExecutionReceipt) (VerifyExecutionReceiptResult, error)
 	SettleJob(ctx context.Context, req SettleJobRequest) (SettleJobResult, error)

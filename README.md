@@ -106,7 +106,7 @@ internal/store/                memory and PostgreSQL implementations
 
 ## Run locally
 
-The module uses Go 1.25.
+The module uses Go 1.26.5.
 
 ```bash
 go run ./cmd/api
