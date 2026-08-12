@@ -107,7 +107,7 @@ func testEvidence(t *testing.T) (EvidenceBundle, AnchorReceipt, VerifyOptions) {
 		ledgerRows[index].ChainHash = chainHead
 	}
 	ledgerEvidence := LedgerChainEvidence{State: LedgerChainState{ChainKey: "global", FirstSequence: 1, LastSequence: 2, PreviousHash: strings.Repeat("0", 64), HeadHash: chainHead, GenesisHash: strings.Repeat("0", 64)}, Transactions: ledgerRows}
-	ledgerDigest, err := codec.Digest("tos.atos.financial.blnk-evidence.v1", ledgerEvidence)
+	ledgerDigest, err := ledgerEvidenceDigest(ledgerEvidence)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,9 +121,9 @@ func testEvidence(t *testing.T) (EvidenceBundle, AnchorReceipt, VerifyOptions) {
 	// (stable, deterministic) output -- a transcription error at commit
 	// time, not a later regression. Recomputed directly from the current
 	// code, confirmed deterministic across repeated runs.
-	if batch.Manifest.BatchID != "fbat_dd03ce32eebbf87138ef20d526eb15887de8f8b14369b2b5bc16469ff86ee159" ||
-		batch.ManifestDigest != "sha256:0b174f2f8a96568cba4d3787e5c87ed3c0203f39ae2800fd31d23ea059796471" ||
-		base64.StdEncoding.EncodeToString(batch.ManifestCBOR) != "r2d2ZXJzaW9ud2F0b3NfZmluYW5jaWFsX2JhdGNoX3YyaGJhdGNoX2lkeEVmYmF0X2RkMDNjZTMyZWViYmY4NzEzOGVmMjBkNTI2ZWIxNTg4N2RlOGY4YjE0MzY5YjJiNWJjMTY0NjlmZjg2ZWUxNTlqZ2F0ZXdheV9pZG9nYXRld2F5LmV4YW1wbGVqbmV0d29ya19pZG50b3MtbG9jYWxuZXQtMWttZXJrbGVfcm9vdHhHc2hhMjU2OjJjMjljY2QxZDM4Y2VmZjliNDFhMmIyODAzMTUzYzIwNTE1MDczNzkzODM1Njk3MWQ5MDQ3MTJkMjVmZGJkZWFtbGFzdF9zZXF1ZW5jZQJuYmF0Y2hfc2VxdWVuY2UBbmZpcnN0X3NlcXVlbmNlAXBjYW5vbmljYWxpemF0aW9ueB9yZmM4OTQ5X2NvcmVfZGV0ZXJtaW5pc3RpY19jYm9ycGNvbW1pdG1lbnRfY291bnQCcXByZXZpb3VzX2JhdGNoX2lkYHJjb21taXRtZW50X2RpZ2VzdHOCeEdzaGEyNTY6NmVhMWMwZmMwMzg4YzdjZjM1Y2MzNjc0MDlmMjUyY2I0NDc3M2E1ZDc4ODNhNjJiZmM1ZDdkYzhjOWI5MGVjOHhHc2hhMjU2Ojc5ZjNjZGVkNTY5OGM5N2VjMjY4YThiOGU5NmFiMzNmODYwOWZhNmI0ZWM0Nzc1YjlhM2RmZWFlNzM2NWM1MjZzY3JlYXRlZF91bml4X21pbGxpcxsAAAGf7voqAHRwcmV2aW91c19tZXJrbGVfcm9vdHhHc2hhMjU2OjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDB2bGVkZ2VyX2V2aWRlbmNlX2RpZ2VzdHhHc2hhMjU2OjU1MGNjYTE3MjJmZDdlOTcwMmVmMzJjNzE0MDIxYzA3MDBmZDkyMDZkYmIxMmUxMjQwM2UwYjA3ZDM0ZWUwZmQ=" {
+	if batch.Manifest.BatchID != "fbat_8321559c5d70c00e6311cb36dc7ed0055b4d6e86efb183a9d2db58084f8c4d56" ||
+		batch.ManifestDigest != "sha256:0571729eee4bf4dc7987f3ad307e7aecc9d8569fb34145c48503094f4d24671c" ||
+		base64.StdEncoding.EncodeToString(batch.ManifestCBOR) != "r2d2ZXJzaW9ud2F0b3NfZmluYW5jaWFsX2JhdGNoX3YyaGJhdGNoX2lkeEVmYmF0XzgzMjE1NTljNWQ3MGMwMGU2MzExY2IzNmRjN2VkMDA1NWI0ZDZlODZlZmIxODNhOWQyZGI1ODA4NGY4YzRkNTZqZ2F0ZXdheV9pZG9nYXRld2F5LmV4YW1wbGVqbmV0d29ya19pZG50b3MtbG9jYWxuZXQtMWttZXJrbGVfcm9vdHhHc2hhMjU2OjJjMjljY2QxZDM4Y2VmZjliNDFhMmIyODAzMTUzYzIwNTE1MDczNzkzODM1Njk3MWQ5MDQ3MTJkMjVmZGJkZWFtbGFzdF9zZXF1ZW5jZQJuYmF0Y2hfc2VxdWVuY2UBbmZpcnN0X3NlcXVlbmNlAXBjYW5vbmljYWxpemF0aW9ueB9yZmM4OTQ5X2NvcmVfZGV0ZXJtaW5pc3RpY19jYm9ycGNvbW1pdG1lbnRfY291bnQCcXByZXZpb3VzX2JhdGNoX2lkYHJjb21taXRtZW50X2RpZ2VzdHOCeEdzaGEyNTY6NmVhMWMwZmMwMzg4YzdjZjM1Y2MzNjc0MDlmMjUyY2I0NDc3M2E1ZDc4ODNhNjJiZmM1ZDdkYzhjOWI5MGVjOHhHc2hhMjU2Ojc5ZjNjZGVkNTY5OGM5N2VjMjY4YThiOGU5NmFiMzNmODYwOWZhNmI0ZWM0Nzc1YjlhM2RmZWFlNzM2NWM1MjZzY3JlYXRlZF91bml4X21pbGxpcxsAAAGf7voqAHRwcmV2aW91c19tZXJrbGVfcm9vdHhHc2hhMjU2OjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDB2bGVkZ2VyX2V2aWRlbmNlX2RpZ2VzdHhHc2hhMjU2OjAyZDRlZTIzODU3MTZkMWI5N2E1ZTUxMmY5YWE2MjcxMTRmZjFjMTcxYzU1YmJhMGRkZGZjNWUxOWE3YTdjNGE=" {
 		t.Fatalf("financial batch V2 deterministic test vector changed: batch=%s digest=%s cbor=%s ledger=%s", batch.Manifest.BatchID, batch.ManifestDigest, base64.StdEncoding.EncodeToString(batch.ManifestCBOR), ledgerDigest)
 	}
 	public, private, err := ed25519.GenerateKey(rand.Reader)

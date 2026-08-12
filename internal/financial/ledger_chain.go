@@ -65,6 +65,44 @@ type LedgerChainEvidence struct {
 	Transactions []LedgerChainRow `json:"transactions"`
 }
 
+// ledgerEvidenceDigest hashes an explicit wire model. time.Time carries a
+// location and codec encodings can therefore distinguish equal instants that
+// were parsed in UTC, Asia/Tokyo, or America/New_York. The financial
+// commitment binds instants, not presentation time zones, so timestamps are
+// frozen as Unix nanoseconds before canonical CBOR encoding.
+func ledgerEvidenceDigest(evidence LedgerChainEvidence) (string, error) {
+	type transactionWire struct {
+		TransactionID, Source, Destination               string
+		SourceIndicator, DestinationIndicator, Reference string
+		PreciseAmount, Currency, Description, Status     string
+		CreatedUnixNanos                                 int64
+	}
+	type rowWire struct {
+		Transaction       transactionWire
+		Amount            string
+		ChainVersion      int
+		ChainSequence     int64
+		ChainPreviousHash string
+		ChainHash         string
+	}
+	wire := struct {
+		State        LedgerChainState
+		Transactions []rowWire
+	}{State: evidence.State, Transactions: make([]rowWire, len(evidence.Transactions))}
+	for i, row := range evidence.Transactions {
+		tx := row.Transaction
+		wire.Transactions[i] = rowWire{
+			Transaction: transactionWire{TransactionID: tx.TransactionID, Source: tx.Source, Destination: tx.Destination,
+				SourceIndicator: tx.SourceIndicator, DestinationIndicator: tx.DestinationIndicator, Reference: tx.Reference,
+				PreciseAmount: tx.PreciseAmount.String(), Currency: tx.Currency, Description: tx.Description, Status: tx.Status,
+				CreatedUnixNanos: tx.CreatedAt.UnixNano()},
+			Amount: row.Amount, ChainVersion: row.ChainVersion, ChainSequence: row.ChainSequence,
+			ChainPreviousHash: row.ChainPreviousHash, ChainHash: row.ChainHash,
+		}
+	}
+	return codec.Digest("tos.atos.financial.blnk-evidence.v1", wire)
+}
+
 func (c *BlnkClient) ChainEvidence(ctx context.Context) (LedgerChainEvidence, error) {
 	var evidence LedgerChainEvidence
 	if _, err := c.request(ctx, http.MethodGet, "/transactions/chain/state", nil, &evidence.State); err != nil {

@@ -67,7 +67,7 @@ func VerifyEvidence(ctx context.Context, bundle EvidenceBundle, anchorReceipt An
 	if err != nil || manifestDigest != bundle.Signature.ManifestDigest {
 		return errors.New("financial verifier: manifest digest mismatch")
 	}
-	ledgerEvidenceDigest, err := codec.Digest("tos.atos.financial.blnk-evidence.v1", bundle.LedgerEvidence)
+	ledgerEvidenceDigest, err := ledgerEvidenceDigest(bundle.LedgerEvidence)
 	if err != nil || ledgerEvidenceDigest != manifest.LedgerEvidenceDigest {
 		return errors.New("financial verifier: Blnk ledger evidence digest mismatch")
 	}

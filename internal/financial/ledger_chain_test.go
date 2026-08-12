@@ -7,6 +7,28 @@ import (
 	"time"
 )
 
+func TestLedgerEvidenceDigestIsTimezoneIndependent(t *testing.T) {
+	instant := time.Date(2026, 8, 12, 1, 2, 3, 456789000, time.UTC)
+	base := LedgerChainEvidence{State: LedgerChainState{ChainKey: "global", FirstSequence: 1, LastSequence: 1, PreviousHash: strings.Repeat("0", 64), GenesisHash: strings.Repeat("0", 64), HeadHash: strings.Repeat("1", 64)}, Transactions: []LedgerChainRow{{Transaction: LedgerTransaction{TransactionID: "tx-1", Source: "a", Destination: "b", PreciseAmount: "1.000000000", Currency: "TOS", Status: "applied", CreatedAt: instant}, Amount: "1.000000000", ChainVersion: 3, ChainSequence: 1, ChainPreviousHash: strings.Repeat("0", 64), ChainHash: strings.Repeat("1", 64)}}}
+	want, err := ledgerEvidenceDigest(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Asia/Tokyo", "America/New_York"} {
+		location, err := time.LoadLocation(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidate := base
+		candidate.Transactions = append([]LedgerChainRow(nil), base.Transactions...)
+		candidate.Transactions[0].Transaction.CreatedAt = instant.In(location)
+		got, err := ledgerEvidenceDigest(candidate)
+		if err != nil || got != want {
+			t.Fatalf("timezone %s changed digest: got=%s want=%s err=%v", name, got, want, err)
+		}
+	}
+}
+
 func TestLedgerChainRejectsBalancedUnexpectedTransactions(t *testing.T) {
 	created := time.Unix(1786406400, 123).UTC()
 	expectedTransaction := LedgerTransaction{TransactionID: "txn_expected", Source: "balance_a", Destination: "balance_b",
