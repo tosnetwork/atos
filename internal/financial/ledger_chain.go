@@ -65,34 +65,52 @@ type LedgerChainEvidence struct {
 	Transactions []LedgerChainRow `json:"transactions"`
 }
 
+const ledgerEvidenceWireVersion = "atos_ledger_evidence_v1"
+
+type ledgerEvidenceTransactionV1 struct {
+	TransactionID        string `json:"transaction_id"`
+	Source               string `json:"source"`
+	Destination          string `json:"destination"`
+	SourceIndicator      string `json:"source_indicator"`
+	DestinationIndicator string `json:"destination_indicator"`
+	Reference            string `json:"reference"`
+	PreciseAmount        string `json:"precise_amount"`
+	Currency             string `json:"currency"`
+	Description          string `json:"description"`
+	Status               string `json:"status"`
+	CreatedUnixNanos     int64  `json:"created_unix_nanos"`
+}
+
+type ledgerEvidenceRowV1 struct {
+	Transaction       ledgerEvidenceTransactionV1 `json:"transaction"`
+	Amount            string                      `json:"ledger_amount"`
+	ChainVersion      int                         `json:"chain_version"`
+	ChainSequence     int64                       `json:"chain_sequence"`
+	ChainPreviousHash string                      `json:"chain_previous_hash"`
+	ChainHash         string                      `json:"chain_hash"`
+}
+
+type ledgerEvidenceV1 struct {
+	Version      string                `json:"version"`
+	State        LedgerChainState      `json:"state"`
+	Transactions []ledgerEvidenceRowV1 `json:"transactions"`
+}
+
 // ledgerEvidenceDigest hashes an explicit wire model. time.Time carries a
 // location and codec encodings can therefore distinguish equal instants that
 // were parsed in UTC, Asia/Tokyo, or America/New_York. The financial
 // commitment binds instants, not presentation time zones, so timestamps are
 // frozen as Unix nanoseconds before canonical CBOR encoding.
 func ledgerEvidenceDigest(evidence LedgerChainEvidence) (string, error) {
-	type transactionWire struct {
-		TransactionID, Source, Destination               string
-		SourceIndicator, DestinationIndicator, Reference string
-		PreciseAmount, Currency, Description, Status     string
-		CreatedUnixNanos                                 int64
-	}
-	type rowWire struct {
-		Transaction       transactionWire
-		Amount            string
-		ChainVersion      int
-		ChainSequence     int64
-		ChainPreviousHash string
-		ChainHash         string
-	}
-	wire := struct {
-		State        LedgerChainState
-		Transactions []rowWire
-	}{State: evidence.State, Transactions: make([]rowWire, len(evidence.Transactions))}
+	return codec.Digest("tos.atos.financial.blnk-evidence.v1", ledgerEvidenceWire(evidence))
+}
+
+func ledgerEvidenceWire(evidence LedgerChainEvidence) ledgerEvidenceV1 {
+	wire := ledgerEvidenceV1{Version: ledgerEvidenceWireVersion, State: evidence.State, Transactions: make([]ledgerEvidenceRowV1, len(evidence.Transactions))}
 	for i, row := range evidence.Transactions {
 		tx := row.Transaction
-		wire.Transactions[i] = rowWire{
-			Transaction: transactionWire{TransactionID: tx.TransactionID, Source: tx.Source, Destination: tx.Destination,
+		wire.Transactions[i] = ledgerEvidenceRowV1{
+			Transaction: ledgerEvidenceTransactionV1{TransactionID: tx.TransactionID, Source: tx.Source, Destination: tx.Destination,
 				SourceIndicator: tx.SourceIndicator, DestinationIndicator: tx.DestinationIndicator, Reference: tx.Reference,
 				PreciseAmount: tx.PreciseAmount.String(), Currency: tx.Currency, Description: tx.Description, Status: tx.Status,
 				CreatedUnixNanos: tx.CreatedAt.UnixNano()},
@@ -100,7 +118,11 @@ func ledgerEvidenceDigest(evidence LedgerChainEvidence) (string, error) {
 			ChainPreviousHash: row.ChainPreviousHash, ChainHash: row.ChainHash,
 		}
 	}
-	return codec.Digest("tos.atos.financial.blnk-evidence.v1", wire)
+	return wire
+}
+
+func ledgerEvidenceCanonicalBytes(evidence LedgerChainEvidence) ([]byte, error) {
+	return codec.Marshal(ledgerEvidenceWire(evidence))
 }
 
 func (c *BlnkClient) ChainEvidence(ctx context.Context) (LedgerChainEvidence, error) {
