@@ -768,7 +768,7 @@ func (c *Client) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (t
 	if err != nil {
 		return toscore.SettleJobResult{}, err
 	}
-	if local.Status == domain.EscrowSettled {
+	if local.Status == domain.EscrowSettled && local.TrustMode == domain.TrustModeManaged {
 		if receipt, replayErr := c.store.ReceiptByJob(ctx, req.JobID); replayErr == nil && receipt.EscrowID == local.ID && receipt.Status == domain.ReceiptSettled {
 			return toscore.SettleJobResult{Receipt: receipt}, nil
 		}
@@ -784,6 +784,20 @@ func (c *Client) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (t
 		EscrowId: req.EscrowID, QuoteId: local.QuoteID,
 		JobId: req.JobID, ReceiptId: req.ReceiptID, RequestedCharge: charge,
 	})
+	if local.TrustMode == domain.TrustModeVerified {
+		terms, digestValue, termsErr := verifiedEscrowTerms(req.Quote, req.JobID)
+		if termsErr != nil {
+			return toscore.SettleJobResult{}, termsErr
+		}
+		if err := validateCanonicalEscrow(req.Quote, req.JobID, digestValue, local); err != nil {
+			return toscore.SettleJobResult{}, err
+		}
+		request.Msg.ExpectedTerms = terms
+		request.Msg.ExpectedEscrowRef = parseReference(req.Quote.NetworkID, local.NetworkProofRef)
+		request.Msg.ExpectedEscrowRef.Finalized = local.Finalized
+		request.Msg.ExpectedEscrowRef.FinalizedCheckpoint = local.FinalizedCheckpoint
+		request.Msg.ExpectedReservationDigest = digestValue
+	}
 	decorateRequest(c, ctx, request)
 	response, err := c.settlement.SettleJob(callCtx, request)
 	if err != nil {
@@ -801,7 +815,6 @@ func (c *Client) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (t
 	local.Status = domain.EscrowSettled
 	local.SettledAt = &now
 	if local.TrustMode != domain.TrustModeManaged {
-		local.NetworkProofRef = reference(settlement.SettlementRef)
 		local.Finalized = settlement.SettlementRef.Finalized
 		local.FinalizedCheckpoint = settlement.SettlementRef.FinalizedCheckpoint
 	}
@@ -883,6 +896,12 @@ func (c *Client) validateSettlementResponse(
 		if escrow.JobId != local.JobID || escrow.PrincipalId != local.PrincipalID ||
 			escrow.ProviderId != local.ProviderID || escrow.CapabilityId != local.CapabilityID ||
 			escrow.CapabilityVersion != local.CapabilityVersion || escrow.ProofProfile != proofProfile(local.ProofProfile) ||
+			escrow.EscrowRef == nil || escrow.EscrowRef.Network != c.network ||
+			escrow.EscrowRef.Reference != local.NetworkProofRef ||
+			escrow.ReservationDigest != local.ReservationDigest ||
+			escrow.QuoteCommitmentDigest != local.QuoteCommitmentDigest ||
+			reference(escrow.QuoteCommitmentRef) != local.QuoteCommitmentRef ||
+			escrow.ContractCodeHash != local.ContractCodeHash ||
 			ref == nil || ref.Network != c.network || strings.TrimSpace(ref.Reference) == "" ||
 			!ref.Finalized || ref.FinalizedCheckpoint == 0 || !escrow.Finalized ||
 			escrow.FinalizedCheckpoint == 0 || ref.FinalizedCheckpoint < escrow.FinalizedCheckpoint {
@@ -1091,7 +1110,7 @@ func verifiedEscrowTerms(q domain.Quote, jobID string) (*atostosv1.VerifiedEscro
 
 func validateCanonicalEscrow(q domain.Quote, jobID, digestValue string, e domain.Escrow) error {
 	expectedID := escrowcommitment.EscrowID(q.NetworkID, q.CommitmentDomain, q.ID, jobID)
-	legalState := e.Status == domain.EscrowReserved || e.Status == domain.EscrowReleased
+	legalState := e.Status == domain.EscrowReserved || e.Status == domain.EscrowReleased || e.Status == domain.EscrowSettled
 	if e.ID != expectedID || e.JobID != jobID || e.QuoteID != q.ID || e.PrincipalID != q.PrincipalID || e.ProviderID != q.ProviderID || e.CapabilityID != q.CapabilityID || e.CapabilityVersion != q.CapabilityVersion || e.TrustMode != q.TrustMode || e.ProofProfile != q.ProofProfile || e.Reserved != (domain.Money{Amount: q.Price.TotalMax, Currency: q.Price.Currency}) || e.QuoteCommitmentDigest != q.Commitment.Digest || e.QuoteCommitmentRef != q.Commitment.Reference || e.ReservationDigest != digestValue || e.NetworkProofRef == "" || e.ContractCodeHash == "" || !e.Finalized || e.FinalizedCheckpoint == 0 || !legalState {
 		return domain.NewError(domain.ErrSettlementFailed, "canonical TaskEscrow does not match the frozen verified Job/Quote", false)
 	}

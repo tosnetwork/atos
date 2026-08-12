@@ -392,9 +392,12 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 	if err := validatePricing(cap.Pricing); err != nil {
 		return domain.Quote{}, domain.NewError(domain.ErrCapabilityUnavailable, "capability has invalid metered pricing: "+err.Error(), false)
 	}
-	fees, err := applyFeeRate(subtotal, defaultFeePerMille)
-	if err != nil {
-		return domain.Quote{}, err
+	fees := money.Zero(subtotal.Currency, priceDecimals)
+	if mode == domain.TrustModeManaged {
+		fees, err = applyFeeRate(subtotal, defaultFeePerMille)
+		if err != nil {
+			return domain.Quote{}, err
+		}
 	}
 	totalMax, err := subtotal.Add(fees)
 	if err != nil {

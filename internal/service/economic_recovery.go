@@ -901,7 +901,7 @@ func (s *JobService) settleProviderResultUnderLock(ctx context.Context, current 
 		receipt = *current.ExecutionReceipt
 	}
 	settled, settleErr := s.core.SettleJob(ctx, toscore.SettleJobRequest{
-		EscrowID: current.EscrowID, JobID: current.ID, ReceiptID: receipt.ID, ActualCost: receipt.Cost,
+		EscrowID: current.EscrowID, JobID: current.ID, ReceiptID: receipt.ID, ActualCost: receipt.Cost, Quote: quote,
 	})
 	if settleErr != nil {
 		return s.markEconomicReconciliationUnderLock(ctx, current.ID, domain.EconomicSettlementPending, domain.JobCompleted, domain.ErrSettlementFailed, "settlement outcome requires idempotent replay: "+settleErr.Error())

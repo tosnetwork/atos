@@ -54,7 +54,7 @@ func TestVerifiedQuoteIsCommittedBeforeUsableAndAutoIsConcrete(t *testing.T) {
 	if q.TrustMode != domain.TrustModeVerified || q.Commitment == nil || !q.Commitment.Finalized || q.Commitment.State != "committed" {
 		t.Fatalf("quote not canonically committed: %+v", q)
 	}
-	if q.Price.Subtotal != "1.000000000" || q.Price.Fees != "0.050000000" || q.Price.TotalMax != "1.050000000" || q.AssetDecimals != 9 {
+	if q.Price.Subtotal != "1.000000000" || q.Price.Fees != "0.000000000" || q.Price.TotalMax != "1.000000000" || q.AssetDecimals != 9 {
 		t.Fatalf("non-canonical nanoTOS quote arithmetic: %+v", q.Price)
 	}
 	stored, err := st.GetQuote(context.Background(), q.ID)
@@ -89,7 +89,7 @@ func TestVerifiedQuoteDoesNotUseManagedAccountCurrencyPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if q.Price.TotalMax != "1.050000000" || q.Price.Currency != "TOS" || q.RequiresConfirmation {
+	if q.Price.TotalMax != "1.000000000" || q.Price.Fees != "0.000000000" || q.Price.Currency != "TOS" || q.RequiresConfirmation {
 		t.Fatalf("verified funding terms were interpreted as Managed account money: %+v", q)
 	}
 }
