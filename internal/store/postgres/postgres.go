@@ -440,7 +440,16 @@ func (s *Store) PutEscrow(ctx context.Context, e domain.Escrow) error {
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		ON CONFLICT (id) DO UPDATE SET
 			job_id=$3, reserved=$7, status=$8, expires_at=$10, settled_at=$11, payload=$12
-		WHERE NOT (escrows.status IN ('settled','released') AND escrows.status <> EXCLUDED.status)
+		WHERE (escrows.status = EXCLUDED.status
+			OR (escrows.status='pending' AND EXCLUDED.status IN ('reserved','released'))
+			OR (escrows.status='reserved' AND EXCLUDED.status IN ('disputed','settled','released'))
+			OR (escrows.status='disputed' AND EXCLUDED.status='settled'))
+		AND escrows.quote_id=EXCLUDED.quote_id AND escrows.job_id=EXCLUDED.job_id
+		AND escrows.principal_id=EXCLUDED.principal_id AND escrows.provider_id=EXCLUDED.provider_id
+		AND escrows.capability_id=EXCLUDED.capability_id
+		AND COALESCE((escrows.payload->>'finalized_checkpoint')::numeric,0) <= COALESCE((EXCLUDED.payload->>'finalized_checkpoint')::numeric,0)
+		AND COALESCE(escrows.payload->>'reservation_digest','') = COALESCE(EXCLUDED.payload->>'reservation_digest','')
+		AND COALESCE(escrows.payload->>'network_proof_ref','') = COALESCE(EXCLUDED.payload->>'network_proof_ref','')
 	`, e.ID, e.QuoteID, e.JobID, e.PrincipalID, e.ProviderID, e.CapabilityID,
 		mustMarshal(e.Reserved), string(e.Status), e.CreatedAt, e.ExpiresAt,
 		e.SettledAt, mustMarshal(e))
@@ -574,16 +583,32 @@ func (s *Store) StaleEscrowOperations(ctx context.Context, cutoff time.Time, lim
 }
 
 func (s *Store) PutReceipt(ctx context.Context, r domain.Receipt) error {
-	_, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	current, getErr := scanReceipt(tx.QueryRow(ctx, `SELECT `+receiptColumns+` FROM receipts WHERE id=$1 FOR UPDATE`, r.ID))
+	if getErr == nil && !current.CanAdvanceProjection(r) {
+		return store.ErrConflict
+	}
+	if getErr != nil && !errors.Is(getErr, pgx.ErrNoRows) {
+		return getErr
+	}
+	_, err = tx.Exec(ctx, `
 		INSERT INTO receipts (
 			id, quote_id, escrow_id, job_id, principal_id, charged, refunded,
 			status, created_at, payload
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-		ON CONFLICT (id) DO NOTHING
+		ON CONFLICT (id) DO UPDATE SET
+			payload=$10
 	`, r.ID, r.QuoteID, r.EscrowID, r.JobID, r.PrincipalID,
 		mustMarshal(r.Charged), mustMarshal(r.Refunded), string(r.Status),
 		r.CreatedAt, mustMarshal(r))
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func scanReceipt(row pgx.Row) (domain.Receipt, error) {

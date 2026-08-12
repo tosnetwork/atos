@@ -863,14 +863,15 @@ func (s *JobService) settleProviderResultUnderLock(ctx context.Context, current 
 		// provider's delivered work has already been proven and settlement
 		// must still be recovered rather than unwound, so that case is left
 		// to the existing reconciliation handling below.
-		if current.EconomicState != domain.EconomicSettlementPending {
+		if current.EconomicState != domain.EconomicSettlementPending && current.EconomicState != domain.EconomicReviewPending {
 			failed, _ := s.releaseForTerminalUnderLock(ctx, current, domain.JobFailed, domain.ErrSettlementFailed, "billing calculation failed: "+billErr.Error())
 			return failed
 		}
 		return s.markEconomicReconciliationUnderLock(ctx, current.ID, current.EconomicState, domain.JobCompleted, domain.ErrSettlementFailed, "billing calculation failed: "+billErr.Error())
 	}
 	receipt.Cost = billingSnapshot.GrossCharge
-	if current.EconomicState != domain.EconomicSettlementPending {
+	receiptCommitted := current.EconomicState == domain.EconomicSettlementPending || current.EconomicState == domain.EconomicReviewPending
+	if !receiptCommitted {
 		// Persist the exact signed provider receipt before the first external
 		// commitment call. The signed canonical envelope cannot be reconstructed
 		// from mutable output projections after a crash (and changing Cost would
@@ -940,6 +941,85 @@ func (s *JobService) settleProviderResultUnderLock(ctx context.Context, current 
 		}
 	} else if current.ExecutionReceipt != nil {
 		receipt = *current.ExecutionReceipt
+	}
+	if quote.TrustMode == domain.TrustModeVerified {
+		// Proof-of-Service is part of the immutable tos_verified_v1 chain, not
+		// optional post-settlement telemetry.  Commit it before opening the
+		// dispute/review window so every possible terminal outcome (ordinary
+		// settlement or dispute resolution) has the same complete evidence.
+		// The authority call is idempotent and crash recovery replays this exact
+		// Receipt tuple; proof-package generation itself remains read-only.
+		posRef, posErr := s.core.CommitProofOfServiceEvidence(ctx, receipt)
+		if posErr != nil || posRef == "" {
+			message := "Proof-of-Service commitment requires idempotent recovery"
+			if posErr != nil {
+				message += ": " + posErr.Error()
+			}
+			return s.markEconomicReconciliationUnderLock(ctx, current.ID, current.EconomicState, domain.JobCompleted, domain.ErrSettlementFailed, message)
+		}
+		disputeCore, ok := s.core.(toscore.VerifiedDisputeCore)
+		if !ok {
+			return s.markEconomicReconciliationUnderLock(ctx, current.ID, current.EconomicState, domain.JobCompleted, domain.ErrSettlementFailed, "Verified dispute/review authority is unavailable")
+		}
+		escrow, escrowErr := s.store.GetEscrow(ctx, current.EscrowID)
+		if escrowErr != nil {
+			return s.markEconomicReconciliationUnderLock(ctx, current.ID, current.EconomicState, domain.JobCompleted, domain.ErrSettlementFailed, "Verified escrow projection unavailable during review preparation")
+		}
+		if current.EconomicState != domain.EconomicReviewPending {
+			prepared, prepareErr := disputeCore.PrepareVerifiedResult(ctx, toscore.PrepareVerifiedResultRequest{Quote: quote, Job: current, Receipt: receipt, Escrow: escrow})
+			if prepareErr != nil {
+				return s.markEconomicReconciliationUnderLock(ctx, current.ID, domain.EconomicSettlementPending, domain.JobCompleted, domain.ErrSettlementFailed, "TaskEscrow result review requires recovery: "+prepareErr.Error())
+			}
+			if prepared.ReviewDeadline == nil || prepared.ResultRef == "" || !prepared.Finalized || prepared.FinalizedCheckpoint == 0 {
+				return s.markEconomicReconciliationUnderLock(ctx, current.ID, domain.EconomicSettlementPending, domain.JobCompleted, domain.ErrSettlementFailed, "TaskEscrow result review is not finalized")
+			}
+			if putErr := s.store.PutEscrow(ctx, prepared); putErr != nil {
+				return s.markEconomicReconciliationUnderLock(ctx, current.ID, domain.EconomicSettlementPending, domain.JobCompleted, domain.ErrSettlementFailed, "TaskEscrow result projection requires recovery")
+			}
+			updated, updateErr := s.store.UpdateJob(ctx, current.ID, func(job domain.Job, exists bool) (domain.Job, error) {
+				if !exists {
+					return domain.Job{}, store.ErrNotFound
+				}
+				if job.EconomicState != domain.EconomicSettlementPending {
+					return domain.Job{}, store.ErrConflict
+				}
+				job.EconomicState = domain.EconomicReviewPending
+				job.State = domain.JobReconciling
+				job.ReconciliationRequired = true
+				job.ReconciliationTarget = domain.JobCompleted
+				job.FailureReason = "verified dispute review window open"
+				job.ErrorCode = ""
+				job.UpdatedAt = time.Now().UTC()
+				return job, nil
+			})
+			if updateErr != nil {
+				return current
+			}
+			return updated
+		}
+		if escrow.Status == domain.EscrowDisputed {
+			// Only the Verified dispute reconciler may advance a canonically
+			// disputed TaskEscrow. The ordinary settlement path must never race it.
+			return current
+		}
+		if escrow.ReviewDeadline == nil || time.Now().UTC().Before(*escrow.ReviewDeadline) {
+			return current
+		}
+		advanced, advanceErr := s.store.UpdateJob(ctx, current.ID, func(job domain.Job, exists bool) (domain.Job, error) {
+			if !exists {
+				return domain.Job{}, store.ErrNotFound
+			}
+			if job.EconomicState != domain.EconomicReviewPending {
+				return domain.Job{}, store.ErrConflict
+			}
+			job.EconomicState = domain.EconomicSettlementPending
+			job.UpdatedAt = time.Now().UTC()
+			return job, nil
+		})
+		if advanceErr != nil {
+			return current
+		}
+		current = advanced
 	}
 	settled, settleErr := s.core.SettleJob(ctx, toscore.SettleJobRequest{
 		EscrowID: current.EscrowID, JobID: current.ID, ReceiptID: receipt.ID, ActualCost: receipt.Cost, Quote: quote,
@@ -1093,7 +1173,7 @@ func (s *JobService) recoverProviderExecution(ctx context.Context, jobID string,
 		return job, nil
 	}
 	if job.ExecutionReceipt != nil && job.ReconciliationTarget == domain.JobCompleted &&
-		(job.EconomicState == domain.EconomicSettlementPending || job.ProofStatus.Receipt == domain.ProofSigned) {
+		(job.EconomicState == domain.EconomicSettlementPending || job.EconomicState == domain.EconomicReviewPending || job.ProofStatus.Receipt == domain.ProofSigned) {
 		result := tosai.SubmitJobResult{State: domain.JobCompleted, Output: cloneMap(job.Output), Artifacts: append([]domain.Artifact(nil), job.Artifacts...), Receipt: job.ExecutionReceipt}
 		return s.settleProviderResultUnderLock(ctx, job, result), nil
 	}
@@ -1217,6 +1297,8 @@ func (s *JobService) ReconcileJob(ctx context.Context, jobID string) (domain.Job
 		}
 		return s.recoverProviderExecution(ctx, jobID, true)
 	case domain.EconomicSettlementPending:
+		return s.recoverProviderExecution(ctx, jobID, false)
+	case domain.EconomicReviewPending:
 		return s.recoverProviderExecution(ctx, jobID, false)
 	case domain.EconomicReleasePending:
 		lock := s.jobLock(jobID)

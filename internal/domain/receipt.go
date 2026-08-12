@@ -39,6 +39,19 @@ type Receipt struct {
 	CreatedAt                time.Time       `json:"created_at"`
 }
 
+// CanAdvanceProjection permits only stronger observations of the same
+// immutable terminal economic outcome. It is used by durable stores when a
+// fresh canonical observation raises a checkpoint after a lost response.
+func (r Receipt) CanAdvanceProjection(next Receipt) bool {
+	if r.ID != next.ID || r.QuoteID != next.QuoteID || r.EscrowID != next.EscrowID || r.JobID != next.JobID || r.PrincipalID != next.PrincipalID || r.TrustMode != next.TrustMode || r.ProofProfile != next.ProofProfile || r.Charged != next.Charged || r.Refunded != next.Refunded || r.Status != next.Status || r.NetworkProofRef != next.NetworkProofRef || r.ExecutionSignerID != next.ExecutionSignerID || r.SignerAuthorizationRef != next.SignerAuthorizationRef || r.InputCommitment != next.InputCommitment || r.OutputCommitment != next.OutputCommitment || r.UsageCommitment != next.UsageCommitment {
+		return false
+	}
+	if r.Finalized && !next.Finalized || r.ProofOfServiceRef != "" && (next.ProofOfServiceRef != r.ProofOfServiceRef || next.ProofOfServiceDigest != r.ProofOfServiceDigest) {
+		return false
+	}
+	return next.NetworkProofCheckpoint >= r.NetworkProofCheckpoint && next.FinalizedCheckpoint >= r.FinalizedCheckpoint && next.ProofOfServiceCheckpoint >= r.ProofOfServiceCheckpoint
+}
+
 type ExecutionResult string
 
 const (

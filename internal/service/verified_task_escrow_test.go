@@ -51,6 +51,20 @@ func (failAfterEscrowGateProvider) SubmitJob(context.Context, tosai.SubmitJobReq
 	return tosai.SubmitJobResult{State: domain.JobFailed}, nil
 }
 
+type fixedSignerProvider struct {
+	tosai.Provider
+	authorizationID, signerID string
+}
+
+func (p fixedSignerProvider) SubmitJob(ctx context.Context, req tosai.SubmitJobRequest) (tosai.SubmitJobResult, error) {
+	r, err := p.Provider.SubmitJob(ctx, req)
+	if err == nil && r.Receipt != nil {
+		r.Receipt.ExecutionSignerID = p.signerID
+		r.Receipt.SignerAuthorizationID = p.authorizationID
+	}
+	return r, err
+}
+
 type failReleaseCompletionStore struct {
 	store.Store
 	mu     sync.Mutex
@@ -100,6 +114,57 @@ func TestVerifiedJobPersistsFinalizedEscrowOperationBeforeExecution(t *testing.T
 	}
 	if result.Job.EscrowID != op.Escrow.ID {
 		t.Fatalf("job escrow=%s authority escrow=%s", result.Job.EscrowID, op.Escrow.ID)
+	}
+}
+
+func TestVerifiedDisputeOpensAndResolvesOnCanonicalTaskEscrow(t *testing.T) {
+	quotes, signers, core, st, cap := verifiedQuoteHarness(t)
+	ctx := context.Background()
+	quote, err := quotes.Create(ctx, service.CreateQuoteInput{PrincipalID: "requester", CapabilityID: cap.ID, RequestedTrustMode: domain.RequestedTrustVerified, IdempotencyKey: "verified-dispute-quote"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authID, signerID, found, err := signers.CurrentSigner(ctx, cap.ID)
+	if err != nil || !found {
+		t.Fatalf("current signer: %s %s %v %v", authID, signerID, found, err)
+	}
+	provider := fixedSignerProvider{Provider: tosaimock.NewContractFixture(), authorizationID: authID, signerID: signerID}
+	jobs := service.NewJobService(st, provider, core, service.NewAccountService(st))
+	result, err := jobs.Invoke(ctx, service.SubmitInput{PrincipalID: "requester", CapabilityID: cap.ID, QuoteID: quote.ID, Input: map[string]any{"task": "review"}, IdempotencyKey: "verified-dispute-job", MaxWaitMS: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := st.GetJob(ctx, result.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.EconomicState != domain.EconomicReviewPending || job.State != domain.JobReconciling {
+		t.Fatalf("job bypassed review checkpoint: %+v", job)
+	}
+	disputes := service.NewDisputeService(st, jobs, nil, service.NewAccountService(st), nil)
+	d, err := disputes.Open(ctx, service.OpenDisputeInput{PrincipalID: "requester", JobID: job.ID, Reason: "OUTPUT_MISMATCH", IdempotencyKey: "verified-dispute-open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.EconomicState != domain.DisputeEconomicVerifiedDisputed || d.DisputeDigest == "" || d.DisputeRef == "" || d.DisputeCheckpoint == 0 || d.ReceiptDigest == "" {
+		t.Fatalf("dispute projection incomplete: %+v", d)
+	}
+	if _, err = disputes.Review(ctx, d.ID, "independent-reviewer"); err != nil {
+		t.Fatal(err)
+	}
+	d, err = disputes.Resolve(ctx, service.ResolveDisputeInput{DisputeID: d.ID, ReviewerID: "independent-reviewer", Outcome: domain.DisputeOutcomePrincipal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.EconomicState != domain.DisputeEconomicVerifiedResolved || d.ReviewStatus != domain.DisputeResolvedForPrincipal || d.ResolutionDigest == "" || d.ResolutionRef == "" || d.ResolutionCheckpoint == 0 {
+		t.Fatalf("resolution projection incomplete: %+v", d)
+	}
+	job, err = st.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != domain.JobCompleted || job.EconomicState != domain.EconomicSettled {
+		t.Fatalf("resolved job not terminal: %+v", job)
 	}
 }
 

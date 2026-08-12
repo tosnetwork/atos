@@ -27,13 +27,57 @@ func disputeContentHash(d domain.Dispute) string {
 		ChargedAmount, OriginalRefundAmount                                                       domain.Money
 		Reason, Description                                                                       string
 		Evidence                                                                                  []domain.DisputeEvidence
+		EvidenceDigests                                                                           []string
 		DisputePolicyHash                                                                         string
+		TrustMode, EscrowID                                                                       string
 	}{
 		d.PrincipalID, d.ProviderID, d.JobID, d.QuoteID, d.CapabilityID, d.ReceiptID, d.SettlementID, d.EarningID,
-		d.ChargedAmount, d.OriginalRefundAmount, d.Reason, d.Description, d.Evidence, d.DisputePolicyHash,
+		d.ChargedAmount, d.OriginalRefundAmount, d.Reason, d.Description, d.Evidence, d.EvidenceDigests, d.DisputePolicyHash, string(d.TrustMode), d.EscrowID,
 	})
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
+}
+
+// persistedDispute is the private PostgreSQL wire representation.  The
+// domain.Dispute JSON shape is also the public API shape and deliberately
+// hides authorization and recovery fields.  Persisting that public shape
+// directly used to discard the resolution intent across a process crash,
+// after the canonical chain mutation could already have succeeded.
+//
+// Keep these fields in a store-owned envelope so they remain durable without
+// becoming part of any REST/MCP/A2A response.  Embedding Dispute preserves
+// backwards compatibility with rows written as the old flat public payload.
+type persistedDispute struct {
+	domain.Dispute
+	PendingOutcome        domain.DisputeOutcome `json:"_pending_outcome,omitempty"`
+	PendingReviewerID     string                `json:"_pending_reviewer_id,omitempty"`
+	ResolutionRequestedAt *time.Time            `json:"_resolution_requested_at,omitempty"`
+}
+
+func marshalDisputePayload(d domain.Dispute) []byte {
+	return mustMarshal(persistedDispute{
+		Dispute:               d,
+		PendingOutcome:        d.PendingOutcome,
+		PendingReviewerID:     d.PendingReviewerID,
+		ResolutionRequestedAt: d.ResolutionRequestedAt,
+	})
+}
+
+func applyDisputePayload(payload []byte, d *domain.Dispute) error {
+	// Merge the public fields into the values already scanned from dedicated
+	// columns. Replacing the whole value would erase json:"-" authorization
+	// fields such as PrincipalID and ReviewerID.
+	if err := applyPayload(payload, d); err != nil {
+		return err
+	}
+	var persisted persistedDispute
+	if err := json.Unmarshal(payload, &persisted); err != nil {
+		return err
+	}
+	d.PendingOutcome = persisted.PendingOutcome
+	d.PendingReviewerID = persisted.PendingReviewerID
+	d.ResolutionRequestedAt = persisted.ResolutionRequestedAt
+	return nil
 }
 
 func disputeWriteArgs(d domain.Dispute) []any {
@@ -41,7 +85,7 @@ func disputeWriteArgs(d domain.Dispute) []any {
 		d.ID, d.PrincipalID, d.ProviderID, d.JobID, d.QuoteID, d.CapabilityID, d.ReceiptID, d.SettlementID, d.EarningID,
 		mustMarshal(d.ChargedAmount), mustMarshal(d.OriginalRefundAmount), d.Reason, d.Description, mustMarshal(d.Evidence),
 		d.IdempotencyKey, string(d.ReviewStatus), string(d.EconomicState), string(d.Outcome), d.ReviewerID, d.ReasonRejected,
-		d.DisputePolicyHash, disputeContentHash(d), d.OpenedAt, d.UnderReviewAt, d.ResolvedAt, d.UpdatedAt, mustMarshal(d),
+		d.DisputePolicyHash, disputeContentHash(d), d.OpenedAt, d.UnderReviewAt, d.ResolvedAt, d.UpdatedAt, marshalDisputePayload(d),
 	}
 }
 
@@ -82,7 +126,7 @@ func scanDispute(row pgx.Row) (domain.Dispute, error) {
 	_ = json.Unmarshal(chargedAmount, &d.ChargedAmount)
 	_ = json.Unmarshal(originalRefundAmount, &d.OriginalRefundAmount)
 	_ = json.Unmarshal(evidence, &d.Evidence)
-	if err := applyPayload(payload, &d); err != nil {
+	if err := applyDisputePayload(payload, &d); err != nil {
 		return domain.Dispute{}, err
 	}
 	// review_status/economic_state/outcome are part of the public payload,
@@ -298,7 +342,7 @@ func (s *Store) DisputesForRecovery(ctx context.Context, updatedBefore time.Time
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+disputeColumns+` FROM disputes
-		WHERE economic_state = 'pending_payout_resolution' AND updated_at <= $1
+		WHERE economic_state IN ('pending_payout_resolution','verified_open_pending','verified_resolution_pending') AND updated_at <= $1
 		ORDER BY updated_at ASC, id ASC
 		LIMIT $2
 	`, updatedBefore.UTC(), limit)
@@ -347,6 +391,9 @@ func (s *Store) UpdateDispute(ctx context.Context, id string, fn func(domain.Dis
 		}
 		if disputeContentHash(current) != disputeContentHash(next) {
 			return domain.Dispute{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change identity/economic fields", false)
+		}
+		if !current.CanAdvanceProjection(next) {
+			return domain.Dispute{}, store.ErrConflict
 		}
 	}
 	if _, err := tx.Exec(ctx, upsertDisputeSQL, disputeWriteArgs(next)...); err != nil {
@@ -402,6 +449,9 @@ func (s *Store) UpdateDisputeAndEarning(ctx context.Context, disputeID string, f
 	}
 	if disputeContentHash(currentDispute) != disputeContentHash(nextDispute) {
 		return domain.Dispute{}, domain.ProviderEarning{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change identity/economic fields", false)
+	}
+	if !currentDispute.CanAdvanceProjection(nextDispute) {
+		return domain.Dispute{}, domain.ProviderEarning{}, store.ErrConflict
 	}
 	if _, err := tx.Exec(ctx, upsertDisputeSQL, disputeWriteArgs(nextDispute)...); err != nil {
 		return domain.Dispute{}, domain.ProviderEarning{}, err
@@ -496,6 +546,9 @@ func (s *Store) ResolveDispute(ctx context.Context, disputeID, principalID strin
 	}
 	if disputeContentHash(currentDispute) != disputeContentHash(nextDispute) {
 		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change identity/economic fields", false)
+	}
+	if !currentDispute.CanAdvanceProjection(nextDispute) {
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, store.ErrConflict
 	}
 	if nextAccount.PrincipalID != principalID {
 		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, store.ErrConflict

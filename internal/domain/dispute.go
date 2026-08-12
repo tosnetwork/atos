@@ -78,6 +78,12 @@ const (
 	// so this durably records that manual/external economic recovery is
 	// required rather than reporting funds recovered when they were not.
 	DisputeEconomicClawbackRequired DisputeEconomicState = "clawback_required"
+	// Verified checkpoints describe canonical TaskEscrow recovery. They are
+	// deliberately distinct from Managed earning/account states.
+	DisputeEconomicVerifiedOpenPending       DisputeEconomicState = "verified_open_pending"
+	DisputeEconomicVerifiedDisputed          DisputeEconomicState = "verified_disputed"
+	DisputeEconomicVerifiedResolutionPending DisputeEconomicState = "verified_resolution_pending"
+	DisputeEconomicVerifiedResolved          DisputeEconomicState = "verified_resolved"
 )
 
 // Terminal reports whether no further automated economic recovery action
@@ -86,7 +92,7 @@ const (
 // see that constant's doc comment.
 func (s DisputeEconomicState) Terminal() bool {
 	switch s {
-	case DisputeEconomicRefunded, DisputeEconomicReleased, DisputeEconomicClawbackRequired:
+	case DisputeEconomicRefunded, DisputeEconomicReleased, DisputeEconomicClawbackRequired, DisputeEconomicVerifiedResolved:
 		return true
 	default:
 		return false
@@ -143,6 +149,7 @@ type Dispute struct {
 	Reason               string            `json:"reason"`
 	Description          string            `json:"description,omitempty"`
 	Evidence             []DisputeEvidence `json:"evidence,omitempty"`
+	EvidenceDigests      []string          `json:"evidence_digests,omitempty"`
 	IdempotencyKey       string            `json:"-"`
 
 	ReviewStatus   DisputeReviewStatus  `json:"status"`
@@ -153,17 +160,60 @@ type Dispute struct {
 	// PendingOutcome/Reviewer make the human decision a durable intent before
 	// any Blnk side effect. They prevent a different resolution from racing a
 	// retry after the financial operation committed but the local outcome did not.
-	PendingOutcome    DisputeOutcome `json:"-"`
-	PendingReviewerID string         `json:"-"`
+	PendingOutcome        DisputeOutcome `json:"-"`
+	PendingReviewerID     string         `json:"-"`
+	ResolutionRequestedAt *time.Time     `json:"-"`
 
 	// DisputePolicyHash is copied from the disputed Quote at open time, so
 	// resolution always applies the policy (dispute window, etc.) the
 	// Quote actually committed to, never whatever the current global
 	// policy happens to be later.
-	DisputePolicyHash string `json:"-"`
+	DisputePolicyHash    string    `json:"-"`
+	TrustMode            TrustMode `json:"trust_mode"`
+	EscrowID             string    `json:"escrow_id,omitempty"`
+	ReceiptDigest        string    `json:"receipt_digest,omitempty"`
+	DisputeDigest        string    `json:"dispute_digest,omitempty"`
+	DisputeRef           string    `json:"dispute_ref,omitempty"`
+	DisputeCheckpoint    uint64    `json:"dispute_checkpoint,omitempty"`
+	ResolutionDigest     string    `json:"resolution_digest,omitempty"`
+	ResolutionRef        string    `json:"resolution_ref,omitempty"`
+	ResolutionCheckpoint uint64    `json:"resolution_checkpoint,omitempty"`
 
 	OpenedAt      time.Time  `json:"opened_at"`
 	UnderReviewAt *time.Time `json:"under_review_at,omitempty"`
 	ResolvedAt    *time.Time `json:"resolved_at,omitempty"`
 	UpdatedAt     time.Time  `json:"-"`
+}
+
+// CanAdvanceProjection rejects stale-replica regression while allowing the
+// orthogonal reviewer status to advance during a canonical Verified checkpoint.
+func (d Dispute) CanAdvanceProjection(next Dispute) bool {
+	if d.ReviewStatus.Terminal() && (next.ReviewStatus != d.ReviewStatus || next.Outcome != d.Outcome || next.EconomicState != d.EconomicState) {
+		return false
+	}
+	if d.TrustMode != TrustModeVerified {
+		return true
+	}
+	if next.TrustMode != d.TrustMode || next.DisputeCheckpoint < d.DisputeCheckpoint || next.ResolutionCheckpoint < d.ResolutionCheckpoint {
+		return false
+	}
+	if d.DisputeDigest != "" && (next.DisputeDigest != d.DisputeDigest || next.DisputeRef != d.DisputeRef) {
+		return false
+	}
+	if d.ResolutionDigest != "" && (next.ResolutionDigest != d.ResolutionDigest || next.ResolutionRef != d.ResolutionRef) {
+		return false
+	}
+	if d.EconomicState == next.EconomicState {
+		return true
+	}
+	switch d.EconomicState {
+	case DisputeEconomicVerifiedOpenPending:
+		return next.EconomicState == DisputeEconomicVerifiedDisputed
+	case DisputeEconomicVerifiedDisputed:
+		return next.EconomicState == DisputeEconomicVerifiedResolutionPending
+	case DisputeEconomicVerifiedResolutionPending:
+		return next.EconomicState == DisputeEconomicVerifiedResolved
+	default:
+		return false
+	}
 }

@@ -185,7 +185,24 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 	if e != nil || quoteWire.Digest != liveQ.Digest {
 		return fail(domain.NewError(domain.ErrProofVerificationFailed, "canonical Quote bytes mismatch", false))
 	}
-	liveE, found, e := s.core.GetEscrow(ctx, toscore.GetEscrowRequest{Quote: q, JobID: j.ID, EscrowID: esc.ID, ExpectedReservationDigest: esc.ReservationDigest, ExpectedEscrowRef: esc.NetworkProofRef, ExpectedTerminalRef: r.NetworkProofRef, ExpectedReleaseDigest: esc.ReleaseDigest, ExpectedReleaseReasonCode: esc.ReleaseReason})
+	kind := "provider_settlement"
+	if r.Status == domain.ReceiptReleased {
+		kind = "requester_release"
+	} else if r.Status == domain.ReceiptSettledAfterDispute || r.Status == domain.ReceiptReleasedAfterDispute {
+		kind = "dispute_resolution"
+	}
+	var dispute domain.Dispute
+	getEscrow := toscore.GetEscrowRequest{Quote: q, JobID: j.ID, EscrowID: esc.ID, ExpectedReservationDigest: esc.ReservationDigest, ExpectedEscrowRef: esc.NetworkProofRef, ExpectedTerminalRef: r.NetworkProofRef, ExpectedReleaseDigest: esc.ReleaseDigest, ExpectedReleaseReasonCode: esc.ReleaseReason}
+	if kind == "dispute_resolution" {
+		dispute, e = s.store.DisputeByJob(ctx, j.ID)
+		if e != nil || dispute.TrustMode != domain.TrustModeVerified || dispute.EconomicState != domain.DisputeEconomicVerifiedResolved || dispute.DisputeDigest == "" || dispute.DisputeRef == "" || dispute.ResolutionDigest == "" {
+			return fail(domain.NewError(domain.ErrProofVerificationFailed, "canonical Verified dispute projection unavailable or inconsistent", true))
+		}
+		getEscrow.ExpectedDisputeDigest = dispute.DisputeDigest
+		getEscrow.ExpectedDisputeRef = dispute.DisputeRef
+		getEscrow.ExpectedDisputePayout = r.Charged
+	}
+	liveE, found, e := s.core.GetEscrow(ctx, getEscrow)
 	if e != nil || !found {
 		return fail(domain.NewError(domain.ErrNetworkUnavailable, "canonical TaskEscrow unavailable", true))
 	}
@@ -270,19 +287,26 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 	if e != nil {
 		return fail(e)
 	}
-	kind := "provider_settlement"
-	if r.Status == domain.ReceiptReleased {
-		kind = "requester_release"
-	} else if r.Status == domain.ReceiptSettledAfterDispute || r.Status == domain.ReceiptReleasedAfterDispute {
-		kind = "dispute_resolution"
+	var disputeDigest, resolutionDigest, disputeOutcome string
+	var disputeRef verifiedproof.Reference
+	if kind == "dispute_resolution" {
+		if dispute.ResolutionRef != r.NetworkProofRef || dispute.ResolutionCheckpoint == 0 || r.FinalizedCheckpoint < dispute.ResolutionCheckpoint {
+			return fail(domain.NewError(domain.ErrProofVerificationFailed, "canonical Verified dispute projection unavailable or inconsistent", true))
+		}
+		disputeDigest, resolutionDigest, disputeOutcome = dispute.DisputeDigest, dispute.ResolutionDigest, string(dispute.Outcome)
+		disputeRef = vpRef(s.core.Network(), dispute.DisputeRef, dispute.DisputeCheckpoint)
 	}
 	if r.NetworkProofRef == "" || r.FinalizedCheckpoint == 0 {
 		return fail(domain.NewError(domain.ErrProofVerificationFailed, "terminal outcome finality unavailable", true))
 	}
 	if receiptProof != nil {
-		receiptProof.ChargedAtomic = charged
+		receiptCharge, receiptChargeErr := atomicTOS(er.Cost)
+		if receiptChargeErr != nil {
+			return fail(receiptChargeErr)
+		}
+		receiptProof.ChargedAtomic = receiptCharge
 	}
-	p := verifiedproof.Package{Version: verifiedproof.Version, Canonicalization: verifiedproof.Canonicalization, NetworkID: s.core.Network(), GatewayDomain: q.CommitmentDomain, PrincipalID: q.PrincipalID, RequesterAgentID: requester.AgentID, RequesterIdentityRef: vpRef(requester.Network, requester.BindingRef, requester.FinalizedCheckpoint), ProviderID: q.ProviderID, ProviderIdentityRef: vpRef(provider.Network, provider.BindingRef, provider.FinalizedCheckpoint), Capability: verifiedproof.Capability{CapabilityID: q.CapabilityID, CapabilityVersion: q.CapabilityVersion, ManifestDigest: q.ManifestCommitment, OwnershipRef: vpRef(own.Network, own.Reference, own.FinalizedCheckpoint)}, Quote: verifiedproof.Quote{QuoteID: q.ID, CommitmentDigest: liveQ.Digest, CommitmentRef: vpRef(liveQ.Network, liveQ.Reference, liveQ.FinalizedCheckpoint), TermsDigest: q.TermsHash, TrustMode: "verified", ProofProfile: "tos_verified_v1", SettlementBackend: "tos", SettlementAsset: "TOS", AssetDecimals: q.AssetDecimals, SubtotalAtomic: subtotal, FeesAtomic: fees, TotalMaxAtomic: total, AcceptanceDeadlineUnixNanos: q.ExpiresAt.UnixNano(), QuoteExpiryUnixNanos: q.ExpiresAt.UnixNano(), ExecutionDeadlineUnixNanos: q.ExecutionDeadline.UnixNano(), UnderlyingServiceQuoteRef: q.UnderlyingServiceQuoteRef, DisputePolicyDigest: q.DisputePolicyHash, CanonicalCBOR: quoteWire.CanonicalCBOR}, Escrow: verifiedproof.Escrow{EscrowID: esc.ID, JobID: j.ID, ContractRef: vpRef(s.core.Network(), esc.NetworkProofRef, liveE.FinalizedCheckpoint), ContractCodeHash: esc.ContractCodeHash, ReservationDigest: esc.ReservationDigest, ReservationRef: vpRef(s.core.Network(), esc.NetworkProofRef, liveE.FinalizedCheckpoint), ReservedAtomic: reserve, EscrowDeadlineUnixNanos: esc.ExpiresAt.UnixNano(), FundingModel: string(q.Settlement.FundingModel), CanonicalCBOR: escrowWire.CanonicalCBOR}, SignerAuthorization: signerProof, Receipt: receiptProof, Outcome: verifiedproof.Outcome{Kind: kind, OutcomeRef: vpRef(s.core.Network(), r.NetworkProofRef, r.FinalizedCheckpoint), ChargedAtomic: charged, RefundedAtomic: refunded, ReleaseDigest: esc.ReleaseDigest, ReasonCode: esc.ReleaseReason}, ProofOfService: posProof}
+	p := verifiedproof.Package{Version: verifiedproof.Version, Canonicalization: verifiedproof.Canonicalization, NetworkID: s.core.Network(), GatewayDomain: q.CommitmentDomain, PrincipalID: q.PrincipalID, RequesterAgentID: requester.AgentID, RequesterIdentityRef: vpRef(requester.Network, requester.BindingRef, requester.FinalizedCheckpoint), ProviderID: q.ProviderID, ProviderIdentityRef: vpRef(provider.Network, provider.BindingRef, provider.FinalizedCheckpoint), Capability: verifiedproof.Capability{CapabilityID: q.CapabilityID, CapabilityVersion: q.CapabilityVersion, ManifestDigest: q.ManifestCommitment, OwnershipRef: vpRef(own.Network, own.Reference, own.FinalizedCheckpoint)}, Quote: verifiedproof.Quote{QuoteID: q.ID, CommitmentDigest: liveQ.Digest, CommitmentRef: vpRef(liveQ.Network, liveQ.Reference, liveQ.FinalizedCheckpoint), TermsDigest: q.TermsHash, TrustMode: "verified", ProofProfile: "tos_verified_v1", SettlementBackend: "tos", SettlementAsset: "TOS", AssetDecimals: q.AssetDecimals, SubtotalAtomic: subtotal, FeesAtomic: fees, TotalMaxAtomic: total, AcceptanceDeadlineUnixNanos: q.ExpiresAt.UnixNano(), QuoteExpiryUnixNanos: q.ExpiresAt.UnixNano(), ExecutionDeadlineUnixNanos: q.ExecutionDeadline.UnixNano(), UnderlyingServiceQuoteRef: q.UnderlyingServiceQuoteRef, DisputePolicyDigest: q.DisputePolicyHash, CanonicalCBOR: quoteWire.CanonicalCBOR}, Escrow: verifiedproof.Escrow{EscrowID: esc.ID, JobID: j.ID, ContractRef: vpRef(s.core.Network(), esc.NetworkProofRef, liveE.FinalizedCheckpoint), ContractCodeHash: esc.ContractCodeHash, ReservationDigest: esc.ReservationDigest, ReservationRef: vpRef(s.core.Network(), esc.NetworkProofRef, liveE.FinalizedCheckpoint), ReservedAtomic: reserve, EscrowDeadlineUnixNanos: esc.ExpiresAt.UnixNano(), FundingModel: string(q.Settlement.FundingModel), CanonicalCBOR: escrowWire.CanonicalCBOR}, SignerAuthorization: signerProof, Receipt: receiptProof, Outcome: verifiedproof.Outcome{Kind: kind, OutcomeRef: vpRef(s.core.Network(), r.NetworkProofRef, r.FinalizedCheckpoint), ChargedAtomic: charged, RefundedAtomic: refunded, ReleaseDigest: esc.ReleaseDigest, ReasonCode: esc.ReleaseReason, DisputeDigest: disputeDigest, DisputeRef: disputeRef, ResolutionDigest: resolutionDigest, DisputeOutcome: disputeOutcome}, ProofOfService: posProof}
 	check := verifiedproof.Verifier{Observer: capturedProofObserver{auth: auth}, Network: s.core.Network(), GatewayDomain: q.CommitmentDomain}.Verify(ctx, p)
 	if !check.Valid {
 		return fail(domain.NewError(domain.ErrProofVerificationFailed, fmt.Sprintf("portable proof self-verification failed: %+v", check.Failures), false))

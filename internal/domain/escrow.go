@@ -15,36 +15,59 @@ func (s EscrowStatus) Terminal() bool {
 	return s == EscrowSettled || s == EscrowReleased
 }
 
+// CanAdvanceTo defines the only legal monotonic projection transitions.
+func (s EscrowStatus) CanAdvanceTo(next EscrowStatus) bool {
+	if s == next {
+		return true
+	}
+	switch s {
+	case EscrowReserved:
+		return next == EscrowDisputed || next == EscrowSettled || next == EscrowReleased
+	case EscrowDisputed:
+		return next == EscrowSettled
+	default:
+		return false
+	}
+}
+
 type Escrow struct {
-	ID                    string                    `json:"escrow_id"`
-	QuoteID               string                    `json:"quote_id"`
-	JobID                 string                    `json:"job_id"`
-	PrincipalID           string                    `json:"principal_id"`
-	ProviderID            string                    `json:"provider_id"`
-	CapabilityID          string                    `json:"capability_id"`
-	CapabilityVersion     string                    `json:"capability_version"`
-	TrustMode             TrustMode                 `json:"trust_mode"`
-	ProofProfile          ProofProfile              `json:"proof_profile,omitempty"`
-	Settlement            SettlementDescriptor      `json:"settlement"`
-	Reserved              Money                     `json:"reserved"`
-	Status                EscrowStatus              `json:"status"`
-	NetworkProofRef       string                    `json:"network_proof_ref,omitempty"`
-	TerminalProofRef      string                    `json:"terminal_proof_ref,omitempty"`
-	QuoteCommitmentDigest string                    `json:"quote_commitment_digest,omitempty"`
-	QuoteCommitmentRef    string                    `json:"quote_commitment_ref,omitempty"`
-	ReservationDigest     string                    `json:"reservation_digest,omitempty"`
-	ReservationActionID   string                    `json:"reservation_action_id,omitempty"`
-	ContractCodeHash      string                    `json:"contract_code_hash,omitempty"`
-	Finalized             bool                      `json:"finalized"`
-	FinalizedCheckpoint   uint64                    `json:"finalized_checkpoint,omitempty"`
-	OperationCheckpoint   EscrowOperationCheckpoint `json:"operation_checkpoint,omitempty"`
-	ReleaseReason         string                    `json:"release_reason,omitempty"`
-	ReleaseDigest         string                    `json:"release_digest,omitempty"`
-	ReleaseActionID       string                    `json:"release_action_id,omitempty"`
-	ReleaseRef            string                    `json:"release_ref,omitempty"`
-	CreatedAt             time.Time                 `json:"created_at"`
-	ExpiresAt             time.Time                 `json:"expires_at"`
-	SettledAt             *time.Time                `json:"settled_at,omitempty"`
+	ID                      string                    `json:"escrow_id"`
+	QuoteID                 string                    `json:"quote_id"`
+	JobID                   string                    `json:"job_id"`
+	PrincipalID             string                    `json:"principal_id"`
+	ProviderID              string                    `json:"provider_id"`
+	CapabilityID            string                    `json:"capability_id"`
+	CapabilityVersion       string                    `json:"capability_version"`
+	TrustMode               TrustMode                 `json:"trust_mode"`
+	ProofProfile            ProofProfile              `json:"proof_profile,omitempty"`
+	Settlement              SettlementDescriptor      `json:"settlement"`
+	Reserved                Money                     `json:"reserved"`
+	Status                  EscrowStatus              `json:"status"`
+	NetworkProofRef         string                    `json:"network_proof_ref,omitempty"`
+	TerminalProofRef        string                    `json:"terminal_proof_ref,omitempty"`
+	QuoteCommitmentDigest   string                    `json:"quote_commitment_digest,omitempty"`
+	QuoteCommitmentRef      string                    `json:"quote_commitment_ref,omitempty"`
+	ReservationDigest       string                    `json:"reservation_digest,omitempty"`
+	ReservationActionID     string                    `json:"reservation_action_id,omitempty"`
+	ContractCodeHash        string                    `json:"contract_code_hash,omitempty"`
+	Finalized               bool                      `json:"finalized"`
+	FinalizedCheckpoint     uint64                    `json:"finalized_checkpoint,omitempty"`
+	OperationCheckpoint     EscrowOperationCheckpoint `json:"operation_checkpoint,omitempty"`
+	ReleaseReason           string                    `json:"release_reason,omitempty"`
+	ReleaseDigest           string                    `json:"release_digest,omitempty"`
+	ReleaseActionID         string                    `json:"release_action_id,omitempty"`
+	ReleaseRef              string                    `json:"release_ref,omitempty"`
+	ResultRef               string                    `json:"result_ref,omitempty"`
+	ResultDigest            string                    `json:"result_digest,omitempty"`
+	ResultEvidenceDigest    string                    `json:"result_evidence_digest,omitempty"`
+	ReviewDeadline          *time.Time                `json:"review_deadline,omitempty"`
+	DisputeDigest           string                    `json:"dispute_digest,omitempty"`
+	DisputeRef              string                    `json:"dispute_ref,omitempty"`
+	DisputeResolutionDigest string                    `json:"dispute_resolution_digest,omitempty"`
+	DisputeOutcome          string                    `json:"dispute_outcome,omitempty"`
+	CreatedAt               time.Time                 `json:"created_at"`
+	ExpiresAt               time.Time                 `json:"expires_at"`
+	SettledAt               *time.Time                `json:"settled_at,omitempty"`
 }
 
 type EscrowOperationKind string

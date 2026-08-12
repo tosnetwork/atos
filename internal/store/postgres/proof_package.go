@@ -79,7 +79,7 @@ func (s *Store) UpdateProofPackageOperation(ctx context.Context, id string, fn f
 	if e != nil {
 		return old, e
 	}
-	if next.ID != old.ID || next.ReceiptID != old.ReceiptID || next.JobID!=old.JobID||next.QuoteID!=old.QuoteID||next.EscrowID!=old.EscrowID||next.PrincipalID!=old.PrincipalID||next.SemanticDigest != old.SemanticDigest || (old.PackageDigest!=""&&next.PackageDigest!=old.PackageDigest) || !old.Checkpoint.CanAdvance(next.Checkpoint) {
+	if next.ID != old.ID || next.ReceiptID != old.ReceiptID || next.JobID != old.JobID || next.QuoteID != old.QuoteID || next.EscrowID != old.EscrowID || next.PrincipalID != old.PrincipalID || next.SemanticDigest != old.SemanticDigest || (old.PackageDigest != "" && next.PackageDigest != old.PackageDigest) || !old.Checkpoint.CanAdvance(next.Checkpoint) {
 		return old, store.ErrConflict
 	}
 	tag, e := tx.Exec(ctx, `UPDATE proof_package_operations SET package_digest=$2,canonical_cbor=$3,checkpoint=$4,last_error=$5,updated_at=$6,completed_at=$7 WHERE id=$1 AND checkpoint=$8`, id, next.PackageDigest, next.CanonicalCBOR, string(next.Checkpoint), next.LastError, next.UpdatedAt, next.CompletedAt, string(old.Checkpoint))

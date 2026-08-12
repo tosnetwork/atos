@@ -52,7 +52,7 @@ func (s *Store) UpdateProofPackageOperation(_ context.Context, id string, fn fun
 	if e != nil {
 		return old, e
 	}
-	if next.ID != old.ID || next.ReceiptID != old.ReceiptID || next.JobID!=old.JobID||next.QuoteID!=old.QuoteID||next.EscrowID!=old.EscrowID||next.PrincipalID!=old.PrincipalID||next.SemanticDigest != old.SemanticDigest || (old.PackageDigest!=""&&next.PackageDigest!=old.PackageDigest) || !old.Checkpoint.CanAdvance(next.Checkpoint) {
+	if next.ID != old.ID || next.ReceiptID != old.ReceiptID || next.JobID != old.JobID || next.QuoteID != old.QuoteID || next.EscrowID != old.EscrowID || next.PrincipalID != old.PrincipalID || next.SemanticDigest != old.SemanticDigest || (old.PackageDigest != "" && next.PackageDigest != old.PackageDigest) || !old.Checkpoint.CanAdvance(next.Checkpoint) {
 		return old, store.ErrConflict
 	}
 	s.proofPackageOperations[id] = next

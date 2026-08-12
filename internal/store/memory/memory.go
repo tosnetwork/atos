@@ -302,8 +302,10 @@ func (s *Store) StaleQuoteCommitmentOperations(_ context.Context, cutoff time.Ti
 func (s *Store) PutEscrow(ctx context.Context, e domain.Escrow) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if current, ok := s.escrows[e.ID]; ok && current.Status.Terminal() && e.Status != current.Status {
-		return store.ErrConflict
+	if current, ok := s.escrows[e.ID]; ok {
+		if !current.Status.CanAdvanceTo(e.Status) || e.FinalizedCheckpoint < current.FinalizedCheckpoint || current.QuoteID != e.QuoteID || current.JobID != e.JobID || current.PrincipalID != e.PrincipalID || current.ProviderID != e.ProviderID || current.CapabilityID != e.CapabilityID || current.ReservationDigest != e.ReservationDigest || current.NetworkProofRef != e.NetworkProofRef {
+			return store.ErrConflict
+		}
 	}
 	s.escrows[e.ID] = e
 	return nil
@@ -397,6 +399,9 @@ func (s *Store) StaleEscrowOperations(_ context.Context, cutoff time.Time, limit
 func (s *Store) PutReceipt(ctx context.Context, r domain.Receipt) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if current, ok := s.receipts[r.ID]; ok && !current.CanAdvanceProjection(r) {
+		return store.ErrConflict
+	}
 	s.receipts[r.ID] = r
 	s.receiptsByJob[r.JobID] = r.ID
 	return nil

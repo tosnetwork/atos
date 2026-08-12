@@ -32,6 +32,9 @@ type GetEscrowRequest struct {
 	ExpectedTerminalRef       string
 	ExpectedReleaseDigest     string
 	ExpectedReleaseReasonCode string
+	ExpectedDisputeDigest     string
+	ExpectedDisputeRef        string
+	ExpectedDisputePayout     domain.Money
 }
 
 type ReleaseEscrowRequest struct {
@@ -79,6 +82,35 @@ type SettleJobRequest struct {
 
 type SettleJobResult struct {
 	Receipt domain.Receipt
+}
+
+type PrepareVerifiedResultRequest struct {
+	Quote   domain.Quote
+	Job     domain.Job
+	Receipt domain.ExecutionReceipt
+	Escrow  domain.Escrow
+}
+type VerifiedDisputeOpenRequest struct {
+	Quote                 domain.Quote
+	Job                   domain.Job
+	Escrow                domain.Escrow
+	DisputeID, ReasonCode string
+	EvidenceDigests       []string
+	OpenedAt              time.Time
+}
+type VerifiedDisputeResolutionRequest struct {
+	Quote                                                     domain.Quote
+	Job                                                       domain.Job
+	Escrow                                                    domain.Escrow
+	DisputeID, DisputeDigest, DisputeRef, Outcome, ReviewerID string
+	ProviderPayout, RequesterRefund                           domain.Money
+	ResolvedAt                                                time.Time
+}
+type VerifiedDisputeResult struct {
+	Escrow                                                                    domain.Escrow
+	Receipt                                                                   domain.Receipt
+	ReceiptDigest, DisputeDigest, DisputeRef, ResolutionDigest, ResolutionRef string
+	FinalizedCheckpoint                                                       uint64
 }
 
 type ExecutionSignerAuthorization struct {
@@ -220,4 +252,10 @@ type Core interface {
 	ReadProofOfServiceEvidence(ctx context.Context, receipt domain.ExecutionReceipt) (ProofOfServiceEvidence, bool, error)
 	ReadSettlementStatus(ctx context.Context, escrowID string) (domain.EscrowStatus, error)
 	ReadProof(ctx context.Context, receiptID string) (map[string]any, error)
+}
+
+type VerifiedDisputeCore interface {
+	PrepareVerifiedResult(context.Context, PrepareVerifiedResultRequest) (domain.Escrow, error)
+	OpenVerifiedDispute(context.Context, VerifiedDisputeOpenRequest) (VerifiedDisputeResult, error)
+	ResolveVerifiedDispute(context.Context, VerifiedDisputeResolutionRequest) (VerifiedDisputeResult, error)
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/tosnetwork/atos/internal/adapters/toscore"
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/financial"
 	"github.com/tosnetwork/atos/internal/money"
@@ -114,6 +115,12 @@ func (s *DisputeService) Open(ctx context.Context, in OpenDisputeInput) (domain.
 	// recovery: the unique (principal_id, job_id) dispute identity makes
 	// this unambiguous.
 	if existing, lookupErr := s.store.DisputeByIdempotencyKey(ctx, in.PrincipalID, in.IdempotencyKey); lookupErr == nil {
+		if existing.TrustMode == domain.TrustModeVerified {
+			existing, err = s.reconcileVerifiedDisputeOpen(ctx, existing)
+			if err != nil {
+				return domain.Dispute{}, err
+			}
+		}
 		if err := s.ensureFinancialDisputeHold(ctx, existing); err != nil {
 			return domain.Dispute{}, err
 		}
@@ -137,8 +144,19 @@ func (s *DisputeService) Open(ctx context.Context, in OpenDisputeInput) (domain.
 	if job.PrincipalID != in.PrincipalID {
 		return domain.Dispute{}, domain.NewError(domain.ErrPermissionDenied, "not the owning principal of this job", false)
 	}
+	if job.TrustMode == domain.TrustModeVerified {
+		dispute, openErr := s.openVerified(ctx, job, in, now)
+		if openErr != nil {
+			return domain.Dispute{}, openErr
+		}
+		if err := s.store.Finish(ctx, in.PrincipalID, in.IdempotencyKey, dispute.ID); err != nil {
+			return domain.Dispute{}, err
+		}
+		committed = true
+		return dispute, nil
+	}
 	if job.TrustMode != domain.TrustModeManaged {
-		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "only Managed-mode jobs may be disputed", false)
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "only Managed or Verified jobs may be disputed", false)
 	}
 	if job.State != domain.JobCompleted || job.EconomicState != domain.EconomicSettled {
 		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "job is not a completed, settled Managed job", false)
@@ -304,6 +322,128 @@ func (s *DisputeService) ensureFinancialDisputeHold(ctx context.Context, dispute
 	return err
 }
 
+func (s *DisputeService) openVerified(ctx context.Context, job domain.Job, in OpenDisputeInput, now time.Time) (domain.Dispute, error) {
+	if job.State != domain.JobReconciling || job.EconomicState != domain.EconomicReviewPending || job.ExecutionReceipt == nil {
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "Verified job is not in its canonical review window", false)
+	}
+	quote, err := s.store.GetQuote(ctx, job.QuoteID)
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	escrow, err := s.store.GetEscrow(ctx, job.EscrowID)
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	if escrow.Status != domain.EscrowReserved || escrow.ReviewDeadline == nil || !now.Before(*escrow.ReviewDeadline) || escrow.ResultRef == "" || !escrow.Finalized {
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeWindowExpired, "canonical TaskEscrow review window is unavailable or expired", false)
+	}
+	snap, err := computeBillingSnapshot(quote, *job.ExecutionReceipt)
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	evidence := make([]domain.DisputeEvidence, 0, len(in.Evidence))
+	evidenceDigests := make([]string, 0, len(in.Evidence))
+	for _, v := range in.Evidence {
+		if v.ArtifactID == "" {
+			continue
+		}
+		artifact, getErr := s.artifacts.Get(ctx, in.PrincipalID, v.ArtifactID)
+		if getErr != nil {
+			return domain.Dispute{}, domain.NewError(domain.ErrValidationFailed, "dispute evidence is unavailable", false)
+		}
+		digest := artifact.SHA256
+		if digest != "" && len(digest) == 64 {
+			digest = "sha256:" + digest
+		}
+		if digest == "" {
+			return domain.Dispute{}, domain.NewError(domain.ErrValidationFailed, "dispute evidence has no content digest", false)
+		}
+		evidence = append(evidence, v)
+		evidenceDigests = append(evidenceDigests, digest)
+	}
+	d := domain.Dispute{ID: "dispute_" + uuid.NewString(), PrincipalID: job.PrincipalID, ProviderID: job.ProviderID, JobID: job.ID, QuoteID: job.QuoteID, CapabilityID: job.CapabilityID, ReceiptID: job.ExecutionReceipt.ID, ChargedAmount: snap.GrossCharge, OriginalRefundAmount: snap.PrincipalRefund, Reason: in.Reason, Description: in.Description, Evidence: evidence, EvidenceDigests: evidenceDigests, IdempotencyKey: in.IdempotencyKey, DisputePolicyHash: quote.DisputePolicyHash, TrustMode: domain.TrustModeVerified, EscrowID: escrow.ID, ReviewStatus: domain.DisputeOpened, EconomicState: domain.DisputeEconomicVerifiedOpenPending, OpenedAt: now, UpdatedAt: now}
+	d, _, created, err := s.store.OpenDispute(ctx, job.ID, "", func(_ domain.ProviderEarning, _ bool) (domain.Dispute, domain.ProviderEarning, error) {
+		return d, domain.ProviderEarning{}, nil
+	})
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	if !created {
+		return s.reconcileVerifiedDisputeOpen(ctx, d)
+	}
+	core, ok := s.jobs.core.(toscore.VerifiedDisputeCore)
+	if !ok {
+		return domain.Dispute{}, domain.NewError(domain.ErrNetworkUnavailable, "Verified dispute authority unavailable", true)
+	}
+	result, err := core.OpenVerifiedDispute(ctx, toscore.VerifiedDisputeOpenRequest{Quote: quote, Job: job, Escrow: escrow, DisputeID: d.ID, ReasonCode: in.Reason, EvidenceDigests: evidenceDigests, OpenedAt: d.OpenedAt})
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	d.DisputeDigest = result.DisputeDigest
+	d.DisputeRef = result.DisputeRef
+	d.DisputeCheckpoint = result.FinalizedCheckpoint
+	d.ReceiptDigest = result.ReceiptDigest
+	d.EconomicState = domain.DisputeEconomicVerifiedDisputed
+	d.UpdatedAt = time.Now().UTC()
+	if _, err = s.store.UpdateDispute(ctx, d.ID, func(current domain.Dispute, exists bool) (domain.Dispute, error) {
+		if !exists {
+			return domain.Dispute{}, store.ErrNotFound
+		}
+		current.DisputeDigest = d.DisputeDigest
+		current.DisputeRef = d.DisputeRef
+		current.DisputeCheckpoint = d.DisputeCheckpoint
+		current.ReceiptDigest = d.ReceiptDigest
+		current.EconomicState = domain.DisputeEconomicVerifiedDisputed
+		current.UpdatedAt = d.UpdatedAt
+		return current, nil
+	}); err != nil {
+		return domain.Dispute{}, err
+	}
+	if err = s.store.PutEscrow(ctx, result.Escrow); err != nil {
+		return domain.Dispute{}, err
+	}
+	return s.store.GetDispute(ctx, d.ID)
+}
+
+func (s *DisputeService) reconcileVerifiedDisputeOpen(ctx context.Context, d domain.Dispute) (domain.Dispute, error) {
+	if d.DisputeRef != "" && d.DisputeCheckpoint > 0 {
+		return d, nil
+	}
+	job, err := s.store.GetJob(ctx, d.JobID)
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	quote, err := s.store.GetQuote(ctx, d.QuoteID)
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	escrow, err := s.store.GetEscrow(ctx, d.EscrowID)
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	digests := append([]string(nil), d.EvidenceDigests...)
+	core, ok := s.jobs.core.(toscore.VerifiedDisputeCore)
+	if !ok {
+		return domain.Dispute{}, domain.NewError(domain.ErrNetworkUnavailable, "Verified dispute authority unavailable", true)
+	}
+	result, err := core.OpenVerifiedDispute(ctx, toscore.VerifiedDisputeOpenRequest{Quote: quote, Job: job, Escrow: escrow, DisputeID: d.ID, ReasonCode: d.Reason, EvidenceDigests: digests, OpenedAt: d.OpenedAt})
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	return s.store.UpdateDispute(ctx, d.ID, func(x domain.Dispute, exists bool) (domain.Dispute, error) {
+		if !exists {
+			return domain.Dispute{}, store.ErrNotFound
+		}
+		x.DisputeDigest = result.DisputeDigest
+		x.DisputeRef = result.DisputeRef
+		x.DisputeCheckpoint = result.FinalizedCheckpoint
+		x.ReceiptDigest = result.ReceiptDigest
+		x.EconomicState = domain.DisputeEconomicVerifiedDisputed
+		x.UpdatedAt = time.Now().UTC()
+		return x, nil
+	})
+}
+
 // Review transitions a dispute from Opened to UnderReview, claiming it
 // exclusively for reviewerID: once claimed, no other reviewer may claim or
 // resolve it (see Resolve's ReviewerID check) -- only the original
@@ -388,6 +528,9 @@ func (s *DisputeService) Resolve(ctx context.Context, in ResolveDisputeInput) (d
 	seed, err = s.reserveResolutionIntent(ctx, seed.ID, in)
 	if err != nil {
 		return domain.Dispute{}, err
+	}
+	if seed.TrustMode == domain.TrustModeVerified {
+		return s.resolveVerified(ctx, seed, in)
 	}
 	if err := s.applyFinancialDisputeResolution(ctx, seed, in.Outcome); err != nil {
 		return domain.Dispute{}, err
@@ -536,9 +679,126 @@ func (s *DisputeService) reserveResolutionIntent(ctx context.Context, disputeID 
 		}
 		d.PendingOutcome = in.Outcome
 		d.PendingReviewerID = in.ReviewerID
+		if in.Outcome == domain.DisputeOutcomeRejected {
+			d.ReasonRejected = in.ReasonRejected
+		}
+		if d.ResolutionRequestedAt == nil {
+			now := time.Now().UTC()
+			d.ResolutionRequestedAt = &now
+		}
+		if d.TrustMode == domain.TrustModeVerified {
+			d.EconomicState = domain.DisputeEconomicVerifiedResolutionPending
+		}
 		d.UpdatedAt = time.Now().UTC()
 		return d, nil
 	})
+}
+
+func (s *DisputeService) resolveVerified(ctx context.Context, dispute domain.Dispute, in ResolveDisputeInput) (domain.Dispute, error) {
+	if dispute.PrincipalID == in.ReviewerID || dispute.ProviderID == in.ReviewerID {
+		return domain.Dispute{}, domain.NewError(domain.ErrPermissionDenied, "a party to the dispute cannot resolve it", false)
+	}
+	if dispute.ReviewerID != "" && dispute.ReviewerID != in.ReviewerID {
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute is claimed by a different reviewer", false)
+	}
+	if in.Outcome != domain.DisputeOutcomeRejected && dispute.ReviewStatus != domain.DisputeUnderReview && !dispute.ReviewStatus.Terminal() {
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeInvalidTransition, "dispute must be under review before it can be decided for a party", false)
+	}
+	job, err := s.store.GetJob(ctx, dispute.JobID)
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	quote, err := s.store.GetQuote(ctx, dispute.QuoteID)
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	escrow, err := s.store.GetEscrow(ctx, dispute.EscrowID)
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	if job.TrustMode != domain.TrustModeVerified || quote.TrustMode != domain.TrustModeVerified || job.ExecutionReceipt == nil || escrow.ID != dispute.EscrowID || dispute.DisputeDigest == "" || dispute.DisputeRef == "" || dispute.DisputeCheckpoint == 0 {
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeNotEligible, "Verified dispute canonical tuple is incomplete", false)
+	}
+	snapshot, err := computeBillingSnapshot(quote, *job.ExecutionReceipt)
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	payout, refund := snapshot.GrossCharge, snapshot.PrincipalRefund
+	if in.Outcome == domain.DisputeOutcomePrincipal {
+		payout = domain.Money{Amount: "0.000000000", Currency: escrow.Reserved.Currency}
+		refund = escrow.Reserved
+	}
+	core, ok := s.jobs.core.(toscore.VerifiedDisputeCore)
+	if !ok {
+		return domain.Dispute{}, domain.NewError(domain.ErrNetworkUnavailable, "Verified dispute authority unavailable", true)
+	}
+	if dispute.ResolutionRequestedAt == nil {
+		return domain.Dispute{}, domain.NewError(domain.ErrDisputeInvalidTransition, "resolution time intent missing", false)
+	}
+	result, err := core.ResolveVerifiedDispute(ctx, toscore.VerifiedDisputeResolutionRequest{Quote: quote, Job: job, Escrow: escrow, DisputeID: dispute.ID, DisputeDigest: dispute.DisputeDigest, DisputeRef: dispute.DisputeRef, Outcome: string(in.Outcome), ReviewerID: in.ReviewerID, ProviderPayout: payout, RequesterRefund: refund, ResolvedAt: *dispute.ResolutionRequestedAt})
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	if result.ResolutionDigest == "" || result.ResolutionRef == "" || result.FinalizedCheckpoint == 0 || !result.Escrow.Finalized {
+		return domain.Dispute{}, domain.NewError(domain.ErrSettlementFailed, "canonical dispute resolution is incomplete", true)
+	}
+	if err = s.store.PutEscrow(ctx, result.Escrow); err != nil {
+		return domain.Dispute{}, err
+	}
+	if err = s.store.PutReceipt(ctx, result.Receipt); err != nil {
+		return domain.Dispute{}, err
+	}
+	now := time.Now().UTC()
+	resolved, err := s.store.UpdateDispute(ctx, dispute.ID, func(current domain.Dispute, exists bool) (domain.Dispute, error) {
+		if !exists {
+			return domain.Dispute{}, store.ErrNotFound
+		}
+		if current.ReviewStatus.Terminal() {
+			if current.Outcome == in.Outcome && current.ResolutionDigest == result.ResolutionDigest {
+				return current, nil
+			}
+			return domain.Dispute{}, domain.NewError(domain.ErrDisputeInvalidTransition, "terminal Verified dispute cannot regress", false)
+		}
+		if current.PendingOutcome != in.Outcome || current.PendingReviewerID != in.ReviewerID {
+			return domain.Dispute{}, domain.NewError(domain.ErrDisputeInvalidTransition, "resolution intent changed", false)
+		}
+		current.Outcome, current.ReviewerID = in.Outcome, in.ReviewerID
+		current.ResolutionDigest, current.ResolutionRef, current.ResolutionCheckpoint = result.ResolutionDigest, result.ResolutionRef, result.FinalizedCheckpoint
+		current.EconomicState = domain.DisputeEconomicVerifiedResolved
+		switch in.Outcome {
+		case domain.DisputeOutcomePrincipal:
+			current.ReviewStatus = domain.DisputeResolvedForPrincipal
+		case domain.DisputeOutcomeProvider:
+			current.ReviewStatus = domain.DisputeResolvedForProvider
+		default:
+			current.ReviewStatus = domain.DisputeRejected
+			current.ReasonRejected = in.ReasonRejected
+		}
+		current.ResolvedAt, current.UpdatedAt = &now, now
+		return current, nil
+	})
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	_, err = s.store.UpdateJob(ctx, job.ID, func(current domain.Job, exists bool) (domain.Job, error) {
+		if !exists {
+			return domain.Job{}, store.ErrNotFound
+		}
+		if current.EconomicState == domain.EconomicSettled && current.State == domain.JobCompleted {
+			return current, nil
+		}
+		if current.EconomicState != domain.EconomicReviewPending {
+			return domain.Job{}, domain.NewError(domain.ErrDisputeInvalidTransition, "Verified Job economic state changed", false)
+		}
+		current.EconomicState, current.State = domain.EconomicSettled, domain.JobCompleted
+		current.ReconciliationRequired, current.ReconciliationTarget, current.FailureReason = false, "", ""
+		current.UpdatedAt = now
+		return current, nil
+	})
+	if err != nil {
+		return domain.Dispute{}, err
+	}
+	return resolved, nil
 }
 
 func (s *DisputeService) applyFinancialDisputeResolution(ctx context.Context, dispute domain.Dispute, outcome domain.DisputeOutcome) error {
@@ -659,6 +919,12 @@ func (s *DisputeService) ReconcileDispute(ctx context.Context, disputeID string)
 	}
 	if dispute.EconomicState == domain.DisputeEconomicPendingPayoutResolution {
 		return s.reconcilePendingPayout(ctx, dispute)
+	}
+	if dispute.EconomicState == domain.DisputeEconomicVerifiedOpenPending {
+		return s.reconcileVerifiedDisputeOpen(ctx, dispute)
+	}
+	if dispute.EconomicState == domain.DisputeEconomicVerifiedResolutionPending && dispute.PendingOutcome != "" && dispute.PendingReviewerID != "" {
+		return s.resolveVerified(ctx, dispute, ResolveDisputeInput{DisputeID: dispute.ID, ReviewerID: dispute.PendingReviewerID, Outcome: dispute.PendingOutcome, ReasonRejected: dispute.ReasonRejected})
 	}
 	return dispute, nil
 }

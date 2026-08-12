@@ -14,6 +14,7 @@ import (
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/store"
 	atostosv1 "github.com/tosnetwork/tos-protocol/gen/atos/tos/v1"
+	"github.com/tosnetwork/tos-protocol/pkg/disputecommitment"
 	"github.com/tosnetwork/tos-protocol/pkg/escrowcommitment"
 	"github.com/tosnetwork/tos-protocol/pkg/poscommitment"
 	"github.com/tosnetwork/tos-protocol/pkg/quotecommitment"
@@ -410,6 +411,13 @@ func parseReference(network, value string) *atostosv1.NetworkReference {
 	return &atostosv1.NetworkReference{Network: network, Reference: strings.TrimPrefix(value, network+":")}
 }
 
+func finalizedReference(network, value string, checkpoint uint64) *atostosv1.NetworkReference {
+	ref := parseReference(network, value)
+	ref.Finalized = checkpoint > 0
+	ref.FinalizedCheckpoint = checkpoint
+	return ref
+}
+
 func (c *Client) ResolveExecutionSignerAuthorization(
 	ctx context.Context,
 	providerID, capabilityID, capabilityVersion, signerID string,
@@ -629,6 +637,17 @@ func (c *Client) GetEscrow(ctx context.Context, req toscore.GetEscrowRequest) (d
 	}
 	request.Msg.ExpectedReleaseDigest = req.ExpectedReleaseDigest
 	request.Msg.ExpectedReleaseReasonCode = req.ExpectedReleaseReasonCode
+	request.Msg.ExpectedDisputeDigest = req.ExpectedDisputeDigest
+	if req.ExpectedDisputeRef != "" {
+		request.Msg.ExpectedDisputeRef = parseReference(req.Quote.NetworkID, req.ExpectedDisputeRef)
+	}
+	if req.ExpectedDisputePayout.Amount != "" {
+		payout, amountErr := networkAmount(req.ExpectedDisputePayout)
+		if amountErr != nil {
+			return domain.Escrow{}, false, amountErr
+		}
+		request.Msg.ExpectedDisputePayout = payout
+	}
 	decorateRequest(c, ctx, request)
 	response, err := c.settlement.GetEscrow(callCtx, request)
 	if err != nil {
@@ -709,6 +728,125 @@ func (c *Client) ReleaseEscrow(ctx context.Context, req toscore.ReleaseEscrowReq
 		c.proofRefs.Store(receipt.ID, receipt.NetworkProofRef)
 	}
 	return toscore.ReleaseEscrowResult{Escrow: released, Receipt: receipt}, nil
+}
+
+func (c *Client) PrepareVerifiedResult(ctx context.Context, req toscore.PrepareVerifiedResultRequest) (domain.Escrow, error) {
+	terms, reservationDigest, err := verifiedEscrowTerms(req.Quote, req.Job.ID)
+	if err != nil {
+		return domain.Escrow{}, err
+	}
+	receipt, err := c.executionEnvelope(ctx, req.Receipt)
+	if err != nil {
+		return domain.Escrow{}, err
+	}
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	r := connect.NewRequest(&atostosv1.PrepareVerifiedResultRequest{Context: c.requestContext(ctx, req.Job.PrincipalID, "prepare-result:"+req.Job.ID, time.Time{}), EscrowId: req.Escrow.ID, QuoteId: req.Quote.ID, JobId: req.Job.ID, ReceiptId: req.Receipt.ID, ExpectedTerms: terms, ExpectedEscrowRef: parseReference(req.Quote.NetworkID, req.Escrow.NetworkProofRef), ExpectedReservationDigest: reservationDigest, ExpectedReceipt: receipt, ExpectedReceiptRef: finalizedReference(req.Quote.NetworkID, req.Receipt.NetworkProofRef, req.Receipt.NetworkProofCheckpoint)})
+	decorateRequest(c, ctx, r)
+	resp, e := c.settlement.PrepareVerifiedResult(callCtx, r)
+	if e != nil {
+		return domain.Escrow{}, rpcError(e)
+	}
+	if resp.Msg == nil || !resp.Msg.Prepared || resp.Msg.Escrow == nil {
+		return domain.Escrow{}, domain.NewError(domain.ErrSettlementFailed, "TOS result review was not prepared", true)
+	}
+	escrow := domainEscrow(resp.Msg.Escrow, req.Job.ID, req.Job.CapabilityVersion, req.Quote.Settlement)
+	if escrow.ResultRef == "" || escrow.ReviewDeadline == nil || escrow.FinalizedCheckpoint == 0 {
+		return domain.Escrow{}, domain.NewError(domain.ErrSettlementFailed, "finalized result review evidence missing", true)
+	}
+	return escrow, nil
+}
+
+func (c *Client) OpenVerifiedDispute(ctx context.Context, req toscore.VerifiedDisputeOpenRequest) (toscore.VerifiedDisputeResult, error) {
+	terms, reservationDigest, e := verifiedEscrowTerms(req.Quote, req.Job.ID)
+	if e != nil {
+		return toscore.VerifiedDisputeResult{}, e
+	}
+	if req.Job.ExecutionReceipt == nil {
+		return toscore.VerifiedDisputeResult{}, domain.NewError(domain.ErrDisputeNotEligible, "execution Receipt unavailable", false)
+	}
+	wire, e := c.PortableReceiptEvidence(ctx, *req.Job.ExecutionReceipt)
+	if e != nil {
+		return toscore.VerifiedDisputeResult{}, e
+	}
+	receiptEnvelope, e := c.executionEnvelope(ctx, *req.Job.ExecutionReceipt)
+	if e != nil {
+		return toscore.VerifiedDisputeResult{}, e
+	}
+	digests := make([]*atostosv1.Digest, 0, len(req.EvidenceDigests))
+	for _, d := range req.EvidenceDigests {
+		digests = append(digests, mustDigest(d))
+	}
+	d := &atostosv1.VerifiedDisputeOpen{Version: "atos_verified_dispute_open_v1", NetworkId: req.Quote.NetworkID, GatewayDomain: req.Quote.CommitmentDomain, DisputeId: req.DisputeID, EscrowId: req.Escrow.ID, JobId: req.Job.ID, QuoteId: req.Quote.ID, ReceiptId: req.Job.ExecutionReceipt.ID, PrincipalId: req.Job.PrincipalID, ProviderId: req.Job.ProviderID, CapabilityId: req.Job.CapabilityID, CapabilityVersion: req.Job.CapabilityVersion, QuoteCommitmentDigest: req.Quote.Commitment.Digest, ReservationDigest: req.Escrow.ReservationDigest, ReceiptDigest: wire.Digest, DisputePolicyDigest: mustDigest(req.Quote.DisputePolicyHash), ReasonCode: req.ReasonCode, EvidenceDigests: digests, OpenedUnixMillis: req.OpenedAt.UnixMilli()}
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	r := connect.NewRequest(&atostosv1.OpenVerifiedDisputeRequest{Context: c.requestContext(ctx, req.Job.PrincipalID, "open-dispute:"+req.DisputeID, time.Time{}), Dispute: d, ExpectedTerms: terms, ExpectedEscrowRef: parseReference(req.Quote.NetworkID, req.Escrow.NetworkProofRef), ExpectedReservationDigest: reservationDigest, ExpectedResultHash: req.Escrow.ResultDigest, ExpectedEvidenceHash: req.Escrow.ResultEvidenceDigest, ExpectedResultRef: parseReference(req.Quote.NetworkID, req.Escrow.ResultRef), ExpectedReceipt: receiptEnvelope, ExpectedReceiptRef: finalizedReference(req.Quote.NetworkID, req.Job.ExecutionReceipt.NetworkProofRef, req.Job.ExecutionReceipt.NetworkProofCheckpoint)})
+	decorateRequest(c, ctx, r)
+	expectedDigest, e := disputecommitment.OpenDigest(d)
+	if e != nil {
+		return toscore.VerifiedDisputeResult{}, domain.NewError(domain.ErrValidationFailed, e.Error(), false)
+	}
+	resp, e := c.settlement.OpenVerifiedDispute(callCtx, r)
+	if e != nil {
+		return toscore.VerifiedDisputeResult{}, rpcError(e)
+	}
+	if resp.Msg == nil || !resp.Msg.Opened || resp.Msg.Escrow == nil || resp.Msg.DisputeRef == nil {
+		return toscore.VerifiedDisputeResult{}, domain.NewError(domain.ErrSettlementFailed, "TOS dispute was not finalized", true)
+	}
+	escrow := domainEscrow(resp.Msg.Escrow, req.Job.ID, req.Job.CapabilityVersion, req.Quote.Settlement)
+	if resp.Msg.DisputeDigest != expectedDigest || escrow.Status != domain.EscrowDisputed || escrow.DisputeDigest != expectedDigest || reference(resp.Msg.DisputeRef) != escrow.DisputeRef || resp.Msg.DisputeRef.Network != req.Quote.NetworkID || !resp.Msg.DisputeRef.Finalized || resp.Msg.DisputeRef.FinalizedCheckpoint == 0 {
+		return toscore.VerifiedDisputeResult{}, domain.NewError(domain.ErrSettlementFailed, "TOS dispute response tuple mismatch", false)
+	}
+	return toscore.VerifiedDisputeResult{Escrow: escrow, ReceiptDigest: wire.Digest, DisputeDigest: resp.Msg.DisputeDigest, DisputeRef: reference(resp.Msg.DisputeRef), FinalizedCheckpoint: resp.Msg.DisputeRef.FinalizedCheckpoint}, nil
+}
+
+func (c *Client) ResolveVerifiedDispute(ctx context.Context, req toscore.VerifiedDisputeResolutionRequest) (toscore.VerifiedDisputeResult, error) {
+	terms, reservationDigest, e := verifiedEscrowTerms(req.Quote, req.Job.ID)
+	if e != nil {
+		return toscore.VerifiedDisputeResult{}, e
+	}
+	receiptEnvelope, e := c.executionEnvelope(ctx, *req.Job.ExecutionReceipt)
+	if e != nil {
+		return toscore.VerifiedDisputeResult{}, e
+	}
+	reserved, e := networkAmount(req.Escrow.Reserved)
+	if e != nil {
+		return toscore.VerifiedDisputeResult{}, e
+	}
+	payout, e := networkAmount(req.ProviderPayout)
+	if e != nil {
+		return toscore.VerifiedDisputeResult{}, e
+	}
+	refund, e := networkAmount(req.RequesterRefund)
+	if e != nil {
+		return toscore.VerifiedDisputeResult{}, e
+	}
+	rv := &atostosv1.VerifiedDisputeResolution{Version: "atos_verified_dispute_resolution_v1", NetworkId: req.Quote.NetworkID, GatewayDomain: req.Quote.CommitmentDomain, DisputeId: req.DisputeID, EscrowId: req.Escrow.ID, JobId: req.Job.ID, QuoteId: req.Quote.ID, ReceiptId: req.Job.ExecutionReceipt.ID, DisputeDigest: req.DisputeDigest, Outcome: req.Outcome, ReviewerPrincipalId: req.ReviewerID, Reserved: reserved, ProviderPayout: payout, RequesterRefund: refund, ResolvedUnixMillis: req.ResolvedAt.UnixMilli()}
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	r := connect.NewRequest(&atostosv1.ResolveVerifiedDisputeRequest{Context: c.requestContext(ctx, req.ReviewerID, "resolve-dispute:"+req.DisputeID, time.Time{}), Resolution: rv, ExpectedTerms: terms, ExpectedEscrowRef: parseReference(req.Quote.NetworkID, req.Escrow.NetworkProofRef), ExpectedReservationDigest: reservationDigest, ExpectedDisputeRef: parseReference(req.Quote.NetworkID, req.DisputeRef), ExpectedReceipt: receiptEnvelope, ExpectedReceiptRef: finalizedReference(req.Quote.NetworkID, req.Job.ExecutionReceipt.NetworkProofRef, req.Job.ExecutionReceipt.NetworkProofCheckpoint)})
+	decorateRequest(c, ctx, r)
+	expectedDigest, e := disputecommitment.ResolutionDigest(rv)
+	if e != nil {
+		return toscore.VerifiedDisputeResult{}, domain.NewError(domain.ErrValidationFailed, e.Error(), false)
+	}
+	resp, e := c.settlement.ResolveVerifiedDispute(callCtx, r)
+	if e != nil {
+		return toscore.VerifiedDisputeResult{}, rpcError(e)
+	}
+	if resp.Msg == nil || !resp.Msg.Resolved || resp.Msg.Escrow == nil || resp.Msg.ResolutionRef == nil || resp.Msg.Settlement == nil {
+		return toscore.VerifiedDisputeResult{}, domain.NewError(domain.ErrSettlementFailed, "TOS dispute resolution was not finalized", true)
+	}
+	escrow := domainEscrow(resp.Msg.Escrow, req.Job.ID, req.Job.CapabilityVersion, req.Quote.Settlement)
+	if resp.Msg.ResolutionDigest != expectedDigest || escrow.Status != domain.EscrowSettled || escrow.DisputeDigest != req.DisputeDigest || escrow.DisputeResolutionDigest != expectedDigest || reference(resp.Msg.ResolutionRef) != escrow.TerminalProofRef || resp.Msg.ResolutionRef.Network != req.Quote.NetworkID || !resp.Msg.ResolutionRef.Finalized || resp.Msg.ResolutionRef.FinalizedCheckpoint == 0 || resp.Msg.Settlement.State != atostosv1.SettlementState_SETTLEMENT_STATE_SETTLED || resp.Msg.Settlement.JobId != req.Job.ID || resp.Msg.Settlement.QuoteId != req.Quote.ID || resp.Msg.Settlement.EscrowId != req.Escrow.ID || resp.Msg.Settlement.ReceiptId != req.Job.ExecutionReceipt.ID || domainMoney(resp.Msg.Settlement.Charged) != req.ProviderPayout || domainMoney(resp.Msg.Settlement.Refunded) != req.RequesterRefund {
+		return toscore.VerifiedDisputeResult{}, domain.NewError(domain.ErrSettlementFailed, "TOS dispute resolution response tuple mismatch", false)
+	}
+	receiptStatus := domain.ReceiptSettledAfterDispute
+	if req.Outcome == string(domain.DisputeOutcomePrincipal) {
+		receiptStatus = domain.ReceiptReleasedAfterDispute
+	}
+	receipt := domain.Receipt{ID: "rcpt_dispute_" + req.DisputeID, QuoteID: req.Quote.ID, EscrowID: req.Escrow.ID, JobID: req.Job.ID, PrincipalID: req.Job.PrincipalID, TrustMode: domain.TrustModeVerified, ProofProfile: domain.ProofProfileTOSVerifiedV1, Charged: req.ProviderPayout, Refunded: req.RequesterRefund, Status: receiptStatus, ProofStatus: domain.ProofSettled, NetworkProofRef: reference(resp.Msg.ResolutionRef), NetworkProofCheckpoint: resp.Msg.ResolutionRef.FinalizedCheckpoint, Finalized: true, FinalizedCheckpoint: resp.Msg.ResolutionRef.FinalizedCheckpoint, CreatedAt: req.ResolvedAt}
+	return toscore.VerifiedDisputeResult{Escrow: escrow, Receipt: receipt, DisputeDigest: req.DisputeDigest, DisputeRef: req.DisputeRef, ResolutionDigest: resp.Msg.ResolutionDigest, ResolutionRef: reference(resp.Msg.ResolutionRef), FinalizedCheckpoint: resp.Msg.ResolutionRef.FinalizedCheckpoint}, nil
 }
 
 func (c *Client) releaseManagedEscrow(ctx context.Context, req toscore.ReleaseEscrowRequest) (toscore.ReleaseEscrowResult, error) {
@@ -1209,6 +1347,11 @@ func domainEscrow(value *atostosv1.Escrow, jobID, capabilityVersion string, sett
 	if value == nil {
 		return domain.Escrow{}
 	}
+	var reviewDeadline *time.Time
+	if value.ReviewDeadlineUnixMillis > 0 {
+		v := time.UnixMilli(value.ReviewDeadlineUnixMillis).UTC()
+		reviewDeadline = &v
+	}
 	return domain.Escrow{
 		ID: value.EscrowId, QuoteID: value.QuoteId, JobID: jobID,
 		PrincipalID: value.PrincipalId, ProviderID: value.ProviderId,
@@ -1220,6 +1363,7 @@ func domainEscrow(value *atostosv1.Escrow, jobID, capabilityVersion string, sett
 		ReservationDigest: value.ReservationDigest, ReservationActionID: value.ReservationActionId,
 		ContractCodeHash: value.ContractCodeHash, Finalized: value.Finalized, FinalizedCheckpoint: value.FinalizedCheckpoint,
 		ReleaseReason: value.ReleaseReasonCode, ReleaseDigest: value.ReleaseDigest, ReleaseActionID: value.ReleaseActionId, ReleaseRef: reference(value.ReleaseRef),
+		ResultRef: reference(value.ResultRef), ResultDigest: value.ResultDigest, ResultEvidenceDigest: value.ResultEvidenceDigest, ReviewDeadline: reviewDeadline, DisputeDigest: value.DisputeDigest, DisputeRef: reference(value.DisputeRef), DisputeResolutionDigest: value.DisputeResolutionDigest, DisputeOutcome: value.DisputeOutcome,
 		CreatedAt: time.UnixMilli(value.CreatedUnixMillis).UTC(),
 		ExpiresAt: time.UnixMilli(value.ExpiresUnixMillis).UTC(),
 	}

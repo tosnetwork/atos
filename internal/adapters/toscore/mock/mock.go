@@ -7,12 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/tosnetwork/tos-protocol/pkg/codec"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tosnetwork/tos-protocol/pkg/codec"
 
 	"github.com/tosnetwork/atos/internal/adapters/toscore"
 	"github.com/tosnetwork/atos/internal/domain"
@@ -537,7 +538,7 @@ func (c *Core) ReleaseEscrow(ctx context.Context, req toscore.ReleaseEscrowReque
 		e.ReleaseDigest = "sha256:mock-release"
 		e.ReleaseActionID = "action:mock:release:" + e.ID
 		e.ReleaseRef = simulatedRef("escrow-release", e.TrustMode, e.ID)
-		e.NetworkProofRef = e.ReleaseRef
+		e.TerminalProofRef = e.ReleaseRef
 	}
 	if e.TrustMode == domain.TrustModeManaged {
 		e.NetworkProofRef = ""
@@ -582,6 +583,58 @@ func (c *Core) CommitExecutionReceipt(ctx context.Context, receipt domain.Execut
 		return simulatedRef("receipt", receipt.TrustMode, receipt.ID), nil
 	}
 	return "", nil
+}
+
+func (c *Core) PrepareVerifiedResult(ctx context.Context, req toscore.PrepareVerifiedResultRequest) (domain.Escrow, error) {
+	e, err := c.store.GetEscrow(ctx, req.Escrow.ID)
+	if err != nil {
+		return domain.Escrow{}, err
+	}
+	now := time.Now().UTC()
+	deadline := now.Add(time.Hour)
+	e.ResultRef = simulatedRef("escrow-result", e.TrustMode, e.ID)
+	e.ResultDigest = "sha256:" + strings.Repeat("31", 32)
+	e.ResultEvidenceDigest = "sha256:" + strings.Repeat("32", 32)
+	e.ReviewDeadline = &deadline
+	e.Finalized = true
+	if e.FinalizedCheckpoint == 0 {
+		e.FinalizedCheckpoint = 1
+	}
+	if err = c.store.PutEscrow(ctx, e); err != nil {
+		return domain.Escrow{}, err
+	}
+	return e, nil
+}
+func (c *Core) OpenVerifiedDispute(ctx context.Context, req toscore.VerifiedDisputeOpenRequest) (toscore.VerifiedDisputeResult, error) {
+	e, err := c.store.GetEscrow(ctx, req.Escrow.ID)
+	if err != nil {
+		return toscore.VerifiedDisputeResult{}, err
+	}
+	e.Status = domain.EscrowDisputed
+	e.DisputeDigest = "sha256:mock-dispute"
+	e.DisputeRef = simulatedRef("escrow-dispute", e.TrustMode, e.ID)
+	if err = c.store.PutEscrow(ctx, e); err != nil {
+		return toscore.VerifiedDisputeResult{}, err
+	}
+	return toscore.VerifiedDisputeResult{Escrow: e, ReceiptDigest: "sha256:" + strings.Repeat("33", 32), DisputeDigest: e.DisputeDigest, DisputeRef: e.DisputeRef, FinalizedCheckpoint: e.FinalizedCheckpoint}, nil
+}
+func (c *Core) ResolveVerifiedDispute(ctx context.Context, req toscore.VerifiedDisputeResolutionRequest) (toscore.VerifiedDisputeResult, error) {
+	e, err := c.store.GetEscrow(ctx, req.Escrow.ID)
+	if err != nil {
+		return toscore.VerifiedDisputeResult{}, err
+	}
+	e.Status = domain.EscrowSettled
+	e.DisputeOutcome = req.Outcome
+	e.DisputeResolutionDigest = "sha256:mock-resolution"
+	e.TerminalProofRef = simulatedRef("escrow-dispute-resolution", e.TrustMode, e.ID)
+	receiptStatus := domain.ReceiptSettledAfterDispute
+	if req.Outcome == string(domain.DisputeOutcomePrincipal) {
+		receiptStatus = domain.ReceiptReleasedAfterDispute
+	}
+	receipt := domain.Receipt{ID: "rcpt_dispute_" + req.DisputeID, QuoteID: req.Quote.ID, EscrowID: e.ID, JobID: req.Job.ID, PrincipalID: req.Job.PrincipalID, TrustMode: domain.TrustModeVerified, ProofProfile: domain.ProofProfileTOSVerifiedV1, Charged: req.ProviderPayout, Refunded: req.RequesterRefund, Status: receiptStatus, ProofStatus: domain.ProofSettled, NetworkProofRef: e.TerminalProofRef, Finalized: true, FinalizedCheckpoint: e.FinalizedCheckpoint, CreatedAt: req.ResolvedAt}
+	_ = c.store.PutEscrow(ctx, e)
+	_ = c.store.PutReceipt(ctx, receipt)
+	return toscore.VerifiedDisputeResult{Escrow: e, Receipt: receipt, DisputeDigest: e.DisputeDigest, DisputeRef: e.DisputeRef, ResolutionDigest: e.DisputeResolutionDigest, ResolutionRef: e.TerminalProofRef, FinalizedCheckpoint: e.FinalizedCheckpoint}, nil
 }
 
 func (c *Core) VerifyExecutionReceipt(ctx context.Context, escrowID string, receipt domain.ExecutionReceipt) (toscore.VerifyExecutionReceiptResult, error) {

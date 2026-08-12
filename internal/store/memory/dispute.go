@@ -23,10 +23,12 @@ func disputeContentHash(d domain.Dispute) string {
 		ChargedAmount, OriginalRefundAmount                                                       domain.Money
 		Reason, Description                                                                       string
 		Evidence                                                                                  []domain.DisputeEvidence
+		EvidenceDigests                                                                           []string
 		DisputePolicyHash                                                                         string
+		TrustMode, EscrowID                                                                       string
 	}{
 		d.PrincipalID, d.ProviderID, d.JobID, d.QuoteID, d.CapabilityID, d.ReceiptID, d.SettlementID, d.EarningID,
-		d.ChargedAmount, d.OriginalRefundAmount, d.Reason, d.Description, d.Evidence, d.DisputePolicyHash,
+		d.ChargedAmount, d.OriginalRefundAmount, d.Reason, d.Description, d.Evidence, d.EvidenceDigests, d.DisputePolicyHash, string(d.TrustMode), d.EscrowID,
 	})
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
@@ -166,7 +168,7 @@ func (s *Store) DisputesForRecovery(ctx context.Context, updatedBefore time.Time
 		if d.EconomicState.Terminal() {
 			continue
 		}
-		if d.EconomicState != domain.DisputeEconomicPendingPayoutResolution {
+		if d.EconomicState != domain.DisputeEconomicPendingPayoutResolution && d.EconomicState != domain.DisputeEconomicVerifiedOpenPending && d.EconomicState != domain.DisputeEconomicVerifiedResolutionPending {
 			continue
 		}
 		if d.UpdatedAt.After(updatedBefore) {
@@ -201,6 +203,9 @@ func (s *Store) UpdateDispute(ctx context.Context, id string, fn func(domain.Dis
 		if disputeContentHash(current) != disputeContentHash(next) {
 			return domain.Dispute{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change identity/economic fields", false)
 		}
+		if !current.CanAdvanceProjection(next) {
+			return domain.Dispute{}, store.ErrConflict
+		}
 	}
 	s.disputes[id] = next
 	if next.JobID != "" {
@@ -228,6 +233,9 @@ func (s *Store) UpdateDisputeAndEarning(ctx context.Context, disputeID string, f
 	}
 	if disputeContentHash(currentDispute) != disputeContentHash(nextDispute) {
 		return domain.Dispute{}, domain.ProviderEarning{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change identity/economic fields", false)
+	}
+	if !currentDispute.CanAdvanceProjection(nextDispute) {
+		return domain.Dispute{}, domain.ProviderEarning{}, store.ErrConflict
 	}
 	if earningExists {
 		if nextEarning.ID != currentEarning.ID {
@@ -271,6 +279,9 @@ func (s *Store) ResolveDispute(ctx context.Context, disputeID, principalID strin
 	}
 	if disputeContentHash(currentDispute) != disputeContentHash(nextDispute) {
 		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, domain.NewError(domain.ErrIdempotencyConflict, "dispute update must not change identity/economic fields", false)
+	}
+	if !currentDispute.CanAdvanceProjection(nextDispute) {
+		return domain.Dispute{}, domain.ProviderEarning{}, domain.Account{}, store.ErrConflict
 	}
 	if earningExists {
 		if nextEarning.ID != currentEarning.ID {

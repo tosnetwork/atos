@@ -25,6 +25,7 @@ const (
 	EconomicEscrowPending     EconomicState = "escrow_pending"
 	EconomicEscrowReserved    EconomicState = "escrow_reserved"
 	EconomicSettlementPending EconomicState = "settlement_pending"
+	EconomicReviewPending     EconomicState = "review_pending"
 	EconomicReleasePending    EconomicState = "release_pending"
 	EconomicSettled           EconomicState = "settled"
 	EconomicReleased          EconomicState = "released"
