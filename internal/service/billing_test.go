@@ -248,6 +248,9 @@ func TestComputeBillingSnapshot_SubCentUsageTruncatesNotZero(t *testing.T) {
 	if snap.ProviderGross.Amount != "0.00" {
 		t.Fatalf("provider gross = %s, want 0.00 (truncated, not rejected)", snap.ProviderGross.Amount)
 	}
+	if snap.GatewayFee.Amount != "0.00" || snap.GrossCharge.Amount != "0.00" || snap.PrincipalRefund.Amount != "10.50" {
+		t.Fatalf("zero-charge settlement split is not a full refund: %+v", snap)
+	}
 }
 
 // The gross charge must never exceed quote.total_max, checked across a
