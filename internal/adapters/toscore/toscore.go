@@ -208,6 +208,8 @@ type Core interface {
 	CommitExecutionReceipt(ctx context.Context, receipt domain.ExecutionReceipt) (proofRef string, err error)
 	VerifyExecutionReceipt(ctx context.Context, escrowID string, receipt domain.ExecutionReceipt) (VerifyExecutionReceiptResult, error)
 	PortableReceiptEvidence(context.Context, domain.ExecutionReceipt) (PortableReceiptEvidence, error)
+	PortableQuoteEvidence(context.Context, domain.Quote) (PortableReceiptEvidence, error)
+	PortableEscrowEvidence(context.Context, domain.Quote, string) (PortableReceiptEvidence, error)
 	ResolveExecutionReceiptEvidence(context.Context, domain.ExecutionReceipt) (CanonicalEvidence, bool, error)
 	SettleJob(ctx context.Context, req SettleJobRequest) (SettleJobResult, error)
 	CommitProofOfServiceEvidence(ctx context.Context, receipt domain.ExecutionReceipt) (evidenceRef string, err error)

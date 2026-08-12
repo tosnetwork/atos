@@ -651,6 +651,12 @@ func (c *Core) PortableReceiptEvidence(_ context.Context, receipt domain.Executi
 	d, e := codec.DigestCanonical("tos.atos.execution-receipt.v2", b)
 	return toscore.PortableReceiptEvidence{CanonicalCBOR: b, Digest: d}, e
 }
+func (c *Core) PortableQuoteEvidence(context.Context, domain.Quote) (toscore.PortableReceiptEvidence, error) {
+	return toscore.PortableReceiptEvidence{}, errors.New("portable Quote evidence unavailable in mock")
+}
+func (c *Core) PortableEscrowEvidence(context.Context, domain.Quote, string) (toscore.PortableReceiptEvidence, error) {
+	return toscore.PortableReceiptEvidence{}, errors.New("portable escrow evidence unavailable in mock")
+}
 func (c *Core) ResolveExecutionReceiptEvidence(ctx context.Context, r domain.ExecutionReceipt) (toscore.CanonicalEvidence, bool, error) {
 	e, err := c.PortableReceiptEvidence(ctx, r)
 	if err != nil {

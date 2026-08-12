@@ -811,6 +811,27 @@ func (c *Client) PortableReceiptEvidence(_ context.Context, receipt domain.Execu
 	}
 	return toscore.PortableReceiptEvidence{CanonicalCBOR: b, Digest: d}, nil
 }
+func (c *Client) PortableQuoteEvidence(_ context.Context, q domain.Quote) (toscore.PortableReceiptEvidence, error) {
+	in := quoteCommitmentInput(q)
+	b, err := quotecommitment.Bytes(in)
+	if err != nil {
+		return toscore.PortableReceiptEvidence{}, err
+	}
+	d, err := quotecommitment.Digest(in)
+	return toscore.PortableReceiptEvidence{CanonicalCBOR: b, Digest: d}, err
+}
+func (c *Client) PortableEscrowEvidence(_ context.Context, q domain.Quote, jobID string) (toscore.PortableReceiptEvidence, error) {
+	in, _, err := verifiedEscrowTerms(q, jobID)
+	if err != nil {
+		return toscore.PortableReceiptEvidence{}, err
+	}
+	b, err := escrowcommitment.Bytes(in)
+	if err != nil {
+		return toscore.PortableReceiptEvidence{}, err
+	}
+	d, err := escrowcommitment.Digest(in)
+	return toscore.PortableReceiptEvidence{CanonicalCBOR: b, Digest: d}, err
+}
 
 func (c *Client) ResolveExecutionReceiptEvidence(ctx context.Context, receipt domain.ExecutionReceipt) (toscore.CanonicalEvidence, bool, error) {
 	envelope, err := c.executionEnvelope(receipt)
@@ -1042,32 +1063,44 @@ func (c *Client) CommitProofOfServiceEvidence(ctx context.Context, receipt domai
 	return ref, nil
 }
 
+func proofOfServiceInput(receipt domain.ExecutionReceipt) (*atostosv1.ProofOfServiceEvidenceInput, error) {
+	volume, err := networkAmount(receipt.Cost)
+	if err != nil {
+		return nil, err
+	}
+	latency := uint64(0)
+	if !receipt.StartedAt.IsZero() && !receipt.CompletedAt.Before(receipt.StartedAt) {
+		latency = uint64(receipt.CompletedAt.Sub(receipt.StartedAt) / time.Millisecond)
+	}
+	evidenceID := "pos_" + receipt.ID
+	return &atostosv1.ProofOfServiceEvidenceInput{EvidenceId: evidenceID, ReceiptId: receipt.ID, ProviderId: receipt.ProviderID, CapabilityId: receipt.CapabilityID, CapabilityVersion: receipt.CapabilityVersion, Result: protoExecutionResult(receipt.Result), LatencyMillis: latency, SettlementVolume: volume, EvidenceDigest: textDigest(evidenceID, receipt.ID, receipt.ProviderID, receipt.CapabilityID, receipt.CapabilityVersion, string(receipt.Result), fmt.Sprintf("%d", latency), volume.Asset, volume.AtomicAmount), ObservedUnixMillis: receipt.CompletedAt.UnixMilli()}, nil
+}
+
 func (c *Client) ReadProofOfServiceEvidence(ctx context.Context, receipt domain.ExecutionReceipt) (toscore.ProofOfServiceEvidence, bool, error) {
 	if receipt.ID == "" || receipt.ProviderID == "" || receipt.CapabilityID == "" {
 		return toscore.ProofOfServiceEvidence{}, false, domain.NewError(domain.ErrValidationFailed, "complete receipt tuple is required", false)
 	}
+	input, err := proofOfServiceInput(receipt)
+	if err != nil {
+		return toscore.ProofOfServiceEvidence{}, false, err
+	}
 	callCtx, cancel := c.callContext(ctx, time.Time{})
 	defer cancel()
-	request := connect.NewRequest(&atostosv1.ReadProofOfServiceRequest{Context: c.requestContext(ctx, receipt.PrincipalID, "", time.Time{}), ProviderId: receipt.ProviderID, CapabilityId: receipt.CapabilityID, Page: &atostosv1.PageRequest{PageSize: 1000}})
+	request := connect.NewRequest(&atostosv1.ResolveProofOfServiceEvidenceRequest{Context: c.requestContext(ctx, receipt.PrincipalID, "", time.Time{}), Evidence: input})
 	decorateRequest(c, ctx, request)
-	response, err := c.proof.ReadProofOfService(callCtx, request)
+	response, err := c.proof.ResolveProofOfServiceEvidence(callCtx, request)
 	if err != nil {
 		return toscore.ProofOfServiceEvidence{}, false, rpcError(err)
 	}
-	if response.Msg == nil {
+	if response.Msg == nil || !response.Msg.Found {
 		return toscore.ProofOfServiceEvidence{}, false, nil
 	}
-	for _, e := range response.Msg.Evidence {
-		if e == nil || e.Value == nil || e.Value.ReceiptId != receipt.ID {
-			continue
-		}
-		r := e.EvidenceRef
-		if e.Value.ProviderId != receipt.ProviderID || e.Value.CapabilityId != receipt.CapabilityID || e.Value.CapabilityVersion != receipt.CapabilityVersion || r == nil || r.Network != c.network || !r.Finalized || r.FinalizedCheckpoint == 0 {
-			return toscore.ProofOfServiceEvidence{}, false, domain.NewError(domain.ErrProofVerificationFailed, "Proof-of-Service tuple/finality mismatch", false)
-		}
-		return toscore.ProofOfServiceEvidence{EvidenceID: e.Value.EvidenceId, ReceiptID: e.Value.ReceiptId, ProviderID: e.Value.ProviderId, CapabilityID: e.Value.CapabilityId, CapabilityVersion: e.Value.CapabilityVersion, ContentDigest: digestString(e.Value.EvidenceDigest), CanonicalEvidence: toscore.CanonicalEvidence{Network: r.Network, Reference: r.Reference, Digest: digestString(e.Value.EvidenceDigest), Finalized: r.Finalized, FinalizedCheckpoint: r.FinalizedCheckpoint}}, true, nil
+	r := response.Msg.EvidenceRef
+	if r == nil || r.Network != c.network || !r.Finalized || r.FinalizedCheckpoint == 0 {
+		return toscore.ProofOfServiceEvidence{}, false, domain.NewError(domain.ErrProofVerificationFailed, "Proof-of-Service tuple/finality mismatch", false)
 	}
-	return toscore.ProofOfServiceEvidence{}, false, nil
+	d := digestString(response.Msg.EvidenceDigest)
+	return toscore.ProofOfServiceEvidence{EvidenceID: input.EvidenceId, ReceiptID: input.ReceiptId, ProviderID: input.ProviderId, CapabilityID: input.CapabilityId, CapabilityVersion: input.CapabilityVersion, ContentDigest: d, CanonicalEvidence: toscore.CanonicalEvidence{Network: r.Network, Reference: r.Reference, Digest: d, Finalized: r.Finalized, FinalizedCheckpoint: r.FinalizedCheckpoint}}, true, nil
 }
 
 func (c *Client) ReadSettlementStatus(ctx context.Context, escrowID string) (domain.EscrowStatus, error) {
