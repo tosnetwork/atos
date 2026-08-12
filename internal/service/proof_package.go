@@ -11,6 +11,8 @@ import (
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/money"
 	"github.com/tosnetwork/atos/internal/store"
+	atostosv1 "github.com/tosnetwork/tos-protocol/gen/atos/tos/v1"
+	"github.com/tosnetwork/tos-protocol/pkg/disputecommitment"
 	"github.com/tosnetwork/tos-protocol/pkg/verifiedproof"
 	"reflect"
 	"strings"
@@ -196,13 +198,52 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 	getEscrow := toscore.GetEscrowRequest{Quote: q, JobID: j.ID, EscrowID: esc.ID, ExpectedReservationDigest: esc.ReservationDigest, ExpectedEscrowRef: esc.NetworkProofRef, ExpectedTerminalRef: r.NetworkProofRef, ExpectedReleaseDigest: esc.ReleaseDigest, ExpectedReleaseReasonCode: esc.ReleaseReason}
 	if kind == "dispute_resolution" {
 		dispute, e = s.store.DisputeByJob(ctx, j.ID)
-		if e != nil || dispute.TrustMode != domain.TrustModeVerified || dispute.EconomicState != domain.DisputeEconomicVerifiedResolved || dispute.DisputeDigest == "" || dispute.DisputeRef == "" || dispute.ResolutionDigest == "" {
+		if e != nil || j.ExecutionReceipt == nil || dispute.TrustMode != domain.TrustModeVerified || dispute.EconomicState != domain.DisputeEconomicVerifiedResolved || dispute.DisputeDigest == "" || dispute.DisputeRef == "" || dispute.ResolutionDigest == "" {
 			return fail(domain.NewError(domain.ErrProofVerificationFailed, "canonical Verified dispute projection unavailable or inconsistent", true))
 		}
 		getEscrow.ExpectedDisputeDigest = dispute.DisputeDigest
 		getEscrow.ExpectedDisputeRef = dispute.DisputeRef
 		getEscrow.ExpectedDisputePayout = r.Charged
+		getEscrow.ExpectedResolutionDigest = dispute.ResolutionDigest
+		getEscrow.ExpectedResolutionRef = dispute.ResolutionRef
+		getEscrow.ExpectedDisputeOutcome = string(dispute.Outcome)
+		getEscrow.ExpectedDisputeID = dispute.ID
+		getEscrow.ExpectedReviewerID = dispute.ReviewerID
+		if dispute.ResolvedAt != nil {
+			getEscrow.ExpectedResolvedAt = *dispute.ResolvedAt
+		}
+		getEscrow.ExpectedReceipt = j.ExecutionReceipt
+		getEscrow.ExpectedReceiptRef = j.ExecutionReceipt.NetworkProofRef
+		getEscrow.ExpectedSettlementCharge = r.Charged
+	} else if kind == "provider_settlement" {
+		getEscrow.ExpectedReceipt = j.ExecutionReceipt
+		if j.ExecutionReceipt != nil {
+			getEscrow.ExpectedReceiptRef = j.ExecutionReceipt.NetworkProofRef
+		}
+		getEscrow.ExpectedSettlementCharge = r.Charged
 	}
+	requester, bound, revoked, _, e := s.core.ResolvePrincipalBindingStatus(ctx, q.PrincipalID)
+	if e != nil || !bound || revoked || requester.FinalizedCheckpoint == 0 {
+		return fail(domain.NewError(domain.ErrProofVerificationFailed, "requester identity binding unavailable", true))
+	}
+	provider, bound, revoked, _, e := s.core.ResolvePrincipalBindingStatus(ctx, q.ProviderID)
+	if e != nil || !bound || revoked || provider.FinalizedCheckpoint == 0 {
+		return fail(domain.NewError(domain.ErrProofVerificationFailed, "provider identity binding unavailable", true))
+	}
+	identityResolver, ok := s.core.(toscore.AgentIdentityEvidenceResolver)
+	if !ok {
+		return fail(domain.NewError(domain.ErrProofVerificationFailed, "canonical Agent identity resolver unavailable", true))
+	}
+	requesterIdentity, found, e := identityResolver.ResolveAgentIdentityEvidence(ctx, requester.AgentID)
+	if e != nil || !found || requesterIdentity.FinalizedCheckpoint == 0 || len(requesterIdentity.Controllers) != 1 {
+		return fail(domain.NewError(domain.ErrProofVerificationFailed, "requester Agent identity unavailable", true))
+	}
+	providerIdentity, found, e := identityResolver.ResolveAgentIdentityEvidence(ctx, provider.AgentID)
+	if e != nil || !found || providerIdentity.FinalizedCheckpoint == 0 || len(providerIdentity.Controllers) != 1 {
+		return fail(domain.NewError(domain.ErrProofVerificationFailed, "provider Agent identity unavailable", true))
+	}
+	getEscrow.ExpectedCreatorAddress = requesterIdentity.Controllers[0]
+	getEscrow.ExpectedAgentAddress = providerIdentity.Controllers[0]
 	liveE, found, e := s.core.GetEscrow(ctx, getEscrow)
 	if e != nil || !found {
 		return fail(domain.NewError(domain.ErrNetworkUnavailable, "canonical TaskEscrow unavailable", true))
@@ -216,14 +257,6 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 	escrowWire, e := s.core.PortableEscrowEvidence(ctx, q, j.ID)
 	if e != nil || escrowWire.Digest != esc.ReservationDigest {
 		return fail(domain.NewError(domain.ErrProofVerificationFailed, "canonical reservation bytes mismatch", false))
-	}
-	requester, bound, revoked, _, e := s.core.ResolvePrincipalBindingStatus(ctx, q.PrincipalID)
-	if e != nil || !bound || revoked || requester.FinalizedCheckpoint == 0 {
-		return fail(domain.NewError(domain.ErrProofVerificationFailed, "requester identity binding unavailable", true))
-	}
-	provider, bound, revoked, _, e := s.core.ResolvePrincipalBindingStatus(ctx, q.ProviderID)
-	if e != nil || !bound || revoked || provider.FinalizedCheckpoint == 0 {
-		return fail(domain.NewError(domain.ErrProofVerificationFailed, "provider identity binding unavailable", true))
 	}
 	own, found, e := s.core.ResolveCapabilityOwnershipEvidence(ctx, q.CapabilityID, q.ProviderID, q.CapabilityVersion, q.ManifestCommitment)
 	if e != nil || !found {
@@ -289,13 +322,27 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 		return fail(e)
 	}
 	var disputeDigest, resolutionDigest, disputeOutcome string
-	var disputeRef verifiedproof.Reference
+	var resolutionCBOR []byte
+	var disputeRef, resolutionRef verifiedproof.Reference
 	if kind == "dispute_resolution" {
 		if dispute.ResolutionRef != r.NetworkProofRef || dispute.ResolutionCheckpoint == 0 || r.FinalizedCheckpoint < dispute.ResolutionCheckpoint {
 			return fail(domain.NewError(domain.ErrProofVerificationFailed, "canonical Verified dispute projection unavailable or inconsistent", true))
 		}
 		disputeDigest, resolutionDigest, disputeOutcome = dispute.DisputeDigest, dispute.ResolutionDigest, string(dispute.Outcome)
 		disputeRef = vpRef(s.core.Network(), dispute.DisputeRef, dispute.DisputeCheckpoint)
+		resolutionRef = vpRef(s.core.Network(), dispute.ResolutionRef, dispute.ResolutionCheckpoint)
+		if dispute.ResolvedAt == nil || dispute.ReviewerID == "" {
+			return fail(domain.NewError(domain.ErrProofVerificationFailed, "complete Verified dispute resolution tuple unavailable", true))
+		}
+		resolution := &atostosv1.VerifiedDisputeResolution{Version: "atos_verified_dispute_resolution_v1", NetworkId: s.core.Network(), GatewayDomain: q.CommitmentDomain, DisputeId: dispute.ID, EscrowId: esc.ID, JobId: j.ID, QuoteId: q.ID, ReceiptId: r.ID, DisputeDigest: dispute.DisputeDigest, Outcome: string(dispute.Outcome), ReviewerPrincipalId: dispute.ReviewerID, Reserved: &atostosv1.NetworkAmount{Asset: "TOS", AtomicAmount: reserve}, ProviderPayout: &atostosv1.NetworkAmount{Asset: "TOS", AtomicAmount: charged}, RequesterRefund: &atostosv1.NetworkAmount{Asset: "TOS", AtomicAmount: refunded}, ResolvedUnixMillis: dispute.ResolvedAt.UnixMilli()}
+		var resolutionErr error
+		resolutionCBOR, resolutionErr = disputecommitment.ResolutionBytes(resolution)
+		if resolutionErr != nil {
+			return fail(domain.NewError(domain.ErrProofVerificationFailed, "canonical Verified dispute resolution encoding failed", false))
+		}
+		if digest, digestErr := disputecommitment.ResolutionDigest(resolution); digestErr != nil || digest != resolutionDigest {
+			return fail(domain.NewError(domain.ErrProofVerificationFailed, "canonical Verified dispute resolution digest mismatch", false))
+		}
 	}
 	if r.NetworkProofRef == "" || r.FinalizedCheckpoint == 0 {
 		return fail(domain.NewError(domain.ErrProofVerificationFailed, "terminal outcome finality unavailable", true))
@@ -307,7 +354,10 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 		}
 		receiptProof.ChargedAtomic = receiptCharge
 	}
-	p := verifiedproof.Package{Version: verifiedproof.Version, Canonicalization: verifiedproof.Canonicalization, NetworkID: s.core.Network(), GatewayDomain: q.CommitmentDomain, PrincipalID: q.PrincipalID, RequesterAgentID: requester.AgentID, RequesterIdentityRef: vpRef(requester.Network, requester.BindingRef, requester.FinalizedCheckpoint), ProviderID: q.ProviderID, ProviderIdentityRef: vpRef(provider.Network, provider.BindingRef, provider.FinalizedCheckpoint), Capability: verifiedproof.Capability{CapabilityID: q.CapabilityID, CapabilityVersion: q.CapabilityVersion, ManifestDigest: q.ManifestCommitment, OwnershipRef: vpRef(own.Network, own.Reference, own.FinalizedCheckpoint)}, Quote: verifiedproof.Quote{QuoteID: q.ID, CommitmentDigest: liveQ.Digest, CommitmentRef: vpRef(liveQ.Network, liveQ.Reference, liveQ.FinalizedCheckpoint), TermsDigest: q.TermsHash, TrustMode: "verified", ProofProfile: "tos_verified_v1", SettlementBackend: "tos", SettlementAsset: "TOS", AssetDecimals: q.AssetDecimals, SubtotalAtomic: subtotal, FeesAtomic: fees, TotalMaxAtomic: total, AcceptanceDeadlineUnixNanos: q.ExpiresAt.UnixNano(), QuoteExpiryUnixNanos: q.ExpiresAt.UnixNano(), ExecutionDeadlineUnixNanos: q.ExecutionDeadline.UnixNano(), UnderlyingServiceQuoteRef: q.UnderlyingServiceQuoteRef, DisputePolicyDigest: q.DisputePolicyHash, CanonicalCBOR: quoteWire.CanonicalCBOR}, Escrow: verifiedproof.Escrow{EscrowID: esc.ID, JobID: j.ID, ContractRef: vpRef(s.core.Network(), esc.NetworkProofRef, liveE.FinalizedCheckpoint), ContractCodeHash: esc.ContractCodeHash, ReservationDigest: esc.ReservationDigest, ReservationRef: vpRef(s.core.Network(), esc.NetworkProofRef, liveE.FinalizedCheckpoint), ReservedAtomic: reserve, EscrowDeadlineUnixNanos: esc.ExpiresAt.UnixNano(), FundingModel: string(q.Settlement.FundingModel), CanonicalCBOR: escrowWire.CanonicalCBOR}, SignerAuthorization: signerProof, Receipt: receiptProof, Outcome: verifiedproof.Outcome{Kind: kind, OutcomeRef: vpRef(s.core.Network(), r.NetworkProofRef, r.FinalizedCheckpoint), ChargedAtomic: charged, RefundedAtomic: refunded, ReleaseDigest: esc.ReleaseDigest, ReasonCode: esc.ReleaseReason, DisputeDigest: disputeDigest, DisputeRef: disputeRef, ResolutionDigest: resolutionDigest, DisputeOutcome: disputeOutcome}, ProofOfService: posProof}
+	p := verifiedproof.Package{Version: verifiedproof.Version, Canonicalization: verifiedproof.Canonicalization, NetworkID: s.core.Network(), GatewayDomain: q.CommitmentDomain, PrincipalID: q.PrincipalID, RequesterAgentID: requester.AgentID, RequesterIdentityRef: vpRef(requester.Network, requester.BindingRef, requester.FinalizedCheckpoint), ProviderID: q.ProviderID, ProviderIdentityRef: vpRef(provider.Network, provider.BindingRef, provider.FinalizedCheckpoint), Capability: verifiedproof.Capability{CapabilityID: q.CapabilityID, CapabilityVersion: q.CapabilityVersion, ManifestDigest: q.ManifestCommitment, OwnershipDigest: own.Digest, OwnershipRef: vpRef(own.Network, own.Reference, own.FinalizedCheckpoint)}, Quote: verifiedproof.Quote{QuoteID: q.ID, CommitmentDigest: liveQ.Digest, CommitmentRef: vpRef(liveQ.Network, liveQ.Reference, liveQ.FinalizedCheckpoint), TermsDigest: q.TermsHash, TrustMode: "verified", ProofProfile: "tos_verified_v1", SettlementBackend: "tos", SettlementAsset: "TOS", AssetDecimals: q.AssetDecimals, SubtotalAtomic: subtotal, FeesAtomic: fees, TotalMaxAtomic: total, AcceptanceDeadlineUnixNanos: q.ExpiresAt.UnixNano(), QuoteExpiryUnixNanos: q.ExpiresAt.UnixNano(), ExecutionDeadlineUnixNanos: q.ExecutionDeadline.UnixNano(), UnderlyingServiceQuoteRef: q.UnderlyingServiceQuoteRef, DisputePolicyDigest: q.DisputePolicyHash, CanonicalCBOR: quoteWire.CanonicalCBOR}, Escrow: verifiedproof.Escrow{EscrowID: esc.ID, JobID: j.ID, ContractRef: vpRef(s.core.Network(), esc.NetworkProofRef, liveE.FinalizedCheckpoint), ContractCodeHash: esc.ContractCodeHash, ReservationDigest: esc.ReservationDigest, ReservationRef: vpRef(s.core.Network(), esc.NetworkProofRef, liveE.FinalizedCheckpoint), ReservedAtomic: reserve, EscrowDeadlineUnixNanos: esc.ExpiresAt.UnixNano(), FundingModel: string(q.Settlement.FundingModel), CanonicalCBOR: escrowWire.CanonicalCBOR}, SignerAuthorization: signerProof, Receipt: receiptProof, Outcome: verifiedproof.Outcome{Kind: kind, OutcomeRef: vpRef(s.core.Network(), r.NetworkProofRef, r.FinalizedCheckpoint), ChargedAtomic: charged, RefundedAtomic: refunded, ReleaseDigest: esc.ReleaseDigest, ReasonCode: esc.ReleaseReason, DisputeDigest: disputeDigest, DisputeRef: disputeRef, ResolutionDigest: resolutionDigest, ResolutionRef: resolutionRef, DisputeOutcome: disputeOutcome, ResolutionCBOR: resolutionCBOR}, ProofOfService: posProof}
+	p.RequesterIdentity = verifiedproof.Identity{AgentID: requesterIdentity.AgentID, CanonicalURI: requesterIdentity.CanonicalURI, Controllers: requesterIdentity.Controllers, Assurance: requesterIdentity.Assurance, IdentityRef: vpRef(requesterIdentity.Network, requesterIdentity.Reference, requesterIdentity.FinalizedCheckpoint)}
+	p.ProviderIdentity = verifiedproof.Identity{AgentID: providerIdentity.AgentID, CanonicalURI: providerIdentity.CanonicalURI, Controllers: providerIdentity.Controllers, Assurance: providerIdentity.Assurance, IdentityRef: vpRef(providerIdentity.Network, providerIdentity.Reference, providerIdentity.FinalizedCheckpoint)}
+	p.ProviderAgentID = provider.AgentID
 	check := verifiedproof.Verifier{Observer: capturedProofObserver{auth: auth}, Network: s.core.Network(), GatewayDomain: q.CommitmentDomain}.Verify(ctx, p)
 	if !check.Valid {
 		return fail(domain.NewError(domain.ErrProofVerificationFailed, fmt.Sprintf("portable proof self-verification failed: %+v", check.Failures), false))
@@ -387,7 +437,7 @@ func sameProofSemantics(stored, live verifiedproof.Package) bool {
 }
 
 func proofReferences(p *verifiedproof.Package) []*verifiedproof.Reference {
-	candidates := []*verifiedproof.Reference{&p.RequesterIdentityRef, &p.ProviderIdentityRef, &p.Capability.OwnershipRef, &p.Quote.CommitmentRef, &p.Escrow.ContractRef, &p.Escrow.ReservationRef, &p.Outcome.OutcomeRef, &p.Outcome.DisputeRef}
+	candidates := []*verifiedproof.Reference{&p.RequesterIdentityRef, &p.RequesterIdentity.IdentityRef, &p.ProviderIdentityRef, &p.ProviderIdentity.IdentityRef, &p.Capability.OwnershipRef, &p.Quote.CommitmentRef, &p.Escrow.ContractRef, &p.Escrow.ReservationRef, &p.Outcome.OutcomeRef, &p.Outcome.DisputeRef, &p.Outcome.ResolutionRef}
 	refs := make([]*verifiedproof.Reference, 0, len(candidates)+3)
 	for _, ref := range candidates {
 		if ref.Reference != "" {

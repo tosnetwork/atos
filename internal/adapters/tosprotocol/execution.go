@@ -381,6 +381,6 @@ func (c *Client) executionEnvelope(ctx context.Context, receipt domain.Execution
 		ExecutionSignerId:     receipt.ExecutionSignerID,
 		SignerAuthorizationId: receipt.SignerAuthorizationID,
 		Signature:             signature, SignatureAlgorithm: receipt.SignatureAlgorithm,
-		CompletedUnixMillis: receipt.CompletedAt.UnixMilli(), ErrorCode: string(receipt.ErrorCode),
+		StartedUnixMillis: receipt.StartedAt.UnixMilli(), CompletedUnixMillis: receipt.CompletedAt.UnixMilli(), ErrorCode: string(receipt.ErrorCode),
 	}, nil
 }

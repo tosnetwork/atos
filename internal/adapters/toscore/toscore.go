@@ -23,6 +23,16 @@ type CreateEscrowRequest struct {
 	Reserved          domain.Money
 }
 
+type AgentIdentityEvidence struct {
+	AgentID             string
+	CanonicalURI        string
+	Controllers         []string
+	Assurance           string
+	Network             string
+	Reference           string
+	FinalizedCheckpoint uint64
+}
+
 type GetEscrowRequest struct {
 	Quote                     domain.Quote
 	JobID                     string
@@ -35,6 +45,17 @@ type GetEscrowRequest struct {
 	ExpectedDisputeDigest     string
 	ExpectedDisputeRef        string
 	ExpectedDisputePayout     domain.Money
+	ExpectedResolutionDigest  string
+	ExpectedResolutionRef     string
+	ExpectedDisputeOutcome    string
+	ExpectedDisputeID         string
+	ExpectedReviewerID        string
+	ExpectedResolvedAt        time.Time
+	ExpectedReceipt           *domain.ExecutionReceipt
+	ExpectedReceiptRef        string
+	ExpectedSettlementCharge  domain.Money
+	ExpectedCreatorAddress    string
+	ExpectedAgentAddress      string
 }
 
 type ReleaseEscrowRequest struct {
@@ -252,6 +273,10 @@ type Core interface {
 	ReadProofOfServiceEvidence(ctx context.Context, receipt domain.ExecutionReceipt) (ProofOfServiceEvidence, bool, error)
 	ReadSettlementStatus(ctx context.Context, escrowID string) (domain.EscrowStatus, error)
 	ReadProof(ctx context.Context, receiptID string) (map[string]any, error)
+}
+
+type AgentIdentityEvidenceResolver interface {
+	ResolveAgentIdentityEvidence(ctx context.Context, agentID string) (AgentIdentityEvidence, bool, error)
 }
 
 type VerifiedDisputeCore interface {

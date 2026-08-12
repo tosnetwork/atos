@@ -410,7 +410,7 @@ func main() {
 	go identityBindings.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) {
 		logger.Error("identity-binding operation reconciliation pending", "error", reconcileErr)
 	})
-	go proofPackages.RunReconciler(reconcileCtx,15*time.Second,30*time.Second,100,func(reconcileErr error){logger.Error("portable proof reconciliation failed","error",reconcileErr)})
+	go proofPackages.RunReconciler(reconcileCtx, 15*time.Second, 30*time.Second, 100, func(reconcileErr error) { logger.Error("portable proof reconciliation failed", "error", reconcileErr) })
 	// Only run the suspension sweep when a REAL authority is wired.
 	// FailClosedActivationAuthority always returns granted=false with a nil
 	// error -- indistinguishable, from SweepVerified's perspective, from a

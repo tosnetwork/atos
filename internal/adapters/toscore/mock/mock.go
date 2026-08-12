@@ -191,6 +191,10 @@ func (c *Core) ResolvePrincipalBindingStatus(ctx context.Context, principalID st
 	return domain.PrincipalIdentityBinding{}, false, false, "", nil
 }
 
+func (c *Core) ResolveAgentIdentityEvidence(context.Context, string) (toscore.AgentIdentityEvidence, bool, error) {
+	return toscore.AgentIdentityEvidence{}, false, nil
+}
+
 func (c *Core) CreatePrincipalBinding(ctx context.Context, callerID, idempotencyKey, principalID, agentID string) (domain.PrincipalIdentityBinding, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

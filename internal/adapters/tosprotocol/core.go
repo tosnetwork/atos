@@ -111,6 +111,38 @@ func (c *Client) ResolvePrincipalBindingStatus(ctx context.Context, principalID 
 	return binding, true, revoked, response.Msg.RevocationReasonCode, nil
 }
 
+func (c *Client) ResolveAgentIdentityEvidence(ctx context.Context, agentID string) (toscore.AgentIdentityEvidence, bool, error) {
+	if strings.TrimSpace(agentID) == "" {
+		return toscore.AgentIdentityEvidence{}, false, domain.NewError(domain.ErrValidationFailed, "agent_id is required", false)
+	}
+	callCtx, cancel := c.callContext(ctx, time.Time{})
+	defer cancel()
+	request := connect.NewRequest(&atostosv1.ResolveAgentIdentityRequest{Context: c.requestContext(ctx, "atos-gateway", "", time.Time{}), AgentId: agentID})
+	decorateRequest(c, ctx, request)
+	response, err := c.identity.ResolveAgentIdentity(callCtx, request)
+	if err != nil {
+		return toscore.AgentIdentityEvidence{}, false, rpcError(err)
+	}
+	if response.Msg == nil || !response.Msg.Found || response.Msg.Identity == nil || response.Msg.Identity.IdentityRef == nil {
+		return toscore.AgentIdentityEvidence{}, false, nil
+	}
+	i := response.Msg.Identity
+	liveRequest := connect.NewRequest(&atostosv1.ResolveAgentIdentityRequest{Context: c.requestContext(ctx, "atos-gateway", "", time.Time{}), AgentId: i.AgentId, CanonicalUri: i.CanonicalUri, ExpectedIdentity: &atostosv1.AgentIdentity{AgentId: i.AgentId, CanonicalUri: i.CanonicalUri, Controllers: append([]string(nil), i.Controllers...), Assurance: i.Assurance}, ExpectedIdentityRef: i.IdentityRef})
+	decorateRequest(c, ctx, liveRequest)
+	liveResponse, liveErr := c.identity.ResolveAgentIdentity(callCtx, liveRequest)
+	if liveErr != nil || liveResponse.Msg == nil || !liveResponse.Msg.Found || liveResponse.Msg.Identity == nil {
+		if liveErr != nil {
+			return toscore.AgentIdentityEvidence{}, false, rpcError(liveErr)
+		}
+		return toscore.AgentIdentityEvidence{}, false, domain.NewError(domain.ErrNetworkUnavailable, "canonical identity unavailable", true)
+	}
+	i = liveResponse.Msg.Identity
+	if !i.IdentityRef.Finalized || i.IdentityRef.FinalizedCheckpoint == 0 || i.IdentityRef.Network != c.network {
+		return toscore.AgentIdentityEvidence{}, false, domain.NewError(domain.ErrProofVerificationFailed, "identity finality mismatch", false)
+	}
+	return toscore.AgentIdentityEvidence{AgentID: i.AgentId, CanonicalURI: i.CanonicalUri, Controllers: append([]string(nil), i.Controllers...), Assurance: i.Assurance, Network: i.IdentityRef.Network, Reference: i.IdentityRef.Reference, FinalizedCheckpoint: i.IdentityRef.FinalizedCheckpoint}, true, nil
+}
+
 // CreatePrincipalBinding anchors a durable binding from principalID to
 // agentID through tos-protocol's IdentityService.CreatePrincipalBinding
 // (Phase 4A). callerID scopes the underlying RPC's idempotency namespace --
@@ -276,7 +308,10 @@ func (c *Client) ResolveCapabilityOwnershipEvidence(ctx context.Context, capabil
 	if r.Network != c.network || !r.Finalized || r.FinalizedCheckpoint == 0 {
 		return toscore.CanonicalEvidence{}, false, domain.NewError(domain.ErrNetworkUnavailable, "capability ownership is not finalized on configured network", true)
 	}
-	return toscore.CanonicalEvidence{Network: r.Network, Reference: r.Reference, Digest: expectedManifestDigest, Finalized: r.Finalized, FinalizedCheckpoint: r.FinalizedCheckpoint}, true, nil
+	if response.Msg.OwnershipDigest == "" {
+		return toscore.CanonicalEvidence{}, false, domain.NewError(domain.ErrProofVerificationFailed, "capability ownership authority digest is missing", false)
+	}
+	return toscore.CanonicalEvidence{Network: r.Network, Reference: r.Reference, Digest: response.Msg.OwnershipDigest, Finalized: r.Finalized, FinalizedCheckpoint: r.FinalizedCheckpoint}, true, nil
 }
 
 func (c *Client) UpdateReputationEvidence(context.Context, string, string) error {
@@ -629,6 +664,8 @@ func (c *Client) GetEscrow(ctx context.Context, req toscore.GetEscrowRequest) (d
 	callCtx, cancel := c.callContext(ctx, time.Time{})
 	defer cancel()
 	request := connect.NewRequest(&atostosv1.GetEscrowRequest{Context: c.requestContext(ctx, req.Quote.PrincipalID, "", time.Time{}), EscrowId: req.EscrowID, QuoteId: req.Quote.ID, ExpectedTerms: terms, ExpectedReservationDigest: digestValue})
+	request.Msg.ExpectedCreatorAddress = req.ExpectedCreatorAddress
+	request.Msg.ExpectedAgentAddress = req.ExpectedAgentAddress
 	if req.ExpectedEscrowRef != "" {
 		request.Msg.ExpectedEscrowRef = parseReference(req.Quote.NetworkID, req.ExpectedEscrowRef)
 	}
@@ -647,6 +684,47 @@ func (c *Client) GetEscrow(ctx context.Context, req toscore.GetEscrowRequest) (d
 			return domain.Escrow{}, false, amountErr
 		}
 		request.Msg.ExpectedDisputePayout = payout
+	}
+	if req.ExpectedResolutionDigest != "" {
+		request.Msg.ExpectedDisputeResolutionDigest = req.ExpectedResolutionDigest
+		request.Msg.ExpectedDisputeOutcome = req.ExpectedDisputeOutcome
+		request.Msg.ExpectedDisputeResolutionRef = parseReference(req.Quote.NetworkID, req.ExpectedResolutionRef)
+		refund, amountErr := networkAmount(domain.Money{Amount: req.Quote.Price.TotalMax, Currency: req.Quote.Price.Currency})
+		if amountErr != nil {
+			return domain.Escrow{}, false, amountErr
+		}
+		payout := request.Msg.ExpectedDisputePayout
+		if payout == nil {
+			return domain.Escrow{}, false, domain.NewError(domain.ErrValidationFailed, "dispute payout is required", false)
+		}
+		reserved, _ := new(big.Int).SetString(refund.AtomicAmount, 10)
+		paid, _ := new(big.Int).SetString(payout.AtomicAmount, 10)
+		if reserved == nil || paid == nil || paid.Sign() < 0 || paid.Cmp(reserved) > 0 {
+			return domain.Escrow{}, false, domain.NewError(domain.ErrValidationFailed, "invalid dispute payout", false)
+		}
+		request.Msg.ExpectedDisputeResolution = &atostosv1.VerifiedDisputeResolution{
+			Version: "atos_verified_dispute_resolution_v1", NetworkId: req.Quote.NetworkID,
+			GatewayDomain: req.Quote.CommitmentDomain, DisputeId: req.ExpectedDisputeID,
+			EscrowId: req.EscrowID, JobId: req.JobID, QuoteId: req.Quote.ID,
+			ReceiptId: req.ExpectedReceipt.ID, DisputeDigest: req.ExpectedDisputeDigest,
+			Outcome: req.ExpectedDisputeOutcome, ReviewerPrincipalId: req.ExpectedReviewerID,
+			Reserved: refund, ProviderPayout: payout,
+			RequesterRefund:    &atostosv1.NetworkAmount{Asset: "TOS", AtomicAmount: new(big.Int).Sub(reserved, paid).String()},
+			ResolvedUnixMillis: req.ExpectedResolvedAt.UnixMilli(),
+		}
+	}
+	if req.ExpectedReceipt != nil {
+		envelope, envelopeErr := c.executionEnvelope(ctx, *req.ExpectedReceipt)
+		if envelopeErr != nil {
+			return domain.Escrow{}, false, envelopeErr
+		}
+		request.Msg.ExpectedReceipt = envelope
+		request.Msg.ExpectedReceiptRef = parseReference(req.Quote.NetworkID, req.ExpectedReceiptRef)
+		charge, amountErr := networkAmount(req.ExpectedSettlementCharge)
+		if amountErr != nil {
+			return domain.Escrow{}, false, amountErr
+		}
+		request.Msg.ExpectedSettlementCharge = charge
 	}
 	decorateRequest(c, ctx, request)
 	response, err := c.settlement.GetEscrow(callCtx, request)
