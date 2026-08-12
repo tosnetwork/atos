@@ -288,6 +288,32 @@ func TestHealthService_Availability_ReadyRequiresHealthyAndCertified(t *testing.
 	}
 }
 
+func TestHealthService_NativeBindingNeedsNoThirdPartyCertification(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	capabilities := service.NewCapabilityService(st)
+	cap, err := capabilities.Register(ctx, service.RegisterCapabilityInput{
+		ProviderID: "provider-native", Name: "native", Description: "native readiness",
+		DeliveryMode: domain.DeliveryInstant,
+		InputSchema:  map[string]any{"type": "object"}, OutputSchema: map[string]any{"type": "object"},
+		Pricing:             domain.Pricing{Model: domain.PricingFixed, PriceHint: domain.PriceHint{Amount: "1.0", Currency: "TOS"}},
+		RequestedTrustModes: []domain.TrustMode{domain.TrustModeVerified},
+		Bindings:            []domain.CapabilityBinding{{Transport: domain.AdapterTOSNative, EndpointRef: "tos://provider-native", EligibleTrustModes: []domain.TrustMode{domain.TrustModeVerified}}},
+		IdempotencyKey:      "native-readiness",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	health := service.NewHealthService(st, capabilities, provideradapter.NewResolver())
+	availability, err := health.Availability(ctx, cap.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(availability) != 1 || !availability[0].TransportHealthy || !availability[0].HealthFresh || !availability[0].Certified || !availability[0].Ready {
+		t.Fatalf("native authority readiness was treated as third-party certification: %+v", availability)
+	}
+}
+
 // TestHealthService_Availability_CertificationDoesNotCarryAcrossCapabilityVersionBump
 // is atos-spec IMPLEMENTATION_ROADMAP.md §7.1.3's explicit acceptance
 // scenario: "stale results do not certify a new Capability version."

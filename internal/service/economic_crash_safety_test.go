@@ -36,6 +36,20 @@ type loseSettleResponseCore struct {
 	lost bool
 }
 
+type loseReceiptCommitResponseCore struct {
+	toscore.Core
+	lost bool
+}
+
+func (c *loseReceiptCommitResponseCore) CommitExecutionReceipt(ctx context.Context, receipt domain.ExecutionReceipt) (string, error) {
+	ref, err := c.Core.CommitExecutionReceipt(ctx, receipt)
+	if err == nil && !c.lost {
+		c.lost = true
+		return "", domain.NewError(domain.ErrNetworkUnavailable, "injected lost CommitExecutionReceipt response", true)
+	}
+	return ref, err
+}
+
 func (c *loseSettleResponseCore) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (toscore.SettleJobResult, error) {
 	result, err := c.Core.SettleJob(ctx, req)
 	if err == nil && !c.lost {
@@ -134,6 +148,51 @@ func TestCrashRecoveryLostSettlementResponseFinalizesExactlyOnce(t *testing.T) {
 	}
 	if account.Balance.Amount != "23.95" {
 		t.Fatalf("settlement replay mutated balance twice: %s", account.Balance.Amount)
+	}
+}
+
+func TestCrashRecoveryPersistsSignedReceiptBeforeAuthorityCommit(t *testing.T) {
+	ctx := context.Background()
+	st := memory.New()
+	provider := tosaimock.New()
+	baseCore := toscoremock.New(st)
+	losingCore := &loseReceiptCommitResponseCore{Core: baseCore}
+	capabilities := service.NewCapabilityService(st)
+	quotes := service.NewQuoteService(st)
+	accounts := service.NewAccountService(st)
+	quotes.WithAccountService(accounts)
+	jobs := service.NewJobService(st, provider, losingCore, accounts)
+	h := harness{capabilities: capabilities, quotes: quotes, accounts: accounts, jobs: jobs, st: st}
+
+	cap := registerCapability(t, h, "agt_crash_receipt_commit", "1.00")
+	quote := createQuote(t, h, cap.ID)
+	result, err := jobs.Invoke(ctx, service.SubmitInput{
+		PrincipalID: "prn_crash_receipt_commit", CapabilityID: cap.ID, QuoteID: quote.ID,
+		Input: map[string]any{"checkpoint": true}, IdempotencyKey: "crash-receipt-commit",
+	})
+	if err != nil {
+		t.Fatalf("Invoke should return a durable reconciling Job: %v", err)
+	}
+	persisted, err := st.GetJob(ctx, result.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ExecutionReceipt == nil || persisted.ExecutionReceipt.ID == "" || persisted.ProofStatus.Receipt != domain.ProofSigned {
+		t.Fatalf("signed receipt intent was not durably checkpointed: %+v", persisted)
+	}
+	if persisted.EconomicState != domain.EconomicEscrowReserved || persisted.State != domain.JobReconciling {
+		t.Fatalf("unverified receipt opened an economic gate: %+v", persisted)
+	}
+
+	// A new service instance cannot query the provider. It must commit and
+	// verify the exact durable receipt snapshot rather than dispatching again.
+	restarted := service.NewJobService(st, &unavailableProvider{Provider: provider}, baseCore, service.NewAccountService(st))
+	recovered, err := restarted.ReconcileJob(ctx, persisted.ID)
+	if err != nil {
+		t.Fatalf("ReconcileJob: %v", err)
+	}
+	if recovered.State != domain.JobCompleted || recovered.EconomicState != domain.EconomicSettled || recovered.ProofStatus.Receipt != domain.ProofVerified {
+		t.Fatalf("durable receipt recovery did not converge: %+v", recovered)
 	}
 }
 

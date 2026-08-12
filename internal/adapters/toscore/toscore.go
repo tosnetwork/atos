@@ -29,6 +29,9 @@ type GetEscrowRequest struct {
 	EscrowID                  string
 	ExpectedReservationDigest string
 	ExpectedEscrowRef         string
+	ExpectedTerminalRef       string
+	ExpectedReleaseDigest     string
+	ExpectedReleaseReasonCode string
 }
 
 type ReleaseEscrowRequest struct {
@@ -58,6 +61,7 @@ type CanonicalEvidence struct {
 }
 type ProofOfServiceEvidence struct {
 	EvidenceID, ReceiptID, ProviderID, CapabilityID, CapabilityVersion, ContentDigest string
+	CanonicalCBOR                                                                     []byte
 	CanonicalEvidence
 }
 type PortableReceiptEvidence struct {

@@ -69,7 +69,11 @@ func (s *PortableProofService) Get(ctx context.Context, receiptID, principalID s
 	if op.Checkpoint != domain.ProofPackageCompleted {
 		return PortableProof{}, domain.NewError(domain.ErrNetworkUnavailable, "portable proof is still reconciling", true)
 	}
-	return publicProof(op), nil
+	// A completed local operation is only a projection. Retrieval must traverse
+	// Create's live canonical reconciliation so cached bytes cannot bypass a
+	// reorganization, finality regression, revoked signer, or unavailable
+	// authority.
+	return s.Create(ctx, receiptID, principalID)
 }
 func publicProof(op domain.ProofPackageOperation) PortableProof {
 	id, _ := func() (string, error) {
@@ -110,9 +114,6 @@ func (s *PortableProofService) Create(ctx context.Context, receiptID, principalI
 	op, _, e = s.store.OpenProofPackageOperation(ctx, op)
 	if e != nil {
 		return PortableProof{}, e
-	}
-	if op.Checkpoint == domain.ProofPackageCompleted {
-		return publicProof(op), nil
 	}
 	return s.reconcile(ctx, op, q, j, esc, r)
 }
@@ -184,7 +185,7 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 	if e != nil || quoteWire.Digest != liveQ.Digest {
 		return fail(domain.NewError(domain.ErrProofVerificationFailed, "canonical Quote bytes mismatch", false))
 	}
-	liveE, found, e := s.core.GetEscrow(ctx, toscore.GetEscrowRequest{Quote: q, JobID: j.ID, EscrowID: esc.ID, ExpectedReservationDigest: esc.ReservationDigest, ExpectedEscrowRef: esc.NetworkProofRef})
+	liveE, found, e := s.core.GetEscrow(ctx, toscore.GetEscrowRequest{Quote: q, JobID: j.ID, EscrowID: esc.ID, ExpectedReservationDigest: esc.ReservationDigest, ExpectedEscrowRef: esc.NetworkProofRef, ExpectedTerminalRef: r.NetworkProofRef, ExpectedReleaseDigest: esc.ReleaseDigest, ExpectedReleaseReasonCode: esc.ReleaseReason})
 	if e != nil || !found {
 		return fail(domain.NewError(domain.ErrNetworkUnavailable, "canonical TaskEscrow unavailable", true))
 	}
@@ -210,28 +211,40 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 	if e != nil || !found {
 		return fail(domain.NewError(domain.ErrProofVerificationFailed, "Capability ownership unavailable", true))
 	}
-	if r.Status == domain.ReceiptReleased && j.ExecutionReceipt == nil {
-		return fail(domain.NewError(domain.ErrProofVerificationFailed, "requester release proof generation is not yet wired", false))
-	}
-	if j.ExecutionReceipt == nil {
+	hasExecution := j.ExecutionReceipt != nil
+	if !hasExecution && r.Status != domain.ReceiptReleased {
 		return fail(domain.NewError(domain.ErrProofVerificationFailed, "execution Receipt unavailable", false))
 	}
-	er := *j.ExecutionReceipt
-	auth, found, e := s.core.ResolveExecutionSignerAuthorization(ctx, q.ProviderID, q.CapabilityID, q.CapabilityVersion, er.ExecutionSignerID, er.CompletedAt)
-	if e != nil || !found || auth.Revoked || len(auth.SignerPublicKey) != 32 || auth.FinalizedCheckpoint == 0 {
-		return fail(domain.NewError(domain.ErrProofVerificationFailed, "execution signer authorization unavailable", true))
-	}
-	receiptWire, e := s.core.PortableReceiptEvidence(ctx, er)
-	if e != nil {
-		return fail(e)
-	}
-	receiptLive, found, e := s.core.ResolveExecutionReceiptEvidence(ctx, er)
-	if e != nil || !found || !receiptLive.Finalized || receiptLive.FinalizedCheckpoint == 0 || receiptLive.Digest != receiptWire.Digest {
-		return fail(domain.NewError(domain.ErrProofVerificationFailed, "canonical Receipt unavailable", true))
-	}
-	pos, found, e := s.core.ReadProofOfServiceEvidence(ctx, er)
-	if e != nil || !found || !pos.Finalized || pos.FinalizedCheckpoint == 0 {
-		return fail(domain.NewError(domain.ErrProofVerificationFailed, "Proof-of-Service unavailable", true))
+	var er domain.ExecutionReceipt
+	var auth toscore.ExecutionSignerAuthorization
+	var signerProof *verifiedproof.SignerAuthorization
+	var receiptProof *verifiedproof.Receipt
+	var posProof *verifiedproof.ProofOfService
+	if hasExecution {
+		er = *j.ExecutionReceipt
+		auth, found, e = s.core.ResolveExecutionSignerAuthorization(ctx, q.ProviderID, q.CapabilityID, q.CapabilityVersion, er.ExecutionSignerID, er.CompletedAt)
+		if e != nil || !found || auth.Revoked || len(auth.SignerPublicKey) != 32 || auth.FinalizedCheckpoint == 0 {
+			return fail(domain.NewError(domain.ErrProofVerificationFailed, "execution signer authorization unavailable", true))
+		}
+		receiptWire, wireErr := s.core.PortableReceiptEvidence(ctx, er)
+		if wireErr != nil {
+			return fail(wireErr)
+		}
+		receiptLive, receiptFound, receiptErr := s.core.ResolveExecutionReceiptEvidence(ctx, er)
+		if receiptErr != nil || !receiptFound || !receiptLive.Finalized || receiptLive.FinalizedCheckpoint == 0 || receiptLive.Digest != receiptWire.Digest {
+			return fail(domain.NewError(domain.ErrProofVerificationFailed, "canonical Receipt unavailable", true))
+		}
+		pos, posFound, posErr := s.core.ReadProofOfServiceEvidence(ctx, er)
+		if posErr != nil || !posFound || !pos.Finalized || pos.FinalizedCheckpoint == 0 {
+			return fail(domain.NewError(domain.ErrProofVerificationFailed, "Proof-of-Service unavailable", true))
+		}
+		sig, sigErr := base64.StdEncoding.DecodeString(er.Signature)
+		if sigErr != nil {
+			return fail(domain.NewError(domain.ErrProofVerificationFailed, "Receipt signature encoding invalid", false))
+		}
+		signerProof = &verifiedproof.SignerAuthorization{AuthorizationID: auth.AuthorizationID, ExecutionSignerID: auth.ExecutionSignerID, AuthorizationRef: vpRef(s.core.Network(), auth.AuthorizationRef, auth.FinalizedCheckpoint), SignatureAlgorithm: auth.SignatureAlgorithm, SignerPublicKey: auth.SignerPublicKey, ValidFromUnixNanos: auth.ValidFrom.UnixNano(), ValidUntilUnixNanos: auth.ValidUntil.UnixNano()}
+		receiptProof = &verifiedproof.Receipt{ReceiptID: er.ID, ReceiptDigest: receiptWire.Digest, ReceiptRef: vpRef(receiptLive.Network, receiptLive.Reference, receiptLive.FinalizedCheckpoint), Result: string(er.Result), InputCommitment: er.InputHash, OutputCommitment: er.OutputHash, UsageCommitment: er.UsageCommitment, StartedUnixNanos: er.StartedAt.UnixNano(), CompletedUnixNanos: er.CompletedAt.UnixNano(), ChargedAtomic: "", SignatureAlgorithm: er.SignatureAlgorithm, Signature: sig, CanonicalCBOR: receiptWire.CanonicalCBOR}
+		posProof = &verifiedproof.ProofOfService{EvidenceID: pos.EvidenceID, EvidenceDigest: pos.Digest, EvidenceRef: vpRef(pos.Network, pos.Reference, pos.FinalizedCheckpoint), ContentDigest: pos.ContentDigest, CanonicalCBOR: pos.CanonicalCBOR}
 	}
 	reserve, e := atomicTOS(esc.Reserved)
 	if e != nil {
@@ -257,10 +270,6 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 	if e != nil {
 		return fail(e)
 	}
-	sig, e := base64.StdEncoding.DecodeString(er.Signature)
-	if e != nil {
-		return fail(domain.NewError(domain.ErrProofVerificationFailed, "Receipt signature encoding invalid", false))
-	}
 	kind := "provider_settlement"
 	if r.Status == domain.ReceiptReleased {
 		kind = "requester_release"
@@ -270,9 +279,9 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 	if r.NetworkProofRef == "" || r.FinalizedCheckpoint == 0 {
 		return fail(domain.NewError(domain.ErrProofVerificationFailed, "terminal outcome finality unavailable", true))
 	}
-	signerProof := &verifiedproof.SignerAuthorization{AuthorizationID: auth.AuthorizationID, ExecutionSignerID: auth.ExecutionSignerID, AuthorizationRef: vpRef(s.core.Network(), auth.AuthorizationRef, auth.FinalizedCheckpoint), SignatureAlgorithm: auth.SignatureAlgorithm, SignerPublicKey: auth.SignerPublicKey, ValidFromUnixNanos: auth.ValidFrom.UnixNano(), ValidUntilUnixNanos: auth.ValidUntil.UnixNano()}
-	receiptProof := &verifiedproof.Receipt{ReceiptID: er.ID, ReceiptDigest: receiptWire.Digest, ReceiptRef: vpRef(receiptLive.Network, receiptLive.Reference, receiptLive.FinalizedCheckpoint), Result: string(er.Result), InputCommitment: er.InputHash, OutputCommitment: er.OutputHash, UsageCommitment: er.UsageCommitment, StartedUnixNanos: er.StartedAt.UnixNano(), CompletedUnixNanos: er.CompletedAt.UnixNano(), ChargedAtomic: charged, SignatureAlgorithm: er.SignatureAlgorithm, Signature: sig, CanonicalCBOR: receiptWire.CanonicalCBOR}
-	posProof := &verifiedproof.ProofOfService{EvidenceID: pos.EvidenceID, EvidenceDigest: pos.Digest, EvidenceRef: vpRef(pos.Network, pos.Reference, pos.FinalizedCheckpoint), ContentDigest: pos.ContentDigest}
+	if receiptProof != nil {
+		receiptProof.ChargedAtomic = charged
+	}
 	p := verifiedproof.Package{Version: verifiedproof.Version, Canonicalization: verifiedproof.Canonicalization, NetworkID: s.core.Network(), GatewayDomain: q.CommitmentDomain, PrincipalID: q.PrincipalID, RequesterAgentID: requester.AgentID, RequesterIdentityRef: vpRef(requester.Network, requester.BindingRef, requester.FinalizedCheckpoint), ProviderID: q.ProviderID, ProviderIdentityRef: vpRef(provider.Network, provider.BindingRef, provider.FinalizedCheckpoint), Capability: verifiedproof.Capability{CapabilityID: q.CapabilityID, CapabilityVersion: q.CapabilityVersion, ManifestDigest: q.ManifestCommitment, OwnershipRef: vpRef(own.Network, own.Reference, own.FinalizedCheckpoint)}, Quote: verifiedproof.Quote{QuoteID: q.ID, CommitmentDigest: liveQ.Digest, CommitmentRef: vpRef(liveQ.Network, liveQ.Reference, liveQ.FinalizedCheckpoint), TermsDigest: q.TermsHash, TrustMode: "verified", ProofProfile: "tos_verified_v1", SettlementBackend: "tos", SettlementAsset: "TOS", AssetDecimals: q.AssetDecimals, SubtotalAtomic: subtotal, FeesAtomic: fees, TotalMaxAtomic: total, AcceptanceDeadlineUnixNanos: q.ExpiresAt.UnixNano(), QuoteExpiryUnixNanos: q.ExpiresAt.UnixNano(), ExecutionDeadlineUnixNanos: q.ExecutionDeadline.UnixNano(), UnderlyingServiceQuoteRef: q.UnderlyingServiceQuoteRef, DisputePolicyDigest: q.DisputePolicyHash, CanonicalCBOR: quoteWire.CanonicalCBOR}, Escrow: verifiedproof.Escrow{EscrowID: esc.ID, JobID: j.ID, ContractRef: vpRef(s.core.Network(), esc.NetworkProofRef, liveE.FinalizedCheckpoint), ContractCodeHash: esc.ContractCodeHash, ReservationDigest: esc.ReservationDigest, ReservationRef: vpRef(s.core.Network(), esc.NetworkProofRef, liveE.FinalizedCheckpoint), ReservedAtomic: reserve, EscrowDeadlineUnixNanos: esc.ExpiresAt.UnixNano(), FundingModel: string(q.Settlement.FundingModel), CanonicalCBOR: escrowWire.CanonicalCBOR}, SignerAuthorization: signerProof, Receipt: receiptProof, Outcome: verifiedproof.Outcome{Kind: kind, OutcomeRef: vpRef(s.core.Network(), r.NetworkProofRef, r.FinalizedCheckpoint), ChargedAtomic: charged, RefundedAtomic: refunded, ReleaseDigest: esc.ReleaseDigest, ReasonCode: esc.ReleaseReason}, ProofOfService: posProof}
 	check := verifiedproof.Verifier{Observer: capturedProofObserver{auth: auth}, Network: s.core.Network(), GatewayDomain: q.CommitmentDomain}.Verify(ctx, p)
 	if !check.Valid {

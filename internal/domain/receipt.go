@@ -84,7 +84,11 @@ type ExecutionReceipt struct {
 	SignerAuthorizationRef string          `json:"signer_authorization_ref,omitempty"`
 	SignatureAlgorithm     string          `json:"signature_algorithm,omitempty"`
 	Signature              string          `json:"signature"`
-	NetworkProofRef        string          `json:"network_proof_ref,omitempty"`
-	NetworkProofCheckpoint uint64          `json:"network_proof_checkpoint,omitempty"`
-	ErrorCode              ErrorCode       `json:"error_code,omitempty"`
+	// CanonicalEnvelope preserves the exact signed protocol wire bytes across
+	// ATOS crashes. It is an internal durable recovery projection; authority
+	// verification still happens in tos-protocol and on TOS.
+	CanonicalEnvelope      string    `json:"canonical_envelope,omitempty"`
+	NetworkProofRef        string    `json:"network_proof_ref,omitempty"`
+	NetworkProofCheckpoint uint64    `json:"network_proof_checkpoint,omitempty"`
+	ErrorCode              ErrorCode `json:"error_code,omitempty"`
 }

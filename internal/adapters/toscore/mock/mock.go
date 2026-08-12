@@ -561,6 +561,13 @@ func (c *Core) ReleaseEscrow(ctx context.Context, req toscore.ReleaseEscrowReque
 		ProofStatus:  domain.ProofNotRequired,
 		CreatedAt:    now,
 	}
+	if e.TrustMode == domain.TrustModeVerified {
+		receipt.ProofStatus = domain.ProofReleased
+		receipt.NetworkProofRef = e.ReleaseRef
+		receipt.NetworkProofCheckpoint = e.FinalizedCheckpoint
+		receipt.Finalized = e.Finalized
+		receipt.FinalizedCheckpoint = e.FinalizedCheckpoint
+	}
 	if err := c.store.PutReceipt(ctx, receipt); err != nil {
 		return toscore.ReleaseEscrowResult{}, err
 	}

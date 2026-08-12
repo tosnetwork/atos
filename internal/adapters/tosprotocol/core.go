@@ -15,6 +15,7 @@ import (
 	"github.com/tosnetwork/atos/internal/store"
 	atostosv1 "github.com/tosnetwork/tos-protocol/gen/atos/tos/v1"
 	"github.com/tosnetwork/tos-protocol/pkg/escrowcommitment"
+	"github.com/tosnetwork/tos-protocol/pkg/poscommitment"
 	"github.com/tosnetwork/tos-protocol/pkg/quotecommitment"
 	"github.com/tosnetwork/tos-protocol/pkg/receiptcommitment"
 )
@@ -623,6 +624,11 @@ func (c *Client) GetEscrow(ctx context.Context, req toscore.GetEscrowRequest) (d
 	if req.ExpectedEscrowRef != "" {
 		request.Msg.ExpectedEscrowRef = parseReference(req.Quote.NetworkID, req.ExpectedEscrowRef)
 	}
+	if req.ExpectedTerminalRef != "" {
+		request.Msg.ExpectedTerminalRef = parseReference(req.Quote.NetworkID, req.ExpectedTerminalRef)
+	}
+	request.Msg.ExpectedReleaseDigest = req.ExpectedReleaseDigest
+	request.Msg.ExpectedReleaseReasonCode = req.ExpectedReleaseReasonCode
 	decorateRequest(c, ctx, request)
 	response, err := c.settlement.GetEscrow(callCtx, request)
 	if err != nil {
@@ -695,6 +701,9 @@ func (c *Client) ReleaseEscrow(ctx context.Context, req toscore.ReleaseEscrowReq
 	}
 	if local.TrustMode != domain.TrustModeManaged {
 		receipt.NetworkProofRef = reference(response.Msg.ReleaseRef)
+		receipt.NetworkProofCheckpoint = response.Msg.ReleaseRef.GetFinalizedCheckpoint()
+		receipt.Finalized = response.Msg.ReleaseRef.GetFinalized()
+		receipt.FinalizedCheckpoint = response.Msg.ReleaseRef.GetFinalizedCheckpoint()
 	}
 	if receipt.NetworkProofRef != "" {
 		c.proofRefs.Store(receipt.ID, receipt.NetworkProofRef)
@@ -732,7 +741,7 @@ func (c *Client) releaseManagedEscrow(ctx context.Context, req toscore.ReleaseEs
 }
 
 func (c *Client) CommitExecutionReceipt(ctx context.Context, receipt domain.ExecutionReceipt) (string, error) {
-	envelope, err := c.executionEnvelope(receipt)
+	envelope, err := c.executionEnvelope(ctx, receipt)
 	if err != nil {
 		return "", err
 	}
@@ -764,7 +773,7 @@ func (c *Client) VerifyExecutionReceipt(ctx context.Context, escrowID string, re
 	if receipt.EscrowID == "" || receipt.EscrowID != escrowID {
 		return toscore.VerifyExecutionReceiptResult{Valid: false, Reason: "escrow mismatch"}, nil
 	}
-	envelope, err := c.executionEnvelope(receipt)
+	envelope, err := c.executionEnvelope(ctx, receipt)
 	if err != nil {
 		return toscore.VerifyExecutionReceiptResult{}, err
 	}
@@ -796,8 +805,8 @@ func (c *Client) VerifyExecutionReceipt(ctx context.Context, escrowID string, re
 	}, nil
 }
 
-func (c *Client) PortableReceiptEvidence(_ context.Context, receipt domain.ExecutionReceipt) (toscore.PortableReceiptEvidence, error) {
-	envelope, err := c.executionEnvelope(receipt)
+func (c *Client) PortableReceiptEvidence(ctx context.Context, receipt domain.ExecutionReceipt) (toscore.PortableReceiptEvidence, error) {
+	envelope, err := c.executionEnvelope(ctx, receipt)
 	if err != nil {
 		return toscore.PortableReceiptEvidence{}, err
 	}
@@ -834,7 +843,7 @@ func (c *Client) PortableEscrowEvidence(_ context.Context, q domain.Quote, jobID
 }
 
 func (c *Client) ResolveExecutionReceiptEvidence(ctx context.Context, receipt domain.ExecutionReceipt) (toscore.CanonicalEvidence, bool, error) {
-	envelope, err := c.executionEnvelope(receipt)
+	envelope, err := c.executionEnvelope(ctx, receipt)
 	if err != nil {
 		return toscore.CanonicalEvidence{}, false, err
 	}
@@ -1100,7 +1109,11 @@ func (c *Client) ReadProofOfServiceEvidence(ctx context.Context, receipt domain.
 		return toscore.ProofOfServiceEvidence{}, false, domain.NewError(domain.ErrProofVerificationFailed, "Proof-of-Service tuple/finality mismatch", false)
 	}
 	d := digestString(response.Msg.EvidenceDigest)
-	return toscore.ProofOfServiceEvidence{EvidenceID: input.EvidenceId, ReceiptID: input.ReceiptId, ProviderID: input.ProviderId, CapabilityID: input.CapabilityId, CapabilityVersion: input.CapabilityVersion, ContentDigest: d, CanonicalEvidence: toscore.CanonicalEvidence{Network: r.Network, Reference: r.Reference, Digest: d, Finalized: r.Finalized, FinalizedCheckpoint: r.FinalizedCheckpoint}}, true, nil
+	canonical, canonicalErr := poscommitment.Bytes(input)
+	if canonicalErr != nil {
+		return toscore.ProofOfServiceEvidence{}, false, domain.NewError(domain.ErrProofVerificationFailed, "Proof-of-Service canonical encoding failed", false)
+	}
+	return toscore.ProofOfServiceEvidence{EvidenceID: input.EvidenceId, ReceiptID: input.ReceiptId, ProviderID: input.ProviderId, CapabilityID: input.CapabilityId, CapabilityVersion: input.CapabilityVersion, ContentDigest: digestString(input.EvidenceDigest), CanonicalCBOR: canonical, CanonicalEvidence: toscore.CanonicalEvidence{Network: r.Network, Reference: r.Reference, Digest: d, Finalized: r.Finalized, FinalizedCheckpoint: r.FinalizedCheckpoint}}, true, nil
 }
 
 func (c *Client) ReadSettlementStatus(ctx context.Context, escrowID string) (domain.EscrowStatus, error) {

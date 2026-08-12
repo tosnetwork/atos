@@ -713,6 +713,20 @@ func (s *JobService) releaseForTerminalUnderLock(ctx context.Context, job domain
 		if observeErr != nil {
 			return job, observeErr
 		}
+		// The terminal Receipt is part of the durable Verified projection.  It
+		// must be persisted before the Job is made terminal so a crash cannot
+		// leave a canonical release with no public proof identity. PutReceipt is
+		// idempotent for the deterministic release Receipt ID; changed semantics
+		// fail as a store conflict rather than replacing canonical evidence.
+		if receipt.ID == "" || receipt.JobID != job.ID || receipt.QuoteID != quote.ID ||
+			receipt.EscrowID != escrow.ID || receipt.PrincipalID != job.PrincipalID ||
+			receipt.TrustMode != domain.TrustModeVerified || receipt.ProofProfile != quote.ProofProfile ||
+			receipt.Status != domain.ReceiptReleased || receipt.NetworkProofRef != escrow.ReleaseRef {
+			return job, domain.NewError(domain.ErrSettlementFailed, "canonical release Receipt is incomplete or mismatched", false)
+		}
+		if observeErr = s.store.PutReceipt(ctx, receipt); observeErr != nil {
+			return job, observeErr
+		}
 	}
 	if s.financial != nil && quote.TrustMode == domain.TrustModeManaged && nonZeroMoney(receipt.Refunded) {
 		amount, parseErr := money.Parse(receipt.Refunded.Amount, receipt.Refunded.Currency, accountDecimals)
@@ -807,7 +821,7 @@ func (s *JobService) releaseForTerminalUnderLock(ctx context.Context, job domain
 }
 
 func (s *JobService) settleProviderResultUnderLock(ctx context.Context, current domain.Job, result tosai.SubmitJobResult) domain.Job {
-	if current.ExecutionReceipt != nil && current.EconomicState == domain.EconomicSettlementPending {
+	if current.ExecutionReceipt != nil && current.ReconciliationTarget == domain.JobCompleted {
 		copied := *current.ExecutionReceipt
 		result.Receipt = &copied
 		if result.Output == nil {
@@ -857,10 +871,36 @@ func (s *JobService) settleProviderResultUnderLock(ctx context.Context, current 
 	}
 	receipt.Cost = billingSnapshot.GrossCharge
 	if current.EconomicState != domain.EconomicSettlementPending {
+		// Persist the exact signed provider receipt before the first external
+		// commitment call. The signed canonical envelope cannot be reconstructed
+		// from mutable output projections after a crash (and changing Cost would
+		// change its semantics). This checkpoint is deliberately only ProofSigned:
+		// it never opens the execution/settlement gate without live verification.
+		current, err = s.store.UpdateJob(ctx, current.ID, func(job domain.Job, exists bool) (domain.Job, error) {
+			if !exists {
+				return domain.Job{}, store.ErrNotFound
+			}
+			if job.ExecutionReceipt != nil && job.ExecutionReceipt.ID != receipt.ID {
+				return domain.Job{}, store.ErrConflict
+			}
+			job.Output = cloneMap(result.Output)
+			job.Artifacts = append([]domain.Artifact(nil), result.Artifacts...)
+			copied := receipt
+			job.ExecutionReceipt = &copied
+			job.ProofStatus.Receipt = domain.ProofSigned
+			job.State = domain.JobReconciling
+			job.ReconciliationRequired = true
+			job.ReconciliationTarget = domain.JobCompleted
+			job.UpdatedAt = time.Now().UTC()
+			return job, nil
+		})
+		if err != nil {
+			return current
+		}
 		current.ProofStatus.Receipt = domain.ProofSigned
 		proofRef, commitErr := s.core.CommitExecutionReceipt(ctx, receipt)
 		if commitErr != nil {
-			return s.markEconomicReconciliationUnderLock(ctx, current.ID, current.EconomicState, domain.JobWorking, errCode(commitErr), "execution receipt commitment requires replay: "+commitErr.Error())
+			return s.markEconomicReconciliationUnderLock(ctx, current.ID, current.EconomicState, domain.JobCompleted, errCode(commitErr), "execution receipt commitment requires replay: "+commitErr.Error())
 		}
 		if proofRef != "" {
 			receipt.NetworkProofRef = proofRef
@@ -1052,7 +1092,8 @@ func (s *JobService) recoverProviderExecution(ctx context.Context, jobID string,
 	if job.State.Terminal() {
 		return job, nil
 	}
-	if job.EconomicState == domain.EconomicSettlementPending && job.ExecutionReceipt != nil {
+	if job.ExecutionReceipt != nil && job.ReconciliationTarget == domain.JobCompleted &&
+		(job.EconomicState == domain.EconomicSettlementPending || job.ProofStatus.Receipt == domain.ProofSigned) {
 		result := tosai.SubmitJobResult{State: domain.JobCompleted, Output: cloneMap(job.Output), Artifacts: append([]domain.Artifact(nil), job.Artifacts...), Receipt: job.ExecutionReceipt}
 		return s.settleProviderResultUnderLock(ctx, job, result), nil
 	}

@@ -156,8 +156,11 @@ func (s *HealthService) Availability(ctx context.Context, capabilityID string) (
 			}
 			if !isThirdPartyTransport(binding.Transport) {
 				// tos-native/human bindings have no external endpoint to
-				// probe -- treated as inherently reachable and always fresh.
-				healthy, fresh = true, true
+				// probe or sandbox-certify. Their authority boundary is the
+				// configured execution core itself, whose startup readiness is
+				// fail-closed, so no synthetic third-party certification record
+				// may be required to activate them.
+				healthy, fresh, certified = true, true, true
 				continue
 			}
 			check, found, err := s.store.HealthCheck(ctx, cap.ID, cap.Version, binding.Transport)

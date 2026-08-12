@@ -299,6 +299,7 @@ func domainReceipt(value *atostosv1.ExecutionReceiptEnvelope) domain.ExecutionRe
 			ContentCommitment: digestString(artifact.Digest),
 		})
 	}
+	canonical, _ := (proto.MarshalOptions{Deterministic: true}).Marshal(value)
 	return domain.ExecutionReceipt{
 		ID: value.ReceiptId, QuoteID: value.QuoteId, EscrowID: value.EscrowId,
 		JobID: value.JobId, PrincipalID: value.PrincipalId, ProviderID: value.ProviderId,
@@ -310,13 +311,44 @@ func domainReceipt(value *atostosv1.ExecutionReceiptEnvelope) domain.ExecutionRe
 		Cost: money(value.ClientCharge), ExecutionSignerID: value.ExecutionSignerId,
 		SignerAuthorizationID: value.SignerAuthorizationId,
 		SignatureAlgorithm:    value.SignatureAlgorithm,
-		Signature:             base64.StdEncoding.EncodeToString(value.Signature), ErrorCode: domain.ErrorCode(value.ErrorCode),
+		Signature:             base64.StdEncoding.EncodeToString(value.Signature),
+		CanonicalEnvelope:     base64.StdEncoding.EncodeToString(canonical), ErrorCode: domain.ErrorCode(value.ErrorCode),
 	}
 }
 
-func (c *Client) executionEnvelope(receipt domain.ExecutionReceipt) (*atostosv1.ExecutionReceiptEnvelope, error) {
+func (c *Client) executionEnvelope(ctx context.Context, receipt domain.ExecutionReceipt) (*atostosv1.ExecutionReceiptEnvelope, error) {
 	if stored, found := c.receipts.Load(receipt.ID); found {
 		return proto.Clone(stored.(*atostosv1.ExecutionReceiptEnvelope)).(*atostosv1.ExecutionReceiptEnvelope), nil
+	}
+	if receipt.CanonicalEnvelope != "" {
+		canonical, err := base64.StdEncoding.DecodeString(receipt.CanonicalEnvelope)
+		if err != nil {
+			return nil, domain.NewError(domain.ErrSettlementFailed, "canonical execution receipt is not valid base64", false)
+		}
+		envelope := new(atostosv1.ExecutionReceiptEnvelope)
+		if err := proto.Unmarshal(canonical, envelope); err != nil || envelope.ReceiptId != receipt.ID || envelope.JobId != receipt.JobID {
+			return nil, domain.NewError(domain.ErrSettlementFailed, "canonical execution receipt recovery binding mismatch", false)
+		}
+		c.receipts.Store(envelope.ReceiptId, proto.Clone(envelope).(*atostosv1.ExecutionReceiptEnvelope))
+		return envelope, nil
+	}
+	// The signed envelope is protocol authority data, not reconstructible from
+	// ATOS's convenience projection. Recover it read-only after a restart or
+	// cache loss before considering the legacy reconstruction path.
+	if receipt.JobID != "" {
+		callCtx, cancel := c.callContext(ctx, time.Time{})
+		defer cancel()
+		if recovered, err := c.fetchReceipt(callCtx, ctx, receipt.JobID); err == nil && recovered != nil {
+			if stored, found := c.receipts.Load(recovered.ID); found && recovered.ID == receipt.ID {
+				return proto.Clone(stored.(*atostosv1.ExecutionReceiptEnvelope)).(*atostosv1.ExecutionReceiptEnvelope), nil
+			}
+			return nil, domain.NewError(domain.ErrSettlementFailed, "canonical execution receipt identity mismatch during recovery", false)
+		} else if receipt.TrustMode == domain.TrustModeVerified {
+			if err != nil {
+				return nil, err
+			}
+			return nil, domain.NewError(domain.ErrNetworkUnavailable, "canonical execution receipt unavailable during recovery", true)
+		}
 	}
 	inputDigest, err := digest(receipt.InputHash)
 	if err != nil {
