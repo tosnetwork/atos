@@ -27,6 +27,16 @@ func TestPortableProofRejectsManagedAndCrossPrincipal(t *testing.T) {
 	}
 }
 
+func TestProofServiceQuoteRefUsesCommittedBusinessIdentity(t *testing.T) {
+	q := domain.Quote{
+		ServiceQuoteID:            "provider-service-quote",
+		UnderlyingServiceQuoteRef: "tos:tx:v1:chain-observation",
+	}
+	if got := proofServiceQuoteRef(q); got != q.ServiceQuoteID {
+		t.Fatalf("proof service quote ref = %q, want committed %q", got, q.ServiceQuoteID)
+	}
+}
+
 func TestSameProofSemanticsAllowsOnlyCheckpointAdvancement(t *testing.T) {
 	stored := proofSemanticsFixture(101)
 	live := proofSemanticsFixture(202)
