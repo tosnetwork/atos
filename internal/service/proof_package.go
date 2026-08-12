@@ -191,6 +191,9 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 	if !liveE.Finalized || liveE.FinalizedCheckpoint == 0 || liveE.ID != esc.ID || liveE.ReservationDigest != esc.ReservationDigest || liveE.Status != esc.Status {
 		return fail(domain.NewError(domain.ErrProofVerificationFailed, "canonical TaskEscrow mismatch", false))
 	}
+	if liveE.TerminalProofRef == "" || r.NetworkProofRef != liveE.TerminalProofRef {
+		return fail(domain.NewError(domain.ErrProofVerificationFailed, "terminal outcome reference mismatch", false))
+	}
 	escrowWire, e := s.core.PortableEscrowEvidence(ctx, q, j.ID)
 	if e != nil || escrowWire.Digest != esc.ReservationDigest {
 		return fail(domain.NewError(domain.ErrProofVerificationFailed, "canonical reservation bytes mismatch", false))

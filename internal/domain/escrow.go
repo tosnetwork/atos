@@ -29,6 +29,7 @@ type Escrow struct {
 	Reserved              Money                     `json:"reserved"`
 	Status                EscrowStatus              `json:"status"`
 	NetworkProofRef       string                    `json:"network_proof_ref,omitempty"`
+	TerminalProofRef      string                    `json:"terminal_proof_ref,omitempty"`
 	QuoteCommitmentDigest string                    `json:"quote_commitment_digest,omitempty"`
 	QuoteCommitmentRef    string                    `json:"quote_commitment_ref,omitempty"`
 	ReservationDigest     string                    `json:"reservation_digest,omitempty"`

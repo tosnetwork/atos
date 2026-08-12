@@ -1202,7 +1202,7 @@ func domainEscrow(value *atostosv1.Escrow, jobID, capabilityVersion string, sett
 		CapabilityID: value.CapabilityId, CapabilityVersion: capabilityVersion,
 		TrustMode: domainTrustMode(value.TrustMode), ProofProfile: domainProofProfile(value.ProofProfile),
 		Settlement: settlement, Reserved: domainMoney(value.Reserved),
-		Status: domainEscrowStatus(value.State), NetworkProofRef: reference(value.EscrowRef),
+		Status: domainEscrowStatus(value.State), NetworkProofRef: reference(value.EscrowRef), TerminalProofRef: reference(value.TerminalRef),
 		QuoteCommitmentDigest: value.QuoteCommitmentDigest, QuoteCommitmentRef: reference(value.QuoteCommitmentRef),
 		ReservationDigest: value.ReservationDigest, ReservationActionID: value.ReservationActionId,
 		ContractCodeHash: value.ContractCodeHash, Finalized: value.Finalized, FinalizedCheckpoint: value.FinalizedCheckpoint,

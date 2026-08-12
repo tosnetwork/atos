@@ -9,7 +9,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
-	github.com/tosnetwork/tos-protocol v0.0.0-20260812112134-a0d8202eb968
+	github.com/tosnetwork/tos-protocol v0.0.0-20260812112927-aab39aadc463
 	go.etcd.io/bbolt v1.4.3
 	google.golang.org/protobuf v1.36.11
 )
