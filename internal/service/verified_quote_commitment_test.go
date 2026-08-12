@@ -75,6 +75,25 @@ func TestVerifiedQuoteIsCommittedBeforeUsableAndAutoIsConcrete(t *testing.T) {
 	}
 }
 
+func TestVerifiedQuoteDoesNotUseManagedAccountCurrencyPolicy(t *testing.T) {
+	quotes, _, _, _, cap := verifiedQuoteHarness(t)
+	// The default account is USD with two decimal places. A Verified Quote
+	// has a nine-decimal native TOS amount and must therefore never be fed
+	// through the Managed account confirmation ledger.
+	quotes.WithAccountService(service.NewAccountService(memory.New()))
+	q, err := quotes.Create(context.Background(), service.CreateQuoteInput{
+		PrincipalID: "requester", CapabilityID: cap.ID,
+		RequestedTrustMode: domain.RequestedTrustVerified,
+		IdempotencyKey:     "verified-native-funding-policy",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.Price.TotalMax != "1.050000000" || q.Price.Currency != "TOS" || q.RequiresConfirmation {
+		t.Fatalf("verified funding terms were interpreted as Managed account money: %+v", q)
+	}
+}
+
 func TestVerifiedQuoteChangedSemanticsConflictAndJobGate(t *testing.T) {
 	quotes, _, core, st, cap := verifiedQuoteHarness(t)
 	q, err := quotes.Create(context.Background(), service.CreateQuoteInput{PrincipalID: "requester", CapabilityID: cap.ID, RequestedTrustMode: domain.RequestedTrustVerified, IdempotencyKey: "verified-gate"})

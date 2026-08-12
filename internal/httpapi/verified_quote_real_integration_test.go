@@ -78,7 +78,7 @@ func (e *quoteAcceptanceEconomy) ResolveEscrow(context.Context, economic.Reserve
 type quoteAcceptanceQuoter struct{}
 
 func (quoteAcceptanceQuoter) QuoteExecution(_ context.Context, req tosai.QuoteExecutionRequest) (tosai.ServiceExecutionQuote, error) {
-	now := time.Now().UTC().Truncate(time.Millisecond)
+	now := time.Now().UTC().Truncate(time.Second)
 	return tosai.ServiceExecutionQuote{ID: "service-quote-phase4b1", Reference: "service:quote:phase4b1", ExpiresAt: now.Add(5 * time.Minute), ExecutionDeadline: req.ExecutionDeadline.UTC().Truncate(time.Millisecond)}, nil
 }
 

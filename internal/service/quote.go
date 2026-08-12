@@ -402,7 +402,15 @@ func (s *QuoteService) buildQuote(ctx context.Context, in CreateQuoteInput) (dom
 	}
 
 	requiresConfirmation := false
-	if s.accounts != nil && strings.TrimSpace(in.PrincipalID) != "" {
+	// Managed account limits are denominated in the gateway account's
+	// configured display currency (normally USD, with two decimals). They
+	// are neither a TOS wallet authorization nor an authority for a
+	// tos_verified_v1 reservation. Feeding a nine-decimal TOS maximum into
+	// that ledger both conflates assets and makes real Verified quotes fail
+	// before TaskEscrow can enforce the committed amount. Verified funding
+	// consent is therefore represented by acceptance of the immutable Quote
+	// and the canonical TOS reservation, never by Managed account policy.
+	if mode == domain.TrustModeManaged && s.accounts != nil && strings.TrimSpace(in.PrincipalID) != "" {
 		requiresConfirmation, err = s.accounts.RequiresConfirmation(ctx, in.PrincipalID, totalMax.String(), totalMax.Currency)
 		if err != nil {
 			return domain.Quote{}, err
