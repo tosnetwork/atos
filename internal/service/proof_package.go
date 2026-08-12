@@ -12,6 +12,7 @@ import (
 	"github.com/tosnetwork/atos/internal/money"
 	"github.com/tosnetwork/atos/internal/store"
 	"github.com/tosnetwork/tos-protocol/pkg/verifiedproof"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -311,6 +312,34 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 	if !check.Valid {
 		return fail(domain.NewError(domain.ErrProofVerificationFailed, fmt.Sprintf("portable proof self-verification failed: %+v", check.Failures), false))
 	}
+	// The first canonical package is immutable. Live finality checkpoints can
+	// advance forever, so replay must validate that the frozen references are
+	// still canonical at an equal-or-higher live checkpoint without re-encoding
+	// those newer observations into a second semantic package.
+	if op.PackageDigest != "" || len(op.CanonicalCBOR) != 0 {
+		stored, parseErr := verifiedproof.Parse(op.CanonicalCBOR)
+		storedDigest, digestErr := verifiedproof.Digest(stored)
+		if parseErr != nil || digestErr != nil || storedDigest != op.PackageDigest || !sameProofSemantics(stored, p) {
+			return fail(domain.NewError(domain.ErrProofVerificationFailed, "durable portable proof differs from live canonical tuple", false))
+		}
+		storedCheck := verifiedproof.Verifier{Observer: capturedProofObserver{auth: auth}, Network: s.core.Network(), GatewayDomain: q.CommitmentDomain}.Verify(ctx, stored)
+		if !storedCheck.Valid {
+			return fail(domain.NewError(domain.ErrProofVerificationFailed, fmt.Sprintf("durable portable proof revalidation failed: %+v", storedCheck.Failures), false))
+		}
+		if op.Checkpoint == domain.ProofPackageCanonicalObserved {
+			op, e = s.advanceProofCheckpoint(ctx, op, domain.ProofPackageProjectionPersisted)
+			if e != nil {
+				return PortableProof{}, e
+			}
+		}
+		if op.Checkpoint == domain.ProofPackageProjectionPersisted {
+			op, e = s.completeProofOperation(ctx, op)
+			if e != nil {
+				return PortableProof{}, e
+			}
+		}
+		return publicProof(op), nil
+	}
 	bytes, e := verifiedproof.Marshal(p)
 	if e != nil {
 		return fail(e)
@@ -319,36 +348,116 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 	if e != nil {
 		return fail(e)
 	}
-	op, e = s.store.UpdateProofPackageOperation(ctx, op.ID, func(x domain.ProofPackageOperation) (domain.ProofPackageOperation, error) {
+	op, e = s.persistCanonicalProof(ctx, op, p, bytes, digest)
+	if e != nil {
+		return PortableProof{}, e
+	}
+	op, e = s.advanceProofCheckpoint(ctx, op, domain.ProofPackageProjectionPersisted)
+	if e != nil {
+		return PortableProof{}, e
+	}
+	op, e = s.completeProofOperation(ctx, op)
+	if e != nil {
+		return PortableProof{}, e
+	}
+	return publicProof(op), nil
+}
+
+func sameProofSemantics(stored, live verifiedproof.Package) bool {
+	refsStored := proofReferences(&stored)
+	refsLive := proofReferences(&live)
+	if len(refsStored) != len(refsLive) {
+		return false
+	}
+	storedCheckpoints := make([]uint64, len(refsStored))
+	liveCheckpoints := make([]uint64, len(refsLive))
+	for i := range refsStored {
+		if refsStored[i].Network != refsLive[i].Network || refsStored[i].Reference != refsLive[i].Reference || refsStored[i].FinalizedCheckpoint == 0 || refsStored[i].FinalizedCheckpoint > refsLive[i].FinalizedCheckpoint {
+			return false
+		}
+		storedCheckpoints[i], liveCheckpoints[i] = refsStored[i].FinalizedCheckpoint, refsLive[i].FinalizedCheckpoint
+		refsStored[i].FinalizedCheckpoint = 0
+		refsLive[i].FinalizedCheckpoint = 0
+	}
+	equal := reflect.DeepEqual(stored, live)
+	for i := range refsStored {
+		refsStored[i].FinalizedCheckpoint, refsLive[i].FinalizedCheckpoint = storedCheckpoints[i], liveCheckpoints[i]
+	}
+	return equal
+}
+
+func proofReferences(p *verifiedproof.Package) []*verifiedproof.Reference {
+	candidates := []*verifiedproof.Reference{&p.RequesterIdentityRef, &p.ProviderIdentityRef, &p.Capability.OwnershipRef, &p.Quote.CommitmentRef, &p.Escrow.ContractRef, &p.Escrow.ReservationRef, &p.Outcome.OutcomeRef, &p.Outcome.DisputeRef}
+	refs := make([]*verifiedproof.Reference, 0, len(candidates)+3)
+	for _, ref := range candidates {
+		if ref.Reference != "" {
+			refs = append(refs, ref)
+		}
+	}
+	if p.SignerAuthorization != nil {
+		refs = append(refs, &p.SignerAuthorization.AuthorizationRef)
+	}
+	if p.Receipt != nil {
+		refs = append(refs, &p.Receipt.ReceiptRef)
+	}
+	if p.ProofOfService != nil {
+		refs = append(refs, &p.ProofOfService.EvidenceRef)
+	}
+	return refs
+}
+
+func (s *PortableProofService) persistCanonicalProof(ctx context.Context, op domain.ProofPackageOperation, p verifiedproof.Package, canonical []byte, digest string) (domain.ProofPackageOperation, error) {
+	return s.store.UpdateProofPackageOperation(ctx, op.ID, func(x domain.ProofPackageOperation) (domain.ProofPackageOperation, error) {
+		if x.PackageDigest != "" || len(x.CanonicalCBOR) != 0 {
+			stored, parseErr := verifiedproof.Parse(x.CanonicalCBOR)
+			storedDigest, digestErr := verifiedproof.Digest(stored)
+			if parseErr != nil || digestErr != nil || storedDigest != x.PackageDigest || !sameProofSemantics(stored, p) {
+				return x, domain.NewError(domain.ErrProofVerificationFailed, "concurrent portable proof differs from canonical tuple", false)
+			}
+			return x, nil
+		}
 		x.Checkpoint = domain.ProofPackageCanonicalObserved
-		x.CanonicalCBOR = bytes
+		x.CanonicalCBOR = canonical
 		x.PackageDigest = digest
 		x.LastError = ""
 		x.UpdatedAt = s.now()
 		return x, nil
 	})
-	if e != nil {
-		return PortableProof{}, e
+}
+
+func proofCheckpointReached(current, target domain.ProofPackageCheckpoint) bool {
+	order := map[domain.ProofPackageCheckpoint]int{
+		domain.ProofPackageIntentPersisted:     1,
+		domain.ProofPackageReconciling:         2,
+		domain.ProofPackageCanonicalObserved:   3,
+		domain.ProofPackageProjectionPersisted: 4,
+		domain.ProofPackageCompleted:           5,
 	}
-	op, e = s.store.UpdateProofPackageOperation(ctx, op.ID, func(x domain.ProofPackageOperation) (domain.ProofPackageOperation, error) {
-		x.Checkpoint = domain.ProofPackageProjectionPersisted
+	return order[current] != 0 && order[current] >= order[target]
+}
+
+func (s *PortableProofService) advanceProofCheckpoint(ctx context.Context, op domain.ProofPackageOperation, checkpoint domain.ProofPackageCheckpoint) (domain.ProofPackageOperation, error) {
+	return s.store.UpdateProofPackageOperation(ctx, op.ID, func(x domain.ProofPackageOperation) (domain.ProofPackageOperation, error) {
+		if proofCheckpointReached(x.Checkpoint, checkpoint) {
+			return x, nil
+		}
+		x.Checkpoint = checkpoint
 		x.UpdatedAt = s.now()
 		return x, nil
 	})
-	if e != nil {
-		return PortableProof{}, e
-	}
-	op, e = s.store.UpdateProofPackageOperation(ctx, op.ID, func(x domain.ProofPackageOperation) (domain.ProofPackageOperation, error) {
+}
+
+func (s *PortableProofService) completeProofOperation(ctx context.Context, op domain.ProofPackageOperation) (domain.ProofPackageOperation, error) {
+	return s.store.UpdateProofPackageOperation(ctx, op.ID, func(x domain.ProofPackageOperation) (domain.ProofPackageOperation, error) {
+		if x.Checkpoint == domain.ProofPackageCompleted {
+			return x, nil
+		}
 		x.Checkpoint = domain.ProofPackageCompleted
 		now := s.now()
 		x.UpdatedAt = now
 		x.CompletedAt = &now
 		return x, nil
 	})
-	if e != nil {
-		return PortableProof{}, e
-	}
-	return publicProof(op), nil
 }
 
 type capturedProofObserver struct {
