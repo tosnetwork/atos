@@ -25,6 +25,8 @@ type Receipt struct {
 	Status                 ReceiptStatus   `json:"status"`
 	ProofStatus            ProofCheckpoint `json:"proof_status"`
 	NetworkProofRef        string          `json:"network_proof_ref,omitempty"`
+	Finalized              bool            `json:"finalized"`
+	FinalizedCheckpoint    uint64          `json:"finalized_checkpoint,omitempty"`
 	ExecutionSignerID      string          `json:"execution_signer_id,omitempty"`
 	SignerAuthorizationRef string          `json:"signer_authorization_ref,omitempty"`
 	InputCommitment        string          `json:"input_commitment,omitempty"`

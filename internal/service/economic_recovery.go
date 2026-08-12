@@ -129,7 +129,7 @@ func financialIdentities(job domain.Job, quote domain.Quote, billingID, executio
 }
 
 func (s *JobService) settleFinancialLegs(ctx context.Context, job domain.Job, quote domain.Quote, snapshot domain.BillingSnapshot, settlementID string) error {
-	if s.financial == nil {
+	if quote.TrustMode != domain.TrustModeManaged || s.financial == nil {
 		return nil
 	}
 	identities := financialIdentities(job, quote, "billing_"+snapshot.JobID, snapshot.ReceiptID, settlementID, "earn_"+settlementID, "", "")
@@ -905,6 +905,41 @@ func (s *JobService) settleProviderResultUnderLock(ctx context.Context, current 
 	})
 	if settleErr != nil {
 		return s.markEconomicReconciliationUnderLock(ctx, current.ID, domain.EconomicSettlementPending, domain.JobCompleted, domain.ErrSettlementFailed, "settlement outcome requires idempotent replay: "+settleErr.Error())
+	}
+	if quote.TrustMode == domain.TrustModeVerified {
+		final, finalErr := s.store.UpdateJob(ctx, current.ID, func(job domain.Job, exists bool) (domain.Job, error) {
+			if !exists {
+				return domain.Job{}, store.ErrNotFound
+			}
+			if job.EconomicState == domain.EconomicSettled && job.State == domain.JobCompleted {
+				return job, nil
+			}
+			if job.TrustMode != domain.TrustModeVerified || job.EconomicState != domain.EconomicSettlementPending {
+				return domain.Job{}, store.ErrConflict
+			}
+			job.Output = cloneMap(current.Output)
+			job.Artifacts = append([]domain.Artifact(nil), current.Artifacts...)
+			job.ProofStatus.Receipt = domain.ProofVerified
+			job.ProofStatus.Settlement = domain.ProofSettled
+			job.EconomicState = domain.EconomicSettled
+			job.State = domain.JobCompleted
+			job.ReconciliationRequired = false
+			job.ReconciliationTarget = ""
+			job.ErrorCode = ""
+			job.FailureReason = ""
+			job.PendingCredit = nil
+			now := time.Now().UTC()
+			job.UpdatedAt = now
+			job.CompletedAt = &now
+			return job, nil
+		})
+		if finalErr != nil {
+			return s.markEconomicReconciliationUnderLock(ctx, current.ID, domain.EconomicSettlementPending, domain.JobCompleted, domain.ErrSettlementFailed, "verified TOS settlement finalized but local projection must be retried: "+finalErr.Error())
+		}
+		// Verified funds exist only in the canonical TOS TaskEscrow. Never
+		// mirror its payout/refund into Managed/Blnk accounts or policy limits.
+		_, _ = s.core.CommitProofOfServiceEvidence(ctx, receipt)
+		return final
 	}
 	if financialErr := s.settleFinancialLegs(ctx, current, quote, billingSnapshot, settled.Receipt.ID); financialErr != nil {
 		return s.markEconomicReconciliationUnderLock(ctx, current.ID, domain.EconomicSettlementPending, domain.JobCompleted, domain.ErrSettlementFailed, "Blnk settlement requires idempotent recovery: "+financialErr.Error())

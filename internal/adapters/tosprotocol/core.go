@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"math/big"
 	"strings"
 	"time"
 
@@ -791,11 +792,18 @@ func (c *Client) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (t
 	if response.Msg == nil || response.Msg.Settlement == nil || response.Msg.Escrow == nil {
 		return toscore.SettleJobResult{}, domain.NewError(domain.ErrSettlementFailed, "tos-protocol returned an incomplete settlement", true)
 	}
+	settlement := response.Msg.Settlement
+	remoteEscrow := response.Msg.Escrow
+	if err := c.validateSettlementResponse(req, local, charge, settlement, remoteEscrow); err != nil {
+		return toscore.SettleJobResult{}, err
+	}
 	now := time.UnixMilli(response.Msg.Settlement.SettledUnixMillis).UTC()
 	local.Status = domain.EscrowSettled
 	local.SettledAt = &now
 	if local.TrustMode != domain.TrustModeManaged {
-		local.NetworkProofRef = reference(response.Msg.Settlement.SettlementRef)
+		local.NetworkProofRef = reference(settlement.SettlementRef)
+		local.Finalized = settlement.SettlementRef.Finalized
+		local.FinalizedCheckpoint = settlement.SettlementRef.FinalizedCheckpoint
 	}
 	if err := c.store.PutEscrow(ctx, local); err != nil {
 		return toscore.SettleJobResult{}, err
@@ -804,7 +812,6 @@ func (c *Client) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (t
 	if local.TrustMode != domain.TrustModeManaged {
 		proofStatus = domain.ProofVerified
 	}
-	settlement := response.Msg.Settlement
 	receipt := domain.Receipt{
 		ID:      "rcpt_settle_" + settlement.SettlementId,
 		QuoteID: settlement.QuoteId, EscrowID: settlement.EscrowId,
@@ -823,6 +830,8 @@ func (c *Client) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (t
 	}
 	if local.TrustMode != domain.TrustModeManaged {
 		receipt.NetworkProofRef = reference(settlement.SettlementRef)
+		receipt.Finalized = settlement.SettlementRef.Finalized
+		receipt.FinalizedCheckpoint = settlement.SettlementRef.FinalizedCheckpoint
 	}
 	if err := c.store.PutReceipt(ctx, receipt); err != nil {
 		return toscore.SettleJobResult{}, err
@@ -833,6 +842,63 @@ func (c *Client) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (t
 		}
 	}
 	return toscore.SettleJobResult{Receipt: receipt}, nil
+}
+
+func (c *Client) validateSettlementResponse(
+	req toscore.SettleJobRequest,
+	local domain.Escrow,
+	requested *atostosv1.NetworkAmount,
+	settlement *atostosv1.Settlement,
+	escrow *atostosv1.Escrow,
+) error {
+	invalid := func(message string) error {
+		return domain.NewError(domain.ErrSettlementFailed, message, false)
+	}
+	if settlement.SettlementId == "" || settlement.EscrowId != req.EscrowID ||
+		settlement.EscrowId != local.ID || settlement.QuoteId != local.QuoteID ||
+		settlement.JobId != req.JobID || settlement.JobId != local.JobID ||
+		settlement.ReceiptId != req.ReceiptID ||
+		settlement.State != atostosv1.SettlementState_SETTLEMENT_STATE_SETTLED ||
+		settlement.SettledUnixMillis <= 0 {
+		return invalid("tos-protocol settlement tuple does not match the local request")
+	}
+	if escrow.EscrowId != local.ID || escrow.QuoteId != local.QuoteID ||
+		escrow.TrustMode != trustMode(local.TrustMode) || escrow.State != atostosv1.EscrowState_ESCROW_STATE_SETTLED ||
+		!sameNetworkAmount(escrow.Reserved, mustNetworkAmount(local.Reserved)) {
+		return invalid("tos-protocol settled escrow does not match the canonical local escrow")
+	}
+	if !sameNetworkAmount(settlement.Charged, requested) || settlement.Refunded == nil ||
+		settlement.Charged.Asset != escrow.Reserved.Asset || settlement.Refunded.Asset != escrow.Reserved.Asset {
+		return invalid("tos-protocol settlement amount or asset does not match the request")
+	}
+	reserved, reserveOK := new(big.Int).SetString(escrow.Reserved.AtomicAmount, 10)
+	charged, chargeOK := new(big.Int).SetString(settlement.Charged.AtomicAmount, 10)
+	refunded, refundOK := new(big.Int).SetString(settlement.Refunded.AtomicAmount, 10)
+	if !reserveOK || !chargeOK || !refundOK || reserved.Sign() < 0 || charged.Sign() < 0 || refunded.Sign() < 0 ||
+		new(big.Int).Add(charged, refunded).Cmp(reserved) != 0 {
+		return invalid("tos-protocol settlement violates monetary conservation")
+	}
+	if local.TrustMode == domain.TrustModeVerified {
+		ref := settlement.SettlementRef
+		if escrow.JobId != local.JobID || escrow.PrincipalId != local.PrincipalID ||
+			escrow.ProviderId != local.ProviderID || escrow.CapabilityId != local.CapabilityID ||
+			escrow.CapabilityVersion != local.CapabilityVersion || escrow.ProofProfile != proofProfile(local.ProofProfile) ||
+			ref == nil || ref.Network != c.network || strings.TrimSpace(ref.Reference) == "" ||
+			!ref.Finalized || ref.FinalizedCheckpoint == 0 || !escrow.Finalized ||
+			escrow.FinalizedCheckpoint == 0 || ref.FinalizedCheckpoint < escrow.FinalizedCheckpoint {
+			return invalid("verified settlement lacks matching finalized TOS evidence")
+		}
+	}
+	return nil
+}
+
+func sameNetworkAmount(left, right *atostosv1.NetworkAmount) bool {
+	return left != nil && right != nil && left.Asset == right.Asset && left.AtomicAmount == right.AtomicAmount
+}
+
+func mustNetworkAmount(value domain.Money) *atostosv1.NetworkAmount {
+	amount, _ := networkAmount(value)
+	return amount
 }
 
 func (c *Client) CommitProofOfServiceEvidence(ctx context.Context, receipt domain.ExecutionReceipt) (string, error) {
