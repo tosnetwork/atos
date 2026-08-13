@@ -50,6 +50,8 @@ github.com/tosnetwork/tos-protocol v0.0.0-20260813011906-4520beb39c81 h1:iBaTrNU
 github.com/tosnetwork/tos-protocol v0.0.0-20260813011906-4520beb39c81/go.mod h1:v3NvUpGfOAjIe+0B0bjnDZIWKFJRM9IbfpvslO8NHXk=
 github.com/tosnetwork/tos-protocol v0.0.0-20260813025754-dc096113d73f h1:tqU+H+HDst5srr7kV5sTYkaKlApDX4polsl/gyQM1QU=
 github.com/tosnetwork/tos-protocol v0.0.0-20260813025754-dc096113d73f/go.mod h1:v3NvUpGfOAjIe+0B0bjnDZIWKFJRM9IbfpvslO8NHXk=
+github.com/tosnetwork/tos-protocol v0.0.0-20260813034832-58e0d6321b24 h1:w+PvZI7IVUr2rc+hqtiXkfoHfh63M+X9fasblduP+Ig=
+github.com/tosnetwork/tos-protocol v0.0.0-20260813034832-58e0d6321b24/go.mod h1:v3NvUpGfOAjIe+0B0bjnDZIWKFJRM9IbfpvslO8NHXk=
 github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
 github.com/x448/float16 v0.8.4/go.mod h1:14CWIYCyZA/cWjXOioeEpHeN/83MdbZDRQHoFcYsOfg=
 github.com/xssnick/tonutils-go v1.16.0 h1:MLYVZiiMB0Q+XudLo7WyjOli4gMuenNmJpBqETqa5DE=
