@@ -1021,8 +1021,11 @@ func (s *JobService) settleProviderResultUnderLock(ctx context.Context, current 
 		}
 		current = advanced
 	}
+	if current.ExecutionReceipt == nil {
+		return s.markEconomicReconciliationUnderLock(ctx, current.ID, domain.EconomicSettlementPending, domain.JobCompleted, domain.ErrSettlementFailed, "canonical execution receipt is unavailable")
+	}
 	settled, settleErr := s.core.SettleJob(ctx, toscore.SettleJobRequest{
-		EscrowID: current.EscrowID, JobID: current.ID, ReceiptID: receipt.ID, ActualCost: receipt.Cost, Quote: quote,
+		EscrowID: current.EscrowID, JobID: current.ID, ReceiptID: receipt.ID, ActualCost: receipt.Cost, Quote: quote, Receipt: *current.ExecutionReceipt,
 	})
 	if settleErr != nil {
 		return s.markEconomicReconciliationUnderLock(ctx, current.ID, domain.EconomicSettlementPending, domain.JobCompleted, domain.ErrSettlementFailed, "settlement outcome requires idempotent replay: "+settleErr.Error())
