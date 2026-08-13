@@ -46,8 +46,8 @@ github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/tinylib/msgp v1.6.4 h1:mOwYbyYDLPj35mkA2BjjYejgJk9BuHxDdvRnb6v2ZcQ=
 github.com/tinylib/msgp v1.6.4/go.mod h1:RSp0LW9oSxFut3KzESt5Voq4GVWyS+PSulT77roAqEA=
-github.com/tosnetwork/tos-protocol v0.0.0-20260813000336-b0d37455daca h1:VNDEYuCsBPDkEz4l/D2LYUJeZdIIdlphQKN5iiA2nHE=
-github.com/tosnetwork/tos-protocol v0.0.0-20260813000336-b0d37455daca/go.mod h1:v3NvUpGfOAjIe+0B0bjnDZIWKFJRM9IbfpvslO8NHXk=
+github.com/tosnetwork/tos-protocol v0.0.0-20260813001249-e521e218079a h1:2hOx/o/zrK1QyHU7KLnXSfU1icP0uABwvf4cewhqi4A=
+github.com/tosnetwork/tos-protocol v0.0.0-20260813001249-e521e218079a/go.mod h1:v3NvUpGfOAjIe+0B0bjnDZIWKFJRM9IbfpvslO8NHXk=
 github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
 github.com/x448/float16 v0.8.4/go.mod h1:14CWIYCyZA/cWjXOioeEpHeN/83MdbZDRQHoFcYsOfg=
 github.com/xssnick/tonutils-go v1.16.0 h1:MLYVZiiMB0Q+XudLo7WyjOli4gMuenNmJpBqETqa5DE=
