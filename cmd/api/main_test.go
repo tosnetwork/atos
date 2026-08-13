@@ -3,18 +3,32 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 )
 
-func TestReadinessGroupFailsClosed(t *testing.T) {
-	if err := (readinessGroup{readinessFunc(func(context.Context) error { return nil }), nil}).CheckReady(context.Background()); err == nil {
-		t.Fatal("missing dependency passed readiness")
-	}
-	want := errors.New("database unavailable")
-	if err := (readinessGroup{readinessFunc(func(context.Context) error { return want })}).CheckReady(context.Background()); !errors.Is(err, want) {
-		t.Fatalf("err=%v", err)
-	}
-	if err := (readinessGroup{readinessFunc(func(context.Context) error { return nil })}).CheckReady(context.Background()); err != nil {
-		t.Fatal(err)
+type readinessStub struct{ err error }
+
+func (s readinessStub) CheckReady(context.Context) error { return s.err }
+
+func TestReadinessHandlerFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		checker readinessChecker
+		want    int
+	}{
+		{name: "missing", checker: nil, want: http.StatusServiceUnavailable},
+		{name: "failed", checker: readinessStub{err: errors.New("down")}, want: http.StatusServiceUnavailable},
+		{name: "ready", checker: readinessStub{}, want: http.StatusOK},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			readinessHandler(test.checker, time.Second)(response, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+			if response.Code != test.want {
+				t.Fatalf("status = %d, want %d", response.Code, test.want)
+			}
+		})
 	}
 }
