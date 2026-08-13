@@ -239,7 +239,7 @@ func clearEnvironment(t *testing.T) {
 		"ATOS_AUTH_AUTO_APPROVE", "ATOS_AUTH_STATE_PATH", "ATOS_APPROVAL_TOKEN",
 		"ATOS_AUTH_TOKEN_TTL", "ATOS_AUTH_DEVICE_TTL", "ATOS_AUTH_POLL_INTERVAL",
 		"ATOS_MANAGED_CURRENCY", "ATOS_MANAGED_INITIAL_BALANCE", "ATOS_MANAGED_PER_CALL_LIMIT", "ATOS_MANAGED_DAILY_LIMIT",
-		"ATOS_TOS_BACKEND", "ATOS_TOS_RPC_URL", "ATOS_TOS_RPC_TOKEN", "ATOS_TOS_RPC_INSECURE", "ATOS_TOS_NETWORK",
+		"ATOS_TOS_BACKEND", "ATOS_TOS_RPC_URL", "ATOS_TOS_RPC_TOKEN", "ATOS_TOS_RPC_INSECURE", "ATOS_TOS_NETWORK", "ATOS_ENABLE_HOSTED_LEGACY",
 		"ATOS_TOS_RPC_TIMEOUT", "ATOS_TOS_RPC_MAX_MESSAGE_BYTES", "ATOS_TOS_RPC_SERVER_NAME",
 		"ATOS_TOS_RPC_CA_FILE", "ATOS_TOS_RPC_CLIENT_CERT_FILE", "ATOS_TOS_RPC_CLIENT_KEY_FILE",
 		"ATOS_PAYOUT_BACKEND",
@@ -252,6 +252,28 @@ func clearEnvironment(t *testing.T) {
 		"ATOS_WEBAUTHN_RP_ID", "ATOS_WEBAUTHN_RP_NAME", "ATOS_WEBAUTHN_RP_ORIGINS", "ATOS_TRUSTED_PROXY_CIDRS",
 	} {
 		t.Setenv(name, "")
+	}
+	// Existing tests below exercise the frozen hosted v0.2 configuration.
+	// Native-only tests explicitly turn this back off.
+	t.Setenv("ATOS_ENABLE_HOSTED_LEGACY", "true")
+}
+
+func TestNativeOnlyRequiresRPCButNotManagedFinancialInfrastructure(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ATOS_ENABLE_HOSTED_LEGACY", "false")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "atos_native_v1") {
+		t.Fatalf("mock Native config error = %v", err)
+	}
+	t.Setenv("ATOS_TOS_BACKEND", "rpc")
+	t.Setenv("ATOS_TOS_RPC_URL", "https://tos-protocol.internal")
+	t.Setenv("ATOS_TOS_RPC_TOKEN", "integration-token")
+	t.Setenv("ATOS_TOS_NETWORK", "tos-devnet")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.EnableHostedLegacy || cfg.Financial.Backend != FinancialBackendDisabled {
+		t.Fatalf("unexpected Native-only config: %#v", cfg)
 	}
 }
 

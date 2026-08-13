@@ -2,7 +2,11 @@
 
 Go implementation of the ATOS Agent Internet gateway.
 
-ATOS exposes one REST + MCP + A2A business protocol for discovering, quoting,
+ATOS exposes the `atos_native_v1` Connect protocol as its canonical surface.
+Finalized TOS state, rather than this gateway's database, is authoritative for
+Agent, Capability, Accepted Quote, escrow, and receipt facts.
+
+The frozen v0.2 REST + MCP + A2A hosted compatibility implementation supports discovering, quoting,
 invoking and settling third-party **Capabilities** under three concrete trust
 modes:
 
@@ -22,7 +26,7 @@ This branch implements the Phase 0/1 contract and a complete **Managed Mode**
 happy path in two explicit deployments:
 
 ```text
-ATOS_TOS_BACKEND=mock  local development/test adapter
+ATOS_TOS_BACKEND=mock  legacy hosted development/test adapter (requires ATOS_ENABLE_HOSTED_LEGACY=true)
 ATOS_TOS_BACKEND=rpc   real ConnectRPC path through tos-protocol and its private tos-ai Worker RPC
 ```
 
@@ -50,7 +54,10 @@ than a final TOS Network trust anchor.
 | Verified / Native | Contract implemented, runtime availability intentionally `unavailable` until real TOS integration |
 | Open Task Marketplace | Demand-side task publish/propose/accept over REST + MCP; accepted proposals bind through the same Quote/Job pipeline, never a parallel one — see `IMPLEMENTATION_STATUS.md`'s Phase 3C section |
 
-## MCP surface
+It is disabled by default. Setting `ATOS_ENABLE_HOSTED_LEGACY=true` mounts it
+only below `/legacy/v0.2/`; it must not claim `atos_native_v1` completion.
+
+## Legacy MCP surface
 
 A token carrying the recommended ordinary consumer scopes sees **9 tools** in
 stable order:
@@ -114,7 +121,10 @@ go run ./cmd/api
 
 The gateway listens on `:8080` and seeds one Managed `Echo Sandbox`
 Capability. The in-memory store is used unless `ATOS_DATABASE_URL` is set.
-When `ATOS_TOS_BACKEND` is omitted, the development default is `mock`.
+When `ATOS_TOS_BACKEND` is omitted, the development default remains `mock`,
+but the Native-only server fails closed because no canonical TOS RPC boundary
+exists. Configure `rpc` for Native operation. The mock is available only with
+explicit hosted-legacy enablement.
 
 ### Real tos-protocol backend
 
@@ -187,10 +197,10 @@ export TOKEN='<access_token>'
 Discover, quote and invoke:
 
 ```bash
-curl -s 'http://localhost:8080/v1/capabilities?q=echo' \
+curl -s 'http://localhost:8080/legacy/v0.2/v1/capabilities?q=echo' \
   -H "Authorization: Bearer $TOKEN"
 
-curl -s -X POST http://localhost:8080/v1/quotes \
+curl -s -X POST http://localhost:8080/legacy/v0.2/v1/quotes \
   -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{
@@ -198,7 +208,7 @@ curl -s -X POST http://localhost:8080/v1/quotes \
     "requested_trust_mode":"auto"
   }'
 
-curl -s -X POST http://localhost:8080/v1/invocations \
+curl -s -X POST http://localhost:8080/legacy/v0.2/v1/invocations \
   -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{
@@ -209,7 +219,8 @@ curl -s -X POST http://localhost:8080/v1/invocations \
   }'
 ```
 
-MCP is exposed at `POST /mcp`; A2A is exposed at `POST /a2a`.
+With hosted compatibility explicitly enabled, MCP is exposed at
+`POST /legacy/v0.2/mcp`; A2A is exposed at `POST /legacy/v0.2/a2a`.
 
 ### Passkey / WebAuthn (human account authentication)
 

@@ -172,6 +172,9 @@ type Config struct {
 	// Validate() requires it to be true in production -- see atos-spec
 	// docs/THIRD_PARTY_EXECUTION_PLANE.md §7.1.1's placement rule.
 	RemoteThirdPartyExecution bool
+	// EnableHostedLegacy mounts the frozen v0.2 Managed/Verified/Native mode
+	// matrix under /legacy/v0.2 only. It never changes atos_native_v1 state.
+	EnableHostedLegacy bool
 }
 
 func Load() (Config, error) {
@@ -231,6 +234,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	remoteThirdParty, err := boolEnv("ATOS_REMOTE_THIRD_PARTY_EXECUTION", false)
+	if err != nil {
+		return Config{}, err
+	}
+	enableHostedLegacy, err := boolEnv("ATOS_ENABLE_HOSTED_LEGACY", false)
 	if err != nil {
 		return Config{}, err
 	}
@@ -294,6 +301,7 @@ func Load() (Config, error) {
 		},
 		PayoutBackend:             PayoutBackend(strings.ToLower(envOr("ATOS_PAYOUT_BACKEND", string(PayoutBackendDisabled)))),
 		RemoteThirdPartyExecution: remoteThirdParty,
+		EnableHostedLegacy:        enableHostedLegacy,
 	}
 	// Passkey auth is opt-in: cmd/api/main.go only constructs a webauthn.WebAuthn
 	// instance when RPID is non-empty. Deliberately NOT defaulted from
@@ -342,60 +350,62 @@ func (c Config) Validate() error {
 	if !c.Auth.AutoApprove && len(c.Auth.ApprovalToken) < 32 {
 		return errors.New("ATOS_APPROVAL_TOKEN must contain at least 32 characters when automatic approval is disabled")
 	}
-	if strings.TrimSpace(c.ManagedAccount.Currency) == "" || len(c.ManagedAccount.Currency) > 12 {
+	if c.EnableHostedLegacy && (strings.TrimSpace(c.ManagedAccount.Currency) == "" || len(c.ManagedAccount.Currency) > 12) {
 		return errors.New("ATOS_MANAGED_CURRENCY is invalid")
 	}
-	switch c.Financial.Backend {
-	case FinancialBackendDisabled:
-	case FinancialBackendBlnk:
-		if c.DatabaseURL == "" || c.Financial.BlnkURL == "" || c.Financial.GatewayID == "" || c.Financial.NetworkID == "" {
-			return errors.New("ATOS_DATABASE_URL, ATOS_BLNK_URL, ATOS_FINANCIAL_GATEWAY_ID and ATOS_FINANCIAL_NETWORK_ID are required when ATOS_FINANCIAL_BACKEND=blnk")
-		}
-		if c.Financial.Timeout <= 0 || c.Financial.Timeout > 2*time.Minute {
-			return errors.New("ATOS financial Blnk timeout is outside the allowed range")
-		}
-		if len(c.Financial.GatewayID) > 253 || len(c.Financial.NetworkID) > 128 ||
-			!financialDomainIDPattern.MatchString(c.Financial.GatewayID) || !financialDomainIDPattern.MatchString(c.Financial.NetworkID) {
-			return errors.New("ATOS_FINANCIAL_GATEWAY_ID or ATOS_FINANCIAL_NETWORK_ID is not a safe canonical domain identifier")
-		}
-		issuanceLimit, ok := new(big.Rat).SetString(c.Financial.IssuanceLimit)
-		if !ok || issuanceLimit.Sign() < 0 || !nonNegativeDecimalPattern.MatchString(c.Financial.IssuanceLimit) {
-			return errors.New("ATOS_FINANCIAL_ISSUANCE_LIMIT must be a non-negative decimal amount")
-		}
-		initialBalance, ok := new(big.Rat).SetString(c.ManagedAccount.InitialBalance)
-		if !ok || initialBalance.Sign() < 0 || initialBalance.Sign() > 0 && issuanceLimit.Sign() <= 0 {
-			return errors.New("a positive managed initial balance requires a positive ATOS_FINANCIAL_ISSUANCE_LIMIT")
-		}
-		if c.Financial.SealInterval <= 0 || c.Financial.SealInterval > 24*time.Hour || c.Financial.MaxAnchorLag < c.Financial.SealInterval || c.Financial.MaxAnchorLag > 24*time.Hour || c.Financial.MinimumRetention <= 0 || c.Financial.MinimumRetention > 10*365*24*time.Hour || c.Financial.FullAuditInterval < 10*time.Second || c.Financial.FullAuditInterval > 24*time.Hour || c.Financial.BatchSize < 1 || c.Financial.BatchSize > 4096 {
-			return errors.New("ATOS financial seal, anchor lag, WORM retention, full audit interval, or batch size is outside the allowed range")
-		}
-		if c.Financial.SigningAlgorithm != "ed25519" && c.Financial.SigningAlgorithm != "ecdsa_p256_sha256" {
-			return errors.New("ATOS_FINANCIAL_SIGNING_ALGORITHM is unsupported")
-		}
-		if c.Financial.SigningPublicKey != "" {
-			raw, err := base64.StdEncoding.Strict().DecodeString(c.Financial.SigningPublicKey)
-			if err != nil {
-				return errors.New("ATOS_FINANCIAL_SIGNING_PUBLIC_KEY is not strict base64")
+	if c.EnableHostedLegacy {
+		switch c.Financial.Backend {
+		case FinancialBackendDisabled:
+		case FinancialBackendBlnk:
+			if c.DatabaseURL == "" || c.Financial.BlnkURL == "" || c.Financial.GatewayID == "" || c.Financial.NetworkID == "" {
+				return errors.New("ATOS_DATABASE_URL, ATOS_BLNK_URL, ATOS_FINANCIAL_GATEWAY_ID and ATOS_FINANCIAL_NETWORK_ID are required when ATOS_FINANCIAL_BACKEND=blnk")
 			}
-			if c.Financial.SigningAlgorithm == "ed25519" && len(raw) != ed25519.PublicKeySize {
-				return errors.New("ATOS_FINANCIAL_SIGNING_PUBLIC_KEY is not an Ed25519 public key")
+			if c.Financial.Timeout <= 0 || c.Financial.Timeout > 2*time.Minute {
+				return errors.New("ATOS financial Blnk timeout is outside the allowed range")
 			}
-			if c.Financial.SigningAlgorithm == "ecdsa_p256_sha256" {
-				parsed, err := x509.ParsePKIXPublicKey(raw)
-				key, ok := parsed.(*ecdsa.PublicKey)
-				if err != nil || !ok || key.Curve != elliptic.P256() {
-					return errors.New("ATOS_FINANCIAL_SIGNING_PUBLIC_KEY is not a P-256 PKIX public key")
+			if len(c.Financial.GatewayID) > 253 || len(c.Financial.NetworkID) > 128 ||
+				!financialDomainIDPattern.MatchString(c.Financial.GatewayID) || !financialDomainIDPattern.MatchString(c.Financial.NetworkID) {
+				return errors.New("ATOS_FINANCIAL_GATEWAY_ID or ATOS_FINANCIAL_NETWORK_ID is not a safe canonical domain identifier")
+			}
+			issuanceLimit, ok := new(big.Rat).SetString(c.Financial.IssuanceLimit)
+			if !ok || issuanceLimit.Sign() < 0 || !nonNegativeDecimalPattern.MatchString(c.Financial.IssuanceLimit) {
+				return errors.New("ATOS_FINANCIAL_ISSUANCE_LIMIT must be a non-negative decimal amount")
+			}
+			initialBalance, ok := new(big.Rat).SetString(c.ManagedAccount.InitialBalance)
+			if !ok || initialBalance.Sign() < 0 || initialBalance.Sign() > 0 && issuanceLimit.Sign() <= 0 {
+				return errors.New("a positive managed initial balance requires a positive ATOS_FINANCIAL_ISSUANCE_LIMIT")
+			}
+			if c.Financial.SealInterval <= 0 || c.Financial.SealInterval > 24*time.Hour || c.Financial.MaxAnchorLag < c.Financial.SealInterval || c.Financial.MaxAnchorLag > 24*time.Hour || c.Financial.MinimumRetention <= 0 || c.Financial.MinimumRetention > 10*365*24*time.Hour || c.Financial.FullAuditInterval < 10*time.Second || c.Financial.FullAuditInterval > 24*time.Hour || c.Financial.BatchSize < 1 || c.Financial.BatchSize > 4096 {
+				return errors.New("ATOS financial seal, anchor lag, WORM retention, full audit interval, or batch size is outside the allowed range")
+			}
+			if c.Financial.SigningAlgorithm != "ed25519" && c.Financial.SigningAlgorithm != "ecdsa_p256_sha256" {
+				return errors.New("ATOS_FINANCIAL_SIGNING_ALGORITHM is unsupported")
+			}
+			if c.Financial.SigningPublicKey != "" {
+				raw, err := base64.StdEncoding.Strict().DecodeString(c.Financial.SigningPublicKey)
+				if err != nil {
+					return errors.New("ATOS_FINANCIAL_SIGNING_PUBLIC_KEY is not strict base64")
+				}
+				if c.Financial.SigningAlgorithm == "ed25519" && len(raw) != ed25519.PublicKeySize {
+					return errors.New("ATOS_FINANCIAL_SIGNING_PUBLIC_KEY is not an Ed25519 public key")
+				}
+				if c.Financial.SigningAlgorithm == "ecdsa_p256_sha256" {
+					parsed, err := x509.ParsePKIXPublicKey(raw)
+					key, ok := parsed.(*ecdsa.PublicKey)
+					if err != nil || !ok || key.Curve != elliptic.P256() {
+						return errors.New("ATOS_FINANCIAL_SIGNING_PUBLIC_KEY is not a P-256 PKIX public key")
+					}
 				}
 			}
+			if c.Financial.RetentionURL != "" && len(c.Financial.RetentionHMACKey) < 32 {
+				return errors.New("ATOS_FINANCIAL_RETENTION_HMAC_KEY must contain at least 32 characters when WORM retention is configured")
+			}
+			if c.Financial.SignerURL != "" && len(c.Financial.SignerToken) < 32 {
+				return errors.New("ATOS_FINANCIAL_SIGNER_TOKEN must contain at least 32 characters when an external signer is configured")
+			}
+		default:
+			return fmt.Errorf("invalid ATOS_FINANCIAL_BACKEND %q (expected disabled or blnk)", c.Financial.Backend)
 		}
-		if c.Financial.RetentionURL != "" && len(c.Financial.RetentionHMACKey) < 32 {
-			return errors.New("ATOS_FINANCIAL_RETENTION_HMAC_KEY must contain at least 32 characters when WORM retention is configured")
-		}
-		if c.Financial.SignerURL != "" && len(c.Financial.SignerToken) < 32 {
-			return errors.New("ATOS_FINANCIAL_SIGNER_TOKEN must contain at least 32 characters when an external signer is configured")
-		}
-	default:
-		return fmt.Errorf("invalid ATOS_FINANCIAL_BACKEND %q (expected disabled or blnk)", c.Financial.Backend)
 	}
 
 	switch c.TOSBackend {
@@ -426,15 +436,20 @@ func (c Config) Validate() error {
 	default:
 		return fmt.Errorf("invalid ATOS_TOS_BACKEND %q (expected mock or rpc)", c.TOSBackend)
 	}
+	if !c.EnableHostedLegacy && c.TOSBackend != TOSBackendRPC {
+		return errors.New("ATOS_TOS_BACKEND=rpc is required for atos_native_v1")
+	}
 
-	switch c.PayoutBackend {
-	case PayoutBackendDisabled, PayoutBackendMock:
-	default:
-		return fmt.Errorf("invalid ATOS_PAYOUT_BACKEND %q (expected disabled or mock)", c.PayoutBackend)
+	if c.EnableHostedLegacy {
+		switch c.PayoutBackend {
+		case PayoutBackendDisabled, PayoutBackendMock:
+		default:
+			return fmt.Errorf("invalid ATOS_PAYOUT_BACKEND %q (expected disabled or mock)", c.PayoutBackend)
+		}
 	}
 
 	if c.Environment == EnvironmentProduction {
-		if c.DatabaseURL == "" {
+		if c.EnableHostedLegacy && c.DatabaseURL == "" {
 			return errors.New("ATOS_DATABASE_URL is required in production")
 		}
 		if parsedBase.Scheme != "https" {
@@ -449,30 +464,32 @@ func (c Config) Validate() error {
 		if c.TOSBackend != TOSBackendRPC {
 			return errors.New("ATOS_TOS_BACKEND=rpc is required in production")
 		}
-		if c.Financial.Backend != FinancialBackendBlnk {
+		if c.EnableHostedLegacy && c.Financial.Backend != FinancialBackendBlnk {
 			return errors.New("ATOS_FINANCIAL_BACKEND=blnk is required in production")
 		}
-		if c.Financial.BlnkKey == "" {
+		if c.EnableHostedLegacy && c.Financial.BlnkKey == "" {
 			return errors.New("ATOS_BLNK_KEY is required in production")
 		}
-		if c.Financial.SignerURL == "" || len(c.Financial.SignerToken) < 32 || c.Financial.SigningKeyID == "" || c.Financial.SigningPublicKey == "" || c.Financial.RetentionURL == "" || len(c.Financial.RetentionHMACKey) < 32 {
+		if c.EnableHostedLegacy && (c.Financial.SignerURL == "" || len(c.Financial.SignerToken) < 32 || c.Financial.SigningKeyID == "" || c.Financial.SigningPublicKey == "" || c.Financial.RetentionURL == "" || len(c.Financial.RetentionHMACKey) < 32) {
 			return errors.New("authenticated external financial signer, pinned signing public key, key identity, authenticated WORM retention endpoint, and retention HMAC key are required in production")
 		}
-		for name, endpoint := range map[string]string{
-			"ATOS_BLNK_URL": c.Financial.BlnkURL, "ATOS_FINANCIAL_SIGNER_URL": c.Financial.SignerURL,
-			"ATOS_FINANCIAL_RETENTION_URL": c.Financial.RetentionURL,
-		} {
-			parsed, err := url.Parse(endpoint)
-			if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
-				return fmt.Errorf("%s must be an absolute HTTPS URL in production", name)
+		if c.EnableHostedLegacy {
+			for name, endpoint := range map[string]string{
+				"ATOS_BLNK_URL": c.Financial.BlnkURL, "ATOS_FINANCIAL_SIGNER_URL": c.Financial.SignerURL,
+				"ATOS_FINANCIAL_RETENTION_URL": c.Financial.RetentionURL,
+			} {
+				parsed, err := url.Parse(endpoint)
+				if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+					return fmt.Errorf("%s must be an absolute HTTPS URL in production", name)
+				}
 			}
 		}
-		if !c.RemoteThirdPartyExecution {
+		if c.EnableHostedLegacy && !c.RemoteThirdPartyExecution {
 			return errors.New("ATOS_REMOTE_THIRD_PARTY_EXECUTION=true is required in production " +
 				"(see atos-spec docs/THIRD_PARTY_EXECUTION_PLANE.md §7.1.1: production must not let this " +
 				"Gateway process dial a third-party HTTP/MCP/A2A provider endpoint itself)")
 		}
-		if c.PayoutBackend == PayoutBackendMock {
+		if c.EnableHostedLegacy && c.PayoutBackend == PayoutBackendMock {
 			return errors.New("ATOS_PAYOUT_BACKEND=mock never moves real funds and must not be used in production")
 		}
 	}

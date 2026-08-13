@@ -24,6 +24,8 @@ import (
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/observability"
 	"github.com/tosnetwork/atos/internal/store"
+	nativev1 "github.com/tosnetwork/tos-protocol/gen/atos/native/v1"
+	"github.com/tosnetwork/tos-protocol/gen/atos/native/v1/atosnativev1connect"
 	atostosv1 "github.com/tosnetwork/tos-protocol/gen/atos/tos/v1"
 	"github.com/tosnetwork/tos-protocol/gen/atos/tos/v1/atostosv1connect"
 )
@@ -73,6 +75,7 @@ type Client struct {
 	proof              atostosv1connect.ProofServiceClient
 	execution          atostosv1connect.ExecutionGatewayServiceClient
 	financialIntegrity atostosv1connect.FinancialIntegrityServiceClient
+	native             atosnativev1connect.NativeServiceClient
 
 	receipts  sync.Map // receipt_id -> *ExecutionReceiptEnvelope
 	proofRefs sync.Map // client-facing receipt/proof id -> protocol proof reference
@@ -159,7 +162,35 @@ func New(config Config) (*Client, error) {
 	client.proof = atostosv1connect.NewProofServiceClient(httpClient, config.BaseURL, options...)
 	client.execution = atostosv1connect.NewExecutionGatewayServiceClient(httpClient, config.BaseURL, options...)
 	client.financialIntegrity = atostosv1connect.NewFinancialIntegrityServiceClient(httpClient, config.BaseURL, options...)
+	client.native = atosnativev1connect.NewNativeServiceClient(httpClient, config.BaseURL, options...)
 	return client, nil
+}
+
+func (c *Client) SubmitNativeAction(ctx context.Context, request *connect.Request[nativev1.SubmitNativeActionRequest]) (*connect.Response[nativev1.SubmitNativeActionResponse], error) {
+	if c == nil || c.native == nil {
+		return nil, connect.NewError(connect.CodeUnavailable, errors.New("Native backend is unavailable"))
+	}
+	callCtx, cancel := c.callContext(ctx, nativeDeadline(request.Msg.GetContext()))
+	defer cancel()
+	decorateRequest(c, ctx, request)
+	return c.native.SubmitNativeAction(callCtx, request)
+}
+
+func (c *Client) ResolveNativeState(ctx context.Context, request *connect.Request[nativev1.ResolveNativeStateRequest]) (*connect.Response[nativev1.ResolveNativeStateResponse], error) {
+	if c == nil || c.native == nil {
+		return nil, connect.NewError(connect.CodeUnavailable, errors.New("Native backend is unavailable"))
+	}
+	callCtx, cancel := c.callContext(ctx, nativeDeadline(request.Msg.GetContext()))
+	defer cancel()
+	decorateRequest(c, ctx, request)
+	return c.native.ResolveNativeState(callCtx, request)
+}
+
+func nativeDeadline(value *nativev1.RequestContext) time.Time {
+	if value == nil || value.DeadlineUnixMillis <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(value.DeadlineUnixMillis)
 }
 
 // CheckReady verifies that the configured endpoint is reachable. It does not

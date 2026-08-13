@@ -43,9 +43,13 @@ const (
 	ScopeSettlementWrite Scope = "settlement:write"
 	ScopeProofsRead      Scope = "proofs:read"
 	ScopeNetworkRead     Scope = "network:read"
-	ScopeDisputesOpen    Scope = "disputes:open"
-	ScopeDisputesRead    Scope = "disputes:read"
-	ScopeDisputesReview  Scope = "disputes:review"
+	// Native gateway scopes control transport access only. On-chain
+	// controller signatures remain the sole semantic authorization.
+	ScopeNativeRead     Scope = "native:read"
+	ScopeNativeRelay    Scope = "native:relay"
+	ScopeDisputesOpen   Scope = "disputes:open"
+	ScopeDisputesRead   Scope = "disputes:read"
+	ScopeDisputesReview Scope = "disputes:review"
 	// ScopeExecutionSignersRead/Write authorize the Phase 3B
 	// execution-signer authorize/rotate/revoke/status surface
 	// (atos-spec docs/IMPLEMENTATION_ROADMAP.md §7.2.3). Deliberately a
@@ -108,6 +112,7 @@ var allowedScopes = map[Scope]struct{}{
 	ScopeInvocationsCreate: {}, ScopeJobsCreate: {}, ScopeJobsRead: {}, ScopeJobsCancel: {},
 	ScopeAccountRead: {}, ScopeProviderJobsRead: {}, ScopeProviderJobsDeliver: {},
 	ScopeEarningsRead: {}, ScopeSettlementRead: {}, ScopeSettlementWrite: {}, ScopeProofsRead: {}, ScopeNetworkRead: {},
+	ScopeNativeRead: {}, ScopeNativeRelay: {},
 	ScopeDisputesOpen: {}, ScopeDisputesRead: {}, ScopeDisputesReview: {},
 	ScopeExecutionSignersRead: {}, ScopeExecutionSignersWrite: {},
 	ScopeActivationEvaluate: {},

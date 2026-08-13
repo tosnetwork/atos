@@ -35,11 +35,13 @@ import (
 	"github.com/tosnetwork/atos/internal/financial"
 	"github.com/tosnetwork/atos/internal/httpapi"
 	"github.com/tosnetwork/atos/internal/mcp"
+	"github.com/tosnetwork/atos/internal/nativegateway"
 	"github.com/tosnetwork/atos/internal/observability"
 	"github.com/tosnetwork/atos/internal/service"
 	"github.com/tosnetwork/atos/internal/store"
 	"github.com/tosnetwork/atos/internal/store/memory"
 	"github.com/tosnetwork/atos/internal/store/postgres"
+	"github.com/tosnetwork/tos-protocol/gen/atos/native/v1/atosnativev1connect"
 )
 
 func main() {
@@ -91,6 +93,7 @@ func main() {
 	var core toscore.Core
 	var quoter tosai.Quoter
 	var anchorPublisher financial.AnchorPublisher
+	var nativeBackend nativegateway.Backend
 	var readiness httpapi.ReadinessChecker
 	// remoteProber, when set, routes HealthService's readiness probing
 	// through the same execution/data-plane boundary as third-party
@@ -127,6 +130,7 @@ func main() {
 		readiness = rpcClient
 		execution, core, quoter = rpcClient, rpcClient, rpcClient
 		anchorPublisher = rpcClient
+		nativeBackend = rpcClient
 		if cfg.RemoteThirdPartyExecution {
 			remoteProber = rpcClient
 		}
@@ -137,6 +141,17 @@ func main() {
 	}
 	if pgStore != nil {
 		readiness = readinessGroup{readiness, pgStore}
+	}
+	if !cfg.EnableHostedLegacy {
+		if nativeBackend == nil {
+			logger.Error("atos_native_v1 requires the TOS RPC backend")
+			os.Exit(2)
+		}
+		if err := runNativeOnlyGateway(cfg, logger, authorization, readiness, nativeBackend); err != nil {
+			logger.Error("Native gateway stopped", "error", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	// Shared by dispatch's third-party execution routing below and by
@@ -450,9 +465,11 @@ func main() {
 		}
 	}()
 
-	if err := seedDemoCapability(capabilities, cfg.TOSBackend); err != nil {
-		logger.Error("failed to seed demo capability", "error", err)
-		os.Exit(1)
+	if cfg.EnableHostedLegacy {
+		if err := seedDemoCapability(capabilities, cfg.TOSBackend); err != nil {
+			logger.Error("failed to seed demo capability", "error", err)
+			os.Exit(1)
+		}
 	}
 
 	restServer := &httpapi.Server{
@@ -477,12 +494,24 @@ func main() {
 		Logger: logger, PublicBaseURL: cfg.PublicBaseURL,
 	}
 
-	mux := restServer.Mux()
-	mux.HandleFunc("POST /mcp", mcpServer.Handler())
-	mux.HandleFunc("POST /a2a", a2aServer.Handler())
-	mux.HandleFunc("/v1/blob/", blobStorage.BlobHandler())
+	legacyMux := restServer.Mux()
+	legacyMux.HandleFunc("POST /mcp", mcpServer.Handler())
+	legacyMux.HandleFunc("POST /a2a", a2aServer.Handler())
+	legacyMux.HandleFunc("/v1/blob/", blobStorage.BlobHandler())
 	if financialRepository != nil {
-		mux.Handle("GET /internal/financial-integrity/metrics", financial.MetricsHandler(financialRepository, 5*time.Second))
+		legacyMux.Handle("GET /internal/financial-integrity/metrics", financial.MetricsHandler(financialRepository, 5*time.Second))
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /livez", legacyMux)
+	mux.Handle("GET /readyz", legacyMux)
+	// Authentication is gateway-local infrastructure, not a canonical trust
+	// mode. Keep it available without exposing the hosted business APIs.
+	mux.Handle("/v1/auth/", legacyMux)
+	nativePath, nativeHandler := atosnativev1connect.NewNativeServiceHandler(&nativegateway.Server{Auth: authorization, Backend: nativeBackend})
+	mux.Handle(nativePath, nativeHandler)
+	if cfg.EnableHostedLegacy {
+		mux.Handle("/legacy/v0.2/", http.StripPrefix("/legacy/v0.2", legacyMux))
+		logger.Warn("hosted legacy compatibility enabled", "prefix", "/legacy/v0.2")
 	}
 
 	httpServer := &http.Server{
@@ -526,6 +555,41 @@ type readinessFunc func(context.Context) error
 func (f readinessFunc) CheckReady(ctx context.Context) error { return f(ctx) }
 
 type readinessGroup []httpapi.ReadinessChecker
+
+func runNativeOnlyGateway(cfg config.Config, logger *slog.Logger, authorization *auth.Service,
+	readiness httpapi.ReadinessChecker, backend nativegateway.Backend) error {
+	authHandlers := (&httpapi.Server{Readiness: readiness, Auth: authorization}).Mux()
+	mux := http.NewServeMux()
+	mux.Handle("GET /livez", authHandlers)
+	mux.Handle("GET /readyz", authHandlers)
+	for _, route := range []string{
+		"POST /v1/auth/device", "POST /v1/auth/device/token", "POST /v1/auth/device/decision",
+		"POST /v1/auth/token/refresh", "POST /v1/auth/revoke", "GET /v1/auth/devices",
+		"DELETE /v1/auth/devices/{id}",
+	} {
+		mux.Handle(route, authHandlers)
+	}
+	nativePath, nativeHandler := atosnativev1connect.NewNativeServiceHandler(&nativegateway.Server{Auth: authorization, Backend: backend})
+	mux.Handle(nativePath, nativeHandler)
+	server := &http.Server{Addr: cfg.Addr, Handler: observability.Middleware(logger, mux),
+		ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 32 << 10}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	done := make(chan error, 1)
+	go func() { done <- server.ListenAndServe() }()
+	logger.Info("atos_native_v1 gateway listening", "addr", cfg.Addr)
+	select {
+	case <-ctx.Done():
+		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return server.Shutdown(shutdown)
+	case err := <-done:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+}
 
 func (g readinessGroup) CheckReady(ctx context.Context) error {
 	for _, checker := range g {
