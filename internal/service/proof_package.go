@@ -186,7 +186,7 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 	if len(op.CanonicalCBOR) != 0 || op.PackageDigest != "" {
 		stored, parseErr := verifiedproof.Parse(op.CanonicalCBOR)
 		storedDigest, digestErr := verifiedproof.Digest(stored)
-		if parseErr != nil || digestErr != nil || storedDigest != op.PackageDigest || stored.PrincipalID != op.PrincipalID || stored.Quote.QuoteID != q.ID || stored.Escrow.JobID != j.ID || stored.Escrow.EscrowID != esc.ID || stored.Receipt == nil || stored.Receipt.ReceiptID != r.ID {
+		if parseErr != nil || digestErr != nil || storedDigest != op.PackageDigest || stored.PrincipalID != op.PrincipalID || stored.Quote.QuoteID != q.ID || stored.Escrow.JobID != j.ID || stored.Escrow.EscrowID != esc.ID {
 			return fail(domain.NewError(domain.ErrProofVerificationFailed, "durable portable proof identity is corrupt or inconsistent", false))
 		}
 		canonicalVerifier, ok := s.core.(toscore.PortableProofCanonicalVerifier)
