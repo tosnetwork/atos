@@ -310,19 +310,25 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 	var signerProof *verifiedproof.SignerAuthorization
 	var receiptProof *verifiedproof.Receipt
 	var posProof *verifiedproof.ProofOfService
+	var receiptAuthorityUnixNanos int64
 	if hasExecution {
 		er = *j.ExecutionReceipt
-		auth, found, e = s.core.ResolveExecutionSignerAuthorization(ctx, q.ProviderID, q.CapabilityID, q.CapabilityVersion, er.ExecutionSignerID, er.CompletedAt)
-		if e != nil || !found || auth.Revoked || len(auth.SignerPublicKey) != 32 || auth.FinalizedCheckpoint == 0 {
-			return fail(domain.NewError(domain.ErrProofVerificationFailed, "execution signer authorization unavailable", true))
-		}
 		receiptWire, wireErr := s.core.PortableReceiptEvidence(ctx, er)
 		if wireErr != nil {
 			return fail(wireErr)
 		}
 		receiptLive, receiptFound, receiptErr := s.core.ResolveExecutionReceiptEvidence(ctx, er)
-		if receiptErr != nil || !receiptFound || !receiptLive.Finalized || receiptLive.FinalizedCheckpoint == 0 || receiptLive.Digest != receiptWire.Digest {
+		if receiptErr != nil || !receiptFound || !receiptLive.Finalized || receiptLive.FinalizedCheckpoint == 0 || receiptLive.Digest != receiptWire.Digest || receiptLive.ObservedAt.IsZero() {
 			return fail(domain.NewError(domain.ErrProofVerificationFailed, "canonical Receipt unavailable", true))
+		}
+		receiptAuthorityUnixNanos = receiptLive.ObservedAt.UnixNano()
+		effectiveReceiptAt := er.CompletedAt
+		if receiptLive.ObservedAt.After(effectiveReceiptAt) {
+			effectiveReceiptAt = receiptLive.ObservedAt
+		}
+		auth, found, e = s.core.ResolveExecutionSignerAuthorization(ctx, q.ProviderID, q.CapabilityID, q.CapabilityVersion, er.ExecutionSignerID, effectiveReceiptAt)
+		if e != nil || !found || auth.Revoked || len(auth.SignerPublicKey) != 32 || auth.FinalizedCheckpoint == 0 {
+			return fail(domain.NewError(domain.ErrProofVerificationFailed, "execution signer authorization unavailable", true))
 		}
 		pos, posFound, posErr := s.core.ReadProofOfServiceEvidence(ctx, er)
 		if posErr != nil || !posFound || !pos.Finalized || pos.FinalizedCheckpoint == 0 {
@@ -397,7 +403,7 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 	p.RequesterIdentity = verifiedproof.Identity{AgentID: requesterIdentity.AgentID, CanonicalURI: requesterIdentity.CanonicalURI, Controllers: requesterIdentity.Controllers, Assurance: requesterIdentity.Assurance, IdentityRef: vpRef(requesterIdentity.Network, requesterIdentity.Reference, requesterIdentity.FinalizedCheckpoint)}
 	p.ProviderIdentity = verifiedproof.Identity{AgentID: providerIdentity.AgentID, CanonicalURI: providerIdentity.CanonicalURI, Controllers: providerIdentity.Controllers, Assurance: providerIdentity.Assurance, IdentityRef: vpRef(providerIdentity.Network, providerIdentity.Reference, providerIdentity.FinalizedCheckpoint)}
 	p.ProviderAgentID = provider.AgentID
-	check := verifiedproof.Verifier{Observer: capturedProofObserver{auth: auth}, Network: s.core.Network(), GatewayDomain: q.CommitmentDomain}.Verify(ctx, p)
+	check := verifiedproof.Verifier{Observer: capturedProofObserver{auth: auth, receiptAuthorityUnixNanos: receiptAuthorityUnixNanos}, Network: s.core.Network(), GatewayDomain: q.CommitmentDomain}.Verify(ctx, p)
 	if !check.Valid {
 		return fail(domain.NewError(domain.ErrProofVerificationFailed, fmt.Sprintf("portable proof self-verification failed: %+v", check.Failures), false))
 	}
@@ -411,7 +417,7 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 		if parseErr != nil || digestErr != nil || storedDigest != op.PackageDigest || !sameProofSemantics(stored, p) {
 			return fail(domain.NewError(domain.ErrProofVerificationFailed, "durable portable proof differs from live canonical tuple", false))
 		}
-		storedCheck := verifiedproof.Verifier{Observer: capturedProofObserver{auth: auth}, Network: s.core.Network(), GatewayDomain: q.CommitmentDomain}.Verify(ctx, stored)
+		storedCheck := verifiedproof.Verifier{Observer: capturedProofObserver{auth: auth, receiptAuthorityUnixNanos: receiptAuthorityUnixNanos}, Network: s.core.Network(), GatewayDomain: q.CommitmentDomain}.Verify(ctx, stored)
 		if !storedCheck.Valid {
 			return fail(domain.NewError(domain.ErrProofVerificationFailed, fmt.Sprintf("durable portable proof revalidation failed: %+v", storedCheck.Failures), false))
 		}
@@ -572,12 +578,17 @@ func (s *PortableProofService) completeProofOperation(ctx context.Context, op do
 }
 
 type capturedProofObserver struct {
-	auth toscore.ExecutionSignerAuthorization
+	auth                      toscore.ExecutionSignerAuthorization
+	receiptAuthorityUnixNanos int64
 }
 
 func (c capturedProofObserver) Observe(_ context.Context, r verifiedproof.EvidenceRequest) (verifiedproof.EvidenceObservation, error) {
-	return verifiedproof.EvidenceObservation{Found: true, Network: r.Reference.Network, Kind: r.Kind, ObjectID: r.ObjectID, Digest: r.Digest, Reference: r.Reference.Reference, Finalized: true, FinalizedCheckpoint: r.Reference.FinalizedCheckpoint}, nil
+	observation := verifiedproof.EvidenceObservation{Found: true, Network: r.Reference.Network, Kind: r.Kind, ObjectID: r.ObjectID, Digest: r.Digest, Reference: r.Reference.Reference, Finalized: true, FinalizedCheckpoint: r.Reference.FinalizedCheckpoint}
+	if r.Kind == "verified-receipt" {
+		observation.ObservedUnixNanos = c.receiptAuthorityUnixNanos
+	}
+	return observation, nil
 }
-func (c capturedProofObserver) ResolveSigner(_ context.Context, p verifiedproof.Package) (verifiedproof.SignerObservation, error) {
+func (c capturedProofObserver) ResolveSigner(_ context.Context, p verifiedproof.Package, _ int64) (verifiedproof.SignerObservation, error) {
 	return verifiedproof.SignerObservation{Found: true, Network: p.NetworkID, AuthorizationID: c.auth.AuthorizationID, ProviderID: c.auth.ProviderID, CapabilityID: c.auth.CapabilityID, CapabilityVersion: c.auth.CapabilityVersion, SignerID: c.auth.ExecutionSignerID, Reference: c.auth.AuthorizationRef, SignatureAlgorithm: c.auth.SignatureAlgorithm, PublicKey: c.auth.SignerPublicKey, ValidFromUnixNanos: c.auth.ValidFrom.UnixNano(), ValidUntilUnixNanos: c.auth.ValidUntil.UnixNano(), FinalizedCheckpoint: c.auth.FinalizedCheckpoint}, nil
 }

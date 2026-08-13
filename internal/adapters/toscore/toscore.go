@@ -90,6 +90,7 @@ type CanonicalEvidence struct {
 	Network, Reference, Digest string
 	Finalized                  bool
 	FinalizedCheckpoint        uint64
+	ObservedAt                 time.Time
 }
 type ProofOfServiceEvidence struct {
 	EvidenceID, ReceiptID, ProviderID, CapabilityID, CapabilityVersion, ContentDigest string

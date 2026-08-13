@@ -735,7 +735,7 @@ func (c *Core) ResolveExecutionReceiptEvidence(ctx context.Context, r domain.Exe
 	if err != nil {
 		return toscore.CanonicalEvidence{}, false, err
 	}
-	return toscore.CanonicalEvidence{Network: c.Network(), Reference: r.NetworkProofRef, Digest: e.Digest, Finalized: true, FinalizedCheckpoint: 1}, true, nil
+	return toscore.CanonicalEvidence{Network: c.Network(), Reference: r.NetworkProofRef, Digest: e.Digest, Finalized: true, FinalizedCheckpoint: 1, ObservedAt: r.CompletedAt}, true, nil
 }
 
 // SettleJob is replayable: a lost response after a committed settlement

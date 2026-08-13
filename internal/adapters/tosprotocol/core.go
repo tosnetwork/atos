@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"math"
 	"math/big"
 	"strings"
 	"time"
@@ -1088,7 +1089,10 @@ func (c *Client) ResolveExecutionReceiptEvidence(ctx context.Context, receipt do
 		return toscore.CanonicalEvidence{}, false, nil
 	}
 	r := response.Msg.ReceiptRef
-	return toscore.CanonicalEvidence{Network: r.Network, Reference: r.Reference, Digest: digestString(response.Msg.ReceiptDigest), Finalized: r.Finalized, FinalizedCheckpoint: r.FinalizedCheckpoint}, true, nil
+	if response.Msg.ObservedUnixMillis <= 0 || response.Msg.ObservedUnixMillis > math.MaxInt64/int64(time.Millisecond) {
+		return toscore.CanonicalEvidence{}, false, domain.NewError(domain.ErrNetworkUnavailable, "canonical receipt transaction time is unavailable", true)
+	}
+	return toscore.CanonicalEvidence{Network: r.Network, Reference: r.Reference, Digest: digestString(response.Msg.ReceiptDigest), Finalized: r.Finalized, FinalizedCheckpoint: r.FinalizedCheckpoint, ObservedAt: time.UnixMilli(response.Msg.ObservedUnixMillis).UTC()}, true, nil
 }
 
 func (c *Client) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (toscore.SettleJobResult, error) {
