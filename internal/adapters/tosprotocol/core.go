@@ -1129,6 +1129,17 @@ func (c *Client) SettleJob(ctx context.Context, req toscore.SettleJobRequest) (t
 		request.Msg.ExpectedEscrowRef.Finalized = local.Finalized
 		request.Msg.ExpectedEscrowRef.FinalizedCheckpoint = local.FinalizedCheckpoint
 		request.Msg.ExpectedReservationDigest = digestValue
+		expectedReceipt, receiptErr := c.executionEnvelope(ctx, req.Receipt)
+		if receiptErr != nil {
+			return toscore.SettleJobResult{}, receiptErr
+		}
+		if expectedReceipt.ReceiptId != req.ReceiptID || req.Receipt.NetworkProofRef == "" || req.Receipt.NetworkProofCheckpoint == 0 {
+			return toscore.SettleJobResult{}, domain.NewError(domain.ErrSettlementFailed, "canonical execution receipt binding is incomplete", true)
+		}
+		request.Msg.ExpectedReceipt = expectedReceipt
+		request.Msg.ExpectedReceiptRef = parseReference(req.Quote.NetworkID, req.Receipt.NetworkProofRef)
+		request.Msg.ExpectedReceiptRef.Finalized = true
+		request.Msg.ExpectedReceiptRef.FinalizedCheckpoint = req.Receipt.NetworkProofCheckpoint
 	}
 	decorateRequest(c, ctx, request)
 	response, err := c.settlement.SettleJob(callCtx, request)

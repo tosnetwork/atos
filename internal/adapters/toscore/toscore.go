@@ -108,6 +108,7 @@ type SettleJobRequest struct {
 	ReceiptID  string
 	ActualCost domain.Money
 	Quote      domain.Quote
+	Receipt    domain.ExecutionReceipt
 }
 
 type SettleJobResult struct {
