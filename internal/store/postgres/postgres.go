@@ -38,6 +38,10 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 
 func (s *Store) Close() { s.pool.Close() }
 
+// CheckReady verifies the live PostgreSQL durability boundary used by all
+// multi-replica economic and proof operations.
+func (s *Store) CheckReady(ctx context.Context) error { return s.pool.Ping(ctx) }
+
 // Pool exposes the process-owned connection pool to tightly scoped internal
 // repositories which participate in the same PostgreSQL durability boundary.
 // Callers must not close it.

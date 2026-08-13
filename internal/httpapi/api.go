@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/tosnetwork/atos/internal/auth"
 	"github.com/tosnetwork/atos/internal/domain"
@@ -19,6 +21,13 @@ import (
 )
 
 const maxRequestJSONBytes = 1 << 20
+
+// ReadinessChecker represents a required downstream production boundary.
+// A nil checker is intentionally not considered ready: liveness must never be
+// mistaken for authorization to receive new economic work.
+type ReadinessChecker interface {
+	CheckReady(context.Context) error
+}
 
 // decodeRequestJSON enforces one bounded JSON value with no unknown struct
 // fields or trailing data. Keeping this rule shared prevents REST adapters from
@@ -47,6 +56,10 @@ func decodeRequestJSON(r *http.Request, dst any) error {
 }
 
 type Server struct {
+	Readiness    ReadinessChecker
+	readinessMu  sync.Mutex
+	readinessAt  time.Time
+	readinessErr error
 	Auth         *auth.Service
 	Capabilities *service.CapabilityService
 	// Health is optional: nil omits the readiness projection from
@@ -101,6 +114,7 @@ type Server struct {
 func (s *Server) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /livez", s.handleLivez)
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.HandleFunc("GET /.well-known/agent-card.json", s.handleAgentCard)
 	mux.HandleFunc("GET /.well-known/agent.json", s.handleAgentCard)
 	mux.HandleFunc("GET /skills/atos/SKILL.md", s.handleSkill)
@@ -250,6 +264,35 @@ func scopesFrom(r *http.Request) auth.Principal { return authFrom(r).Principal }
 func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
+}
+
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if s.Readiness == nil {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+	defer cancel()
+	if err := s.checkReady(ctx); err != nil {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
+func (s *Server) checkReady(ctx context.Context) error {
+	s.readinessMu.Lock()
+	defer s.readinessMu.Unlock()
+	now := time.Now()
+	if !s.readinessAt.IsZero() && now.Sub(s.readinessAt) < 2*time.Second {
+		return s.readinessErr
+	}
+	err := s.Readiness.CheckReady(ctx)
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		s.readinessAt, s.readinessErr = now, err
+	}
+	return err
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

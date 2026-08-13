@@ -91,6 +91,7 @@ func main() {
 	var core toscore.Core
 	var quoter tosai.Quoter
 	var anchorPublisher financial.AnchorPublisher
+	var readiness httpapi.ReadinessChecker
 	// remoteProber, when set, routes HealthService's readiness probing
 	// through the same execution/data-plane boundary as third-party
 	// execution (see service.ThirdPartyHealthProber's doc comment) instead
@@ -100,6 +101,7 @@ func main() {
 	case config.TOSBackendMock:
 		execution = tosaimock.New()
 		core = toscoremock.New(st)
+		readiness = readinessFunc(func(context.Context) error { return nil })
 		logger.Info("using explicit mock TOS backend")
 	case config.TOSBackendRPC:
 		rpcClient, rpcErr := toprotocol.New(toprotocol.Config{
@@ -122,6 +124,7 @@ func main() {
 			os.Exit(1)
 		}
 		defer rpcClient.Close()
+		readiness = rpcClient
 		execution, core, quoter = rpcClient, rpcClient, rpcClient
 		anchorPublisher = rpcClient
 		if cfg.RemoteThirdPartyExecution {
@@ -131,6 +134,9 @@ func main() {
 	default:
 		logger.Error("unsupported TOS backend", "backend", cfg.TOSBackend)
 		os.Exit(2)
+	}
+	if pgStore != nil {
+		readiness = readinessGroup{readiness, pgStore}
 	}
 
 	// Shared by dispatch's third-party execution routing below and by
@@ -450,7 +456,7 @@ func main() {
 	}
 
 	restServer := &httpapi.Server{
-		Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,
+		Readiness: readiness, Auth: authorization, Capabilities: capabilities, Health: health, ExecutionSigners: executionSigners,
 		Certifications:      certifications,
 		Passkeys:            passkeys,
 		ActivationAuthority: activationAuthority, IdentityBindings: identityBindings, OpenTasks: openTasks, Quotes: quotes,
@@ -513,6 +519,24 @@ func main() {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
 	}
+}
+
+type readinessFunc func(context.Context) error
+
+func (f readinessFunc) CheckReady(ctx context.Context) error { return f(ctx) }
+
+type readinessGroup []httpapi.ReadinessChecker
+
+func (g readinessGroup) CheckReady(ctx context.Context) error {
+	for _, checker := range g {
+		if checker == nil {
+			return errors.New("required readiness dependency is missing")
+		}
+		if err := checker.CheckReady(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func seedDemoCapability(capabilities *service.CapabilityService, backend config.TOSBackend) error {
