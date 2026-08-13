@@ -19,7 +19,16 @@ import (
 	"github.com/tosnetwork/tos-protocol/pkg/poscommitment"
 	"github.com/tosnetwork/tos-protocol/pkg/quotecommitment"
 	"github.com/tosnetwork/tos-protocol/pkg/receiptcommitment"
+	"github.com/tosnetwork/tos-protocol/pkg/verifiedproof"
 )
+
+func (c *Client) VerifyPortableProof(ctx context.Context, p verifiedproof.Package) verifiedproof.Result {
+	observer, err := verifiedproof.NewProtocolObserverWithHTTPClient(c.httpClient, c.baseURL, c.token)
+	if err != nil {
+		return verifiedproof.Result{Failures: []verifiedproof.Failure{{Code: verifiedproof.CodeUnavailable, Message: err.Error()}}}
+	}
+	return verifiedproof.Verifier{Observer: observer, Network: c.network, GatewayDomain: c.trustDomain}.Verify(ctx, p)
+}
 
 // Network returns this client's configured TOS network identity ("" if
 // unconfigured -- see Config.Network's doc comment).

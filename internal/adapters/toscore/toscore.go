@@ -7,7 +7,15 @@ import (
 	"time"
 
 	"github.com/tosnetwork/atos/internal/domain"
+	"github.com/tosnetwork/tos-protocol/pkg/verifiedproof"
 )
+
+// PortableProofCanonicalVerifier validates immutable package bytes through
+// the protocol's read-only expected-tuple RPC surface. It is deliberately
+// optional so non-Verified adapters do not acquire proof authority.
+type PortableProofCanonicalVerifier interface {
+	VerifyPortableProof(context.Context, verifiedproof.Package) verifiedproof.Result
+}
 
 type CreateEscrowRequest struct {
 	Quote             domain.Quote

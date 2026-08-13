@@ -61,6 +61,18 @@ func TestSameProofSemanticsAllowsOnlyCheckpointAdvancement(t *testing.T) {
 	if sameProofSemantics(stored, changed) {
 		t.Fatal("changed immutable tuple was accepted")
 	}
+
+	// Force an early mismatch after pointer-backed signer references have
+	// already been visited. Neither caller-owned package may be modified.
+	left := proofSemanticsFixture(101)
+	right := proofSemanticsFixture(202)
+	right.Receipt.ReceiptRef.Reference = "different-receipt"
+	if sameProofSemantics(left, right) {
+		t.Fatal("different Receipt reference was accepted")
+	}
+	if left.SignerAuthorization.AuthorizationRef.FinalizedCheckpoint != 101 || right.SignerAuthorization.AuthorizationRef.FinalizedCheckpoint != 202 {
+		t.Fatal("failed semantic comparison mutated signer checkpoints")
+	}
 }
 
 func proofSemanticsFixture(checkpoint uint64) verifiedproof.Package {

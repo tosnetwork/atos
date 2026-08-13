@@ -179,6 +179,40 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 		})
 		return PortableProof{}, err
 	}
+	// Once canonical bytes exist they contain the complete expected tuples
+	// needed by an empty tos-protocol replica. Revalidate those bytes first via
+	// the read-only protocol observer instead of depending on that replica's
+	// local principal/identity/signer projections.
+	if len(op.CanonicalCBOR) != 0 || op.PackageDigest != "" {
+		stored, parseErr := verifiedproof.Parse(op.CanonicalCBOR)
+		storedDigest, digestErr := verifiedproof.Digest(stored)
+		if parseErr != nil || digestErr != nil || storedDigest != op.PackageDigest || stored.PrincipalID != op.PrincipalID || stored.Quote.QuoteID != q.ID || stored.Escrow.JobID != j.ID || stored.Escrow.EscrowID != esc.ID || stored.Receipt == nil || stored.Receipt.ReceiptID != r.ID {
+			return fail(domain.NewError(domain.ErrProofVerificationFailed, "durable portable proof identity is corrupt or inconsistent", false))
+		}
+		canonicalVerifier, ok := s.core.(toscore.PortableProofCanonicalVerifier)
+		if !ok {
+			return fail(domain.NewError(domain.ErrNetworkUnavailable, "read-only portable proof verifier unavailable", true))
+		}
+		result := canonicalVerifier.VerifyPortableProof(ctx, stored)
+		if !result.Valid {
+			return fail(domain.NewError(domain.ErrProofVerificationFailed, fmt.Sprintf("durable portable proof canonical replay failed: %+v", result.Failures), true))
+		}
+		if op.Checkpoint == domain.ProofPackageCanonicalObserved {
+			var advanceErr error
+			op, advanceErr = s.advanceProofCheckpoint(ctx, op, domain.ProofPackageProjectionPersisted)
+			if advanceErr != nil {
+				return PortableProof{}, advanceErr
+			}
+		}
+		if op.Checkpoint == domain.ProofPackageProjectionPersisted {
+			var completeErr error
+			op, completeErr = s.completeProofOperation(ctx, op)
+			if completeErr != nil {
+				return PortableProof{}, completeErr
+			}
+		}
+		return publicProof(op), nil
+	}
 	if q.Commitment == nil || !q.Commitment.Finalized || q.Commitment.FinalizedCheckpoint == 0 {
 		return fail(domain.NewError(domain.ErrProofVerificationFailed, "finalized Quote commitment required", true))
 	}
@@ -419,6 +453,11 @@ func (s *PortableProofService) reconcile(ctx context.Context, op domain.ProofPac
 }
 
 func sameProofSemantics(stored, live verifiedproof.Package) bool {
+	// proofReferences returns pointers into its package. Work on deep copies:
+	// semantic comparison must never mutate caller-owned parsed evidence, even
+	// when a later reference mismatch causes an early return.
+	stored = cloneProofPackageForComparison(stored)
+	live = cloneProofPackageForComparison(live)
 	refsStored := proofReferences(&stored)
 	refsLive := proofReferences(&live)
 	if len(refsStored) != len(refsLive) {
@@ -439,6 +478,23 @@ func sameProofSemantics(stored, live verifiedproof.Package) bool {
 		refsStored[i].FinalizedCheckpoint, refsLive[i].FinalizedCheckpoint = storedCheckpoints[i], liveCheckpoints[i]
 	}
 	return equal
+}
+
+func cloneProofPackageForComparison(p verifiedproof.Package) verifiedproof.Package {
+	clone := p
+	if p.SignerAuthorization != nil {
+		value := *p.SignerAuthorization
+		clone.SignerAuthorization = &value
+	}
+	if p.Receipt != nil {
+		value := *p.Receipt
+		clone.Receipt = &value
+	}
+	if p.ProofOfService != nil {
+		value := *p.ProofOfService
+		clone.ProofOfService = &value
+	}
+	return clone
 }
 
 func proofReferences(p *verifiedproof.Package) []*verifiedproof.Reference {

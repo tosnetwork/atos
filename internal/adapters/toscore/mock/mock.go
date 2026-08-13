@@ -19,7 +19,16 @@ import (
 	"github.com/tosnetwork/atos/internal/domain"
 	"github.com/tosnetwork/atos/internal/money"
 	"github.com/tosnetwork/atos/internal/store"
+	"github.com/tosnetwork/tos-protocol/pkg/verifiedproof"
 )
+
+func (c *Core) VerifyPortableProof(_ context.Context, p verifiedproof.Package) verifiedproof.Result {
+	digest, err := verifiedproof.Digest(p)
+	if err != nil {
+		return verifiedproof.Result{Failures: []verifiedproof.Failure{{Code: verifiedproof.CodeMalformed, Message: err.Error()}}}
+	}
+	return verifiedproof.Result{Valid: true, PackageDigest: digest, Version: p.Version, Network: p.NetworkID, QuoteID: p.Quote.QuoteID, JobID: p.Escrow.JobID, CapabilityID: p.Capability.CapabilityID, EscrowID: p.Escrow.EscrowID, Outcome: p.Outcome.Kind}
+}
 
 const settlementDecimals = 2
 
