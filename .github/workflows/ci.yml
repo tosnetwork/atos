@@ -31,15 +31,5 @@ jobs:
           echo "expected=${{ github.event.pull_request.head.sha || github.sha }}"
           echo "actual=$(git rev-parse HEAD)"
           test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
-      - name: Verify formatting
-        run: |
-          unformatted="$(gofmt -l .)"
-          if [ -n "$unformatted" ]; then
-            echo "The following files are not gofmt-clean:"
-            echo "$unformatted"
-            exit 1
-          fi
-      - name: Vet
-        run: go vet ./...
-      - name: Test
-        run: go test -race ./...
+      - name: Verify the repository
+        run: make verify
