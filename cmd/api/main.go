@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -71,6 +72,7 @@ func main() {
 	mux.Handle(discoveryPath, discoveryHandler)
 	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", readinessHandler(backend, cfg.TOSRPC.Timeout))
+	mux.HandleFunc("GET /.well-known/atos-native.json", gatewayDiscoveryHandler(cfg, time.Now))
 
 	server := &http.Server{
 		Addr: cfg.Addr, Handler: mux,
@@ -98,6 +100,42 @@ func main() {
 	defer cancelShutdown()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("gateway shutdown failed", "error", err)
+	}
+}
+
+type gatewayDiscoveryDocument struct {
+	Schema           string                   `json:"schema"`
+	Protocol         string                   `json:"protocol"`
+	Network          gatewayDiscoveryNetwork  `json:"network"`
+	RegistryCodeHash string                   `json:"registry_code_hash"`
+	Services         gatewayDiscoveryServices `json:"services"`
+	Limits           gatewayDiscoveryLimits   `json:"limits"`
+	ExpiresAt        int64                    `json:"expires_at_unix_seconds"`
+}
+
+type gatewayDiscoveryNetwork struct {
+	NetworkID       string `json:"network_id"`
+	GenesisRootHash string `json:"genesis_root_hash"`
+	GenesisFileHash string `json:"genesis_file_hash"`
+}
+type gatewayDiscoveryServices struct {
+	NativeConnect string `json:"native_connect"`
+}
+type gatewayDiscoveryLimits struct {
+	MaxRequestBytes  int `json:"max_request_bytes"`
+	MaxResponseBytes int `json:"max_response_bytes"`
+}
+
+func gatewayDiscoveryHandler(cfg config.Config, now func() time.Time) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		document := gatewayDiscoveryDocument{Schema: "atos.gateway-discovery.v1", Protocol: "atos_native_v1",
+			Network:          gatewayDiscoveryNetwork{cfg.Catalog.NetworkID, cfg.Catalog.GenesisRootHash, cfg.Catalog.GenesisFileHash},
+			RegistryCodeHash: cfg.Catalog.RegistryCodeHash, Services: gatewayDiscoveryServices{cfg.PublicBaseURL},
+			Limits:    gatewayDiscoveryLimits{MaxRequestBytes: 1 << 20, MaxResponseBytes: cfg.TOSRPC.MaxMessageBytes},
+			ExpiresAt: now().Add(time.Hour).Unix()}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		_ = json.NewEncoder(w).Encode(document)
 	}
 }
 

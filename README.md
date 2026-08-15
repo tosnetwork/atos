@@ -37,6 +37,7 @@ server, then run:
 ```bash
 export ATOS_NATIVE_READ_TOKEN='<read-token>'
 export ATOS_NATIVE_RELAY_TOKEN='<distinct-relay-token>'
+export ATOS_PUBLIC_BASE_URL='https://gateway.example'
 export ATOS_TOS_RPC_URL='http://127.0.0.1:8090'
 export ATOS_TOS_RPC_TOKEN='<private-backend-token>'
 export ATOS_TOS_RPC_INSECURE=true

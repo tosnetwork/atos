@@ -25,6 +25,7 @@ type TOSRPCConfig struct {
 
 type Config struct {
 	Addr             string
+	PublicBaseURL    string
 	NativeReadToken  string
 	NativeRelayToken string
 	TOSRPC           TOSRPCConfig
@@ -59,6 +60,7 @@ func Load() (Config, error) {
 	}
 	cfg := Config{
 		Addr:             envOr("ATOS_ADDR", ":8080"),
+		PublicBaseURL:    strings.TrimRight(strings.TrimSpace(os.Getenv("ATOS_PUBLIC_BASE_URL")), "/"),
 		NativeReadToken:  strings.TrimSpace(os.Getenv("ATOS_NATIVE_READ_TOKEN")),
 		NativeRelayToken: strings.TrimSpace(os.Getenv("ATOS_NATIVE_RELAY_TOKEN")),
 		TOSRPC: TOSRPCConfig{
@@ -79,6 +81,13 @@ func Load() (Config, error) {
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.Addr) == "" {
 		return errors.New("ATOS_ADDR is required")
+	}
+	publicURL, err := url.Parse(c.PublicBaseURL)
+	if err != nil || publicURL == nil || publicURL.Scheme == "" || publicURL.Host == "" || publicURL.User != nil || publicURL.RawQuery != "" || publicURL.Fragment != "" || publicURL.Path != "" {
+		return errors.New("ATOS_PUBLIC_BASE_URL must be an absolute origin without path, credentials, query, or fragment")
+	}
+	if publicURL.Scheme != "https" && !(publicURL.Scheme == "http" && (publicURL.Hostname() == "127.0.0.1" || publicURL.Hostname() == "localhost" || publicURL.Hostname() == "::1")) {
+		return errors.New("ATOS_PUBLIC_BASE_URL must use HTTPS outside loopback development")
 	}
 	if c.NativeReadToken == "" || c.NativeRelayToken == "" {
 		return errors.New("ATOS_NATIVE_READ_TOKEN and ATOS_NATIVE_RELAY_TOKEN are required")
