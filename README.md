@@ -17,8 +17,9 @@ The product and protocol specification lives in
   `ATOS_NATIVE_RELAY_TOKEN`.
 - `atos.native.v1.NativeService/ResolveNativeState` accepts the read or relay
   token.
-- `atos.native.v1.CapabilityDiscoveryService/ListCapabilities` and
-  `GetSoftwareWorkManifest` accept the read or relay token.
+- `atos.native.v1.CapabilityDiscoveryService/ListCapabilities`,
+  `SearchCapabilities`, and `GetSoftwareWorkManifest` accept the read or relay
+  token.
 - `atos.native.v1.CapabilityDiscoveryService/PublishSoftwareWorkManifest`
   requires the relay token.
 - `GET /livez` reports process liveness.
@@ -72,6 +73,12 @@ fences in the owner-private catalog directory. Every listed Capability is
 freshly resolved from finalized TOS state. Clients must compare a retrieved
 manifest digest with that fresh state or an Accepted Quote; catalog inclusion,
 ordering, and availability have no semantic authority.
+
+Search scans that same bounded local set in Capability-ID order. Each result
+keeps the freshly finalized Capability/version/digest separate from the
+`gateway_local` name, description, operation, and match score. Those local
+fields are digest-authenticated manifest projections for discovery only; they
+are not chain state or consensus ranking.
 
 ## Repository layout
 

@@ -72,8 +72,24 @@ type Server struct {
 
 type DiscoveryCatalog interface {
 	List(context.Context, uint32, string) (*capabilitycatalog.Page, error)
+	Search(context.Context, string, uint32, string) (*capabilitycatalog.SearchPage, error)
 	PublishManifest(context.Context, string, []byte) (*nativev1.NativeStateV1, string, error)
 	Manifest(string) ([]byte, error)
+}
+
+func (s *Server) SearchCapabilities(ctx context.Context, request *connect.Request[nativev1.SearchCapabilitiesRequest]) (*connect.Response[nativev1.SearchCapabilitiesResponse], error) {
+	if request == nil || request.Msg == nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("Capability search request is required"))
+	}
+	if err := s.authorizeDiscovery(request.Header().Get("Authorization"), request.Msg.Context, PermissionRead); err != nil {
+		return nil, err
+	}
+	page, err := s.Catalog.Search(ctx, request.Msg.Query, request.Msg.PageSize, request.Msg.AfterCapabilityId)
+	if err != nil {
+		return nil, discoveryError(err, connect.CodeInvalidArgument)
+	}
+	return connect.NewResponse(&nativev1.SearchCapabilitiesResponse{Results: page.Results,
+		NextAfterCapabilityId: page.NextToken}), nil
 }
 
 func (s *Server) SubmitNativeAction(ctx context.Context, request *connect.Request[nativev1.SubmitNativeActionRequest]) (*connect.Response[nativev1.SubmitNativeActionResponse], error) {

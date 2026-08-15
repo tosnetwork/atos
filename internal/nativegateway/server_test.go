@@ -17,11 +17,15 @@ func (b *backendStub) SubmitNativeAction(context.Context, *connect.Request[nativ
 	return connect.NewResponse(&nativev1.SubmitNativeActionResponse{ActionHash: "sha256:test"}), nil
 }
 
-type discoveryStub struct{ published, listed, loaded int }
+type discoveryStub struct{ published, listed, searched, loaded int }
 
 func (d *discoveryStub) List(context.Context, uint32, string) (*capabilitycatalog.Page, error) {
 	d.listed++
 	return &capabilitycatalog.Page{}, nil
+}
+func (d *discoveryStub) Search(context.Context, string, uint32, string) (*capabilitycatalog.SearchPage, error) {
+	d.searched++
+	return &capabilitycatalog.SearchPage{}, nil
 }
 func (d *discoveryStub) PublishManifest(context.Context, string, []byte) (*nativev1.NativeStateV1, string, error) {
 	d.published++
@@ -91,12 +95,17 @@ func TestDiscoveryPermissionsAndDispatch(t *testing.T) {
 	if _, err := server.ListCapabilities(context.Background(), list); err != nil {
 		t.Fatal(err)
 	}
+	search := connect.NewRequest(&nativev1.SearchCapabilitiesRequest{Context: requestContext, Query: "test"})
+	search.Header().Set("Authorization", "Bearer read-secret")
+	if _, err := server.SearchCapabilities(context.Background(), search); err != nil {
+		t.Fatal(err)
+	}
 	get := connect.NewRequest(&nativev1.GetSoftwareWorkManifestRequest{Context: requestContext, ManifestDigest: "sha256:test"})
 	get.Header().Set("Authorization", "Bearer read-secret")
 	if _, err := server.GetSoftwareWorkManifest(context.Background(), get); err != nil {
 		t.Fatal(err)
 	}
-	if discovery.published != 1 || discovery.listed != 1 || discovery.loaded != 1 {
+	if discovery.published != 1 || discovery.listed != 1 || discovery.searched != 1 || discovery.loaded != 1 {
 		t.Fatal("discovery calls did not reach the expected bounded adapter")
 	}
 }
