@@ -1,4 +1,4 @@
-// Package toprotocol is the privileged Native-only client for tos-protocol.
+// Package toprotocol is the privileged Native-only client for tos-service-protocol.
 package toprotocol
 
 import (
@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	nativev1 "github.com/tosnetwork/tos-protocol/gen/atos/native/v1"
-	"github.com/tosnetwork/tos-protocol/gen/atos/native/v1/atosnativev1connect"
+	nativev1 "github.com/tosnetwork/tos-service-protocol/gen/tos/service/v1"
+	"github.com/tosnetwork/tos-service-protocol/gen/tos/service/v1/tosservicev1connect"
 )
 
 const (
@@ -40,36 +40,36 @@ type Client struct {
 	token      string
 	timeout    time.Duration
 	httpClient *http.Client
-	native     atosnativev1connect.NativeServiceClient
+	native     tosservicev1connect.NativeServiceClient
 }
 
 func New(config Config) (*Client, error) {
 	config.BaseURL = strings.TrimRight(strings.TrimSpace(config.BaseURL), "/")
 	config.BearerToken = strings.TrimSpace(config.BearerToken)
 	if config.BaseURL == "" || config.BearerToken == "" {
-		return nil, errors.New("tos-protocol RPC base URL and bearer token are required")
+		return nil, errors.New("tos-service-protocol RPC base URL and bearer token are required")
 	}
 	parsed, err := url.Parse(config.BaseURL)
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
-		return nil, errors.New("tos-protocol RPC base URL must be an absolute http(s) URL")
+		return nil, errors.New("tos-service-protocol RPC base URL must be an absolute http(s) URL")
 	}
 	if parsed.Scheme == "http" && !config.Insecure {
-		return nil, errors.New("plaintext tos-protocol RPC requires explicit insecure mode")
+		return nil, errors.New("plaintext tos-service-protocol RPC requires explicit insecure mode")
 	}
 	if config.Timeout == 0 {
 		config.Timeout = defaultTimeout
 	}
 	if config.Timeout <= 0 || config.Timeout > 15*time.Minute {
-		return nil, errors.New("invalid tos-protocol RPC timeout")
+		return nil, errors.New("invalid tos-service-protocol RPC timeout")
 	}
 	if config.MaxMessageBytes == 0 {
 		config.MaxMessageBytes = defaultMaxMessageBytes
 	}
 	if config.MaxMessageBytes <= 0 || config.MaxMessageBytes > 64<<20 {
-		return nil, errors.New("invalid tos-protocol RPC message limit")
+		return nil, errors.New("invalid tos-service-protocol RPC message limit")
 	}
 	if (config.ClientCertFile == "") != (config.ClientKeyFile == "") {
-		return nil, errors.New("tos-protocol client certificate and key must be configured together")
+		return nil, errors.New("tos-service-protocol client certificate and key must be configured together")
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if parsed.Scheme == "https" {
@@ -77,21 +77,21 @@ func New(config Config) (*Client, error) {
 		if config.CAFile != "" {
 			pem, err := os.ReadFile(config.CAFile)
 			if err != nil {
-				return nil, fmt.Errorf("read tos-protocol CA: %w", err)
+				return nil, fmt.Errorf("read tos-service-protocol CA: %w", err)
 			}
 			pool, err := x509.SystemCertPool()
 			if err != nil || pool == nil {
 				pool = x509.NewCertPool()
 			}
 			if !pool.AppendCertsFromPEM(pem) {
-				return nil, errors.New("tos-protocol CA file contains no valid certificate")
+				return nil, errors.New("tos-service-protocol CA file contains no valid certificate")
 			}
 			tlsConfig.RootCAs = pool
 		}
 		if config.ClientCertFile != "" {
 			certificate, err := tls.LoadX509KeyPair(config.ClientCertFile, config.ClientKeyFile)
 			if err != nil {
-				return nil, fmt.Errorf("load tos-protocol client certificate: %w", err)
+				return nil, fmt.Errorf("load tos-service-protocol client certificate: %w", err)
 			}
 			tlsConfig.Certificates = []tls.Certificate{certificate}
 		}
@@ -100,7 +100,7 @@ func New(config Config) (*Client, error) {
 	httpClient := &http.Client{Transport: transport}
 	options := []connect.ClientOption{connect.WithReadMaxBytes(config.MaxMessageBytes), connect.WithSendMaxBytes(config.MaxMessageBytes)}
 	return &Client{baseURL: config.BaseURL, token: config.BearerToken, timeout: config.Timeout, httpClient: httpClient,
-		native: atosnativev1connect.NewNativeServiceClient(httpClient, config.BaseURL, options...)}, nil
+		native: tosservicev1connect.NewNativeServiceClient(httpClient, config.BaseURL, options...)}, nil
 }
 
 func (c *Client) SubmitNativeAction(ctx context.Context, request *connect.Request[nativev1.SubmitNativeActionRequest]) (*connect.Response[nativev1.SubmitNativeActionResponse], error) {
@@ -146,11 +146,11 @@ func (c *Client) CheckReady(ctx context.Context) error {
 	request.Header.Set("Authorization", "Bearer "+c.token)
 	response, err := c.httpClient.Do(request)
 	if err != nil {
-		return fmt.Errorf("tos-protocol readiness check failed: %w", err)
+		return fmt.Errorf("tos-service-protocol readiness check failed: %w", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("tos-protocol readiness returned HTTP %d", response.StatusCode)
+		return fmt.Errorf("tos-service-protocol readiness returned HTTP %d", response.StatusCode)
 	}
 	return nil
 }

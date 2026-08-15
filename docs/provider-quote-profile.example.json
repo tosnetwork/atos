@@ -1,5 +1,5 @@
 {
-  "schema": "atos.provider-quote-profile.v1",
+  "schema": "tos.service.provider-quote-profile.v1",
   "provider_agent_id": "agent_<64 lowercase hex>",
   "provider_address": "0:<64 lowercase hex>",
   "manifest_cbor_file": "/absolute/private/provider/manifest.cbor",

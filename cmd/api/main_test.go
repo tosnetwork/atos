@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tosnetwork/atos/internal/config"
+	"github.com/tosnetwork/tos-service-gateway/internal/config"
 )
 
 type readinessStub struct{ err error }
@@ -41,7 +41,7 @@ func TestGatewayDiscoveryUsesConfiguredOriginAndNetwork(t *testing.T) {
 	cfg := config.Config{PublicBaseURL: "https://gateway.example", TOSRPC: config.TOSRPCConfig{MaxMessageBytes: 2048},
 		Catalog: config.CatalogConfig{NetworkID: "tos-test", GenesisRootHash: "sha256:root", GenesisFileHash: "sha256:file", RegistryCodeHash: "tvm-cell-sha256:code"}}
 	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "https://attacker.invalid/.well-known/atos-native.json", nil)
+	request := httptest.NewRequest(http.MethodGet, "https://attacker.invalid/.well-known/tos-service.json", nil)
 	request.Host = "attacker.invalid"
 	gatewayDiscoveryHandler(cfg, func() time.Time { return now })(response, request)
 	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/json" ||

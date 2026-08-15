@@ -13,7 +13,7 @@ func TestNewRejectsImplicitPlaintextRPC(t *testing.T) {
 }
 
 func TestNewRequiresBearerToken(t *testing.T) {
-	_, err := New(Config{BaseURL: "https://tos-protocol.internal"})
+	_, err := New(Config{BaseURL: "https://tos-service-protocol.internal"})
 	if err == nil || !strings.Contains(err.Error(), "bearer token") {
 		t.Fatalf("New() error = %v", err)
 	}

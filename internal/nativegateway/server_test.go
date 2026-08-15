@@ -9,10 +9,10 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	nativev1 "github.com/tosnetwork/tos-protocol/gen/atos/native/v1"
-	"github.com/tosnetwork/tos-protocol/gen/atos/native/v1/atosnativev1connect"
-	"github.com/tosnetwork/tos-protocol/pkg/capabilitycatalog"
-	"github.com/tosnetwork/tos-protocol/pkg/publicerrors"
+	nativev1 "github.com/tosnetwork/tos-service-protocol/gen/tos/service/v1"
+	"github.com/tosnetwork/tos-service-protocol/gen/tos/service/v1/tosservicev1connect"
+	"github.com/tosnetwork/tos-service-protocol/pkg/capabilitycatalog"
+	"github.com/tosnetwork/tos-service-protocol/pkg/publicerrors"
 )
 
 type backendStub struct{ submissions, resolutions int }
@@ -45,12 +45,12 @@ func TestPublicBoundaryErrorsCarryCanonicalRetryDetails(t *testing.T) {
 
 func TestPublicErrorDetailSurvivesConnectWire(t *testing.T) {
 	server := &Server{Authorizer: NewTokenAuthorizer("read-secret", "relay-secret"), Catalog: &discoveryStub{}}
-	path, handler := atosnativev1connect.NewCapabilityDiscoveryServiceHandler(server)
+	path, handler := tosservicev1connect.NewCapabilityDiscoveryServiceHandler(server)
 	mux := http.NewServeMux()
 	mux.Handle(path, handler)
 	httpServer := httptest.NewServer(mux)
 	defer httpServer.Close()
-	client := atosnativev1connect.NewCapabilityDiscoveryServiceClient(httpServer.Client(), httpServer.URL)
+	client := tosservicev1connect.NewCapabilityDiscoveryServiceClient(httpServer.Client(), httpServer.URL)
 	request := connect.NewRequest(&nativev1.SearchCapabilitiesRequest{Context: &nativev1.RequestContext{
 		RequestId: "request", CallerId: "caller", DeadlineUnixMillis: time.Now().Add(-time.Second).UnixMilli()}})
 	request.Header().Set("Authorization", "Bearer read-secret")

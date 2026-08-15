@@ -13,12 +13,12 @@ import (
 	"syscall"
 	"time"
 
-	nativev1 "github.com/tosnetwork/tos-protocol/gen/atos/native/v1"
-	"github.com/tosnetwork/tos-protocol/pkg/nativecore"
-	"github.com/tosnetwork/tos-protocol/pkg/quoteprovider"
+	nativev1 "github.com/tosnetwork/tos-service-protocol/gen/tos/service/v1"
+	"github.com/tosnetwork/tos-service-protocol/pkg/nativecore"
+	"github.com/tosnetwork/tos-service-protocol/pkg/quoteprovider"
 )
 
-const Schema = "atos.provider-quote-profile.v1"
+const Schema = "tos.service.provider-quote-profile.v1"
 
 type Profile struct {
 	Schema           string `json:"schema"`
@@ -81,7 +81,7 @@ func Load(path string, resolver quoteprovider.NativeResolver, network *nativev1.
 		ProposalTTL:       time.Duration(profile.ProposalTTLSeconds) * time.Second,
 		FundingWindow:     time.Duration(profile.FundingWindowSeconds) * time.Second,
 		RefundDelay:       time.Duration(profile.RefundDelaySeconds) * time.Second,
-		ResolutionTimeout: timeout, CallerID: "atos-provider-quote-source"})
+		ResolutionTimeout: timeout, CallerID: "tos-service-provider-quote-source"})
 }
 
 func readPrivate(path string, maximum int64) ([]byte, error) {

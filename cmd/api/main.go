@@ -1,4 +1,4 @@
-// Command api runs the stateless atos_native_v1 gateway.
+// Command api runs the stateless tos_service_v1 gateway.
 package main
 
 import (
@@ -13,13 +13,13 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	"github.com/tosnetwork/atos/internal/adapters/tosprotocol"
-	"github.com/tosnetwork/atos/internal/config"
-	"github.com/tosnetwork/atos/internal/nativegateway"
-	"github.com/tosnetwork/atos/internal/quotesource"
-	nativev1 "github.com/tosnetwork/tos-protocol/gen/atos/native/v1"
-	"github.com/tosnetwork/tos-protocol/gen/atos/native/v1/atosnativev1connect"
-	"github.com/tosnetwork/tos-protocol/pkg/capabilitycatalog"
+	"github.com/tosnetwork/tos-service-gateway/internal/adapters/serviceprotocol"
+	"github.com/tosnetwork/tos-service-gateway/internal/config"
+	"github.com/tosnetwork/tos-service-gateway/internal/nativegateway"
+	"github.com/tosnetwork/tos-service-gateway/internal/quotesource"
+	nativev1 "github.com/tosnetwork/tos-service-protocol/gen/tos/service/v1"
+	"github.com/tosnetwork/tos-service-protocol/gen/tos/service/v1/tosservicev1connect"
+	"github.com/tosnetwork/tos-service-protocol/pkg/capabilitycatalog"
 )
 
 func main() {
@@ -38,7 +38,7 @@ func main() {
 		ClientKeyFile: cfg.TOSRPC.ClientKeyFile,
 	})
 	if err != nil {
-		logger.Error("configure tos-protocol backend", "error", err)
+		logger.Error("configure tos-service-protocol backend", "error", err)
 		os.Exit(2)
 	}
 	defer backend.Close()
@@ -46,7 +46,7 @@ func main() {
 		Directory: cfg.Catalog.Directory, Resolver: catalogBackend{backend},
 		Network: &nativev1.NetworkDomain{NetworkId: cfg.Catalog.NetworkID,
 			GenesisRootHash: cfg.Catalog.GenesisRootHash, GenesisFileHash: cfg.Catalog.GenesisFileHash},
-		RegistryCodeHash: cfg.Catalog.RegistryCodeHash, CallerID: "atos-capability-catalog",
+		RegistryCodeHash: cfg.Catalog.RegistryCodeHash, CallerID: "tos-service-capability-catalog",
 		ResolveTimeout: cfg.TOSRPC.Timeout, MaxEntries: cfg.Catalog.MaxEntries,
 	})
 	if err != nil {
@@ -69,7 +69,7 @@ func main() {
 	err = backend.CheckReady(readyCtx)
 	cancelReady()
 	if err != nil {
-		logger.Error("tos-protocol backend is unavailable", "error", err)
+		logger.Error("tos-service-protocol backend is unavailable", "error", err)
 		os.Exit(1)
 	}
 
@@ -78,13 +78,13 @@ func main() {
 		Backend:    backend, Catalog: catalog, QuoteSource: quoteSource, Network: network,
 	}
 	mux := http.NewServeMux()
-	path, handler := atosnativev1connect.NewNativeServiceHandler(gateway)
+	path, handler := tosservicev1connect.NewNativeServiceHandler(gateway)
 	mux.Handle(path, handler)
-	discoveryPath, discoveryHandler := atosnativev1connect.NewCapabilityDiscoveryServiceHandler(gateway)
+	discoveryPath, discoveryHandler := tosservicev1connect.NewCapabilityDiscoveryServiceHandler(gateway)
 	mux.Handle(discoveryPath, discoveryHandler)
 	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", readinessHandler(backend, cfg.TOSRPC.Timeout))
-	mux.HandleFunc("GET /.well-known/atos-native.json", gatewayDiscoveryHandler(cfg, time.Now))
+	mux.HandleFunc("GET /.well-known/tos-service.json", gatewayDiscoveryHandler(cfg, time.Now))
 
 	server := &http.Server{
 		Addr: cfg.Addr, Handler: mux,
@@ -93,7 +93,7 @@ func main() {
 	}
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("ATOS Native gateway listening", "address", cfg.Addr)
+		logger.Info("TOS Native Service gateway listening", "address", cfg.Addr)
 		errCh <- server.ListenAndServe()
 	}()
 
@@ -140,7 +140,7 @@ type gatewayDiscoveryLimits struct {
 
 func gatewayDiscoveryHandler(cfg config.Config, now func() time.Time) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
-		document := gatewayDiscoveryDocument{Schema: "atos.gateway-discovery.v1", Protocol: "atos_native_v1",
+		document := gatewayDiscoveryDocument{Schema: "tos.service.gateway-discovery.v1", Protocol: "tos_service_v1",
 			Network:          gatewayDiscoveryNetwork{cfg.Catalog.NetworkID, cfg.Catalog.GenesisRootHash, cfg.Catalog.GenesisFileHash},
 			RegistryCodeHash: cfg.Catalog.RegistryCodeHash, Services: gatewayDiscoveryServices{cfg.PublicBaseURL},
 			Limits:    gatewayDiscoveryLimits{MaxRequestBytes: 1 << 20, MaxResponseBytes: cfg.TOSRPC.MaxMessageBytes},

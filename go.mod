@@ -1,10 +1,10 @@
-module github.com/tosnetwork/atos
+module github.com/tosnetwork/tos-service-gateway
 
 go 1.26.5
 
 require (
 	connectrpc.com/connect v1.19.1
-	github.com/tosnetwork/tos-protocol v0.0.0-20260815060602-5c091f96e561
+	github.com/tosnetwork/tos-service-protocol v0.0.0-20260815145921-010ad335688d
 )
 
 require (

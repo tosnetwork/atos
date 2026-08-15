@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	nativev1 "github.com/tosnetwork/tos-protocol/gen/atos/native/v1"
+	nativev1 "github.com/tosnetwork/tos-service-protocol/gen/tos/service/v1"
 )
 
 type resolverStub struct{}
@@ -19,7 +19,7 @@ func (resolverStub) ResolveNativeState(context.Context, *nativev1.ResolveNativeS
 func TestLoadRejectsNonPrivateOrAmbiguousProfile(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "profile.json")
-	if err := os.WriteFile(path, []byte(`{"schema":"atos.provider-quote-profile.v1","unknown":true}`), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(`{"schema":"tos.service.provider-quote-profile.v1","unknown":true}`), 0644); err != nil {
 		t.Fatal(err)
 	}
 	network := &nativev1.NetworkDomain{NetworkId: "test", GenesisRootHash: "sha256:" + strings.Repeat("11", 32),

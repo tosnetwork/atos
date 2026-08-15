@@ -1,33 +1,33 @@
-<img src="ATOS.png" alt="ATOS" width="220">
+<img src="TOS-SERVICE.png" alt="TOS Service Protocol" width="220">
 
-# ATOS Native Gateway
+# TOS Service Gateway
 
-This repository implements the stateless public gateway for `atos_native_v1`.
+This repository implements the stateless public gateway for `tos_service_v1`.
 Finalized TOS Network state is the sole authority for Agent and Capability
 state. The gateway authenticates transport access and forwards Native actions
 and resolution requests; it does not keep a canonical business database or
 define alternate trust modes.
 
 The product and protocol specification lives in
-[`tosnetwork/atos-spec`](https://github.com/tosnetwork/atos-spec).
+[`tosnetwork/tos-service-spec`](https://github.com/tosnetwork/tos-service-spec).
 
 ## Runtime surface
 
-- `atos.native.v1.NativeService/SubmitNativeAction` requires the
-  `ATOS_NATIVE_RELAY_TOKEN`.
-- `atos.native.v1.NativeService/ResolveNativeState` accepts the read or relay
+- `tos.service.v1.NativeService/SubmitNativeAction` requires the
+  `TOS_SERVICE_RELAY_TOKEN`.
+- `tos.service.v1.NativeService/ResolveNativeState` accepts the read or relay
   token.
-- `atos.native.v1.CapabilityDiscoveryService/ListCapabilities`,
+- `tos.service.v1.CapabilityDiscoveryService/ListCapabilities`,
   `SearchCapabilities`, and `GetSoftwareWorkManifest` accept the read or relay
   token.
-- `atos.native.v1.CapabilityDiscoveryService/PublishSoftwareWorkManifest`
+- `tos.service.v1.CapabilityDiscoveryService/PublishSoftwareWorkManifest`
   requires the relay token.
-- `atos.native.v1.CapabilityDiscoveryService/RequestQuoteProposal` accepts a
+- `tos.service.v1.CapabilityDiscoveryService/RequestQuoteProposal` accepts a
   read or relay token and proxies only a provider-supplied complete-preimage
   package. The gateway validates the non-canonical proposal but cannot accept
   terms for the buyer.
 - `GET /livez` reports process liveness.
-- `GET /readyz` verifies that the authoritative `tos-protocol` boundary is
+- `GET /readyz` verifies that the authoritative `tos-service-protocol` boundary is
   reachable.
 
 These tokens grant transport permissions only. They cannot create or change
@@ -35,25 +35,25 @@ canonical state without a valid signed Native action accepted by TOS.
 
 ## Run locally
 
-The module uses Go 1.26.5. Start a configured Native-only `tos-protocol` RPC
+The module uses Go 1.26.5. Start a configured Native-only `tos-service-protocol` RPC
 server, then run:
 
 ```bash
-export ATOS_NATIVE_READ_TOKEN='<read-token>'
-export ATOS_NATIVE_RELAY_TOKEN='<distinct-relay-token>'
-export ATOS_PUBLIC_BASE_URL='https://gateway.example'
-export ATOS_TOS_RPC_URL='http://127.0.0.1:8090'
-export ATOS_TOS_RPC_TOKEN='<private-backend-token>'
-export ATOS_TOS_RPC_INSECURE=true
+export TOS_SERVICE_READ_TOKEN='<read-token>'
+export TOS_SERVICE_RELAY_TOKEN='<distinct-relay-token>'
+export TOS_SERVICE_PUBLIC_BASE_URL='https://gateway.example'
+export TOS_SERVICE_TOS_RPC_URL='http://127.0.0.1:8090'
+export TOS_SERVICE_TOS_RPC_TOKEN='<private-backend-token>'
+export TOS_SERVICE_TOS_RPC_INSECURE=true
 install -d -m 0700 /absolute/private/catalog
-export ATOS_CAPABILITY_CATALOG_DIRECTORY='/absolute/private/catalog'
-export ATOS_NATIVE_NETWORK_ID='<network-id>'
-export ATOS_NATIVE_GENESIS_ROOT_HASH='sha256:<64 lowercase hex>'
-export ATOS_NATIVE_GENESIS_FILE_HASH='sha256:<64 lowercase hex>'
-export ATOS_NATIVE_REGISTRY_CODE_HASH='tvm-cell-sha256:<64 lowercase hex>'
+export TOS_SERVICE_CAPABILITY_CATALOG_DIRECTORY='/absolute/private/catalog'
+export TOS_SERVICE_NETWORK_ID='<network-id>'
+export TOS_SERVICE_GENESIS_ROOT_HASH='sha256:<64 lowercase hex>'
+export TOS_SERVICE_GENESIS_FILE_HASH='sha256:<64 lowercase hex>'
+export TOS_SERVICE_REGISTRY_CODE_HASH='tvm-cell-sha256:<64 lowercase hex>'
 # Optional: enables provider Quote construction. Both this profile and its
 # manifest_cbor_file must be owner-owned regular files with mode 0600.
-export ATOS_PROVIDER_QUOTE_PROFILE_FILE='/absolute/private/provider/quote-profile.json'
+export TOS_SERVICE_PROVIDER_QUOTE_PROFILE_FILE='/absolute/private/provider/quote-profile.json'
 
 GOWORK=off go run ./cmd/api
 ```
@@ -65,21 +65,21 @@ atomic price, transport policy, canonical manifest file, and bounded timing.
 Every request re-resolves the Capability from finalized Native state before a
 proposal is returned.
 
-Plaintext backend RPC is rejected unless `ATOS_TOS_RPC_INSECURE=true`. Use
+Plaintext backend RPC is rejected unless `TOS_SERVICE_TOS_RPC_INSECURE=true`. Use
 HTTPS outside local development. Optional TLS settings are:
 
 ```text
-ATOS_TOS_RPC_SERVER_NAME
-ATOS_TOS_RPC_CA_FILE
-ATOS_TOS_RPC_CLIENT_CERT_FILE
-ATOS_TOS_RPC_CLIENT_KEY_FILE
-ATOS_TOS_RPC_TIMEOUT
-ATOS_TOS_RPC_MAX_MESSAGE_BYTES
-ATOS_CAPABILITY_CATALOG_MAX_ENTRIES
+TOS_SERVICE_TOS_RPC_SERVER_NAME
+TOS_SERVICE_TOS_RPC_CA_FILE
+TOS_SERVICE_TOS_RPC_CLIENT_CERT_FILE
+TOS_SERVICE_TOS_RPC_CLIENT_KEY_FILE
+TOS_SERVICE_TOS_RPC_TIMEOUT
+TOS_SERVICE_TOS_RPC_MAX_MESSAGE_BYTES
+TOS_SERVICE_CAPABILITY_CATALOG_MAX_ENTRIES
 ```
 
 Client certificate and key must be configured together. Startup and readiness
-fail closed when `tos-protocol` is unavailable; there is no mock or Managed
+fail closed when `tos-service-protocol` is unavailable; there is no mock or Managed
 fallback.
 
 Capability discovery is derived and explicitly incomplete. The gateway keeps
@@ -99,7 +99,7 @@ are not chain state or consensus ranking.
 
 ```text
 cmd/api/                              Native gateway process
-internal/adapters/tosprotocol/        private Native Connect client
+internal/adapters/serviceprotocol/        private Native Connect client
 internal/config/                      Native-only configuration
 internal/nativegateway/               transport auth and pass-through service
 ```

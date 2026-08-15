@@ -1,4 +1,4 @@
-// Package nativegateway exposes the stateless atos_native_v1 transport.
+// Package nativegateway exposes the stateless tos_service_v1 transport.
 // Authentication grants transport access only; it never decides Native state.
 package nativegateway
 
@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	nativev1 "github.com/tosnetwork/tos-protocol/gen/atos/native/v1"
-	"github.com/tosnetwork/tos-protocol/pkg/capabilitycatalog"
-	"github.com/tosnetwork/tos-protocol/pkg/publicerrors"
-	"github.com/tosnetwork/tos-protocol/pkg/quoteexchange"
+	nativev1 "github.com/tosnetwork/tos-service-protocol/gen/tos/service/v1"
+	"github.com/tosnetwork/tos-service-protocol/pkg/capabilitycatalog"
+	"github.com/tosnetwork/tos-service-protocol/pkg/publicerrors"
+	"github.com/tosnetwork/tos-service-protocol/pkg/quoteexchange"
 )
 
 type Backend interface {
