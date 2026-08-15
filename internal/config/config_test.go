@@ -8,7 +8,9 @@ import (
 
 func validConfig() Config {
 	return Config{Addr: ":8080", NativeReadToken: "read", NativeRelayToken: "relay",
-		TOSRPC: TOSRPCConfig{URL: "https://tos-protocol.internal", Token: "backend", Timeout: time.Second, MaxMessageBytes: 1024}}
+		TOSRPC: TOSRPCConfig{URL: "https://tos-protocol.internal", Token: "backend", Timeout: time.Second, MaxMessageBytes: 1024},
+		Catalog: CatalogConfig{Directory: "/var/lib/atos/catalog", NetworkID: "test", GenesisRootHash: "sha256:root",
+			GenesisFileHash: "sha256:file", RegistryCodeHash: "tvm-cell-sha256:code", MaxEntries: 100}}
 }
 
 func TestValidateNativeOnlyConfig(t *testing.T) {

@@ -17,6 +17,10 @@ The product and protocol specification lives in
   `ATOS_NATIVE_RELAY_TOKEN`.
 - `atos.native.v1.NativeService/ResolveNativeState` accepts the read or relay
   token.
+- `atos.native.v1.CapabilityDiscoveryService/ListCapabilities` and
+  `GetSoftwareWorkManifest` accept the read or relay token.
+- `atos.native.v1.CapabilityDiscoveryService/PublishSoftwareWorkManifest`
+  requires the relay token.
 - `GET /livez` reports process liveness.
 - `GET /readyz` verifies that the authoritative `tos-protocol` boundary is
   reachable.
@@ -35,6 +39,12 @@ export ATOS_NATIVE_RELAY_TOKEN='<distinct-relay-token>'
 export ATOS_TOS_RPC_URL='http://127.0.0.1:8090'
 export ATOS_TOS_RPC_TOKEN='<private-backend-token>'
 export ATOS_TOS_RPC_INSECURE=true
+install -d -m 0700 /absolute/private/catalog
+export ATOS_CAPABILITY_CATALOG_DIRECTORY='/absolute/private/catalog'
+export ATOS_NATIVE_NETWORK_ID='<network-id>'
+export ATOS_NATIVE_GENESIS_ROOT_HASH='sha256:<64 lowercase hex>'
+export ATOS_NATIVE_GENESIS_FILE_HASH='sha256:<64 lowercase hex>'
+export ATOS_NATIVE_REGISTRY_CODE_HASH='tvm-cell-sha256:<64 lowercase hex>'
 
 GOWORK=off go run ./cmd/api
 ```
@@ -49,11 +59,19 @@ ATOS_TOS_RPC_CLIENT_CERT_FILE
 ATOS_TOS_RPC_CLIENT_KEY_FILE
 ATOS_TOS_RPC_TIMEOUT
 ATOS_TOS_RPC_MAX_MESSAGE_BYTES
+ATOS_CAPABILITY_CATALOG_MAX_ENTRIES
 ```
 
 Client certificate and key must be configured together. Startup and readiness
 fail closed when `tos-protocol` is unavailable; there is no mock or Managed
 fallback.
+
+Capability discovery is derived and explicitly incomplete. The gateway keeps
+only bounded discovery IDs, immutable canonical manifest bytes, and rollback
+fences in the owner-private catalog directory. Every listed Capability is
+freshly resolved from finalized TOS state. Clients must compare a retrieved
+manifest digest with that fresh state or an Accepted Quote; catalog inclusion,
+ordering, and availability have no semantic authority.
 
 ## Repository layout
 

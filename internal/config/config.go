@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +28,16 @@ type Config struct {
 	NativeReadToken  string
 	NativeRelayToken string
 	TOSRPC           TOSRPCConfig
+	Catalog          CatalogConfig
+}
+
+type CatalogConfig struct {
+	Directory        string
+	NetworkID        string
+	GenesisRootHash  string
+	GenesisFileHash  string
+	RegistryCodeHash string
+	MaxEntries       uint32
 }
 
 func Load() (Config, error) {
@@ -37,6 +48,10 @@ func Load() (Config, error) {
 	maxBytes, err := intEnv("ATOS_TOS_RPC_MAX_MESSAGE_BYTES", 16<<20)
 	if err != nil {
 		return Config{}, err
+	}
+	maxCatalogEntries, err := intEnv("ATOS_CAPABILITY_CATALOG_MAX_ENTRIES", 10_000)
+	if err != nil || maxCatalogEntries <= 0 {
+		return Config{}, errors.New("ATOS_CAPABILITY_CATALOG_MAX_ENTRIES must be a positive integer")
 	}
 	insecure, err := boolEnv("ATOS_TOS_RPC_INSECURE", false)
 	if err != nil {
@@ -52,6 +67,11 @@ func Load() (Config, error) {
 			ServerName: strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_SERVER_NAME")), CAFile: strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_CA_FILE")),
 			ClientCertFile: strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_CLIENT_CERT_FILE")), ClientKeyFile: strings.TrimSpace(os.Getenv("ATOS_TOS_RPC_CLIENT_KEY_FILE")),
 		},
+		Catalog: CatalogConfig{Directory: strings.TrimSpace(os.Getenv("ATOS_CAPABILITY_CATALOG_DIRECTORY")),
+			NetworkID:        strings.TrimSpace(os.Getenv("ATOS_NATIVE_NETWORK_ID")),
+			GenesisRootHash:  strings.TrimSpace(os.Getenv("ATOS_NATIVE_GENESIS_ROOT_HASH")),
+			GenesisFileHash:  strings.TrimSpace(os.Getenv("ATOS_NATIVE_GENESIS_FILE_HASH")),
+			RegistryCodeHash: strings.TrimSpace(os.Getenv("ATOS_NATIVE_REGISTRY_CODE_HASH")), MaxEntries: uint32(maxCatalogEntries)},
 	}
 	return cfg, cfg.Validate()
 }
@@ -84,6 +104,15 @@ func (c Config) Validate() error {
 	}
 	if (c.TOSRPC.ClientCertFile == "") != (c.TOSRPC.ClientKeyFile == "") {
 		return errors.New("tos-protocol client certificate and key must be configured together")
+	}
+	if !filepath.IsAbs(c.Catalog.Directory) || filepath.Clean(c.Catalog.Directory) != c.Catalog.Directory {
+		return errors.New("ATOS_CAPABILITY_CATALOG_DIRECTORY must be absolute and clean")
+	}
+	if c.Catalog.NetworkID == "" || c.Catalog.GenesisRootHash == "" || c.Catalog.GenesisFileHash == "" || c.Catalog.RegistryCodeHash == "" {
+		return errors.New("Native network/genesis/Registry identity is required for Capability discovery")
+	}
+	if c.Catalog.MaxEntries == 0 || c.Catalog.MaxEntries > 1_000_000 {
+		return errors.New("Capability catalog entry bound is invalid")
 	}
 	return nil
 }
