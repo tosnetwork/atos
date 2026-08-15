@@ -2,16 +2,62 @@ package nativegateway
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
 	nativev1 "github.com/tosnetwork/tos-protocol/gen/atos/native/v1"
+	"github.com/tosnetwork/tos-protocol/gen/atos/native/v1/atosnativev1connect"
 	"github.com/tosnetwork/tos-protocol/pkg/capabilitycatalog"
+	"github.com/tosnetwork/tos-protocol/pkg/publicerrors"
 )
 
 type backendStub struct{ submissions, resolutions int }
+
+func requirePublicDetail(t *testing.T, err error, code nativev1.NativeErrorCodeV1, retry nativev1.RetryDispositionV1) {
+	t.Helper()
+	detail, ok := publicerrors.Detail(err)
+	if !ok || detail.Code != code || detail.RetryDisposition != retry {
+		t.Fatalf("detail=%+v ok=%v err=%v", detail, ok, err)
+	}
+}
+
+func TestPublicBoundaryErrorsCarryCanonicalRetryDetails(t *testing.T) {
+	server := &Server{Authorizer: NewTokenAuthorizer("read-secret", "relay-secret")}
+	_, err := server.SearchCapabilities(context.Background(), nil)
+	requirePublicDetail(t, err, nativev1.NativeErrorCodeV1_NATIVE_ERROR_CODE_V1_PUBLIC_BAD_REQUEST,
+		nativev1.RetryDispositionV1_RETRY_DISPOSITION_V1_NEVER)
+	resolve := connect.NewRequest(&nativev1.ResolveNativeStateRequest{})
+	resolve.Header().Set("Authorization", "Bearer read-secret")
+	_, err = server.ResolveNativeState(context.Background(), resolve)
+	requirePublicDetail(t, err, nativev1.NativeErrorCodeV1_NATIVE_ERROR_CODE_V1_PUBLIC_DEPENDENCY_UNAVAILABLE,
+		nativev1.RetryDispositionV1_RETRY_DISPOSITION_V1_SAME_REQUEST_AFTER_BACKOFF)
+	expired := connect.NewRequest(&nativev1.ListCapabilitiesRequest{Context: &nativev1.RequestContext{
+		RequestId: "request", CallerId: "caller", DeadlineUnixMillis: time.Now().Add(-time.Second).UnixMilli()}})
+	expired.Header().Set("Authorization", "Bearer read-secret")
+	_, err = server.ListCapabilities(context.Background(), expired)
+	requirePublicDetail(t, err, nativev1.NativeErrorCodeV1_NATIVE_ERROR_CODE_V1_PUBLIC_DEADLINE,
+		nativev1.RetryDispositionV1_RETRY_DISPOSITION_V1_NEVER)
+}
+
+func TestPublicErrorDetailSurvivesConnectWire(t *testing.T) {
+	server := &Server{Authorizer: NewTokenAuthorizer("read-secret", "relay-secret"), Catalog: &discoveryStub{}}
+	path, handler := atosnativev1connect.NewCapabilityDiscoveryServiceHandler(server)
+	mux := http.NewServeMux()
+	mux.Handle(path, handler)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+	client := atosnativev1connect.NewCapabilityDiscoveryServiceClient(httpServer.Client(), httpServer.URL)
+	request := connect.NewRequest(&nativev1.SearchCapabilitiesRequest{Context: &nativev1.RequestContext{
+		RequestId: "request", CallerId: "caller", DeadlineUnixMillis: time.Now().Add(-time.Second).UnixMilli()}})
+	request.Header().Set("Authorization", "Bearer read-secret")
+	_, err := client.SearchCapabilities(context.Background(), request)
+	requirePublicDetail(t, err, nativev1.NativeErrorCodeV1_NATIVE_ERROR_CODE_V1_PUBLIC_DEADLINE,
+		nativev1.RetryDispositionV1_RETRY_DISPOSITION_V1_NEVER)
+}
 
 func (b *backendStub) SubmitNativeAction(context.Context, *connect.Request[nativev1.SubmitNativeActionRequest]) (*connect.Response[nativev1.SubmitNativeActionResponse], error) {
 	b.submissions++
