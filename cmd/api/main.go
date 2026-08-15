@@ -64,6 +64,8 @@ func main() {
 	gateway := &nativegateway.Server{
 		Authorizer: nativegateway.NewTokenAuthorizer(cfg.NativeReadToken, cfg.NativeRelayToken),
 		Backend:    backend, Catalog: catalog,
+		Network: &nativev1.NetworkDomain{NetworkId: cfg.Catalog.NetworkID,
+			GenesisRootHash: cfg.Catalog.GenesisRootHash, GenesisFileHash: cfg.Catalog.GenesisFileHash},
 	}
 	mux := http.NewServeMux()
 	path, handler := atosnativev1connect.NewNativeServiceHandler(gateway)

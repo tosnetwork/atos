@@ -13,6 +13,7 @@ import (
 	"connectrpc.com/connect"
 	nativev1 "github.com/tosnetwork/tos-protocol/gen/atos/native/v1"
 	"github.com/tosnetwork/tos-protocol/pkg/capabilitycatalog"
+	"github.com/tosnetwork/tos-protocol/pkg/quoteexchange"
 )
 
 type Backend interface {
@@ -65,9 +66,15 @@ func constantTimeEqual(left, right string) bool {
 }
 
 type Server struct {
-	Authorizer Authorizer
-	Backend    Backend
-	Catalog    DiscoveryCatalog
+	Authorizer  Authorizer
+	Backend     Backend
+	Catalog     DiscoveryCatalog
+	QuoteSource QuoteSource
+	Network     *nativev1.NetworkDomain
+}
+
+type QuoteSource interface {
+	RequestQuoteProposal(context.Context, *nativev1.RequestQuoteProposalRequest) (*nativev1.QuoteProposalPackageV1, error)
 }
 
 type DiscoveryCatalog interface {
@@ -174,12 +181,39 @@ func (s *Server) GetSoftwareWorkManifest(_ context.Context, request *connect.Req
 	return connect.NewResponse(&nativev1.GetSoftwareWorkManifestResponse{ManifestDigest: request.Msg.ManifestDigest, CanonicalCbor: raw}), nil
 }
 
+func (s *Server) RequestQuoteProposal(ctx context.Context, request *connect.Request[nativev1.RequestQuoteProposalRequest]) (*connect.Response[nativev1.RequestQuoteProposalResponse], error) {
+	if request == nil || request.Msg == nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("Quote Proposal request is required"))
+	}
+	if err := s.authorizeRequestContext(request.Header().Get("Authorization"), request.Msg.Context, PermissionRead); err != nil {
+		return nil, err
+	}
+	if s.QuoteSource == nil || s.Network == nil {
+		return nil, connect.NewError(connect.CodeUnavailable, errors.New("Quote Proposal source is unavailable"))
+	}
+	proposal, err := s.QuoteSource.RequestQuoteProposal(ctx, request.Msg)
+	if err != nil {
+		return nil, discoveryError(err, connect.CodeUnavailable)
+	}
+	if _, err := quoteexchange.Validate(s.Network, request.Msg, proposal, time.Now()); err != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("Quote Proposal source returned conflicting preimages"))
+	}
+	return connect.NewResponse(&nativev1.RequestQuoteProposalResponse{Package: proposal}), nil
+}
+
 func (s *Server) authorizeDiscovery(header string, requestContext *nativev1.RequestContext, required Permission) error {
-	if err := s.authorize(header, required); err != nil {
+	if err := s.authorizeRequestContext(header, requestContext, required); err != nil {
 		return err
 	}
 	if s.Catalog == nil {
 		return connect.NewError(connect.CodeUnavailable, errors.New("Capability discovery is unavailable"))
+	}
+	return nil
+}
+
+func (s *Server) authorizeRequestContext(header string, requestContext *nativev1.RequestContext, required Permission) error {
+	if err := s.authorize(header, required); err != nil {
+		return err
 	}
 	now := time.Now()
 	if requestContext == nil || requestContext.RequestId == "" || len(requestContext.RequestId) > 128 ||

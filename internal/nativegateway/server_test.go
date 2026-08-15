@@ -2,6 +2,7 @@ package nativegateway
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,9 +20,38 @@ func (b *backendStub) SubmitNativeAction(context.Context, *connect.Request[nativ
 
 type discoveryStub struct{ published, listed, searched, loaded int }
 
+type quoteStub struct{ calls int }
+
+func (q *quoteStub) RequestQuoteProposal(context.Context, *nativev1.RequestQuoteProposalRequest) (*nativev1.QuoteProposalPackageV1, error) {
+	q.calls++
+	return &nativev1.QuoteProposalPackageV1{}, nil
+}
+
 func (d *discoveryStub) List(context.Context, uint32, string) (*capabilitycatalog.Page, error) {
 	d.listed++
 	return &capabilitycatalog.Page{}, nil
+}
+
+func TestQuoteExchangeRequiresReadPermissionAndCompletePreimages(t *testing.T) {
+	source := &quoteStub{}
+	server := &Server{Authorizer: NewTokenAuthorizer("read-secret", "relay-secret"), QuoteSource: source,
+		Network: &nativev1.NetworkDomain{NetworkId: "test", GenesisRootHash: "sha256:" + strings.Repeat("11", 32),
+			GenesisFileHash: "sha256:" + strings.Repeat("22", 32)}}
+	requestContext := &nativev1.RequestContext{RequestId: "request", CallerId: "buyer",
+		DeadlineUnixMillis: time.Now().Add(time.Minute).UnixMilli()}
+	request := connect.NewRequest(&nativev1.RequestQuoteProposalRequest{Context: requestContext,
+		CapabilityId: "cap_" + strings.Repeat("33", 32), CapabilityVersion: "1.0.0",
+		BuyerAddress: "0:" + strings.Repeat("44", 32)})
+	if _, err := server.RequestQuoteProposal(context.Background(), request); connect.CodeOf(err) != connect.CodeUnauthenticated {
+		t.Fatalf("missing token error=%v", err)
+	}
+	request.Header().Set("Authorization", "Bearer read-secret")
+	if _, err := server.RequestQuoteProposal(context.Background(), request); connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("incomplete preimage error=%v", err)
+	}
+	if source.calls != 1 {
+		t.Fatalf("quote source calls=%d", source.calls)
+	}
 }
 func (d *discoveryStub) Search(context.Context, string, uint32, string) (*capabilitycatalog.SearchPage, error) {
 	d.searched++

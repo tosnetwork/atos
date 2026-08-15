@@ -22,6 +22,10 @@ The product and protocol specification lives in
   token.
 - `atos.native.v1.CapabilityDiscoveryService/PublishSoftwareWorkManifest`
   requires the relay token.
+- `atos.native.v1.CapabilityDiscoveryService/RequestQuoteProposal` accepts a
+  read or relay token and proxies only a provider-supplied complete-preimage
+  package. The gateway validates the non-canonical proposal but cannot accept
+  terms for the buyer.
 - `GET /livez` reports process liveness.
 - `GET /readyz` verifies that the authoritative `tos-protocol` boundary is
   reachable.
