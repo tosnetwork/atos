@@ -51,9 +51,19 @@ export ATOS_NATIVE_NETWORK_ID='<network-id>'
 export ATOS_NATIVE_GENESIS_ROOT_HASH='sha256:<64 lowercase hex>'
 export ATOS_NATIVE_GENESIS_FILE_HASH='sha256:<64 lowercase hex>'
 export ATOS_NATIVE_REGISTRY_CODE_HASH='tvm-cell-sha256:<64 lowercase hex>'
+# Optional: enables provider Quote construction. Both this profile and its
+# manifest_cbor_file must be owner-owned regular files with mode 0600.
+export ATOS_PROVIDER_QUOTE_PROFILE_FILE='/absolute/private/provider/quote-profile.json'
 
 GOWORK=off go run ./cmd/api
 ```
+
+The Quote profile schema is illustrated in
+[`docs/provider-quote-profile.example.json`](docs/provider-quote-profile.example.json).
+It binds the provider Agent/address, exact TOS-network stablecoin identity,
+atomic price, transport policy, canonical manifest file, and bounded timing.
+Every request re-resolves the Capability from finalized Native state before a
+proposal is returned.
 
 Plaintext backend RPC is rejected unless `ATOS_TOS_RPC_INSECURE=true`. Use
 HTTPS outside local development. Optional TLS settings are:

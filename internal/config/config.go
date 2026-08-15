@@ -30,6 +30,7 @@ type Config struct {
 	NativeRelayToken string
 	TOSRPC           TOSRPCConfig
 	Catalog          CatalogConfig
+	QuoteProfileFile string
 }
 
 type CatalogConfig struct {
@@ -74,6 +75,7 @@ func Load() (Config, error) {
 			GenesisRootHash:  strings.TrimSpace(os.Getenv("ATOS_NATIVE_GENESIS_ROOT_HASH")),
 			GenesisFileHash:  strings.TrimSpace(os.Getenv("ATOS_NATIVE_GENESIS_FILE_HASH")),
 			RegistryCodeHash: strings.TrimSpace(os.Getenv("ATOS_NATIVE_REGISTRY_CODE_HASH")), MaxEntries: uint32(maxCatalogEntries)},
+		QuoteProfileFile: strings.TrimSpace(os.Getenv("ATOS_PROVIDER_QUOTE_PROFILE_FILE")),
 	}
 	return cfg, cfg.Validate()
 }
@@ -122,6 +124,9 @@ func (c Config) Validate() error {
 	}
 	if c.Catalog.MaxEntries == 0 || c.Catalog.MaxEntries > 1_000_000 {
 		return errors.New("Capability catalog entry bound is invalid")
+	}
+	if c.QuoteProfileFile != "" && (!filepath.IsAbs(c.QuoteProfileFile) || filepath.Clean(c.QuoteProfileFile) != c.QuoteProfileFile) {
+		return errors.New("ATOS_PROVIDER_QUOTE_PROFILE_FILE must be absolute and clean")
 	}
 	return nil
 }

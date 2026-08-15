@@ -16,6 +16,7 @@ import (
 	"github.com/tosnetwork/atos/internal/adapters/tosprotocol"
 	"github.com/tosnetwork/atos/internal/config"
 	"github.com/tosnetwork/atos/internal/nativegateway"
+	"github.com/tosnetwork/atos/internal/quotesource"
 	nativev1 "github.com/tosnetwork/tos-protocol/gen/atos/native/v1"
 	"github.com/tosnetwork/tos-protocol/gen/atos/native/v1/atosnativev1connect"
 	"github.com/tosnetwork/tos-protocol/pkg/capabilitycatalog"
@@ -52,6 +53,17 @@ func main() {
 		logger.Error("configure Capability catalog", "error", err)
 		os.Exit(2)
 	}
+	network := &nativev1.NetworkDomain{NetworkId: cfg.Catalog.NetworkID,
+		GenesisRootHash: cfg.Catalog.GenesisRootHash, GenesisFileHash: cfg.Catalog.GenesisFileHash}
+	var quoteSource nativegateway.QuoteSource
+	if cfg.QuoteProfileFile != "" {
+		quoteSource, err = quotesource.Load(cfg.QuoteProfileFile, catalogBackend{backend}, network,
+			cfg.Catalog.RegistryCodeHash, cfg.TOSRPC.Timeout)
+		if err != nil {
+			logger.Error("configure provider Quote source", "error", err)
+			os.Exit(2)
+		}
+	}
 
 	readyCtx, cancelReady := context.WithTimeout(context.Background(), cfg.TOSRPC.Timeout)
 	err = backend.CheckReady(readyCtx)
@@ -63,9 +75,7 @@ func main() {
 
 	gateway := &nativegateway.Server{
 		Authorizer: nativegateway.NewTokenAuthorizer(cfg.NativeReadToken, cfg.NativeRelayToken),
-		Backend:    backend, Catalog: catalog,
-		Network: &nativev1.NetworkDomain{NetworkId: cfg.Catalog.NetworkID,
-			GenesisRootHash: cfg.Catalog.GenesisRootHash, GenesisFileHash: cfg.Catalog.GenesisFileHash},
+		Backend:    backend, Catalog: catalog, QuoteSource: quoteSource, Network: network,
 	}
 	mux := http.NewServeMux()
 	path, handler := atosnativev1connect.NewNativeServiceHandler(gateway)

@@ -32,4 +32,9 @@ func TestValidateNativeOnlyConfig(t *testing.T) {
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "INSECURE") {
 		t.Fatalf("error = %v", err)
 	}
+	cfg = validConfig()
+	cfg.QuoteProfileFile = "relative/profile.json"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "absolute") {
+		t.Fatalf("error = %v", err)
+	}
 }
