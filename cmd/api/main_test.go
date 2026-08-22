@@ -46,6 +46,7 @@ func TestGatewayDiscoveryUsesConfiguredOriginAndNetwork(t *testing.T) {
 	gatewayDiscoveryHandler(cfg, func() time.Time { return now })(response, request)
 	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/json" ||
 		!strings.Contains(response.Body.String(), `"native_connect":"https://gateway.example"`) ||
+		!strings.Contains(response.Body.String(), `"dns_alias_connect":"https://gateway.example"`) ||
 		strings.Contains(response.Body.String(), "attacker.invalid") ||
 		!strings.Contains(response.Body.String(), `"max_response_bytes":2048`) ||
 		!strings.Contains(response.Body.String(), `"expires_at_unix_seconds":1786803600`) {

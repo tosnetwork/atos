@@ -4,7 +4,7 @@ go 1.26.5
 
 require (
 	connectrpc.com/connect v1.19.1
-	github.com/tosnetwork/tos-service-protocol v0.0.0-20260820090236-2a06d05b29db
+	github.com/tosnetwork/tos-service-protocol v0.0.0-20260822014957-94afb396892d
 )
 
 require (

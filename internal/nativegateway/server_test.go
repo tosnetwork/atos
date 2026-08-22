@@ -15,7 +15,7 @@ import (
 	"github.com/tosnetwork/tos-service-protocol/pkg/publicerrors"
 )
 
-type backendStub struct{ submissions, resolutions int }
+type backendStub struct{ submissions, resolutions, dnsResolutions int }
 
 func requirePublicDetail(t *testing.T, err error, code nativev1.NativeErrorCodeV1, retry nativev1.RetryDispositionV1) {
 	t.Helper()
@@ -115,6 +115,10 @@ func (b *backendStub) ResolveNativeState(context.Context, *connect.Request[nativ
 	b.resolutions++
 	return connect.NewResponse(&nativev1.ResolveNativeStateResponse{}), nil
 }
+func (b *backendStub) ResolveDNSAlias(_ context.Context, request *connect.Request[nativev1.ResolveDNSAliasRequest]) (*connect.Response[nativev1.ResolveDNSAliasResponse], error) {
+	b.dnsResolutions++
+	return connect.NewResponse(&nativev1.ResolveDNSAliasResponse{CanonicalName: request.Msg.Name}), nil
+}
 
 func TestTransportPermissionsAreSeparated(t *testing.T) {
 	backend := &backendStub{}
@@ -148,6 +152,29 @@ func TestUnknownTokenFailsBeforeBackend(t *testing.T) {
 	}
 	if backend.resolutions != 0 {
 		t.Fatal("unauthenticated request reached backend")
+	}
+}
+
+func TestDNSAliasRequiresReadTokenAndBoundedContext(t *testing.T) {
+	backend := &backendStub{}
+	server := &Server{Authorizer: NewTokenAuthorizer("read-secret", "relay-secret"), Backend: backend}
+	request := connect.NewRequest(&nativev1.ResolveDNSAliasRequest{Name: "alice.tos",
+		Kind: nativev1.DNSAliasKindV1_DNS_ALIAS_KIND_V1_AGENT, Context: &nativev1.RequestContext{
+			RequestId: "dns-one", CallerId: "wallet", DeadlineUnixMillis: time.Now().Add(time.Minute).UnixMilli()}})
+	if _, err := server.ResolveDNSAlias(context.Background(), request); connect.CodeOf(err) != connect.CodeUnauthenticated {
+		t.Fatalf("missing token error = %v", err)
+	}
+	request.Header().Set("Authorization", "Bearer read-secret")
+	response, err := server.ResolveDNSAlias(context.Background(), request)
+	if err != nil || response.Msg.CanonicalName != "alice.tos" || backend.dnsResolutions != 1 {
+		t.Fatalf("DNS response = %#v, calls=%d, err=%v", response, backend.dnsResolutions, err)
+	}
+	request.Msg.Context.DeadlineUnixMillis = time.Now().Add(16 * time.Minute).UnixMilli()
+	if _, err := server.ResolveDNSAlias(context.Background(), request); connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Fatalf("unbounded DNS deadline error = %v", err)
+	}
+	if backend.dnsResolutions != 1 {
+		t.Fatal("invalid DNS request reached backend")
 	}
 }
 

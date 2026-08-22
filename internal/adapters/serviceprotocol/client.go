@@ -41,6 +41,7 @@ type Client struct {
 	timeout    time.Duration
 	httpClient *http.Client
 	native     tosservicev1connect.NativeServiceClient
+	dns        tosservicev1connect.DNSAliasServiceClient
 }
 
 func New(config Config) (*Client, error) {
@@ -100,7 +101,21 @@ func New(config Config) (*Client, error) {
 	httpClient := &http.Client{Transport: transport}
 	options := []connect.ClientOption{connect.WithReadMaxBytes(config.MaxMessageBytes), connect.WithSendMaxBytes(config.MaxMessageBytes)}
 	return &Client{baseURL: config.BaseURL, token: config.BearerToken, timeout: config.Timeout, httpClient: httpClient,
-		native: tosservicev1connect.NewNativeServiceClient(httpClient, config.BaseURL, options...)}, nil
+		native: tosservicev1connect.NewNativeServiceClient(httpClient, config.BaseURL, options...),
+		dns:    tosservicev1connect.NewDNSAliasServiceClient(httpClient, config.BaseURL, options...)}, nil
+}
+
+func (c *Client) ResolveDNSAlias(ctx context.Context, request *connect.Request[nativev1.ResolveDNSAliasRequest]) (*connect.Response[nativev1.ResolveDNSAliasResponse], error) {
+	if c == nil || c.dns == nil {
+		return nil, connect.NewError(connect.CodeUnavailable, errors.New("DNS alias backend is unavailable"))
+	}
+	if request == nil || request.Msg == nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("DNS alias request is required"))
+	}
+	callCtx, cancel := c.callContext(ctx, nativeDeadline(request.Msg.GetContext()))
+	defer cancel()
+	request.Header().Set("Authorization", "Bearer "+c.token)
+	return c.dns.ResolveDNSAlias(callCtx, request)
 }
 
 func (c *Client) SubmitNativeAction(ctx context.Context, request *connect.Request[nativev1.SubmitNativeActionRequest]) (*connect.Response[nativev1.SubmitNativeActionResponse], error) {

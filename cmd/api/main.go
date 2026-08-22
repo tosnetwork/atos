@@ -80,6 +80,8 @@ func main() {
 	mux := http.NewServeMux()
 	path, handler := tosservicev1connect.NewNativeServiceHandler(gateway)
 	mux.Handle(path, handler)
+	dnsPath, dnsHandler := tosservicev1connect.NewDNSAliasServiceHandler(gateway)
+	mux.Handle(dnsPath, dnsHandler)
 	discoveryPath, discoveryHandler := tosservicev1connect.NewCapabilityDiscoveryServiceHandler(gateway)
 	mux.Handle(discoveryPath, discoveryHandler)
 	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
@@ -132,6 +134,7 @@ type gatewayDiscoveryNetwork struct {
 }
 type gatewayDiscoveryServices struct {
 	NativeConnect string `json:"native_connect"`
+	DNSConnect    string `json:"dns_alias_connect"`
 }
 type gatewayDiscoveryLimits struct {
 	MaxRequestBytes  int `json:"max_request_bytes"`
@@ -142,7 +145,7 @@ func gatewayDiscoveryHandler(cfg config.Config, now func() time.Time) http.Handl
 	return func(w http.ResponseWriter, _ *http.Request) {
 		document := gatewayDiscoveryDocument{Schema: "tos.service.gateway-discovery.v1", Protocol: "tos_service_v1",
 			Network:          gatewayDiscoveryNetwork{cfg.Catalog.NetworkID, cfg.Catalog.GenesisRootHash, cfg.Catalog.GenesisFileHash},
-			RegistryCodeHash: cfg.Catalog.RegistryCodeHash, Services: gatewayDiscoveryServices{cfg.PublicBaseURL},
+			RegistryCodeHash: cfg.Catalog.RegistryCodeHash, Services: gatewayDiscoveryServices{cfg.PublicBaseURL, cfg.PublicBaseURL},
 			Limits:    gatewayDiscoveryLimits{MaxRequestBytes: 1 << 20, MaxResponseBytes: cfg.TOSRPC.MaxMessageBytes},
 			ExpiresAt: now().Add(time.Hour).Unix()}
 		w.Header().Set("Content-Type", "application/json")

@@ -20,6 +20,7 @@ import (
 type Backend interface {
 	SubmitNativeAction(context.Context, *connect.Request[nativev1.SubmitNativeActionRequest]) (*connect.Response[nativev1.SubmitNativeActionResponse], error)
 	ResolveNativeState(context.Context, *connect.Request[nativev1.ResolveNativeStateRequest]) (*connect.Response[nativev1.ResolveNativeStateResponse], error)
+	ResolveDNSAlias(context.Context, *connect.Request[nativev1.ResolveDNSAliasRequest]) (*connect.Response[nativev1.ResolveDNSAliasResponse], error)
 }
 
 type Permission uint8
@@ -124,6 +125,19 @@ func (s *Server) ResolveNativeState(ctx context.Context, request *connect.Reques
 		return nil, publicerrors.New(publicerrors.DependencyUnavailable, errors.New("Native backend is unavailable"), time.Second)
 	}
 	return s.Backend.ResolveNativeState(ctx, request)
+}
+
+func (s *Server) ResolveDNSAlias(ctx context.Context, request *connect.Request[nativev1.ResolveDNSAliasRequest]) (*connect.Response[nativev1.ResolveDNSAliasResponse], error) {
+	if request == nil || request.Msg == nil {
+		return nil, publicerrors.New(publicerrors.BadRequest, errors.New("DNS alias resolution request is required"), 0)
+	}
+	if err := s.authorizeRequestContext(request.Header().Get("Authorization"), request.Msg.Context, PermissionRead); err != nil {
+		return nil, err
+	}
+	if s.Backend == nil {
+		return nil, publicerrors.New(publicerrors.DependencyUnavailable, errors.New("DNS alias backend is unavailable"), time.Second)
+	}
+	return s.Backend.ResolveDNSAlias(ctx, request)
 }
 
 func (s *Server) authorize(header string, required Permission) error {
